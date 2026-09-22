@@ -283,6 +283,9 @@ class Supervisor:
             valid = self.journal.valid_reviews(mission_id, head)
             for reviewer in spec.reviews:
                 if reviewer not in valid:
+                    if not permitted(f"review:{reviewer}", spec.forbidden_actions):
+                        advance(State.BLOCKED_POLICY, f"mission forbids review:{reviewer}")
+                        return State.BLOCKED_POLICY
                     result: GateResult = self.adapter.review(reviewer, head)
                     self.journal.record_receipt(mission_id, reviewer, head, result.status)
                     if result.status == "BLOCKED_EXTERNAL":
@@ -292,6 +295,10 @@ class Supervisor:
                         self.journal.update(mission_id, pending_gate=f"review:{reviewer}", ci_state="PENDING")
                         return state
                     if result.status != "PASS":
+                        if not permitted("source_edit", spec.forbidden_actions):
+                            advance(State.BLOCKED_POLICY,
+                                    "mission forbids source-edit repair for review findings")
+                            return State.BLOCKED_POLICY
                         if self._agent_turn(mission_id, f"Repair reviewer {reviewer} findings: {result.evidence}",
                                             spec.forbidden_actions):
                             self.journal.transition_after_codex_turn(

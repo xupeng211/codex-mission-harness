@@ -660,6 +660,33 @@ class HarnessTest(unittest.TestCase):
         self.assertFalse(permitted("merge", (), approved="APPROVED"))
         self.assertTrue(permitted("merge", (), approved=True))
         self.assertTrue(permitted("source_edit", (), approved=False))
+        self.assertTrue(permitted("review:codex", (), approved=False))
+        self.assertFalse(permitted("review:codex", ("review:codex",), approved=False))
+
+    def test_review_branch_enforces_review_and_repair_policy(self):
+        review_forbidden = replace(self.spec, forbidden_actions=("review:codex",))
+        self.journal.update(
+            self.spec.mission_id, spec_json=json.dumps(review_forbidden.__dict__),
+            current_head="a" * 40, current_state=State.REVIEW,
+        )
+        self.assertEqual(
+            self.supervisor.step(self.spec.mission_id, review_forbidden),
+            State.BLOCKED_POLICY,
+        )
+        self.assertEqual(self.adapter.review_index, 0)
+
+        repair_forbidden = replace(self.spec, forbidden_actions=("source_edit",))
+        self.journal.update(
+            self.spec.mission_id, spec_json=json.dumps(repair_forbidden.__dict__),
+            current_head="a" * 40, current_state=State.REVIEW,
+            pending_gate=None,
+        )
+        self.adapter.reviews = ["FAIL"]
+        self.assertEqual(
+            self.supervisor.step(self.spec.mission_id, repair_forbidden),
+            State.BLOCKED_POLICY,
+        )
+        self.assertEqual(self.codex.turns, [])
 
     def test_pass_is_reopened_when_canonical_head_changes(self):
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.PASS, terminal_state=State.PASS, merge_claim_head="a" * 40)

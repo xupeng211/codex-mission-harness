@@ -24,7 +24,8 @@ def decide(action: str, merge_policy: str = "owner_approval") -> Decision:
         return Decision.DENY
     if action in SENSITIVE:
         return Decision.OWNER_APPROVAL_REQUIRED
-    if action == "source_edit" or (action.startswith("gate:") and len(action) > 5):
+    if (action == "source_edit" or (action.startswith("gate:") and len(action) > 5)
+            or (action.startswith("review:") and len(action) > 7)):
         return Decision.AUTO_CONTINUE
     return Decision.DENY
 
