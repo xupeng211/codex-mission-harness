@@ -24,10 +24,10 @@ def load_spec(path: Path) -> MissionSpec:
     return MissionSpec(**data)
 
 
-def build(root: Path, adapter_name: str = "footballprediction") -> Supervisor:
+def build(root: Path, adapter_name: str = "footballprediction", codex=None) -> Supervisor:
     journal = Journal(root / "data" / "harness.sqlite")
     adapter = SimulatedAdapter() if adapter_name == "simulation" else FootballPredictionAdapter()
-    return Supervisor(journal, ProcessSupervisor(journal, root / "data" / "logs"), AppServerCodex(), adapter)
+    return Supervisor(journal, ProcessSupervisor(journal, root / "data" / "logs"), codex or AppServerCodex(), adapter)
 
 
 def describe(supervisor: Supervisor, mission_id: str) -> None:

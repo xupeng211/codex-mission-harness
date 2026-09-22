@@ -199,7 +199,7 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(state, State.PASS)
 
     def test_simulation_cli_build_selects_simulated_contract_adapter(self):
-        supervisor = build(Path(self.tmp.name), "simulation")
+        supervisor = build(Path(self.tmp.name), "simulation", FakeCodex())
         self.assertIsInstance(supervisor.adapter, SimulatedAdapter)
 
     def test_football_adapter_review_fails_closed_instead_of_crashing(self):
