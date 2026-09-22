@@ -291,7 +291,7 @@ class Supervisor:
             row = self.journal.mission(mission_id)
             active_turn = row["codex_turn_state"] == "RUNNING"
             pending_review = after == State.REVIEW and str(row["pending_gate"] or "").startswith("review:")
-            if after in TERMINAL or after == State.BLOCKED_EXTERNAL or self.journal.status(mission_id).background_jobs or (
+            if after in TERMINAL or after in {State.BLOCKED_EXTERNAL, State.BLOCKED_POLICY} or self.journal.status(mission_id).background_jobs or (
                     before.state == after and after in {State.CI, State.MERGE, State.WAITING_APPROVAL}
                     ) or pending_review or (before.state == after and after in {State.IMPLEMENT, State.REVIEW, State.CI}
                                             and active_turn):
@@ -302,7 +302,7 @@ class Supervisor:
         """Keep this controller alive long enough to journal owned child exits."""
         for _ in range(limit):
             state = self.run_until_wait(mission_id, spec)
-            if state in TERMINAL or state in {State.WAITING_APPROVAL, State.BLOCKED_EXTERNAL}:
+            if state in TERMINAL or state in {State.WAITING_APPROVAL, State.BLOCKED_EXTERNAL, State.BLOCKED_POLICY}:
                 return state
             status = self.journal.status(mission_id)
             if status.background_jobs:

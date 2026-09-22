@@ -427,6 +427,14 @@ class HarnessTest(unittest.TestCase):
         )
         self.assertEqual(self.adapter.review_index, review_index)
 
+    def test_policy_block_is_a_stable_terminal_wait_state(self):
+        spec = replace(self.spec, forbidden_actions=("source_edit",))
+        self.journal.db.execute("UPDATE missions SET spec_json=?,current_state=? WHERE mission_id=?",
+                                (json.dumps(spec.__dict__), State.IMPLEMENT, spec.mission_id))
+        self.journal.db.commit()
+        self.assertEqual(self.supervisor.run_until_wait(spec.mission_id, spec), State.BLOCKED_POLICY)
+        self.assertEqual(self.supervisor.run_until_terminal(spec.mission_id, spec), State.BLOCKED_POLICY)
+
     def test_app_server_turn_requires_completed_notification(self):
         adapter = AppServerCodex.__new__(AppServerCodex)
         adapter.proc = type("Process", (), {"stdout": StringIO(
