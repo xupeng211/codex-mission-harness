@@ -45,15 +45,24 @@ def main() -> None:
     run = sub.add_parser("run"); run.add_argument("mission", type=Path)
     status = sub.add_parser("status"); status.add_argument("mission_id")
     resume = sub.add_parser("resume"); resume.add_argument("mission", type=Path)
+    approve = sub.add_parser("approve"); approve.add_argument("mission_id"); approve.add_argument("--action", required=True); approve.add_argument("--reason", default="")
     args = parser.parse_args()
     if args.command == "status":
         # status is read-only and deliberately does not start Codex.
         journal = Journal(args.root / "data" / "harness.sqlite")
-        row = journal.mission(args.mission_id)
+        try:
+            row = journal.mission(args.mission_id)
+        except KeyError:
+            parser.error(f"unknown mission: {args.mission_id}")
         observed = journal.status(args.mission_id)
         print(f"MISSION={args.mission_id}\nSTATE={observed.state}\nHEAD={observed.head or 'UNKNOWN'}\nWORKTREE={observed.worktree or 'UNKNOWN'}")
         print(f"BACKGROUND_JOBS={observed.background_jobs}\nCOMPLETED_GATES={row['completed_gates_json']}\nPENDING_GATE={observed.pending_gate or 'NONE'}")
         print(f"APPROVAL={row['approval_state']}\nTERMINAL={'YES' if observed.terminal else 'NO'}")
+        return
+    if args.command == "approve":
+        journal = Journal(args.root / "data" / "harness.sqlite")
+        journal.approve(args.mission_id, args.action, args.reason)
+        print(f"MISSION={args.mission_id}\nAPPROVAL={args.action}:APPROVED")
         return
     spec = load_spec(args.mission)
     supervisor = build(args.root, spec.adapter)

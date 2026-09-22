@@ -13,6 +13,6 @@ The test count and scenario count deliberately differ: two tests each verify two
 | 7: Agent says incomplete | Natural-language text cannot terminate a mission. | `test_agent_prose_is_not_terminal_and_invalid_transition_fails_closed` |
 | 8: Agent says done early | A prohibited direct transition to PASS fails closed. | `test_agent_prose_is_not_terminal_and_invalid_transition_fails_closed` |
 
-Additional protocol coverage: `test_app_server_turn_requires_completed_notification` proves that accepting `turn/start` is not treated as completion; the adapter waits for matching `turn/completed`.
+Additional adversarial coverage: `test_app_server_turn_requires_completed_notification` proves that accepting `turn/start` is not treated as completion; `test_stale_starting_lease_is_recoverable_without_a_second_launch` proves a dead pre-launch lease is safely retired; `test_restart_gate_crash_points_fail_closed_and_recover` covers completed-but-not-journaled and journaled-before-transition recovery; `test_owner_approval_is_persisted_and_resume_consumes_only_explicit_grant` proves explicit persisted approval is required across a restart; and `test_simulation_cli_build_selects_simulated_contract_adapter` proves the CLI selects the simulation contract rather than silently using the production adapter.
 
 All scenarios are deterministic fixtures: no live provider, DNS probe, production authorization, FootballPrediction Stage D action, or external CI credential is used.

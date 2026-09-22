@@ -66,7 +66,7 @@ class Supervisor:
             if not permitted("source_edit", spec.forbidden_actions):
                 self.journal.transition(mission_id, State.BLOCKED_POLICY, "mission forbids source_edit")
                 return State.BLOCKED_POLICY
-            self._agent_turn(mission_id, "Continue the same mission. Inspect actual gates; do not declare terminal state from prose.")
+            self._agent_turn(mission_id, f"Continue mission objective: {spec.objective}. Inspect actual gates; do not declare terminal state from prose.")
             self.journal.transition(mission_id, State.TEST, "primary turn completed")
         elif state == State.TEST:
             for gate in spec.required_gates:
@@ -107,14 +107,27 @@ class Supervisor:
                 self.journal.update(mission_id, pending_gate="github-ci", ci_state=result.status)
         elif state == State.MERGE:
             if decide("merge", spec.merge_policy) == Decision.OWNER_APPROVAL_REQUIRED:
-                self.journal.update(mission_id, approval_state="PENDING", pending_gate="owner-merge")
-                self.journal.transition(mission_id, State.BLOCKED_POLICY, "owner merge approval required")
+                if not self.journal.approved(mission_id, "merge"):
+                    self.journal.update(mission_id, approval_state="PENDING", pending_gate="owner-merge")
+                    self.journal.transition(mission_id, State.WAITING_APPROVAL, "owner merge approval required")
+                    return State.WAITING_APPROVAL
+                self.journal.update(mission_id, approval_state="APPROVED", pending_gate=None)
+                result = self.adapter.merge(row["worktree"], row["current_head"])
+                if result.status != "PASS":
+                    self.journal.transition(mission_id, State.BLOCKED_POLICY, result.evidence)
+                else:
+                    self.journal.transition(mission_id, State.POST_MERGE, result.evidence)
             else:
                 result = self.adapter.merge(row["worktree"], row["current_head"])
                 if result.status != "PASS":
                     self.journal.transition(mission_id, State.BLOCKED_POLICY, result.evidence)
                 else:
                     self.journal.transition(mission_id, State.POST_MERGE, result.evidence)
+        elif state == State.WAITING_APPROVAL:
+            if self.journal.approved(mission_id, "merge"):
+                self.journal.transition(mission_id, State.MERGE, "persisted owner merge approval")
+            else:
+                return state
         elif state == State.POST_MERGE:
             for gate in spec.post_merge_gates:
                 result = self.adapter.post_merge(gate, row["current_head"])
@@ -130,7 +143,7 @@ class Supervisor:
         for _ in range(limit):
             before = self.journal.status(mission_id)
             after = self.step(mission_id, spec)
-            if after in TERMINAL or self.journal.status(mission_id).background_jobs or before.state == after == State.CI:
+            if after in TERMINAL or self.journal.status(mission_id).background_jobs or before.state == after in {State.CI, State.WAITING_APPROVAL}:
                 return after
         raise RuntimeError("supervisor progress limit reached")
 

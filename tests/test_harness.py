@@ -6,6 +6,7 @@ from io import StringIO
 from pathlib import Path
 
 from harness.adapters import FootballPredictionAdapter, SimulatedAdapter
+from harness.cli import build
 from harness.codex import AppServerCodex, Turn
 from harness.domain import InvalidTransition, MissionSpec, State
 from harness.isolation import compose_namespace, docker_env
@@ -57,6 +58,8 @@ class HarnessTest(unittest.TestCase):
             state = self.supervisor.run_until_wait(self.spec.mission_id, self.spec)
             if state == State.PASS:
                 return state
+            for child in list(self.supervisor.process._children.values()):
+                child.wait()
             self.supervisor.collect_jobs(self.spec.mission_id)
         self.fail("did not finish")
 
@@ -135,6 +138,69 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(self.journal.db.execute("SELECT count(*) FROM jobs WHERE name='one-gate'").fetchone()[0], 1)
         next(iter(process._children.values())).wait()
         process.poll(self.spec.mission_id)
+
+    def test_stale_starting_lease_is_recoverable_without_a_second_launch(self):
+        """A crash before PID publication is safe: bootstrap had no release payload."""
+        job_id = "reserved-only"
+        self.journal.db.execute(
+            "INSERT INTO jobs(job_id,mission_id,name,argv_json,launch_head,state,stdout_path,stderr_path,started_at,launcher_pid,launcher_start_ticks,lease_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (job_id, self.spec.mission_id, "verify-pr", "[]", "a" * 40, "STARTING", "", "", "now", 99999999, "never", "lease"),
+        )
+        self.journal.db.commit()
+        result = self.supervisor.process.poll(self.spec.mission_id)
+        self.assertEqual([(item.job_id, item.state) for item in result], [(job_id, "LOST")])
+        replacement = self.supervisor.process.start(self.spec.mission_id, "verify-pr", ["/bin/sh", "-c", "exit 0"], str(self.worktree), {}, "a" * 40)
+        self.assertNotEqual(replacement, job_id)
+        self.assertEqual(self.journal.db.execute("SELECT count(*) FROM jobs WHERE name='verify-pr'").fetchone()[0], 2)
+        self.supervisor.process._children[replacement].wait()
+        self.supervisor.process.poll(self.spec.mission_id)
+
+    def test_restart_gate_crash_points_fail_closed_and_recover(self):
+        self.advance_to_test()
+        # completed-but-not-journaled after a controller restart becomes LOST, not PASS
+        self.supervisor.run_until_wait(self.spec.mission_id, self.spec)
+        child = next(iter(self.supervisor.process._children.values()))
+        child.wait()
+        restarted = Supervisor(self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "restarted-logs"), self.codex, self.adapter)
+        restarted.reconcile(self.spec.mission_id)
+        self.assertFalse(self.journal.gate_passed_at_head(self.spec.mission_id, "verify-pr", "a" * 40))
+        self.assertEqual(self.journal.status(self.spec.mission_id).state, State.TEST)
+        # Retry from canonical TEST truth, then simulate a crash after gate journal but before state transition.
+        restarted.run_until_wait(self.spec.mission_id, self.spec)
+        for child in list(restarted.process._children.values()):
+            child.wait()
+        restarted.collect_jobs(self.spec.mission_id)
+        self.assertTrue(self.journal.gate_passed_at_head(self.spec.mission_id, "verify-pr", "a" * 40))
+        replacement = Supervisor(self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "again-logs"), self.codex, self.adapter)
+        self.assertEqual(replacement.run_until_wait(self.spec.mission_id, self.spec), State.PASS)
+        self.assertEqual(self.journal.db.execute("SELECT count(*) FROM jobs WHERE name='verify-pr'").fetchone()[0], 2)
+
+    def test_owner_approval_is_persisted_and_resume_consumes_only_explicit_grant(self):
+        spec = MissionSpec("approval-demo", "/safe/repo", "approval fixture", adapter="simulation", merge_policy="owner_approval")
+        worktree = Path(self.tmp.name) / "approval-worktree"; worktree.mkdir()
+        supervisor = Supervisor(self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "approval-logs"), self.codex, SimulatedAdapter())
+        supervisor.create(spec, str(worktree), "b" * 40, "harness/approval-demo")
+        for _ in range(20):
+            state = supervisor.run_until_wait(spec.mission_id, spec)
+            if state == State.WAITING_APPROVAL:
+                break
+            for child in list(supervisor.process._children.values()):
+                child.wait()
+            supervisor.collect_jobs(spec.mission_id)
+        self.assertEqual(state, State.WAITING_APPROVAL)
+        self.assertFalse(self.journal.approved(spec.mission_id, "merge"))
+        resumed = Supervisor(self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "approval-restart"), self.codex, supervisor.adapter)
+        self.assertEqual(resumed.step(spec.mission_id, spec), State.WAITING_APPROVAL)
+        self.journal.approve(spec.mission_id, "merge", "explicit owner command")
+        for _ in range(10):
+            state = resumed.run_until_wait(spec.mission_id, spec)
+            if state == State.PASS:
+                break
+        self.assertEqual(state, State.PASS)
+
+    def test_simulation_cli_build_selects_simulated_contract_adapter(self):
+        supervisor = build(Path(self.tmp.name), "simulation")
+        self.assertIsInstance(supervisor.adapter, SimulatedAdapter)
 
     def test_football_adapter_review_fails_closed_instead_of_crashing(self):
         result = FootballPredictionAdapter().review("codex", "a" * 40)

@@ -36,7 +36,8 @@ class Journal:
             CREATE TABLE IF NOT EXISTS jobs (
               job_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, name TEXT NOT NULL, argv_json TEXT NOT NULL,
               launch_head TEXT, pid INTEGER, pgid INTEGER, start_ticks TEXT, state TEXT NOT NULL, exit_code INTEGER,
-              stdout_path TEXT, stderr_path TEXT, started_at TEXT NOT NULL, ended_at TEXT);
+              stdout_path TEXT, stderr_path TEXT, started_at TEXT NOT NULL, ended_at TEXT,
+              launcher_pid INTEGER, launcher_start_ticks TEXT, lease_token TEXT);
             CREATE TABLE IF NOT EXISTS receipts (
               id INTEGER PRIMARY KEY AUTOINCREMENT, mission_id TEXT NOT NULL, reviewer TEXT NOT NULL,
               head_sha TEXT NOT NULL, result TEXT NOT NULL, artifact_path TEXT, invalidated INTEGER NOT NULL DEFAULT 0,
@@ -48,6 +49,12 @@ class Journal:
               ON jobs(mission_id,name) WHERE state IN ('STARTING','RUNNING');
             """
         )
+        # Existing v0.1 journals are migrated in place; these fields make a STARTING
+        # reservation recoverable without guessing from process names.
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}
+        for name, definition in (("launcher_pid", "INTEGER"), ("launcher_start_ticks", "TEXT"), ("lease_token", "TEXT")):
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
         self.db.commit()
 
     def create(self, spec: MissionSpec) -> None:
@@ -121,6 +128,19 @@ class Journal:
         rows = self.db.execute("SELECT reviewer FROM receipts WHERE mission_id=? AND head_sha=? AND result='PASS' AND invalidated=0",
                                (mission_id, head)).fetchall()
         return {row[0] for row in rows}
+
+    def approve(self, mission_id: str, action: str, reason: str = "") -> None:
+        self.mission(mission_id)  # fail closed for an unknown mission
+        self.db.execute("INSERT INTO approvals(mission_id,action,decision,reason,created_at) VALUES(?,?,?,?,?)",
+                        (mission_id, action, "APPROVED", reason, now()))
+        self.update(mission_id, approval_state="APPROVED")
+        self.event(mission_id, "approval_granted", {"action": action, "reason": reason})
+        self.db.commit()
+
+    def approved(self, mission_id: str, action: str) -> bool:
+        row = self.db.execute("SELECT decision FROM approvals WHERE mission_id=? AND action=? ORDER BY id DESC LIMIT 1",
+                              (mission_id, action)).fetchone()
+        return row is not None and row[0] == "APPROVED"
 
     def status(self, mission_id: str) -> Observation:
         row = self.mission(mission_id)
