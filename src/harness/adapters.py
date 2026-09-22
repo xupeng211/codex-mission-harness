@@ -39,6 +39,8 @@ class FootballPredictionAdapter:
 
     def post_merge(self, gate: str, head: str) -> GateResult:
         return GateResult("BLOCKED_EXTERNAL", f"canonical post-merge gate {gate} required for {head}")
+    def merge_status(self, worktree: str, head: str) -> GateResult:
+        return GateResult("BLOCKED_EXTERNAL", f"canonical merge status required for exact head {head}")
 
 
 class SimulatedAdapter(FootballPredictionAdapter):
@@ -46,6 +48,7 @@ class SimulatedAdapter(FootballPredictionAdapter):
     def __init__(self, heads: list[str] | None = None, reviews: list[str] | None = None, ci: list[str] | None = None):
         self.heads, self.reviews, self.ci_results = heads or ["a" * 40], reviews or ["PASS", "PASS"], ci or ["PASS"]
         self.head_index = self.review_index = self.ci_index = 0
+        self.merged_heads: set[str] = set()
 
     def exact_head(self, worktree: str) -> str:
         return self.heads[min(self.head_index, len(self.heads) - 1)]
@@ -64,7 +67,10 @@ class SimulatedAdapter(FootballPredictionAdapter):
         return GateResult(value, f"fixture CI {head}")
 
     def merge(self, worktree: str, head: str) -> GateResult:
+        self.merged_heads.add(head)
         return GateResult("PASS", f"fixture merge {head}")
+    def merge_status(self, worktree: str, head: str) -> GateResult:
+        return GateResult("PASS" if head in self.merged_heads else "NOT_STARTED", f"fixture merge status {head}")
 
     def post_merge(self, gate: str, head: str) -> GateResult:
         return GateResult("PASS", f"fixture post-merge {gate} {head}")

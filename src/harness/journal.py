@@ -151,7 +151,7 @@ class Journal:
                 self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',merge_claim_head=NULL,updated_at=? WHERE mission_id=?",
                                 (State.TEST, now(), mission_id))
                 self.event(mission_id, "pass_reopened_for_new_head", {"reason": "canonical HEAD changed after PASS"})
-            elif source in {State.REVIEW, State.CI, State.MERGE, State.WAITING_APPROVAL}:
+            elif source in {State.REVIEW, State.CI, State.MERGE, State.WAITING_APPROVAL, State.POST_MERGE, State.DELIVER}:
                 self.db.execute("UPDATE missions SET current_state=?,pending_gate=NULL,ci_state=NULL,approval_state='NONE',merge_claim_head=NULL,updated_at=? WHERE mission_id=?",
                                 (State.TEST, now(), mission_id))
                 self.event(mission_id, "state_reconciled_to_test", {"from": source, "reason": "canonical HEAD changed"})

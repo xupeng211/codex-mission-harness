@@ -68,3 +68,14 @@ class AppServerCodex:
             if item.get("type") == "agentMessage":
                 text += item.get("text", "")
         return Turn(thread_id, turn_id, text or "turn completed")
+
+
+class FixtureCodex:
+    """Deterministic Codex contract for explicitly simulation-only missions."""
+    def __init__(self):
+        self.turns = 0
+    def start_or_resume(self, thread_id: str | None, cwd: str) -> str:
+        return thread_id or "fixture-thread"
+    def turn(self, thread_id: str, prompt: str, cwd: str) -> Turn:
+        self.turns += 1
+        return Turn(thread_id, f"fixture-turn-{self.turns}", "任务尚未完成。")

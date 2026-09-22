@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from .adapters import FootballPredictionAdapter, SimulatedAdapter
-from .codex import AppServerCodex
+from .codex import AppServerCodex, FixtureCodex
 from .domain import MissionSpec
 from .isolation import WorktreeManager
 from .journal import Journal
@@ -21,13 +21,21 @@ def load_spec(path: Path) -> MissionSpec:
     for field in ("required_gates", "reviews", "post_merge_gates", "forbidden_actions"):
         if field in data:
             data[field] = tuple(data[field])
+    adapter = data.get("adapter", "footballprediction")
+    if not isinstance(adapter, str) or adapter not in {"footballprediction", "simulation"}:
+        raise ValueError("adapter must be exactly footballprediction or simulation")
     return MissionSpec(**data)
 
 
 def build(root: Path, adapter_name: str = "footballprediction", codex=None) -> Supervisor:
     journal = Journal(root / "data" / "harness.sqlite")
-    adapter = SimulatedAdapter() if adapter_name == "simulation" else FootballPredictionAdapter()
-    return Supervisor(journal, ProcessSupervisor(journal, root / "data" / "logs"), codex or AppServerCodex(), adapter)
+    if adapter_name == "simulation":
+        adapter, selected_codex = SimulatedAdapter(), (codex or FixtureCodex())
+    elif adapter_name == "footballprediction":
+        adapter, selected_codex = FootballPredictionAdapter(), (codex or AppServerCodex())
+    else:
+        raise ValueError("adapter must be exactly footballprediction or simulation")
+    return Supervisor(journal, ProcessSupervisor(journal, root / "data" / "logs"), selected_codex, adapter)
 
 
 def describe(supervisor: Supervisor, mission_id: str) -> None:

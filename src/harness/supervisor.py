@@ -105,9 +105,31 @@ class Supervisor:
             else:
                 self.journal.update(mission_id, pending_gate="github-ci", ci_state=result.status)
         elif state == State.MERGE:
+            if "merge" in spec.forbidden_actions:
+                self.journal.transition(mission_id, State.BLOCKED_POLICY, "mission forbids merge")
+                return State.BLOCKED_POLICY
             # Re-read canonical Git immediately before a durable one-owner claim.
             if self.adapter.exact_head(row["worktree"]) != row["current_head"]:
                 self.reconcile(mission_id)
+                return State(self.journal.mission(mission_id)["current_state"])
+            if row["merge_claim_head"] is not None:
+                status = self.adapter.merge_status(row["worktree"], row["merge_claim_head"])
+                if status.status == "PASS":
+                    self.journal.transition(mission_id, State.POST_MERGE, "canonical merge already completed")
+                    return State.POST_MERGE
+                if status.status != "NOT_STARTED":
+                    self.journal.transition(mission_id, State.BLOCKED_EXTERNAL, status.evidence)
+                    return State.BLOCKED_EXTERNAL
+                self.journal.update(mission_id, merge_claim_head=None)
+                row = self.journal.mission(mission_id)
+                # Canonical adapter proved the previous claim never started; reclaim
+                # this exact HEAD in the same supervisor turn.
+                self.journal.claim_merge(mission_id, row["current_head"])
+                result = self.adapter.merge(row["worktree"], row["current_head"])
+                if result.status != "PASS":
+                    self.journal.transition(mission_id, State.BLOCKED_POLICY, result.evidence)
+                else:
+                    self.journal.transition(mission_id, State.POST_MERGE, result.evidence)
                 return State(self.journal.mission(mission_id)["current_state"])
             if decide("merge", spec.merge_policy) == Decision.OWNER_APPROVAL_REQUIRED:
                 if not self.journal.approved(mission_id, "merge", row["current_head"]):

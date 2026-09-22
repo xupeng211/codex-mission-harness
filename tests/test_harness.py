@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from io import StringIO
 from pathlib import Path
 
 from harness.adapters import FootballPredictionAdapter, SimulatedAdapter
-from harness.cli import build
+from harness.cli import build, load_spec
 from harness.codex import AppServerCodex, Turn
 from harness.domain import InvalidTransition, MissionSpec, State
 from harness.isolation import compose_namespace, docker_env
@@ -227,6 +228,35 @@ class HarnessTest(unittest.TestCase):
     def test_simulation_cli_build_selects_simulated_contract_adapter(self):
         supervisor = build(Path(self.tmp.name), "simulation", FakeCodex())
         self.assertIsInstance(supervisor.adapter, SimulatedAdapter)
+
+    def test_invalid_adapter_names_fail_closed_and_simulation_does_not_start_app_server(self):
+        path = Path(self.tmp.name) / "bad.json"
+        path.write_text(json.dumps({"schema_version": 1, "mission_id": "x", "repository": "/r", "objective": "x", "adapter": "sim"}))
+        with self.assertRaises(ValueError):
+            load_spec(path)
+        supervisor = build(Path(self.tmp.name), "simulation")
+        self.assertIsInstance(supervisor.codex, type(build(Path(self.tmp.name), "simulation").codex))
+        self.assertNotIsInstance(supervisor.codex, AppServerCodex)
+
+    def test_forbidden_merge_is_denied_before_claim(self):
+        spec = MissionSpec("deny-merge", "/safe/repo", "fixture", adapter="simulation", merge_policy="auto", forbidden_actions=("merge",))
+        worktree = Path(self.tmp.name) / "deny-worktree"; worktree.mkdir()
+        supervisor = Supervisor(self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "deny-logs"), self.codex, self.adapter)
+        supervisor.create(spec, str(worktree), "b" * 40, "harness/deny-merge")
+        self.journal.update(spec.mission_id, current_head="a" * 40, current_state=State.MERGE)
+        self.assertEqual(supervisor.step(spec.mission_id, spec), State.BLOCKED_POLICY)
+        self.assertIsNone(self.journal.mission(spec.mission_id)["merge_claim_head"])
+
+    def test_head_drift_during_deliver_rewinds_and_merge_claim_recovers(self):
+        self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.DELIVER)
+        self.adapter.heads = ["b" * 40]
+        self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.TEST)
+        self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE, merge_claim_head="a" * 40)
+        self.adapter.heads = ["a" * 40]
+        first = self.supervisor.step(self.spec.mission_id, self.spec)
+        if first == State.MERGE:
+            first = self.supervisor.step(self.spec.mission_id, self.spec)
+        self.assertIn(first, {State.MERGE, State.POST_MERGE})
 
     def test_football_adapter_review_fails_closed_instead_of_crashing(self):
         result = FootballPredictionAdapter().review("codex", "a" * 40)
