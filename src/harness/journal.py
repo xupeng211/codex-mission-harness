@@ -306,7 +306,7 @@ class Journal:
         try:
             self.db.execute("BEGIN IMMEDIATE")
             row = self.db.execute(
-                "SELECT current_state,codex_turn_state,codex_turn_pid,codex_turn_start_ticks "
+                "SELECT current_state,codex_turn_state,codex_turn_id,codex_turn_pid,codex_turn_start_ticks "
                 "FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
             if row is None:
                 raise KeyError(mission_id)
@@ -318,6 +318,16 @@ class Journal:
                 if isinstance(pid, int) and start and self._proc_start_ticks(pid) == start:
                     self.db.commit()
                     return "ACTIVE"
+                self.db.commit()
+                return "UNKNOWN"
+            if row["codex_turn_state"] == "COMPLETED":
+                # The provider turn may have completed and been journaled just
+                # before the controller crashed.  Let the supervisor consume
+                # that durable completion atomically with the source-state
+                # transition instead of starting the same writable turn again.
+                if row["codex_turn_id"]:
+                    self.db.commit()
+                    return "COMPLETED"
                 self.db.commit()
                 return "UNKNOWN"
             changed = self.db.execute(
@@ -360,6 +370,54 @@ class Journal:
             raise RuntimeError("Codex turn lease was lost before completion persistence")
         self.event(mission_id, "codex_turn_completed", {"turn_id": turn_id})
         self.db.commit()
+
+    def transition_after_codex_turn(self, mission_id: str, target: State, reason: str, *,
+                                    expected_state: State, expected_head: str | None) -> None:
+        """Consume a completed turn and advance its source state in one commit.
+
+        A controller can crash after ``complete_codex_turn`` but before the
+        normal state transition.  The ``COMPLETED`` marker is therefore a
+        durable hand-off, not permission to claim another turn.  This method
+        consumes it under the same writer lock as the state/HEAD CAS so a
+        resumed mission advances exactly once.
+        """
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT current_state,current_head,codex_turn_state,codex_turn_id "
+                "FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
+            if row is None:
+                raise KeyError(mission_id)
+            source = State(row["current_state"])
+            head = row["current_head"]
+            if source != expected_state:
+                raise InvalidTransition(
+                    f"stale turn transition expected state {expected_state}, observed {source}"
+                )
+            if expected_head is not None and head != expected_head:
+                raise InvalidTransition(
+                    f"stale turn transition expected HEAD {expected_head}, observed {head}"
+                )
+            if row["codex_turn_state"] != "COMPLETED" or not row["codex_turn_id"]:
+                raise InvalidTransition("no unconsumed completed Codex turn")
+            if source in TERMINAL or target not in ALLOWED.get(source, set()):
+                raise InvalidTransition(f"{source} -> {target} is forbidden")
+            changed = self.db.execute(
+                "UPDATE missions SET current_state=?,terminal_state=?,codex_turn_state='CONSUMED',"
+                "updated_at=? WHERE mission_id=? AND current_state=? AND current_head IS ? "
+                "AND codex_turn_state='COMPLETED' AND codex_turn_id IS NOT NULL",
+                (target, target if target in TERMINAL else None, now(), mission_id, source, head),
+            ).rowcount
+            if changed != 1:
+                raise InvalidTransition("turn completion or source identity changed during transition")
+            self.event(mission_id, "state_transition", {
+                "from": source, "to": target, "head": head, "reason": reason,
+                "consumed_codex_turn": row["codex_turn_id"],
+            })
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
 
     def fail_codex_turn(self, mission_id: str, reason: str, owner_pid: int,
                         owner_start_ticks: str) -> None:

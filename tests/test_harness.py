@@ -102,6 +102,28 @@ class HarnessTest(unittest.TestCase):
         self.journal.update(self.spec.mission_id, codex_turn_pid=99999999, codex_turn_start_ticks="gone")
         self.assertEqual(second.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
 
+    def test_completed_codex_turn_is_consumed_after_restart_without_replay(self):
+        """A crash after turn completion cannot launch a duplicate writable turn."""
+        self.supervisor.step(self.spec.mission_id, self.spec)  # CREATED -> PREPARING
+        self.supervisor.step(self.spec.mission_id, self.spec)  # PREPARING -> IMPLEMENT
+        owner_pid, owner_start = self.supervisor._merge_owner()
+        self.assertEqual(
+            self.journal.claim_codex_turn(self.spec.mission_id, owner_pid, owner_start),
+            "CLAIMED",
+        )
+        self.journal.record_codex_thread(self.spec.mission_id, "thread-1", owner_pid, owner_start)
+        self.journal.complete_codex_turn(self.spec.mission_id, "turn-1", owner_pid, owner_start)
+
+        replacement = Supervisor(
+            self.journal,
+            ProcessSupervisor(self.journal, Path(self.tmp.name) / "turn-restart-logs"),
+            self.codex,
+            self.adapter,
+        )
+        self.assertEqual(replacement.step(self.spec.mission_id, self.spec), State.TEST)
+        self.assertEqual(self.codex.turns, [])
+        self.assertEqual(self.journal.mission(self.spec.mission_id)["codex_turn_state"], "CONSUMED")
+
     def test_atomic_mission_creation_persists_isolation_metadata(self):
         row = self.journal.mission(self.spec.mission_id)
         self.assertEqual(row["worktree"], str(self.worktree))
@@ -641,6 +663,53 @@ class HarnessTest(unittest.TestCase):
         self.adapter.heads = ["a" * 40]
         self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
         self.assertEqual(self.adapter.merged_heads, {"a" * 40})
+
+    def test_head_drift_during_post_merge_reopens_before_delivery(self):
+        class DriftingPostMergeAdapter(SimulatedAdapter):
+            def post_merge(self, gate, head):
+                self.heads = ["b" * 40]
+                return GateResult("PASS", "post-merge completed before drift")
+
+        adapter = DriftingPostMergeAdapter(heads=["a" * 40])
+        supervisor = Supervisor(
+            self.journal,
+            ProcessSupervisor(self.journal, Path(self.tmp.name) / "post-merge-drift-logs"),
+            self.codex,
+            adapter,
+        )
+        spec = replace(self.spec, post_merge_gates=("production-gate",))
+        self.journal.update(
+            self.spec.mission_id,
+            spec_json=json.dumps(spec.__dict__),
+            current_head="a" * 40,
+            current_state=State.POST_MERGE,
+        )
+        self.assertEqual(supervisor.step(self.spec.mission_id, spec), State.TEST)
+        self.assertEqual(self.journal.mission(self.spec.mission_id)["current_head"], "b" * 40)
+
+    def test_head_drift_at_final_delivery_check_reopens_before_pass(self):
+        class SequenceHeadAdapter(SimulatedAdapter):
+            def __init__(self):
+                super().__init__(heads=["a" * 40])
+                self.observations = iter(["a" * 40, "b" * 40])
+
+            def exact_head(self, worktree):
+                return next(self.observations, "b" * 40)
+
+        adapter = SequenceHeadAdapter()
+        supervisor = Supervisor(
+            self.journal,
+            ProcessSupervisor(self.journal, Path(self.tmp.name) / "deliver-drift-logs"),
+            self.codex,
+            adapter,
+        )
+        self.journal.update(
+            self.spec.mission_id,
+            current_head="a" * 40,
+            current_state=State.DELIVER,
+        )
+        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.TEST)
+        self.assertEqual(self.journal.mission(self.spec.mission_id)["current_head"], "b" * 40)
 
     def test_live_merge_claim_cannot_be_stolen_by_second_controller(self):
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,

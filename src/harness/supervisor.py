@@ -77,6 +77,12 @@ class Supervisor:
             self.journal.transition(mission_id, State.BLOCKED_EXTERNAL,
                                     "previous Codex turn outcome is unknown after owner loss")
             return False
+        if claim == "COMPLETED":
+            # A previous controller durably observed completion but crashed
+            # before publishing the state transition.  The caller consumes
+            # this marker atomically with that transition; never invoke Codex
+            # a second time for the same mission turn.
+            return True
         if claim != "CLAIMED":
             return False
         row = self.journal.mission(mission_id)
@@ -175,7 +181,10 @@ class Supervisor:
             if self._agent_turn(mission_id,
                                 f"Continue mission objective: {spec.objective}. Inspect actual gates; do not declare terminal state from prose.",
                                 spec.forbidden_actions):
-                advance(State.TEST, "primary turn completed")
+                self.journal.transition_after_codex_turn(
+                    mission_id, State.TEST, "primary turn completed",
+                    expected_state=state, expected_head=expected_head,
+                )
             return State(self.journal.mission(mission_id)["current_state"])
         elif state == State.TEST:
             for gate in spec.required_gates:
@@ -203,7 +212,11 @@ class Supervisor:
                     if result.status != "PASS":
                         if self._agent_turn(mission_id, f"Repair reviewer {reviewer} findings: {result.evidence}",
                                             spec.forbidden_actions):
-                            advance(State.IMPLEMENT, "review finding is auto-remediable")
+                            self.journal.transition_after_codex_turn(
+                                mission_id, State.IMPLEMENT,
+                                "review finding is auto-remediable",
+                                expected_state=state, expected_head=expected_head,
+                            )
                             return State.IMPLEMENT
                         return State(self.journal.mission(mission_id)["current_state"])
                     self.journal.update(mission_id, pending_gate=None, ci_state=None)
@@ -217,7 +230,10 @@ class Supervisor:
             elif result.status == "FAIL":
                 if self._agent_turn(mission_id, f"Repair canonical CI failure: {result.evidence}",
                                     spec.forbidden_actions):
-                    advance(State.IMPLEMENT, "CI failure is auto-remediable")
+                    self.journal.transition_after_codex_turn(
+                        mission_id, State.IMPLEMENT, "CI failure is auto-remediable",
+                        expected_state=state, expected_head=expected_head,
+                    )
             elif result.status == "BLOCKED_EXTERNAL":
                 advance(State.BLOCKED_EXTERNAL, result.evidence)
             else:
@@ -286,8 +302,16 @@ class Supervisor:
                 if result.status != "PASS":
                     advance(State.BLOCKED_EXTERNAL, result.evidence)
                     return State.BLOCKED_EXTERNAL
+            observed = self.adapter.exact_head(row["worktree"])
+            if observed != row["current_head"]:
+                self.journal.reconcile_head(mission_id, observed)
+                return State(self.journal.mission(mission_id)["current_state"])
             advance(State.DELIVER, "post merge gates pass")
         elif state == State.DELIVER:
+            observed = self.adapter.exact_head(row["worktree"])
+            if observed != expected_head:
+                self.journal.reconcile_head(mission_id, observed)
+                return State(self.journal.mission(mission_id)["current_state"])
             advance(State.PASS, "terminal acceptance conditions verified")
         return State(self.journal.mission(mission_id)["current_state"])
 
