@@ -20,6 +20,16 @@ class Worktree:
 
 
 class WorktreeManager:
+    @staticmethod
+    def _record_values(lines: list[str]) -> dict[str, str]:
+        """Parse porcelain key/value lines without assuming every line has a value."""
+        values: dict[str, str] = {}
+        for line in lines:
+            key, separator, value = line.partition(" ")
+            if separator:
+                values[key] = value
+        return values
+
     def validate(self, repo: str, branch: str, path: str) -> Worktree:
         repo_path, worktree_path = Path(repo).resolve(), Path(path).resolve()
         if not worktree_path.is_dir() or Path(run("git", "-C", str(worktree_path), "rev-parse", "--show-toplevel")).resolve() != worktree_path:
@@ -41,7 +51,7 @@ class WorktreeManager:
         records = [block.splitlines() for block in listing.strip().split("\n\n") if block]
         expected = str(path.resolve())
         for lines in records:
-            values = dict(line.split(" ", 1) for line in lines if " " in line)
+            values = self._record_values(lines)
             if values.get("worktree") == expected:
                 if values.get("branch") not in {f"refs/heads/{branch}", None}:
                     raise RuntimeError(f"mission path belongs to another branch: {expected}")

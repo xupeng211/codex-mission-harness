@@ -209,7 +209,8 @@ class Supervisor:
         for _ in range(limit):
             before = self.journal.status(mission_id)
             after = self.step(mission_id, spec)
-            if after in TERMINAL or self.journal.status(mission_id).background_jobs or before.state == after in {State.CI, State.WAITING_APPROVAL}:
+            if after in TERMINAL or self.journal.status(mission_id).background_jobs or (
+                    before.state == after and after in {State.CI, State.MERGE, State.WAITING_APPROVAL}):
                 return after
         raise RuntimeError("supervisor progress limit reached")
 

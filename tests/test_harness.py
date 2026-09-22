@@ -9,9 +9,9 @@ from unittest.mock import patch
 
 from harness.adapters import FootballPredictionAdapter, SimulatedAdapter
 from harness.cli import build, load_spec
-from harness.codex import AppServerCodex, Turn
+from harness.codex import AppServerCodex, FixtureCodex, Turn
 from harness.domain import InvalidTransition, MissionSpec, State
-from harness.isolation import compose_namespace, docker_env
+from harness.isolation import WorktreeManager, compose_namespace, docker_env
 from harness.journal import Journal
 from harness.process import JobResult, ProcessSupervisor
 from harness.supervisor import Supervisor
@@ -79,6 +79,11 @@ class HarnessTest(unittest.TestCase):
     def test_docker_namespace_is_unique_and_non_destructive(self):
         self.assertNotEqual(compose_namespace("same mission"), compose_namespace("same/mission"))
         self.assertTrue(docker_env("m1")["COMPOSE_PROJECT_NAME"].startswith("cmh-"))
+
+    def test_worktree_porcelain_parser_ignores_space_less_metadata(self):
+        self.assertEqual(WorktreeManager._record_values([
+            "worktree /tmp/mission path", "HEAD " + "a" * 40, "detached", "bare"
+        ]), {"worktree": "/tmp/mission path", "HEAD": "a" * 40})
 
     def test_head_change_invalidates_both_reviews(self):
         self.advance_to_test()
@@ -277,7 +282,7 @@ class HarnessTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             load_spec(path)
         supervisor = build(Path(self.tmp.name), "simulation")
-        self.assertIsInstance(supervisor.codex, type(build(Path(self.tmp.name), "simulation").codex))
+        self.assertIsInstance(supervisor.codex, FixtureCodex)
         self.assertNotIsInstance(supervisor.codex, AppServerCodex)
 
     def test_forbidden_merge_is_denied_before_claim(self):
@@ -289,19 +294,26 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(supervisor.step(spec.mission_id, spec), State.BLOCKED_POLICY)
         self.assertIsNone(self.journal.mission(spec.mission_id)["merge_claim_head"])
 
+    def test_first_merge_claim_executes_external_merge(self):
+        self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,
+                            merge_claim_head=None, merge_claim_pid=None, merge_claim_start_ticks=None)
+        self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
+        self.assertEqual(self.adapter.merged_heads, {"a" * 40})
+        self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_claim_head"], "a" * 40)
+
     def test_head_drift_during_deliver_rewinds_and_merge_claim_recovers(self):
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.DELIVER)
         self.adapter.heads = ["b" * 40]
         self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.TEST)
+        for child in list(self.supervisor.process._children.values()):
+            child.wait()
+        self.supervisor.collect_jobs(self.spec.mission_id)
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,
-                            merge_claim_head=None, merge_claim_pid=None, merge_claim_start_ticks=None)
+                            merge_claim_head="a" * 40, merge_claim_pid=99999999,
+                            merge_claim_start_ticks="dead-owner")
         self.adapter.heads = ["a" * 40]
-        owner_pid, owner_start_ticks = self.supervisor._merge_owner()
-        self.assertTrue(self.journal.claim_merge(self.spec.mission_id, "a" * 40, owner_pid, owner_start_ticks))
-        first = self.supervisor.step(self.spec.mission_id, self.spec)
-        if first == State.MERGE:
-            first = self.supervisor.step(self.spec.mission_id, self.spec)
-        self.assertIn(first, {State.MERGE, State.POST_MERGE})
+        self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
+        self.assertEqual(self.adapter.merged_heads, {"a" * 40})
 
     def test_live_merge_claim_cannot_be_stolen_by_second_controller(self):
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,
