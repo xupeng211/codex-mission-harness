@@ -88,6 +88,24 @@ class HarnessTest(unittest.TestCase):
         invalid = self.journal.db.execute("SELECT count(*) FROM receipts WHERE invalidated=1").fetchone()[0]
         self.assertEqual(invalid, 2)
 
+    def test_head_change_after_gates_rewinds_to_fresh_exact_head_validation(self):
+        self.advance_to_test()
+        self.supervisor.run_until_wait(self.spec.mission_id, self.spec)
+        for child in self.supervisor.process._children.values(): child.wait()
+        self.supervisor.collect_jobs(self.spec.mission_id)
+        self.assertTrue(self.journal.gate_passed_at_head(self.spec.mission_id, "verify-pr", "a" * 40))
+        self.supervisor.step(self.spec.mission_id, self.spec)  # TEST -> REVIEW
+        self.adapter.heads = ["b" * 40]
+        self.supervisor.reconcile(self.spec.mission_id)
+        self.assertEqual(self.journal.status(self.spec.mission_id).state, State.TEST)
+        self.assertFalse(self.journal.gate_passed_at_head(self.spec.mission_id, "verify-pr", "b" * 40))
+
+    def test_head_change_invalidates_owner_approval_and_requires_new_grant(self):
+        self.journal.update(self.spec.mission_id, current_head="a" * 40)
+        self.journal.approve(self.spec.mission_id, "merge", "head A only")
+        self.assertTrue(self.journal.approved(self.spec.mission_id, "merge", "a" * 40))
+        self.assertFalse(self.journal.approved(self.spec.mission_id, "merge", "b" * 40))
+
     def test_review_p1_and_ci_fail_are_repaired_not_blocked(self):
         self.adapter.reviews = ["FAIL", "PASS", "PASS"]
         self.adapter.ci_results = ["FAIL", "PASS"]
@@ -188,7 +206,7 @@ class HarnessTest(unittest.TestCase):
                 child.wait()
             supervisor.collect_jobs(spec.mission_id)
         self.assertEqual(state, State.WAITING_APPROVAL)
-        self.assertFalse(self.journal.approved(spec.mission_id, "merge"))
+        self.assertFalse(self.journal.approved(spec.mission_id, "merge", "a" * 40))
         resumed = Supervisor(self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "approval-restart"), self.codex, supervisor.adapter)
         self.assertEqual(resumed.step(spec.mission_id, spec), State.WAITING_APPROVAL)
         self.journal.approve(spec.mission_id, "merge", "explicit owner command")

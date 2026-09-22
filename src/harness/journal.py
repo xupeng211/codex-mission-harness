@@ -44,7 +44,7 @@ class Journal:
               created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS approvals (
               id INTEGER PRIMARY KEY AUTOINCREMENT, mission_id TEXT NOT NULL, action TEXT NOT NULL,
-              decision TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL);
+              decision TEXT NOT NULL, reason TEXT, head_sha TEXT, created_at TEXT NOT NULL);
             CREATE UNIQUE INDEX IF NOT EXISTS one_active_job_per_gate
               ON jobs(mission_id,name) WHERE state IN ('STARTING','RUNNING');
             """
@@ -55,6 +55,9 @@ class Journal:
         for name, definition in (("launcher_pid", "INTEGER"), ("launcher_start_ticks", "TEXT"), ("lease_token", "TEXT")):
             if name not in columns:
                 self.db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
+        approval_columns = {row[1] for row in self.db.execute("PRAGMA table_info(approvals)")}
+        if "head_sha" not in approval_columns:
+            self.db.execute("ALTER TABLE approvals ADD COLUMN head_sha TEXT")
         self.db.commit()
 
     def create(self, spec: MissionSpec) -> None:
@@ -130,17 +133,31 @@ class Journal:
         return {row[0] for row in rows}
 
     def approve(self, mission_id: str, action: str, reason: str = "") -> None:
-        self.mission(mission_id)  # fail closed for an unknown mission
-        self.db.execute("INSERT INTO approvals(mission_id,action,decision,reason,created_at) VALUES(?,?,?,?,?)",
-                        (mission_id, action, "APPROVED", reason, now()))
+        mission = self.mission(mission_id)  # fail closed for an unknown mission
+        head = mission["current_head"]
+        if not head:
+            raise RuntimeError("cannot approve before canonical HEAD reconciliation")
+        self.db.execute("INSERT INTO approvals(mission_id,action,decision,reason,head_sha,created_at) VALUES(?,?,?,?,?,?)",
+                        (mission_id, action, "APPROVED", reason, head, now()))
         self.update(mission_id, approval_state="APPROVED")
-        self.event(mission_id, "approval_granted", {"action": action, "reason": reason})
+        self.event(mission_id, "approval_granted", {"action": action, "head": head, "reason": reason})
         self.db.commit()
 
-    def approved(self, mission_id: str, action: str) -> bool:
-        row = self.db.execute("SELECT decision FROM approvals WHERE mission_id=? AND action=? ORDER BY id DESC LIMIT 1",
-                              (mission_id, action)).fetchone()
+    def approved(self, mission_id: str, action: str, head: str) -> bool:
+        row = self.db.execute("SELECT decision FROM approvals WHERE mission_id=? AND action=? AND head_sha=? ORDER BY id DESC LIMIT 1",
+                              (mission_id, action, head)).fetchone()
         return row is not None and row[0] == "APPROVED"
+
+    def rewind_to_test(self, mission_id: str, reason: str) -> None:
+        """Canonical HEAD changed before terminal acceptance: require fresh local gates."""
+        row = self.mission(mission_id)
+        source = State(row["current_state"])
+        if source in TERMINAL:
+            raise InvalidTransition(f"cannot rewind terminal mission {source}")
+        self.db.execute("UPDATE missions SET current_state=?,pending_gate=NULL,ci_state=NULL,approval_state='NONE',updated_at=? WHERE mission_id=?",
+                        (State.TEST, now(), mission_id))
+        self.event(mission_id, "state_reconciled_to_test", {"from": source, "reason": reason})
+        self.db.commit()
 
     def status(self, mission_id: str) -> Observation:
         row = self.mission(mission_id)
