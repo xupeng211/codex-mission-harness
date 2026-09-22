@@ -105,18 +105,26 @@ class Supervisor:
             else:
                 self.journal.update(mission_id, pending_gate="github-ci", ci_state=result.status)
         elif state == State.MERGE:
+            # Re-read canonical Git immediately before a durable one-owner claim.
+            if self.adapter.exact_head(row["worktree"]) != row["current_head"]:
+                self.reconcile(mission_id)
+                return State(self.journal.mission(mission_id)["current_state"])
             if decide("merge", spec.merge_policy) == Decision.OWNER_APPROVAL_REQUIRED:
                 if not self.journal.approved(mission_id, "merge", row["current_head"]):
                     self.journal.update(mission_id, approval_state="PENDING", pending_gate="owner-merge")
                     self.journal.transition(mission_id, State.WAITING_APPROVAL, "owner merge approval required")
                     return State.WAITING_APPROVAL
                 self.journal.update(mission_id, approval_state="APPROVED", pending_gate=None)
+                if not self.journal.claim_merge(mission_id, row["current_head"]):
+                    return State.MERGE
                 result = self.adapter.merge(row["worktree"], row["current_head"])
                 if result.status != "PASS":
                     self.journal.transition(mission_id, State.BLOCKED_POLICY, result.evidence)
                 else:
                     self.journal.transition(mission_id, State.POST_MERGE, result.evidence)
             else:
+                if not self.journal.claim_merge(mission_id, row["current_head"]):
+                    return State.MERGE
                 result = self.adapter.merge(row["worktree"], row["current_head"])
                 if result.status != "PASS":
                     self.journal.transition(mission_id, State.BLOCKED_POLICY, result.evidence)

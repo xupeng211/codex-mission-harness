@@ -28,6 +28,7 @@ class Journal:
               base_sha TEXT, branch TEXT, worktree TEXT, current_head TEXT, codex_thread_id TEXT,
               current_state TEXT NOT NULL, pending_gate TEXT, completed_gates_json TEXT NOT NULL DEFAULT '{}',
               ci_state TEXT, approval_state TEXT NOT NULL DEFAULT 'NONE', terminal_state TEXT,
+              merge_claim_head TEXT,
               created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS events (
               seq INTEGER PRIMARY KEY AUTOINCREMENT, mission_id TEXT NOT NULL, kind TEXT NOT NULL,
@@ -58,6 +59,9 @@ class Journal:
         approval_columns = {row[1] for row in self.db.execute("PRAGMA table_info(approvals)")}
         if "head_sha" not in approval_columns:
             self.db.execute("ALTER TABLE approvals ADD COLUMN head_sha TEXT")
+        mission_columns = {row[1] for row in self.db.execute("PRAGMA table_info(missions)")}
+        if "merge_claim_head" not in mission_columns:
+            self.db.execute("ALTER TABLE missions ADD COLUMN merge_claim_head TEXT")
         self.db.commit()
 
     def create(self, spec: MissionSpec) -> None:
@@ -178,6 +182,25 @@ class Journal:
         row = self.db.execute("SELECT decision FROM approvals WHERE mission_id=? AND action=? AND head_sha=? ORDER BY id DESC LIMIT 1",
                               (mission_id, action, head)).fetchone()
         return row is not None and row[0] == "APPROVED"
+
+    def claim_merge(self, mission_id: str, head: str) -> bool:
+        """One durable claimant may invoke an external merge for one exact HEAD."""
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute("SELECT current_state,current_head,merge_claim_head FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
+            if row is None:
+                raise KeyError(mission_id)
+            if State(row["current_state"]) != State.MERGE or row["current_head"] != head or row["merge_claim_head"] is not None:
+                self.db.commit()
+                return False
+            self.db.execute("UPDATE missions SET merge_claim_head=?,updated_at=? WHERE mission_id=? AND merge_claim_head IS NULL",
+                            (head, now(), mission_id))
+            self.event(mission_id, "merge_claimed", {"head": head})
+            self.db.commit()
+            return True
+        except Exception:
+            self.db.rollback()
+            raise
 
 
     def status(self, mission_id: str) -> Observation:
