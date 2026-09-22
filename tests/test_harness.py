@@ -13,7 +13,7 @@ from harness.codex import AppServerCodex, Turn
 from harness.domain import InvalidTransition, MissionSpec, State
 from harness.isolation import compose_namespace, docker_env
 from harness.journal import Journal
-from harness.process import ProcessSupervisor
+from harness.process import JobResult, ProcessSupervisor
 from harness.supervisor import Supervisor
 
 
@@ -190,6 +190,23 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual([(item.state, item.exit_code) for item in result], [("EXITED", 0)])
         self.assertEqual(tuple(self.journal.db.execute(
             "SELECT state,exit_code FROM jobs WHERE job_id=?", (job_id,)).fetchone()), ("EXITED", 0))
+
+    def test_stale_gate_failure_cannot_trigger_repair_for_new_head(self):
+        self.adapter.heads = ["b" * 40]
+        self.journal.update(self.spec.mission_id, current_head="b" * 40, current_state=State.TEST,
+                            pending_gate="verify-pr")
+        stale = JobResult("old-job", "EXITED", 17, "a" * 40)
+        with patch.object(self.supervisor.process, "poll", return_value=[stale]):
+            self.supervisor.reconcile(self.spec.mission_id)
+        self.assertEqual(self.journal.status(self.spec.mission_id).state, State.TEST)
+        self.assertEqual(self.journal.mission(self.spec.mission_id)["pending_gate"], "verify-pr")
+        event = self.journal.db.execute(
+            "SELECT payload_json FROM events WHERE kind='gate_failure_stale' ORDER BY seq DESC LIMIT 1").fetchone()
+        self.assertIsNotNone(event)
+        payload = json.loads(event[0])
+        self.assertEqual(payload["launch_head"], "a" * 40)
+        self.assertEqual(payload["current_head"], "b" * 40)
+        self.assertEqual(payload["exit_code"], 17)
 
     def test_stale_starting_lease_is_recoverable_without_a_second_launch(self):
         """A crash before PID publication is safe: bootstrap had no release payload."""

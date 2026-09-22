@@ -47,7 +47,18 @@ class Supervisor:
                 self.journal.event(mission_id, "process_retry_required", {"job_id": result.job_id})
             elif result.state == "EXITED" and result.exit_code != 0:
                 pending = self.journal.mission(mission_id)["pending_gate"]
-                if pending and State(self.journal.mission(mission_id)["current_state"]) == State.TEST:
+                current = self.adapter.exact_head(self.journal.mission(mission_id)["worktree"])
+                if result.launch_head != current:
+                    # A failure from an older source identity is evidence about
+                    # neither the current gate nor the current repair cycle.
+                    # Keep the current journal state and force the normal
+                    # exact-head validation path instead of attributing it to
+                    # the new HEAD.
+                    self.journal.event(mission_id, "gate_failure_stale", {
+                        "gate": pending, "launch_head": result.launch_head, "current_head": current,
+                        "exit_code": result.exit_code,
+                    })
+                elif pending and State(self.journal.mission(mission_id)["current_state"]) == State.TEST:
                     self.journal.event(mission_id, "gate_failed_auto_repair", {"gate": pending, "exit_code": result.exit_code})
                     self.journal.transition(mission_id, State.IMPLEMENT, f"canonical gate {pending} failed; repair required")
                 else:
