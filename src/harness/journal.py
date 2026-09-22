@@ -26,7 +26,7 @@ class Journal:
             CREATE TABLE IF NOT EXISTS missions (
               mission_id TEXT PRIMARY KEY, spec_json TEXT NOT NULL, repo TEXT NOT NULL,
               base_sha TEXT, branch TEXT, worktree TEXT, current_head TEXT, codex_thread_id TEXT,
-              current_state TEXT NOT NULL, pending_gate TEXT, completed_gates_json TEXT NOT NULL DEFAULT '[]',
+              current_state TEXT NOT NULL, pending_gate TEXT, completed_gates_json TEXT NOT NULL DEFAULT '{}',
               ci_state TEXT, approval_state TEXT NOT NULL DEFAULT 'NONE', terminal_state TEXT,
               created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS events (
@@ -44,6 +44,8 @@ class Journal:
             CREATE TABLE IF NOT EXISTS approvals (
               id INTEGER PRIMARY KEY AUTOINCREMENT, mission_id TEXT NOT NULL, action TEXT NOT NULL,
               decision TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL);
+            CREATE UNIQUE INDEX IF NOT EXISTS one_active_job_per_gate
+              ON jobs(mission_id,name) WHERE state IN ('STARTING','RUNNING');
             """
         )
         self.db.commit()
@@ -87,14 +89,19 @@ class Journal:
                         [fields[k] for k in keys] + [mission_id])
         self.db.commit()
 
-    def complete_gate(self, mission_id: str, gate: str) -> None:
+    def complete_gate(self, mission_id: str, gate: str, head: str) -> None:
         row = self.mission(mission_id)
         gates = json.loads(row["completed_gates_json"])
-        if gate not in gates:
-            gates.append(gate)
+        if isinstance(gates, list):  # v0.1 pre-release journal migration
+            gates = {name: None for name in gates}
+        gates[gate] = head
         self.update(mission_id, completed_gates_json=json.dumps(gates), pending_gate=None)
-        self.event(mission_id, "gate_pass", {"gate": gate})
+        self.event(mission_id, "gate_pass", {"gate": gate, "head": head})
         self.db.commit()
+
+    def gate_passed_at_head(self, mission_id: str, gate: str, head: str) -> bool:
+        gates = json.loads(self.mission(mission_id)["completed_gates_json"])
+        return isinstance(gates, dict) and gates.get(gate) == head
 
     def record_receipt(self, mission_id: str, reviewer: str, head: str, result: str, artifact: str | None = None) -> None:
         self.db.execute("INSERT INTO receipts(mission_id,reviewer,head_sha,result,artifact_path,created_at) VALUES(?,?,?,?,?,?)",
@@ -117,6 +124,6 @@ class Journal:
 
     def status(self, mission_id: str) -> Observation:
         row = self.mission(mission_id)
-        jobs = self.db.execute("SELECT count(*) FROM jobs WHERE mission_id=? AND state='RUNNING'", (mission_id,)).fetchone()[0]
+        jobs = self.db.execute("SELECT count(*) FROM jobs WHERE mission_id=? AND state IN ('STARTING','RUNNING')", (mission_id,)).fetchone()[0]
         return Observation(State(row["current_state"]), row["current_head"], row["worktree"],
                            row["pending_gate"], jobs, row["terminal_state"] is not None)

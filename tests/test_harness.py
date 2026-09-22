@@ -5,7 +5,7 @@ import unittest
 from io import StringIO
 from pathlib import Path
 
-from harness.adapters import SimulatedAdapter
+from harness.adapters import FootballPredictionAdapter, SimulatedAdapter
 from harness.codex import AppServerCodex, Turn
 from harness.domain import InvalidTransition, MissionSpec, State
 from harness.isolation import compose_namespace, docker_env
@@ -121,3 +121,21 @@ class HarnessTest(unittest.TestCase):
         )})()
         turn = adapter._turn_completed("t", "x")
         self.assertEqual(turn["status"], "completed")
+
+    def test_gate_pass_is_bound_to_exact_head(self):
+        self.journal.complete_gate(self.spec.mission_id, "verify-pr", "a" * 40)
+        self.assertTrue(self.journal.gate_passed_at_head(self.spec.mission_id, "verify-pr", "a" * 40))
+        self.assertFalse(self.journal.gate_passed_at_head(self.spec.mission_id, "verify-pr", "b" * 40))
+
+    def test_process_reservation_prevents_duplicate_launch(self):
+        process = self.supervisor.process
+        first = process.start(self.spec.mission_id, "one-gate", ["/bin/sh", "-c", "exit 0"], str(self.worktree), {})
+        second = process.start(self.spec.mission_id, "one-gate", ["/bin/sh", "-c", "exit 0"], str(self.worktree), {})
+        self.assertEqual(first, second)
+        self.assertEqual(self.journal.db.execute("SELECT count(*) FROM jobs WHERE name='one-gate'").fetchone()[0], 1)
+        next(iter(process._children.values())).wait()
+        process.poll(self.spec.mission_id)
+
+    def test_football_adapter_review_fails_closed_instead_of_crashing(self):
+        result = FootballPredictionAdapter().review("codex", "a" * 40)
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")

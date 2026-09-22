@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import os
-import signal
 import subprocess
-import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,19 +32,36 @@ class ProcessSupervisor:
         log_root.mkdir(parents=True, exist_ok=True)
 
     def start(self, mission_id: str, name: str, argv: list[str], cwd: str, env: dict[str, str]) -> str:
-        old = self.journal.db.execute("SELECT job_id FROM jobs WHERE mission_id=? AND name=? AND state='RUNNING'",
-                                      (mission_id, name)).fetchone()
-        if old:
-            return old[0]  # critical duplicate-execution guard
         job_id = uuid.uuid4().hex
         out, err = self.log_root / f"{job_id}.out", self.log_root / f"{job_id}.err"
+        # Reserve before spawning: concurrent supervisors observe the same durable job, never launch twice.
+        try:
+            self.journal.db.execute("BEGIN IMMEDIATE")
+            old = self.journal.db.execute("SELECT job_id FROM jobs WHERE mission_id=? AND name=? AND state IN ('STARTING','RUNNING')",
+                                          (mission_id, name)).fetchone()
+            if old:
+                self.journal.db.commit()
+                return old[0]
+            self.journal.db.execute(
+                "INSERT INTO jobs(job_id,mission_id,name,argv_json,state,stdout_path,stderr_path,started_at) VALUES(?,?,?,?,?,?,?,?)",
+                (job_id, mission_id, name, str(argv), "STARTING", str(out), str(err), now()),
+            )
+            self.journal.db.commit()
+        except Exception:
+            self.journal.db.rollback()
+            raise
         with out.open("wb") as stdout, err.open("wb") as stderr:
-            proc = subprocess.Popen(argv, cwd=cwd, env={**os.environ, **env}, stdout=stdout, stderr=stderr,
-                                    start_new_session=True)
+            try:
+                proc = subprocess.Popen(argv, cwd=cwd, env={**os.environ, **env}, stdout=stdout, stderr=stderr,
+                                        start_new_session=True)
+            except OSError as exc:
+                self.journal.db.execute("UPDATE jobs SET state='FAILED_LAUNCH',ended_at=? WHERE job_id=?", (now(), job_id))
+                self.journal.event(mission_id, "process_launch_failed", {"job_id": job_id, "error": str(exc)})
+                self.journal.db.commit()
+                raise
         self.journal.db.execute(
-            "INSERT INTO jobs(job_id,mission_id,name,argv_json,pid,pgid,start_ticks,state,stdout_path,stderr_path,started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (job_id, mission_id, name, str(argv), proc.pid, os.getpgid(proc.pid), proc_start_ticks(proc.pid), "RUNNING",
-             str(out), str(err), now()),
+            "UPDATE jobs SET pid=?,pgid=?,start_ticks=?,state='RUNNING' WHERE job_id=?",
+            (proc.pid, os.getpgid(proc.pid), proc_start_ticks(proc.pid), job_id),
         )
         self.journal.event(mission_id, "process_started", {"job_id": job_id, "name": name, "pid": proc.pid, "argv": argv})
         self.journal.db.commit()
@@ -54,9 +69,14 @@ class ProcessSupervisor:
         return job_id
 
     def poll(self, mission_id: str) -> list[JobResult]:
-        rows = self.journal.db.execute("SELECT * FROM jobs WHERE mission_id=? AND state='RUNNING'", (mission_id,)).fetchall()
+        rows = self.journal.db.execute("SELECT * FROM jobs WHERE mission_id=? AND state IN ('STARTING','RUNNING')", (mission_id,)).fetchall()
         results = []
         for row in rows:
+            if row["state"] == "STARTING":
+                self.journal.db.execute("UPDATE jobs SET state='LOST',ended_at=? WHERE job_id=?", (now(), row["job_id"]))
+                self.journal.event(mission_id, "process_lost", {"job_id": row["job_id"], "reason": "crash during launch"})
+                results.append(JobResult(row["job_id"], "LOST", None))
+                continue
             pid, ticks = row["pid"], row["start_ticks"]
             child = self._children.get(row["job_id"])
             if child is not None:

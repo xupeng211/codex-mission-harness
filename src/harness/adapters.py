@@ -31,6 +31,15 @@ class FootballPredictionAdapter:
         # v0.1 intentionally does not claim GitHub truth without a project-specific authenticated query.
         return GateResult("PENDING", f"GitHub query required for exact head {head}")
 
+    def review(self, reviewer: str, head: str) -> GateResult:
+        return GateResult("BLOCKED_EXTERNAL", f"canonical {reviewer} review command/receipt is required for exact head {head}")
+
+    def merge(self, worktree: str, head: str) -> GateResult:
+        return GateResult("BLOCKED_POLICY", "project merge requires owner-controlled canonical evidence")
+
+    def post_merge(self, gate: str, head: str) -> GateResult:
+        return GateResult("BLOCKED_EXTERNAL", f"canonical post-merge gate {gate} required for {head}")
+
 
 class SimulatedAdapter(FootballPredictionAdapter):
     """Deterministic non-production adapter used only by tests and the safe demonstration."""
@@ -53,3 +62,9 @@ class SimulatedAdapter(FootballPredictionAdapter):
         value = self.ci_results[min(self.ci_index, len(self.ci_results) - 1)]
         self.ci_index += 1
         return GateResult(value, f"fixture CI {head}")
+
+    def merge(self, worktree: str, head: str) -> GateResult:
+        return GateResult("PASS", f"fixture merge {head}")
+
+    def post_merge(self, gate: str, head: str) -> GateResult:
+        return GateResult("PASS", f"fixture post-merge {gate} {head}")

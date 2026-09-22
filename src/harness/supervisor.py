@@ -32,7 +32,7 @@ class Supervisor:
             if result.state == "EXITED" and result.exit_code == 0:
                 pending = self.journal.mission(mission_id)["pending_gate"]
                 if pending:
-                    self.journal.complete_gate(mission_id, pending)
+                    self.journal.complete_gate(mission_id, pending, head)
             elif result.state != "RUNNING":
                 self.journal.transition(mission_id, State.FAILED_FATAL,
                                         f"owned process {result.state}: {result.exit_code}")
@@ -62,7 +62,7 @@ class Supervisor:
             self.journal.transition(mission_id, State.TEST, "primary turn completed")
         elif state == State.TEST:
             for gate in spec.required_gates:
-                if gate not in __import__("json").loads(row["completed_gates_json"]):
+                if not self.journal.gate_passed_at_head(mission_id, gate, row["current_head"]):
                     self.journal.update(mission_id, pending_gate=gate)
                     self.process.start(mission_id, gate, self.adapter.gate_argv(gate), row["worktree"], docker_env(mission_id))
                     return state
@@ -74,6 +74,9 @@ class Supervisor:
                 if reviewer not in valid:
                     result: GateResult = self.adapter.review(reviewer, head)
                     self.journal.record_receipt(mission_id, reviewer, head, result.status)
+                    if result.status == "BLOCKED_EXTERNAL":
+                        self.journal.transition(mission_id, State.BLOCKED_EXTERNAL, result.evidence)
+                        return State.BLOCKED_EXTERNAL
                     if result.status != "PASS":
                         self._agent_turn(mission_id, f"Repair reviewer {reviewer} findings: {result.evidence}")
                         self.journal.transition(mission_id, State.IMPLEMENT, "review finding is auto-remediable")
@@ -96,8 +99,17 @@ class Supervisor:
                 self.journal.update(mission_id, approval_state="PENDING", pending_gate="owner-merge")
                 self.journal.transition(mission_id, State.BLOCKED_POLICY, "owner merge approval required")
             else:
-                self.journal.transition(mission_id, State.POST_MERGE, "merge canonical truth confirmed")
+                result = self.adapter.merge(row["worktree"], row["current_head"])
+                if result.status != "PASS":
+                    self.journal.transition(mission_id, State.BLOCKED_POLICY, result.evidence)
+                else:
+                    self.journal.transition(mission_id, State.POST_MERGE, result.evidence)
         elif state == State.POST_MERGE:
+            for gate in spec.post_merge_gates:
+                result = self.adapter.post_merge(gate, row["current_head"])
+                if result.status != "PASS":
+                    self.journal.transition(mission_id, State.BLOCKED_EXTERNAL, result.evidence)
+                    return State.BLOCKED_EXTERNAL
             self.journal.transition(mission_id, State.DELIVER, "post merge gates pass")
         elif state == State.DELIVER:
             self.journal.transition(mission_id, State.PASS, "terminal acceptance conditions verified")

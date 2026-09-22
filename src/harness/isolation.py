@@ -28,8 +28,14 @@ class WorktreeManager:
         branch = "harness/" + mission_id
         path = root / mission_id
         listing = run("git", "-C", repo, "worktree", "list", "--porcelain")
-        if str(path) in listing:
-            return Worktree(repo, base, branch, str(path))
+        records = [block.splitlines() for block in listing.strip().split("\n\n") if block]
+        expected = str(path.resolve())
+        for lines in records:
+            values = dict(line.split(" ", 1) for line in lines if " " in line)
+            if values.get("worktree") == expected:
+                if values.get("branch") not in {f"refs/heads/{branch}", None}:
+                    raise RuntimeError(f"mission path belongs to another branch: {expected}")
+                return Worktree(repo, base, branch, expected)
         if path.exists():
             raise RuntimeError(f"refusing non-mission-owned path: {path}")
         root.mkdir(parents=True, exist_ok=True)
