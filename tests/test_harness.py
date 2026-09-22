@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
 
 from harness.adapters import SimulatedAdapter
-from harness.codex import Turn
+from harness.codex import AppServerCodex, Turn
 from harness.domain import InvalidTransition, MissionSpec, State
 from harness.isolation import compose_namespace, docker_env
 from harness.journal import Journal
@@ -110,3 +111,13 @@ class HarnessTest(unittest.TestCase):
         self.assertFalse(self.journal.status(self.spec.mission_id).terminal)
         with self.assertRaises(InvalidTransition):
             self.journal.transition(self.spec.mission_id, State.PASS, "agent prose")
+
+    def test_app_server_turn_requires_completed_notification(self):
+        adapter = AppServerCodex.__new__(AppServerCodex)
+        adapter.proc = type("Process", (), {"stdout": StringIO(
+            '{"method":"turn/started","params":{}}\n'
+            '{"method":"turn/completed","params":{"threadId":"t","turn":'
+            '{"id":"x","status":"completed","items":[{"type":"agentMessage","text":"done"}]}}}\n'
+        )})()
+        turn = adapter._turn_completed("t", "x")
+        self.assertEqual(turn["status"], "completed")
