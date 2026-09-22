@@ -31,7 +31,8 @@ class Journal:
               mission_id TEXT PRIMARY KEY, spec_json TEXT NOT NULL, repo TEXT NOT NULL,
               base_sha TEXT, branch TEXT, worktree TEXT, current_head TEXT, codex_thread_id TEXT,
               codex_turn_id TEXT, codex_turn_state TEXT, codex_turn_pid INTEGER,
-              codex_turn_start_ticks TEXT,
+              codex_turn_start_ticks TEXT, codex_turn_source_state TEXT,
+              codex_turn_source_head TEXT,
               current_state TEXT NOT NULL, pending_gate TEXT, completed_gates_json TEXT NOT NULL DEFAULT '{}',
               ci_state TEXT, approval_state TEXT NOT NULL DEFAULT 'NONE', terminal_state TEXT,
               merge_claim_head TEXT,
@@ -71,7 +72,9 @@ class Journal:
             self.db.execute("ALTER TABLE approvals ADD COLUMN spec_sha256 TEXT")
         mission_columns = {row[1] for row in self.db.execute("PRAGMA table_info(missions)")}
         for name, definition in (("codex_turn_id", "TEXT"), ("codex_turn_state", "TEXT"),
-                                 ("codex_turn_pid", "INTEGER"), ("codex_turn_start_ticks", "TEXT")):
+                                 ("codex_turn_pid", "INTEGER"), ("codex_turn_start_ticks", "TEXT"),
+                                 ("codex_turn_source_state", "TEXT"),
+                                 ("codex_turn_source_head", "TEXT")):
             if name not in mission_columns:
                 self.db.execute(f"ALTER TABLE missions ADD COLUMN {name} {definition}")
         mission_columns = {row[1] for row in self.db.execute("PRAGMA table_info(missions)")}
@@ -235,7 +238,8 @@ class Journal:
             # Read after the writer lock: another controller cannot race a stale
             # state decision into a later terminal acceptance.
             row = self.db.execute(
-                "SELECT current_head,current_state,merge_claim_head FROM missions WHERE mission_id=?",
+                "SELECT current_head,current_state,merge_claim_head,codex_turn_state,"
+                "codex_turn_source_head FROM missions WHERE mission_id=?",
                 (mission_id,),
             ).fetchone()
             if row is None:
@@ -244,29 +248,55 @@ class Journal:
                 self.db.commit()
                 return False
             source = State(row["current_state"])
-            self.db.execute("UPDATE missions SET current_head=?,updated_at=? WHERE mission_id=?", (head, now(), mission_id))
+            changed = self.db.execute(
+                "UPDATE missions SET current_head=?,updated_at=? WHERE mission_id=? "
+                "AND current_head IS ? AND current_state=? AND merge_claim_head IS ? "
+                "AND codex_turn_state IS ? AND codex_turn_source_head IS ?",
+                (head, now(), mission_id, row["current_head"], source,
+                 row["merge_claim_head"], row["codex_turn_state"],
+                 row["codex_turn_source_head"]),
+            ).rowcount
+            if changed != 1:
+                raise InvalidTransition("canonical HEAD reconcile lost its source snapshot")
+            if (row["codex_turn_state"] == "COMPLETED" and
+                    row["codex_turn_source_head"] != head):
+                self.db.execute(
+                    "UPDATE missions SET codex_turn_state='STALE',updated_at=? WHERE mission_id=? "
+                    "AND codex_turn_state='COMPLETED'",
+                    (now(), mission_id),
+                )
+                self.event(mission_id, "codex_turn_stale_on_head_reconcile", {
+                    "source_head": row["codex_turn_source_head"], "current_head": head,
+                })
             invalidated = self.db.execute("UPDATE receipts SET invalidated=1 WHERE mission_id=? AND head_sha<>? AND invalidated=0",
                                           (mission_id, head)).rowcount
             if source == State.PASS:
-                self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',merge_claim_head=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=?",
-                                (State.TEST, now(), mission_id))
+                changed = self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',merge_claim_head=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=? AND current_state=? AND current_head=?",
+                                          (State.TEST, now(), mission_id, source, head)).rowcount
+                if changed != 1:
+                    raise InvalidTransition("PASS reopen lost its reconciled source snapshot")
                 self.event(mission_id, "pass_reopened_for_new_head", {"reason": "canonical HEAD changed after PASS"})
             elif source == State.MERGE and row["merge_claim_head"] is not None:
                 # HEAD drift invalidates source-bound acceptance, but an
                 # external merge may still be in flight behind this durable
                 # claim. Preserve it until canonical merge status and the
                 # recorded owner identity prove that retrying is safe.
-                self.db.execute(
+                changed = self.db.execute(
                     "UPDATE missions SET terminal_state=NULL,pending_gate=NULL,ci_state=NULL,"
-                    "approval_state='NONE',updated_at=? WHERE mission_id=?",
-                    (now(), mission_id),
-                )
+                    "approval_state='NONE',updated_at=? WHERE mission_id=? "
+                    "AND current_state=? AND current_head=? AND merge_claim_head=?",
+                    (now(), mission_id, source, head, row["merge_claim_head"]),
+                ).rowcount
+                if changed != 1:
+                    raise InvalidTransition("merge claim preservation lost its reconciled snapshot")
                 self.event(mission_id, "merge_claim_preserved_on_head_drift", {
                     "claim_head": row["merge_claim_head"], "current_head": head,
                 })
             elif source in {State.REVIEW, State.CI, State.MERGE, State.WAITING_APPROVAL, State.POST_MERGE, State.DELIVER}:
-                self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',merge_claim_head=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=?",
-                                (State.TEST, now(), mission_id))
+                changed = self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',merge_claim_head=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=? AND current_state=? AND current_head=?",
+                                          (State.TEST, now(), mission_id, source, head)).rowcount
+                if changed != 1:
+                    raise InvalidTransition("state rewind lost its reconciled source snapshot")
                 self.event(mission_id, "state_reconciled_to_test", {"from": source, "reason": "canonical HEAD changed"})
             self.event(mission_id, "canonical_head_reconciled", {"head": head, "invalidated_reviews": invalidated})
             self.db.commit()
@@ -333,7 +363,8 @@ class Journal:
         try:
             self.db.execute("BEGIN IMMEDIATE")
             row = self.db.execute(
-                "SELECT current_state,codex_turn_state,codex_turn_id,codex_turn_pid,codex_turn_start_ticks "
+                "SELECT current_state,current_head,codex_turn_state,codex_turn_id,codex_turn_pid,"
+                "codex_turn_start_ticks,codex_turn_source_state,codex_turn_source_head "
                 "FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
             if row is None:
                 raise KeyError(mission_id)
@@ -341,6 +372,10 @@ class Journal:
                 self.db.commit()
                 return "NOT_IMPLEMENT"
             if row["codex_turn_state"] == "RUNNING":
+                if (row["codex_turn_source_state"] != row["current_state"] or
+                        row["codex_turn_source_head"] != row["current_head"]):
+                    self.db.commit()
+                    return "UNKNOWN"
                 pid, start = row["codex_turn_pid"], row["codex_turn_start_ticks"]
                 if isinstance(pid, int) and start and self._proc_start_ticks(pid) == start:
                     self.db.commit()
@@ -352,22 +387,43 @@ class Journal:
                 # before the controller crashed.  Let the supervisor consume
                 # that durable completion atomically with the source-state
                 # transition instead of starting the same writable turn again.
-                if row["codex_turn_id"]:
+                if (row["codex_turn_id"] and
+                        row["codex_turn_source_state"] == row["current_state"] and
+                        row["codex_turn_source_head"] == row["current_head"]):
                     self.db.commit()
                     return "COMPLETED"
+                self.db.execute(
+                    "UPDATE missions SET codex_turn_state='STALE',updated_at=? "
+                    "WHERE mission_id=? AND codex_turn_state='COMPLETED'",
+                    (now(), mission_id),
+                )
+                self.event(mission_id, "codex_turn_stale", {
+                    "source_state": row["codex_turn_source_state"],
+                    "source_head": row["codex_turn_source_head"],
+                    "current_state": row["current_state"],
+                    "current_head": row["current_head"],
+                })
                 self.db.commit()
-                return "UNKNOWN"
+                return "STALE"
+            if row["codex_turn_state"] == "STALE":
+                self.db.commit()
+                return "STALE"
             changed = self.db.execute(
                 "UPDATE missions SET codex_turn_state='RUNNING',codex_turn_id=NULL,"
-                "codex_turn_pid=?,codex_turn_start_ticks=?,updated_at=? "
-                "WHERE mission_id=? AND current_state IN (?,?,?) AND COALESCE(codex_turn_state,'')<>'RUNNING'",
-                (owner_pid, owner_start_ticks, now(), mission_id, State.IMPLEMENT, State.REVIEW, State.CI),
+                "codex_turn_pid=?,codex_turn_start_ticks=?,codex_turn_source_state=current_state,"
+                "codex_turn_source_head=current_head,updated_at=? "
+                "WHERE mission_id=? AND current_state IN (?,?,?) AND current_head IS ? "
+                "AND COALESCE(codex_turn_state,'') NOT IN ('RUNNING','COMPLETED','STALE')",
+                (owner_pid, owner_start_ticks, now(), mission_id, State.IMPLEMENT,
+                 State.REVIEW, State.CI, row["current_head"]),
             ).rowcount
             if changed != 1:
                 self.db.commit()
                 return "ACTIVE"
-            self.event(mission_id, "codex_turn_claimed", {"owner_pid": owner_pid,
-                                                             "owner_start_ticks": owner_start_ticks})
+            self.event(mission_id, "codex_turn_claimed", {
+                "owner_pid": owner_pid, "owner_start_ticks": owner_start_ticks,
+                "source_state": row["current_state"], "source_head": row["current_head"],
+            })
             self.db.commit()
             return "CLAIMED"
         except Exception:
@@ -395,7 +451,8 @@ class Journal:
             changed = self.db.execute(
                 "UPDATE missions SET codex_turn_id=?,codex_turn_state='COMPLETED',updated_at=? "
                 "WHERE mission_id=? AND codex_turn_state='RUNNING' AND codex_turn_pid=? "
-                "AND codex_turn_start_ticks=?",
+                "AND codex_turn_start_ticks=? AND current_state=codex_turn_source_state "
+                "AND current_head IS codex_turn_source_head",
                 (turn_id, now(), mission_id, owner_pid, owner_start_ticks),
             ).rowcount
             if changed != 1:
@@ -419,7 +476,8 @@ class Journal:
         try:
             self.db.execute("BEGIN IMMEDIATE")
             row = self.db.execute(
-                "SELECT current_state,current_head,codex_turn_state,codex_turn_id "
+                "SELECT current_state,current_head,codex_turn_state,codex_turn_id,"
+                "codex_turn_source_state,codex_turn_source_head "
                 "FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
             if row is None:
                 raise KeyError(mission_id)
@@ -435,13 +493,18 @@ class Journal:
                 )
             if row["codex_turn_state"] != "COMPLETED" or not row["codex_turn_id"]:
                 raise InvalidTransition("no unconsumed completed Codex turn")
+            if (row["codex_turn_source_state"] != source or
+                    row["codex_turn_source_head"] != head):
+                raise InvalidTransition("completed Codex turn is stale for current state or HEAD")
             if source in TERMINAL or target not in ALLOWED.get(source, set()):
                 raise InvalidTransition(f"{source} -> {target} is forbidden")
             changed = self.db.execute(
                 "UPDATE missions SET current_state=?,terminal_state=?,codex_turn_state='CONSUMED',"
                 "updated_at=? WHERE mission_id=? AND current_state=? AND current_head IS ? "
-                "AND codex_turn_state='COMPLETED' AND codex_turn_id IS NOT NULL",
-                (target, target if target in TERMINAL else None, now(), mission_id, source, head),
+                "AND codex_turn_state='COMPLETED' AND codex_turn_id IS NOT NULL "
+                "AND codex_turn_source_state=? AND codex_turn_source_head IS ?",
+                (target, target if target in TERMINAL else None, now(), mission_id,
+                 source, head, source, head),
             ).rowcount
             if changed != 1:
                 raise InvalidTransition("turn completion or source identity changed during transition")
@@ -496,8 +559,15 @@ class Journal:
             if State(row["current_state"]) != State.MERGE or row["current_head"] != head or row["merge_claim_head"] is not None:
                 self.db.commit()
                 return False
-            self.db.execute("UPDATE missions SET merge_claim_head=?,merge_claim_pid=?,merge_claim_start_ticks=?,updated_at=? WHERE mission_id=? AND merge_claim_head IS NULL",
-                            (head, owner_pid, owner_start_ticks, now(), mission_id))
+            changed = self.db.execute(
+                "UPDATE missions SET merge_claim_head=?,merge_claim_pid=?,"
+                "merge_claim_start_ticks=?,updated_at=? WHERE mission_id=? "
+                "AND current_state=? AND current_head=? AND merge_claim_head IS NULL",
+                (head, owner_pid, owner_start_ticks, now(), mission_id, State.MERGE, head),
+            ).rowcount
+            if changed != 1:
+                self.db.commit()
+                return False
             self.event(mission_id, "merge_claimed", {"head": head, "owner_pid": owner_pid,
                                                       "owner_start_ticks": owner_start_ticks})
             self.db.commit()

@@ -55,6 +55,22 @@ class Supervisor:
         return True
 
     def reconcile(self, mission_id: str) -> None:
+        def reconcile_transition(target: State, reason: str) -> None:
+            """Publish a polled-process decision only against its fresh snapshot.
+
+            Reconciliation can race another controller's HEAD/state update.  The
+            journal CAS is the authority; never let an old child-exit result
+            overwrite a newer source identity or state.
+            """
+            snapshot = self.journal.mission(mission_id)
+            self.journal.transition(
+                mission_id,
+                target,
+                reason,
+                expected_state=State(snapshot["current_state"]),
+                expected_head=snapshot["current_head"],
+            )
+
         row = self.journal.mission(mission_id)
         head = self.adapter.exact_head(row["worktree"])
         if head != row["current_head"]:
@@ -87,11 +103,20 @@ class Supervisor:
                     })
                 elif pending and State(self.journal.mission(mission_id)["current_state"]) == State.TEST:
                     self.journal.event(mission_id, "gate_failed_auto_repair", {"gate": pending, "exit_code": result.exit_code})
-                    self.journal.transition(mission_id, State.IMPLEMENT, f"canonical gate {pending} failed; repair required")
+                    reconcile_transition(
+                        State.IMPLEMENT,
+                        f"canonical gate {pending} failed; repair required",
+                    )
                 else:
-                    self.journal.transition(mission_id, State.FAILED_FATAL, f"owned process {result.state}: {result.exit_code}")
+                    reconcile_transition(
+                        State.FAILED_FATAL,
+                        f"owned process {result.state}: {result.exit_code}",
+                    )
             elif result.state != "RUNNING":
-                self.journal.transition(mission_id, State.FAILED_FATAL, f"owned process {result.state}: {result.exit_code}")
+                reconcile_transition(
+                    State.FAILED_FATAL,
+                    f"owned process {result.state}: {result.exit_code}",
+                )
 
     def _agent_turn(self, mission_id: str, prompt: str, forbidden_actions: tuple[str, ...]) -> bool:
         owner_pid, owner_start_ticks = self._merge_owner()
@@ -101,6 +126,12 @@ class Supervisor:
         if claim == "UNKNOWN":
             self.journal.transition(mission_id, State.BLOCKED_EXTERNAL,
                                     "previous Codex turn outcome is unknown after owner loss")
+            return False
+        if claim == "STALE":
+            self.journal.transition(
+                mission_id, State.BLOCKED_EXTERNAL,
+                "completed Codex turn is stale for the current source state or HEAD",
+            )
             return False
         if claim == "COMPLETED":
             # A previous controller durably observed completion but crashed
@@ -294,9 +325,17 @@ class Supervisor:
                     return State.BLOCKED_EXTERNAL
                 if reclaim == "RECLAIMED_HEAD_DRIFT":
                     # The old owner is gone and canonical status proved the
-                    # stale merge never started. Revalidate the new HEAD before
-                    # any new merge claim is possible.
-                    return State.TEST
+                    # stale merge never started. The journal must have atomically
+                    # rewound to TEST before any new merge claim is possible.
+                    reclaimed = self.journal.mission(mission_id)
+                    if (State(reclaimed["current_state"]) != State.TEST or
+                            reclaimed["merge_claim_head"] is not None):
+                        advance(
+                            State.BLOCKED_EXTERNAL,
+                            "merge claim drift reclaim did not durably rewind to TEST",
+                        )
+                        return State.BLOCKED_EXTERNAL
+                    return State(reclaimed["current_state"])
                 if reclaim != "RECLAIMED":
                     return State(self.journal.mission(mission_id)["current_state"])
                 row = self.journal.mission(mission_id)

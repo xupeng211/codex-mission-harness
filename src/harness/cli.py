@@ -94,14 +94,19 @@ def main() -> None:
     journal = Journal(args.root / "data" / "harness.sqlite")
     spec, exists = reconcile_supplied_spec(journal, supplied_spec)
     supervisor = build(args.root, spec.adapter, forbidden_actions=spec.forbidden_actions)
-    if exists:
-        existing = supervisor.journal.mission(spec.mission_id)
-        WorktreeManager().validate(existing["repo"], existing["branch"], existing["worktree"])
-    else:
-        tree = WorktreeManager().ensure(spec.repository, spec.mission_id, args.root / "data" / "worktrees")
-        supervisor.create(spec, tree.path, tree.base_sha, tree.branch)
-    supervisor.run_until_terminal(spec.mission_id, spec)
-    describe(supervisor, spec.mission_id)
+    try:
+        if exists:
+            existing = supervisor.journal.mission(spec.mission_id)
+            WorktreeManager().validate(existing["repo"], existing["branch"], existing["worktree"])
+        else:
+            tree = WorktreeManager().ensure(spec.repository, spec.mission_id, args.root / "data" / "worktrees")
+            supervisor.create(spec, tree.path, tree.base_sha, tree.branch)
+        supervisor.run_until_terminal(spec.mission_id, spec)
+        describe(supervisor, spec.mission_id)
+    finally:
+        close = getattr(supervisor.codex, "close", None)
+        if callable(close):
+            close()
 
 
 if __name__ == "__main__":

@@ -124,6 +124,54 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(self.codex.turns, [])
         self.assertEqual(self.journal.mission(self.spec.mission_id)["codex_turn_state"], "CONSUMED")
 
+    def test_completed_codex_turn_is_stale_after_head_reconciliation(self):
+        """A durable completion for source A cannot authorize source B."""
+        self.supervisor.step(self.spec.mission_id, self.spec)
+        self.supervisor.step(self.spec.mission_id, self.spec)
+        owner_pid, owner_start = self.supervisor._merge_owner()
+        self.assertEqual(
+            self.journal.claim_codex_turn(self.spec.mission_id, owner_pid, owner_start),
+            "CLAIMED",
+        )
+        self.journal.record_codex_thread(self.spec.mission_id, "thread-1", owner_pid, owner_start)
+        self.journal.complete_codex_turn(self.spec.mission_id, "turn-1", owner_pid, owner_start)
+
+        new_head = "b" * 40
+        self.journal.reconcile_head(self.spec.mission_id, new_head)
+        self.adapter.heads = [new_head]
+        replacement = Supervisor(
+            self.journal,
+            ProcessSupervisor(self.journal, Path(self.tmp.name) / "stale-turn-logs"),
+            self.codex,
+            self.adapter,
+        )
+        self.assertEqual(replacement.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertEqual(row["codex_turn_state"], "STALE")
+        self.assertEqual(row["codex_turn_source_head"], "a" * 40)
+        self.assertEqual(row["current_head"], new_head)
+        self.assertEqual(self.codex.turns, [])
+
+    def test_running_codex_turn_cannot_complete_after_source_head_changes(self):
+        """Completion persistence is a CAS against the claimed source identity."""
+        self.supervisor.step(self.spec.mission_id, self.spec)
+        self.supervisor.step(self.spec.mission_id, self.spec)
+        owner_pid, owner_start = self.supervisor._merge_owner()
+        self.assertEqual(
+            self.journal.claim_codex_turn(self.spec.mission_id, owner_pid, owner_start),
+            "CLAIMED",
+        )
+        self.journal.record_codex_thread(self.spec.mission_id, "thread-1", owner_pid, owner_start)
+        self.journal.reconcile_head(self.spec.mission_id, "b" * 40)
+        with self.assertRaisesRegex(RuntimeError, "completion persistence"):
+            self.journal.complete_codex_turn(
+                self.spec.mission_id, "turn-1", owner_pid, owner_start,
+            )
+        self.assertEqual(
+            self.journal.claim_codex_turn(self.spec.mission_id, owner_pid, owner_start),
+            "UNKNOWN",
+        )
+
     def test_completed_production_turn_rechecks_dirty_checkpoint_after_restart(self):
         """Durable completion cannot bypass a post-reconcile worktree mutation."""
         repo = Path(self.tmp.name) / "completed-dirty-repo"
@@ -207,7 +255,7 @@ class HarnessTest(unittest.TestCase):
         adapter = AppServerCodex.__new__(AppServerCodex)
         adapter._forbidden_actions = ("live_provider_request", "quota_consumption")
         adapter._policy_cwd = "/tmp/mission-worktree"
-        params = adapter._policy_params("/ignored")
+        params = adapter._policy_params("/tmp/mission-worktree")
         self.assertEqual(params["approvalPolicy"], "on-request")
         self.assertFalse(params["sandboxPolicy"]["networkAccess"])
         self.assertEqual(params["sandboxPolicy"]["writableRoots"], ["/tmp/mission-worktree"])
@@ -217,9 +265,45 @@ class HarnessTest(unittest.TestCase):
         adapter._configured_forbidden_actions = adapter._effective_policy(())
         adapter._forbidden_actions = adapter._effective_policy(())
         adapter._policy_cwd = "/tmp/mission-worktree"
-        params = adapter._policy_params("/ignored")
+        params = adapter._policy_params("/tmp/mission-worktree")
         self.assertEqual(params["approvalPolicy"], "on-request")
         self.assertFalse(params["sandboxPolicy"]["networkAccess"])
+
+    def test_codex_policy_never_falls_back_to_caller_cwd(self):
+        adapter = AppServerCodex.__new__(AppServerCodex)
+        adapter._forbidden_actions = adapter._effective_policy(())
+        adapter._policy_cwd = None
+        with self.assertRaisesRegex(RuntimeError, "not bound"):
+            adapter._policy_params("/caller-controlled")
+        adapter._policy_cwd = "/mission-worktree"
+        with self.assertRaisesRegex(RuntimeError, "differs"):
+            adapter._policy_params("/caller-controlled")
+
+    def test_thread_start_and_resume_use_bound_turn_sandbox(self):
+        adapter = AppServerCodex.__new__(AppServerCodex)
+        adapter._forbidden_actions = adapter._effective_policy(())
+        adapter._policy_cwd = "/mission-worktree"
+        expected_policy = {
+            "cwd": "/mission-worktree",
+            "approvalPolicy": "on-request",
+            "sandbox": "workspace-write",
+            "config": {
+                "sandbox_workspace_write": {
+                    "writable_roots": ["/mission-worktree"],
+                    "network_access": False,
+                },
+            },
+        }
+        with patch.object(
+                adapter, "_request", return_value={"thread": {"id": "thread-1"}}) as request:
+            self.assertEqual(adapter.start_or_resume(None, "/mission-worktree"), "thread-1")
+            request.assert_called_once_with("thread/start", expected_policy)
+        with patch.object(
+                adapter, "_request", return_value={"thread": {"id": "thread-1"}}) as request:
+            self.assertEqual(adapter.start_or_resume("thread-1", "/mission-worktree"), "thread-1")
+            request.assert_called_once_with(
+                "thread/resume", {"threadId": "thread-1", **expected_policy},
+            )
 
     def test_production_build_injects_immutable_mission_codex_policy(self):
         denied = ("live_provider_request", "quota_consumption")
@@ -236,6 +320,10 @@ class HarnessTest(unittest.TestCase):
         adapter._policy_cwd = None
         with self.assertRaisesRegex(RuntimeError, "configured mission deny-list"):
             adapter.set_policy(("merge",), "/tmp/mission-worktree")
+
+        unconfigured = AppServerCodex.__new__(AppServerCodex)
+        with self.assertRaisesRegex(RuntimeError, "configured mission deny-list"):
+            unconfigured.set_policy((), "/tmp/caller-worktree")
 
     def test_football_adapter_rejects_dirty_worktree_before_head_evidence(self):
         repo = Path(self.tmp.name) / "git-repo"
@@ -560,6 +648,66 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(adapter._request("ping", {}), {"ok": True})
         self.assertIn("request denied by mission harness policy", adapter.proc.stdin.getvalue())
 
+    def test_app_server_buffers_early_turn_completion_while_waiting_for_response(self):
+        adapter = AppServerCodex.__new__(AppServerCodex)
+        adapter.seq = 0
+        adapter._pending_messages = []
+        adapter.proc = type("Process", (), {
+            "stdin": StringIO(),
+            "stdout": StringIO(
+                '{"method":"turn/completed","params":{"threadId":"t","turn":'
+                '{"id":"x","status":"completed","items":[]}}}\n'
+                '{"id":1,"result":{"turn":{"id":"x"}}}\n'
+            ),
+        })()
+        self.assertEqual(adapter._request("turn/start", {}), {"turn": {"id": "x"}})
+        self.assertEqual(adapter._turn_completed("t", "x")["status"], "completed")
+
+    def test_app_server_pipe_read_has_a_response_deadline(self):
+        class BlockingStdout:
+            def fileno(self):
+                return 123
+
+            def readline(self):
+                raise AssertionError("readline must not run when the pipe is not readable")
+
+        adapter = AppServerCodex.__new__(AppServerCodex)
+        adapter.seq = 0
+        adapter._pending_messages = []
+        adapter._response_timeout = 0.01
+        adapter.proc = type("Process", (), {
+            "stdin": StringIO(), "stdout": BlockingStdout(),
+        })()
+        with patch("harness.codex.select.select", return_value=([], [], [])):
+            with self.assertRaisesRegex(RuntimeError, "deadline exceeded"):
+                adapter._request("ping", {})
+
+    def test_app_server_close_terminates_and_reaps_once(self):
+        class FakeProcess:
+            def __init__(self):
+                self.stdin, self.stdout = StringIO(), StringIO()
+                self.stderr = None
+                self.terminated = 0
+                self.waited = 0
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                self.terminated += 1
+
+            def wait(self, timeout):
+                self.waited += 1
+                return 0
+
+        adapter = AppServerCodex.__new__(AppServerCodex)
+        adapter.proc = FakeProcess()
+        adapter.close()
+        adapter.close()
+        self.assertEqual((adapter.proc.terminated, adapter.proc.waited), (1, 1))
+        self.assertTrue(adapter.proc.stdin.closed)
+        self.assertTrue(adapter.proc.stdout.closed)
+
     def test_gate_pass_is_bound_to_exact_head(self):
         self.journal.complete_gate(self.spec.mission_id, "verify-pr", "a" * 40)
         self.assertTrue(self.journal.gate_passed_at_head(self.spec.mission_id, "verify-pr", "a" * 40))
@@ -868,6 +1016,30 @@ class HarnessTest(unittest.TestCase):
         self.assertIsNone(row["merge_claim_head"])
         self.assertEqual(row["current_head"], new_head)
         self.assertEqual(self.adapter.merged_heads, set())
+
+    def test_head_drift_reclaim_result_without_journal_rewind_fails_closed(self):
+        """A return label alone cannot authorize the supervisor to skip validation."""
+        old_head, new_head = "a" * 40, "b" * 40
+        self.journal.update(
+            self.spec.mission_id,
+            current_head=new_head,
+            current_state=State.MERGE,
+            merge_claim_head=old_head,
+            merge_claim_pid=99999999,
+            merge_claim_start_ticks="dead-owner",
+        )
+        self.adapter.heads = [new_head]
+        with patch.object(
+                self.journal, "reclaim_merge_claim_if_stale",
+                return_value="RECLAIMED_HEAD_DRIFT"):
+            self.assertEqual(
+                self.supervisor.step(self.spec.mission_id, self.spec),
+                State.BLOCKED_EXTERNAL,
+            )
+        self.assertEqual(self.adapter.merged_heads, set())
+        self.assertEqual(
+            self.journal.mission(self.spec.mission_id)["merge_claim_head"], old_head,
+        )
 
     def test_completed_stale_head_merge_blocks_instead_of_merging_new_head(self):
         old_head, new_head = "a" * 40, "b" * 40
