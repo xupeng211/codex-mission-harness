@@ -39,14 +39,15 @@ def approval_head(journal: Journal, spec: MissionSpec, row) -> str:
 
 
 def build(root: Path, adapter_name: str = "footballprediction", codex=None,
-          forbidden_actions: tuple[str, ...] = ()) -> Supervisor:
+          forbidden_actions: tuple[str, ...] = (), worktree: str | None = None) -> Supervisor:
     journal = Journal(root / "data" / "harness.sqlite")
     if adapter_name == "simulation":
         adapter, selected_codex = SimulatedAdapter(), (codex or FixtureCodex())
     elif adapter_name == "footballprediction":
-        adapter, selected_codex = FootballPredictionAdapter(), (
-            codex or AppServerCodex(forbidden_actions=forbidden_actions)
-        )
+        codex_args = {"forbidden_actions": forbidden_actions}
+        if worktree is not None:
+            codex_args["worktree"] = worktree
+        adapter, selected_codex = FootballPredictionAdapter(), (codex or AppServerCodex(**codex_args))
     else:
         raise ValueError("adapter must be exactly footballprediction or simulation")
     return Supervisor(journal, ProcessSupervisor(journal, root / "data" / "logs"), selected_codex, adapter)
@@ -83,8 +84,11 @@ def main() -> None:
         return
     if args.command == "approve":
         journal = Journal(args.root / "data" / "harness.sqlite")
-        spec = journal.spec(args.mission_id)
-        row = journal.mission(args.mission_id)
+        try:
+            spec = journal.spec(args.mission_id)
+            row = journal.mission(args.mission_id)
+        except KeyError:
+            parser.error(f"unknown mission: {args.mission_id}")
         observed_head = approval_head(journal, spec, row)
         journal.reconcile_head(args.mission_id, observed_head)
         journal.approve(args.mission_id, args.action, args.reason, observed_head=observed_head)
@@ -93,13 +97,19 @@ def main() -> None:
     supplied_spec = load_spec(args.mission)
     journal = Journal(args.root / "data" / "harness.sqlite")
     spec, exists = reconcile_supplied_spec(journal, supplied_spec)
-    supervisor = build(args.root, spec.adapter, forbidden_actions=spec.forbidden_actions)
+    worktrees = WorktreeManager()
+    if exists:
+        existing = journal.mission(spec.mission_id)
+        tree = worktrees.validate(existing["repo"], existing["branch"], existing["worktree"])
+    else:
+        tree = worktrees.ensure(
+            spec.repository, spec.mission_id, args.root / "data" / "worktrees",
+        )
+    supervisor = build(
+        args.root, spec.adapter, forbidden_actions=spec.forbidden_actions, worktree=tree.path,
+    )
     try:
-        if exists:
-            existing = supervisor.journal.mission(spec.mission_id)
-            WorktreeManager().validate(existing["repo"], existing["branch"], existing["worktree"])
-        else:
-            tree = WorktreeManager().ensure(spec.repository, spec.mission_id, args.root / "data" / "worktrees")
+        if not exists:
             supervisor.create(spec, tree.path, tree.base_sha, tree.branch)
         supervisor.run_until_terminal(spec.mission_id, spec)
         describe(supervisor, spec.mission_id)

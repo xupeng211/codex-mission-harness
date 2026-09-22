@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
-import select
+import queue
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 from .policy import SENSITIVE
@@ -28,17 +30,21 @@ class AppServerCodex:
     MAX_PENDING_MESSAGES = 256
 
     def __init__(self, executable: str = "codex", *,
-                 forbidden_actions: tuple[str, ...] = ()):
-        # The mission deny-list is injected before the real App Server is
-        # constructed.  A later turn may bind the worktree, but it may not
-        # replace the policy selected by the persisted mission contract.
+                 forbidden_actions: tuple[str, ...] = (), worktree: str | None = None):
+        # Both the mission deny-list and its validated worktree are immutable
+        # constructor inputs. A later caller may verify them, but may not bind
+        # either authority boundary from turn-supplied data.
+        if worktree is None:
+            raise ValueError("Codex mission worktree must be constructor-bound")
         self._forbidden_actions = self._effective_policy(forbidden_actions)
         self._configured_forbidden_actions = self._effective_policy(forbidden_actions)
-        self._policy_cwd: str | None = None
+        self._policy_cwd = self._canonical_worktree(worktree)
         self.proc = subprocess.Popen([executable, "app-server", "--stdio"], stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, text=True, bufsize=1)
         self.seq = 0
         self._pending_messages: list[dict] = []
+        self._reader_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._reader_thread: threading.Thread | None = None
         try:
             self._request("initialize", {
                 "clientInfo": {"name": "codex-mission-harness", "version": "0.1"},
@@ -48,7 +54,7 @@ class AppServerCodex:
             raise
 
     def set_policy(self, forbidden_actions: tuple[str, ...], cwd: str) -> None:
-        """Apply mission deny-list controls before a turn is started.
+        """Verify constructor-bound mission controls before a turn is started.
 
         App Server's workspace-write sandbox is restricted to the mission
         worktree and has no network access whenever the mission carries a
@@ -59,8 +65,32 @@ class AppServerCodex:
         configured = getattr(self, "_configured_forbidden_actions", None)
         if configured is None or requested != configured:
             raise RuntimeError("Codex policy differs from the configured mission deny-list")
+        if "source_edit" in requested:
+            raise PermissionError("mission forbids delegated source editing")
+        bound = getattr(self, "_policy_cwd", None)
+        if bound is None:
+            raise RuntimeError("Codex mission worktree was not constructor-bound")
+        canonical = self._canonical_worktree(cwd)
+        if bound != canonical:
+            raise RuntimeError("Codex mission worktree policy is immutable after first binding")
         self._forbidden_actions = requested
-        self._policy_cwd = cwd
+
+    @staticmethod
+    def _canonical_worktree(cwd: str) -> str:
+        candidate = Path(cwd)
+        if not candidate.is_absolute():
+            raise RuntimeError("Codex mission worktree must be an absolute canonical path")
+        try:
+            canonical = candidate.resolve(strict=True)
+            top = Path(subprocess.check_output(
+                ["git", "-C", str(canonical), "rev-parse", "--show-toplevel"],
+                text=True, stderr=subprocess.DEVNULL,
+            ).strip()).resolve(strict=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise RuntimeError("Codex policy path is not a valid Git worktree") from exc
+        if not canonical.is_dir() or str(canonical) != cwd or top != canonical:
+            raise RuntimeError("Codex mission worktree must be its canonical Git top-level path")
+        return str(canonical)
 
     @staticmethod
     def _effective_policy(forbidden_actions: tuple[str, ...]) -> tuple[str, ...]:
@@ -76,7 +106,7 @@ class AppServerCodex:
         if cwd != root:
             raise RuntimeError("Codex caller cwd differs from the bound mission worktree")
         return {
-            "approvalPolicy": "on-request",
+            "approvalPolicy": "never",
             "sandboxPolicy": {
                 "type": "workspaceWrite",
                 "writableRoots": [root],
@@ -92,6 +122,7 @@ class AppServerCodex:
             "cwd": root,
             "approvalPolicy": policy["approvalPolicy"],
             "sandbox": "workspace-write",
+            "developerInstructions": self._authority_instructions(root),
             "config": {
                 "sandbox_workspace_write": {
                     "writable_roots": [root],
@@ -100,32 +131,66 @@ class AppServerCodex:
             },
         }
 
+    def _authority_instructions(self, root: str) -> str:
+        denied = ", ".join(self._forbidden_actions)
+        return (
+            f"Mission authority boundary: only source editing inside {root} is delegated. "
+            f"Controller-only forbidden actions are: {denied}. Never perform, request, or "
+            "simulate merge or another forbidden/sensitive action. If one is required, stop "
+            "and report the boundary; App Server approval requests are always denied."
+        )
+
     def _deadline(self) -> float:
         timeout = float(getattr(self, "_response_timeout", self.RESPONSE_TIMEOUT_SECONDS))
         if timeout <= 0:
             raise RuntimeError("Codex App Server response timeout must be positive")
         return time.monotonic() + timeout
 
+    def _ensure_reader(self) -> None:
+        if getattr(self, "_reader_thread", None) is not None:
+            return
+        assert self.proc.stdout
+        if getattr(self, "_reader_queue", None) is None:
+            self._reader_queue = queue.Queue()
+
+        def read_lines() -> None:
+            try:
+                while True:
+                    line = self.proc.stdout.readline()
+                    self._reader_queue.put(("line", line))
+                    if line == "":
+                        return
+            except BaseException as exc:
+                self._reader_queue.put(("error", exc))
+
+        self._reader_thread = threading.Thread(
+            target=read_lines, name="codex-app-server-stdout", daemon=True,
+        )
+        self._reader_thread.start()
+
     def _read_message(self, deadline: float | None = None) -> dict:
         """Read one JSON-RPC message and fail closed on EOF/protocol damage."""
         assert self.proc.stdout
+        self._ensure_reader()
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 self.close()
                 raise RuntimeError("Codex App Server response deadline exceeded")
-            try:
-                fd = self.proc.stdout.fileno()
-            except (AttributeError, OSError):
-                # In-memory protocol fixtures are immediately readable. Real
-                # App Server pipes always expose a selectable file descriptor.
-                fd = None
-            if fd is not None:
-                readable, _, _ = select.select([fd], [], [], remaining)
-                if not readable:
-                    self.close()
-                    raise RuntimeError("Codex App Server response deadline exceeded")
-        line = self.proc.stdout.readline()
+        else:
+            remaining = None
+        try:
+            kind, payload = self._reader_queue.get(timeout=remaining)
+        except queue.Empty:
+            self.close()
+            raise RuntimeError("Codex App Server response deadline exceeded") from None
+        if kind == "error":
+            self.close()
+            raise RuntimeError("Codex App Server stdout reader failed") from payload
+        line = payload
+        if not isinstance(line, str):
+            self.close()
+            raise RuntimeError("Codex App Server stdout reader returned non-text data")
         if line == "":
             self.close()
             raise RuntimeError("Codex App Server exited before sending a response")
@@ -152,22 +217,34 @@ class AppServerCodex:
             if callable(poll) and poll() is None:
                 terminate = getattr(proc, "terminate", None)
                 if callable(terminate):
-                    terminate()
+                    try:
+                        terminate()
+                    except OSError:
+                        pass
                 wait = getattr(proc, "wait", None)
                 if callable(wait):
                     try:
                         wait(timeout=5)
-                    except subprocess.TimeoutExpired:
+                    except (OSError, subprocess.TimeoutExpired):
                         kill = getattr(proc, "kill", None)
                         if callable(kill):
-                            kill()
-                        wait(timeout=5)
+                            try:
+                                kill()
+                            except OSError:
+                                pass
+                        try:
+                            wait(timeout=5)
+                        except (OSError, subprocess.TimeoutExpired):
+                            pass
         finally:
             for stream_name in ("stdin", "stdout", "stderr"):
                 stream = getattr(proc, stream_name, None)
                 close = getattr(stream, "close", None)
                 if callable(close):
-                    close()
+                    try:
+                        close()
+                    except OSError:
+                        pass
 
     def _pending(self) -> list[dict]:
         pending = getattr(self, "_pending_messages", None)
@@ -276,7 +353,7 @@ class AppServerCodex:
         for item in completed.get("items", []):
             if item.get("type") == "agentMessage":
                 text += item.get("text", "")
-        return Turn(thread_id, turn_id, text or "turn completed")
+        return Turn(thread_id, turn_id, text)
 
 
 class FixtureCodex:

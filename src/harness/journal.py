@@ -533,16 +533,23 @@ class Journal:
             raise
 
     @staticmethod
-    def _proc_start_ticks(pid: int) -> str | None:
+    def _proc_identity(pid: int) -> tuple[str, str | None]:
         try:
             stat = Path(f"/proc/{pid}/stat").read_text()
             comm_end = stat.rfind(")")
             if comm_end < 0:
-                return None
+                return "UNKNOWN", None
             fields = stat[comm_end + 2 :].split()
-            return fields[19] if len(fields) > 19 else None
+            return ("PRESENT", fields[19]) if len(fields) > 19 else ("UNKNOWN", None)
+        except FileNotFoundError:
+            return "ABSENT", None
         except (OSError, IndexError, ValueError):
-            return None
+            return "UNKNOWN", None
+
+    @staticmethod
+    def _proc_start_ticks(pid: int) -> str | None:
+        status, ticks = Journal._proc_identity(pid)
+        return ticks if status == "PRESENT" else None
 
     def claim_merge(self, mission_id: str, head: str, owner_pid: int | None = None,
                     owner_start_ticks: str | None = None) -> bool:
@@ -599,7 +606,11 @@ class Journal:
             if not isinstance(pid, int) or not start_ticks:
                 self.db.commit()
                 return "UNKNOWN"
-            if self._proc_start_ticks(pid) == start_ticks:
+            owner_status, observed_ticks = self._proc_identity(pid)
+            if owner_status == "UNKNOWN":
+                self.db.commit()
+                return "UNKNOWN"
+            if owner_status == "PRESENT" and observed_ticks == start_ticks:
                 self.db.commit()
                 return "ACTIVE"
             current_head = row["current_head"]

@@ -22,7 +22,7 @@ except BaseException as exc:
 """
 
 
-def proc_start_ticks(pid: int) -> str | None:
+def proc_identity(pid: int) -> tuple[str, str | None]:
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
         # ``comm`` is parenthesized and may itself contain spaces or ')'.
@@ -30,11 +30,18 @@ def proc_start_ticks(pid: int) -> str | None:
         # in the remaining fields beginning with state (field 3).
         comm_end = stat.rfind(")")
         if comm_end < 0:
-            return None
+            return "UNKNOWN", None
         fields = stat[comm_end + 2 :].split()
-        return fields[19] if len(fields) > 19 else None
+        return ("PRESENT", fields[19]) if len(fields) > 19 else ("UNKNOWN", None)
+    except FileNotFoundError:
+        return "ABSENT", None
     except (OSError, IndexError, ValueError):
-        return None
+        return "UNKNOWN", None
+
+
+def proc_start_ticks(pid: int) -> str | None:
+    status, ticks = proc_identity(pid)
+    return ticks if status == "PRESENT" else None
 
 
 @dataclass(frozen=True)
@@ -87,32 +94,50 @@ class ProcessSupervisor:
                 self.journal.event(mission_id, "process_launch_failed", {"job_id": job_id, "error": str(exc)})
                 self.journal.db.commit()
                 raise
+        # Register the handle before any durable RUNNING publication or pipe
+        # release. Every later failure can then be polled/reaped deterministically.
+        self._children[job_id] = proc
         updated = self.journal.db.execute(
             "UPDATE jobs SET pid=?,pgid=?,start_ticks=?,state='RUNNING' WHERE job_id=? AND state='STARTING' AND lease_token=? AND launcher_pid=? AND launcher_start_ticks IS ?",
             (proc.pid, os.getpgid(proc.pid), proc_start_ticks(proc.pid), job_id, lease, self.launcher_pid, self.launcher_start_ticks),
         ).rowcount
         if updated != 1:
             proc.terminate()
+            proc.wait()
+            self._children.pop(job_id, None)
             # The bootstrap has not received its release payload yet, so no
             # gate can be running.  Retire the reservation explicitly; leaving
             # it STARTING would make the partial unique index block recovery.
             self.journal.db.execute(
                 "UPDATE jobs SET state='LOST',ended_at=? "
-                "WHERE job_id=? AND state='STARTING' AND lease_token=?",
-                (now(), job_id, lease),
-            )
-            self.journal.event(mission_id, "process_lost", {
-                "job_id": job_id, "reason": "launch lease lost before release",
-            })
+                "WHERE job_id=? AND state='STARTING' AND lease_token=? "
+                "AND launcher_pid=? AND launcher_start_ticks IS ?",
+                (now(), job_id, lease, self.launcher_pid, self.launcher_start_ticks),
+            ).rowcount
             self.journal.db.commit()
             raise RuntimeError("launch lease was lost before gate release")
         self.journal.db.commit()
         assert proc.stdin is not None
-        proc.stdin.write(json.dumps({"argv": argv, "cwd": cwd, "env": {**os.environ, **env}}).encode())
-        proc.stdin.close()
+        payload = json.dumps({"argv": argv, "cwd": cwd,
+                              "env": {**os.environ, **env}}).encode()
+        try:
+            written = proc.stdin.write(payload)
+            if written != len(payload):
+                raise BrokenPipeError("short bootstrap release write")
+            proc.stdin.close()
+        except (OSError, ValueError) as exc:
+            try:
+                proc.stdin.close()
+            except (OSError, ValueError):
+                pass
+            self.journal.event(mission_id, "process_release_failed", {
+                "job_id": job_id, "name": name, "pid": proc.pid,
+                "error": str(exc),
+            })
+            self.journal.db.commit()
+            return job_id
         self.journal.event(mission_id, "process_started", {"job_id": job_id, "name": name, "pid": proc.pid, "argv": argv})
         self.journal.db.commit()
-        self._children[job_id] = proc  # prevents Popen finalizer from reaping our registered child
         return job_id
 
     def poll(self, mission_id: str) -> list[JobResult]:
@@ -122,14 +147,25 @@ class ProcessSupervisor:
             if row["state"] == "STARTING":
                 # Only the recorded launcher may publish a PID. A dead launcher means the
                 # bootstrap was never released, so retrying is safe and deterministic.
-                observed = proc_start_ticks(row["launcher_pid"]) if row["launcher_pid"] else None
-                launcher_alive = (observed is not None and row["launcher_start_ticks"] is not None and
+                owner_status, observed = (proc_identity(row["launcher_pid"])
+                                          if row["launcher_pid"] else ("UNKNOWN", None))
+                launcher_alive = (owner_status == "PRESENT" and
+                                  row["launcher_start_ticks"] is not None and
                                   observed == row["launcher_start_ticks"])
                 if launcher_alive:
                     results.append(JobResult(row["job_id"], "RUNNING", None, row["launch_head"]))
                     continue
-                self.journal.db.execute("UPDATE jobs SET state='LOST',ended_at=? WHERE job_id=? AND state='STARTING'",
-                                        (now(), row["job_id"]))
+                if owner_status == "UNKNOWN":
+                    results.append(JobResult(row["job_id"], "RUNNING", None, row["launch_head"]))
+                    continue
+                changed = self.journal.db.execute(
+                    "UPDATE jobs SET state='LOST',ended_at=? WHERE job_id=? AND state='STARTING' "
+                    "AND lease_token IS ? AND launcher_pid IS ? AND launcher_start_ticks IS ?",
+                    (now(), row["job_id"], row["lease_token"], row["launcher_pid"],
+                     row["launcher_start_ticks"]),
+                ).rowcount
+                if changed != 1:
+                    continue
                 self.journal.event(mission_id, "process_lost", {"job_id": row["job_id"], "reason": "stale_starting_lease"})
                 results.append(JobResult(row["job_id"], "LOST", None, row["launch_head"]))
                 continue
@@ -147,8 +183,11 @@ class ProcessSupervisor:
                 self.journal.event(mission_id, "process_exited", {"job_id": row["job_id"], "exit_code": code})
                 results.append(JobResult(row["job_id"], state, code, row["launch_head"]))
                 continue
-            current = proc_start_ticks(pid) if pid else None
-            if ticks is not None and current is not None and current == ticks:
+            process_status, current = proc_identity(pid) if pid else ("UNKNOWN", None)
+            if process_status == "UNKNOWN":
+                results.append(JobResult(row["job_id"], "RUNNING", None, row["launch_head"]))
+                continue
+            if ticks is not None and process_status == "PRESENT" and current == ticks:
                 results.append(JobResult(row["job_id"], "RUNNING", None, row["launch_head"]))
                 continue
             # waitpid works for children; /proc absence after a restart is a safe, explicit LOST state.

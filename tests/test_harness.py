@@ -3,19 +3,22 @@ from __future__ import annotations
 import tempfile
 import unittest
 import json
+import queue
 import subprocess
+import sys
 from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
 from harness.adapters import FootballPredictionAdapter, GateResult, SimulatedAdapter
-from harness.cli import approval_head, build, load_spec, reconcile_supplied_spec
+from harness.cli import approval_head, build, load_spec, main as cli_main, reconcile_supplied_spec
 from harness.codex import AppServerCodex, FixtureCodex, Turn
 from harness.domain import InvalidTransition, MissionSpec, State
-from harness.isolation import WorktreeManager, compose_namespace, docker_env
+from harness.isolation import Worktree, WorktreeManager, compose_namespace, docker_env
 from harness.journal import Journal
-from harness.process import JobResult, ProcessSupervisor, proc_start_ticks
+from harness.policy import Decision, decide, permitted
+from harness.process import JobResult, ProcessSupervisor, proc_identity, proc_start_ticks
 from harness.supervisor import Supervisor
 
 
@@ -256,7 +259,7 @@ class HarnessTest(unittest.TestCase):
         adapter._forbidden_actions = ("live_provider_request", "quota_consumption")
         adapter._policy_cwd = "/tmp/mission-worktree"
         params = adapter._policy_params("/tmp/mission-worktree")
-        self.assertEqual(params["approvalPolicy"], "on-request")
+        self.assertEqual(params["approvalPolicy"], "never")
         self.assertFalse(params["sandboxPolicy"]["networkAccess"])
         self.assertEqual(params["sandboxPolicy"]["writableRoots"], ["/tmp/mission-worktree"])
 
@@ -266,7 +269,7 @@ class HarnessTest(unittest.TestCase):
         adapter._forbidden_actions = adapter._effective_policy(())
         adapter._policy_cwd = "/tmp/mission-worktree"
         params = adapter._policy_params("/tmp/mission-worktree")
-        self.assertEqual(params["approvalPolicy"], "on-request")
+        self.assertEqual(params["approvalPolicy"], "never")
         self.assertFalse(params["sandboxPolicy"]["networkAccess"])
 
     def test_codex_policy_never_falls_back_to_caller_cwd(self):
@@ -285,8 +288,9 @@ class HarnessTest(unittest.TestCase):
         adapter._policy_cwd = "/mission-worktree"
         expected_policy = {
             "cwd": "/mission-worktree",
-            "approvalPolicy": "on-request",
+            "approvalPolicy": "never",
             "sandbox": "workspace-write",
+            "developerInstructions": adapter._authority_instructions("/mission-worktree"),
             "config": {
                 "sandbox_workspace_write": {
                     "writable_roots": ["/mission-worktree"],
@@ -305,6 +309,59 @@ class HarnessTest(unittest.TestCase):
                 "thread/resume", {"threadId": "thread-1", **expected_policy},
             )
 
+    def test_codex_policy_is_constructor_bound_to_canonical_git_worktree(self):
+        first = Path(self.tmp.name) / "first-policy-repo"
+        second = Path(self.tmp.name) / "second-policy-repo"
+        for repo in (first, second):
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        process = type("Process", (), {
+            "stdin": StringIO(), "stdout": StringIO(), "stderr": None,
+            "poll": lambda self: 0,
+        })()
+        self.assertEqual(AppServerCodex._canonical_worktree(str(first)), str(first))
+        with patch("harness.codex.subprocess.Popen", return_value=process), \
+                patch.object(AppServerCodex, "_canonical_worktree", return_value=str(first)), \
+                patch.object(AppServerCodex, "_request", return_value={}):
+            adapter = AppServerCodex(worktree=str(first))
+        adapter.set_policy((), str(first))
+        self.assertEqual(adapter._policy_cwd, str(first))
+        with self.assertRaisesRegex(RuntimeError, "immutable"):
+            adapter.set_policy((), str(second))
+        with self.assertRaisesRegex(RuntimeError, "absolute canonical"):
+            adapter.set_policy((), "relative/repo")
+        adapter.close()
+
+        unbound = AppServerCodex.__new__(AppServerCodex)
+        unbound._configured_forbidden_actions = unbound._effective_policy(())
+        with self.assertRaisesRegex(RuntimeError, "not constructor-bound"):
+            unbound.set_policy((), str(first))
+
+    def test_codex_thread_receives_explicit_sensitive_action_boundary(self):
+        adapter = AppServerCodex.__new__(AppServerCodex)
+        adapter._forbidden_actions = adapter._effective_policy(("merge",))
+        adapter._policy_cwd = "/mission-worktree"
+        instructions = adapter._thread_policy_params(
+            "/mission-worktree",
+        )["developerInstructions"]
+        self.assertIn("only source editing", instructions)
+        for action in adapter._forbidden_actions:
+            self.assertIn(action, instructions)
+        self.assertIn("approval requests are always denied", instructions)
+
+    def test_app_server_explicitly_rejects_sensitive_approval_requests(self):
+        adapter = AppServerCodex.__new__(AppServerCodex)
+        adapter.proc = type("Process", (), {"stdin": StringIO()})()
+        request = {
+            "id": 41,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"command": "git merge origin/main"},
+        }
+        self.assertTrue(adapter._reject_server_request(request))
+        response = json.loads(adapter.proc.stdin.getvalue())
+        self.assertEqual(response["id"], 41)
+        self.assertEqual(response["error"]["code"], -32001)
+        self.assertIn("denied", response["error"]["message"])
+
     def test_production_build_injects_immutable_mission_codex_policy(self):
         denied = ("live_provider_request", "quota_consumption")
         fake = FakeCodex()
@@ -313,6 +370,13 @@ class HarnessTest(unittest.TestCase):
                                forbidden_actions=denied)
         constructor.assert_called_once_with(forbidden_actions=denied)
         self.assertIs(supervisor.codex, fake)
+
+        with patch("harness.cli.AppServerCodex", return_value=fake) as constructor:
+            build(Path(self.tmp.name), "footballprediction", forbidden_actions=denied,
+                  worktree="/validated/worktree")
+        constructor.assert_called_once_with(
+            forbidden_actions=denied, worktree="/validated/worktree",
+        )
 
         adapter = AppServerCodex.__new__(AppServerCodex)
         adapter._configured_forbidden_actions = denied
@@ -472,6 +536,21 @@ class HarnessTest(unittest.TestCase):
         self.journal.update(self.spec.mission_id, current_head="a" * 40)
         with self.assertRaisesRegex(RuntimeError, "not waiting for approval"):
             self.journal.approve(self.spec.mission_id, "merge")
+
+    def test_cli_approve_unknown_mission_exits_cleanly(self):
+        argv = ["harness", "--root", self.tmp.name, "approve", "missing",
+                "--action", "merge"]
+        with patch.object(sys, "argv", argv), self.assertRaises(SystemExit) as error:
+            cli_main()
+        self.assertEqual(error.exception.code, 2)
+
+    def test_policy_rejects_unknown_actions_and_non_boolean_approval(self):
+        self.assertEqual(decide("merge_pr"), Decision.DENY)
+        self.assertEqual(decide("MERGE"), Decision.DENY)
+        self.assertFalse(permitted("merge_pr", (), approved=True))
+        self.assertFalse(permitted("merge", (), approved="APPROVED"))
+        self.assertTrue(permitted("merge", (), approved=True))
+        self.assertTrue(permitted("source_edit", (), approved=False))
 
     def test_pass_is_reopened_when_canonical_head_changes(self):
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.PASS, terminal_state=State.PASS, merge_claim_head="a" * 40)
@@ -664,23 +743,38 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(adapter._turn_completed("t", "x")["status"], "completed")
 
     def test_app_server_pipe_read_has_a_response_deadline(self):
-        class BlockingStdout:
-            def fileno(self):
-                return 123
-
-            def readline(self):
-                raise AssertionError("readline must not run when the pipe is not readable")
-
         adapter = AppServerCodex.__new__(AppServerCodex)
         adapter.seq = 0
         adapter._pending_messages = []
+        adapter._reader_queue = queue.Queue()
+        adapter._reader_thread = object()
         adapter._response_timeout = 0.01
         adapter.proc = type("Process", (), {
-            "stdin": StringIO(), "stdout": BlockingStdout(),
+            "stdin": StringIO(), "stdout": StringIO(),
         })()
-        with patch("harness.codex.select.select", return_value=([], [], [])):
-            with self.assertRaisesRegex(RuntimeError, "deadline exceeded"):
-                adapter._request("ping", {})
+        with self.assertRaisesRegex(RuntimeError, "deadline exceeded"):
+            adapter._request("ping", {})
+
+    def test_app_server_reader_consumes_text_wrapper_buffer_without_fd_readiness(self):
+        adapter = AppServerCodex.__new__(AppServerCodex)
+        adapter.seq = 0
+        adapter._pending_messages = []
+        adapter.proc = type("Process", (), {
+            "stdin": StringIO(),
+            "stdout": StringIO('{"id":1,"result":{"ok":true}}\n'),
+        })()
+        self.assertEqual(adapter._request("ping", {}), {"ok": True})
+
+    def test_empty_completed_turn_does_not_fabricate_agent_text(self):
+        adapter = AppServerCodex.__new__(AppServerCodex)
+        adapter._forbidden_actions = adapter._effective_policy(())
+        adapter._policy_cwd = "/mission-worktree"
+        with patch.object(adapter, "_request", return_value={"turn": {"id": "turn-1"}}), \
+                patch.object(adapter, "_turn_completed", return_value={
+                    "id": "turn-1", "status": "completed", "items": [],
+                }):
+            turn = adapter.turn("thread-1", "work", "/mission-worktree")
+        self.assertEqual(turn.text, "")
 
     def test_app_server_close_terminates_and_reaps_once(self):
         class FakeProcess:
@@ -708,6 +802,26 @@ class HarnessTest(unittest.TestCase):
         self.assertTrue(adapter.proc.stdin.closed)
         self.assertTrue(adapter.proc.stdout.closed)
 
+    def test_app_server_close_never_masks_a_second_wait_timeout(self):
+        class StuckProcess:
+            stdin, stdout, stderr = StringIO(), StringIO(), None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout):
+                raise subprocess.TimeoutExpired("codex", timeout)
+
+        adapter = AppServerCodex.__new__(AppServerCodex)
+        adapter.proc = StuckProcess()
+        adapter.close()
+
     def test_gate_pass_is_bound_to_exact_head(self):
         self.journal.complete_gate(self.spec.mission_id, "verify-pr", "a" * 40)
         self.assertTrue(self.journal.gate_passed_at_head(self.spec.mission_id, "verify-pr", "a" * 40))
@@ -722,6 +836,45 @@ class HarnessTest(unittest.TestCase):
         next(iter(process._children.values())).wait()
         process.poll(self.spec.mission_id)
 
+    def test_release_pipe_failure_keeps_child_registered_and_reapable(self):
+        class FailingStdin:
+            def write(self, payload):
+                return len(payload)
+
+            def close(self):
+                raise BrokenPipeError("bootstrap exited")
+
+        class ExitedChild:
+            pid = 12345
+
+            def __init__(self):
+                self.stdin = FailingStdin()
+
+            def poll(self):
+                return 17
+
+        child = ExitedChild()
+        process = self.supervisor.process
+        with patch("harness.process.subprocess.Popen", return_value=child), \
+                patch("harness.process.os.getpgid", return_value=12345), \
+                patch("harness.process.proc_start_ticks", return_value="child-start"):
+            job_id = process.start(
+                self.spec.mission_id, "release-fails", ["/bin/false"],
+                str(self.worktree), {}, "a" * 40,
+            )
+        self.assertIs(process._children[job_id], child)
+        result = process.poll(self.spec.mission_id)
+        self.assertIn((job_id, "EXITED", 17), [
+            (item.job_id, item.state, item.exit_code) for item in result
+        ])
+        self.assertNotIn(job_id, process._children)
+        self.assertEqual(
+            self.journal.db.execute(
+                "SELECT state FROM jobs WHERE job_id=?", (job_id,),
+            ).fetchone()[0],
+            "EXITED",
+        )
+
     def test_restart_poll_records_zero_exit_from_reaped_child(self):
         job_id = "reaped-zero"
         self.journal.db.execute(
@@ -731,7 +884,7 @@ class HarnessTest(unittest.TestCase):
         )
         self.journal.db.commit()
         replacement = ProcessSupervisor(self.journal, Path(self.tmp.name) / "reaped-logs")
-        with patch("harness.process.proc_start_ticks", return_value=None), patch(
+        with patch("harness.process.proc_identity", return_value=("ABSENT", None)), patch(
                 "harness.process.os.waitpid", return_value=(123, 0)):
             result = replacement.poll(self.spec.mission_id)
         self.assertEqual([(item.state, item.exit_code) for item in result], [("EXITED", 0)])
@@ -740,8 +893,10 @@ class HarnessTest(unittest.TestCase):
 
     def test_proc_identity_permission_error_fails_closed(self):
         with patch("harness.process.Path.read_text", side_effect=PermissionError):
+            self.assertEqual(proc_identity(123), ("UNKNOWN", None))
             self.assertIsNone(proc_start_ticks(123))
         with patch("harness.journal.Path.read_text", side_effect=PermissionError):
+            self.assertEqual(Journal._proc_identity(123), ("UNKNOWN", None))
             self.assertIsNone(Journal._proc_start_ticks(123))
 
     def test_stale_gate_failure_cannot_trigger_repair_for_new_head(self):
@@ -776,6 +931,32 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(self.journal.db.execute("SELECT count(*) FROM jobs WHERE name='verify-pr'").fetchone()[0], 2)
         self.supervisor.process._children[replacement].wait()
         self.supervisor.process.poll(self.spec.mission_id)
+
+    def test_starting_recovery_cas_rejects_a_changed_lease(self):
+        job_id = "renewed-reservation"
+        self.journal.db.execute(
+            "INSERT INTO jobs(job_id,mission_id,name,argv_json,launch_head,state,"
+            "stdout_path,stderr_path,started_at,launcher_pid,launcher_start_ticks,lease_token) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (job_id, self.spec.mission_id, "verify-pr", "[]", "a" * 40,
+             "STARTING", "", "", "now", 99999999, "old-start", "old-lease"),
+        )
+        self.journal.db.commit()
+        other = Journal(Path(self.tmp.name) / "harness.sqlite")
+
+        def renew_before_recovery(pid):
+            other.db.execute(
+                "UPDATE jobs SET lease_token='new-lease' WHERE job_id=?", (job_id,),
+            )
+            other.db.commit()
+            return "ABSENT", None
+
+        with patch("harness.process.proc_identity", side_effect=renew_before_recovery):
+            self.assertEqual(self.supervisor.process.poll(self.spec.mission_id), [])
+        row = self.journal.db.execute(
+            "SELECT state,lease_token FROM jobs WHERE job_id=?", (job_id,),
+        ).fetchone()
+        self.assertEqual(tuple(row), ("STARTING", "new-lease"))
 
     def test_restart_gate_crash_points_fail_closed_and_recover(self):
         self.advance_to_test()
@@ -823,6 +1004,37 @@ class HarnessTest(unittest.TestCase):
     def test_simulation_cli_build_selects_simulated_contract_adapter(self):
         supervisor = build(Path(self.tmp.name), "simulation", FakeCodex())
         self.assertIsInstance(supervisor.adapter, SimulatedAdapter)
+
+    def test_cli_resolves_worktree_before_constructing_production_codex(self):
+        mission = Path(self.tmp.name) / "production-mission.json"
+        mission.write_text(json.dumps({
+            "schema_version": 1,
+            "mission_id": "constructor-bound",
+            "repository": "/source/repository",
+            "objective": "safe fixture",
+        }))
+        tree = Worktree(
+            "/source/repository", "b" * 40, "harness/constructor-bound",
+            "/validated/mission-worktree",
+        )
+        events = []
+
+        def ensure(*args):
+            events.append("ensure")
+            return tree
+
+        def stop_after_build(*args, **kwargs):
+            events.append("build")
+            self.assertEqual(kwargs["worktree"], tree.path)
+            raise RuntimeError("stop after constructor boundary assertion")
+
+        argv = ["harness", "--root", self.tmp.name, "run", str(mission)]
+        with patch.object(sys, "argv", argv), \
+                patch("harness.cli.WorktreeManager.ensure", side_effect=ensure), \
+                patch("harness.cli.build", side_effect=stop_after_build), \
+                self.assertRaisesRegex(RuntimeError, "constructor boundary"):
+            cli_main()
+        self.assertEqual(events, ["ensure", "build"])
 
     def test_invalid_adapter_names_fail_closed_and_simulation_does_not_start_app_server(self):
         path = Path(self.tmp.name) / "bad.json"
@@ -1076,6 +1288,25 @@ class HarnessTest(unittest.TestCase):
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,
                             merge_claim_head="a" * 40, merge_claim_pid=None, merge_claim_start_ticks=None)
         self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
+        self.assertEqual(self.adapter.merged_heads, set())
+
+    def test_unverifiable_live_merge_owner_claim_cannot_be_reclaimed(self):
+        head = "a" * 40
+        self.journal.update(
+            self.spec.mission_id,
+            current_head=head,
+            current_state=State.MERGE,
+            merge_claim_head=head,
+            merge_claim_pid=12345,
+            merge_claim_start_ticks="owner-start",
+        )
+        with patch.object(
+                self.journal, "_proc_identity", return_value=("UNKNOWN", None)):
+            self.assertEqual(
+                self.supervisor.step(self.spec.mission_id, self.spec),
+                State.BLOCKED_EXTERNAL,
+            )
+        self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_claim_head"], head)
         self.assertEqual(self.adapter.merged_heads, set())
 
     def test_football_adapter_review_fails_closed_instead_of_crashing(self):
