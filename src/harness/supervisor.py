@@ -24,17 +24,9 @@ class Supervisor:
         row = self.journal.mission(mission_id)
         head = self.adapter.exact_head(row["worktree"])
         if head != row["current_head"]:
-            previous_state = State(row["current_state"])
-            self.journal.update(mission_id, current_head=head)
-            self.journal.invalidate_reviews(mission_id, head)
-            self.journal.event(mission_id, "canonical_head_reconciled", {"head": head})
-            self.journal.db.commit()
-            # A source change after local validation invalidates every downstream
-            # acceptance fact, including an owner merge decision for the old HEAD.
-            if previous_state == State.PASS:
-                self.journal.reopen_pass_for_new_head(mission_id, "canonical HEAD changed after PASS")
-            elif previous_state in {State.REVIEW, State.CI, State.MERGE, State.WAITING_APPROVAL}:
-                self.journal.rewind_to_test(mission_id, "canonical HEAD changed")
+            # One transaction makes a crash observe either the old accepted HEAD or
+            # a fully reopened mission; SQLite cache can never accept a hybrid.
+            self.journal.reconcile_head(mission_id, head)
         for result in self.process.poll(mission_id):
             if result.state == "EXITED" and result.exit_code == 0:
                 pending = self.journal.mission(mission_id)["pending_gate"]

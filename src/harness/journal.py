@@ -127,6 +127,32 @@ class Journal:
             self.db.commit()
         return result.rowcount
 
+    def reconcile_head(self, mission_id: str, head: str) -> bool:
+        """Atomically replace cached HEAD and revoke all downstream acceptance facts."""
+        row = self.mission(mission_id)
+        if row["current_head"] == head:
+            return False
+        source = State(row["current_state"])
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            self.db.execute("UPDATE missions SET current_head=?,updated_at=? WHERE mission_id=?", (head, now(), mission_id))
+            invalidated = self.db.execute("UPDATE receipts SET invalidated=1 WHERE mission_id=? AND head_sha<>? AND invalidated=0",
+                                          (mission_id, head)).rowcount
+            if source == State.PASS:
+                self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',updated_at=? WHERE mission_id=?",
+                                (State.TEST, now(), mission_id))
+                self.event(mission_id, "pass_reopened_for_new_head", {"reason": "canonical HEAD changed after PASS"})
+            elif source in {State.REVIEW, State.CI, State.MERGE, State.WAITING_APPROVAL}:
+                self.db.execute("UPDATE missions SET current_state=?,pending_gate=NULL,ci_state=NULL,approval_state='NONE',updated_at=? WHERE mission_id=?",
+                                (State.TEST, now(), mission_id))
+                self.event(mission_id, "state_reconciled_to_test", {"from": source, "reason": "canonical HEAD changed"})
+            self.event(mission_id, "canonical_head_reconciled", {"head": head, "invalidated_reviews": invalidated})
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+        return True
+
     def valid_reviews(self, mission_id: str, head: str) -> set[str]:
         rows = self.db.execute("SELECT reviewer FROM receipts WHERE mission_id=? AND head_sha=? AND result='PASS' AND invalidated=0",
                                (mission_id, head)).fetchall()
@@ -148,26 +174,6 @@ class Journal:
                               (mission_id, action, head)).fetchone()
         return row is not None and row[0] == "APPROVED"
 
-    def rewind_to_test(self, mission_id: str, reason: str) -> None:
-        """Canonical HEAD changed before terminal acceptance: require fresh local gates."""
-        row = self.mission(mission_id)
-        source = State(row["current_state"])
-        if source in TERMINAL:
-            raise InvalidTransition(f"cannot rewind terminal mission {source}")
-        self.db.execute("UPDATE missions SET current_state=?,pending_gate=NULL,ci_state=NULL,approval_state='NONE',updated_at=? WHERE mission_id=?",
-                        (State.TEST, now(), mission_id))
-        self.event(mission_id, "state_reconciled_to_test", {"from": source, "reason": reason})
-        self.db.commit()
-
-    def reopen_pass_for_new_head(self, mission_id: str, reason: str) -> None:
-        """PASS describes one immutable HEAD, never every later worktree mutation."""
-        row = self.mission(mission_id)
-        if State(row["current_state"]) != State.PASS:
-            raise InvalidTransition("only PASS can be reopened by canonical HEAD reconciliation")
-        self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',updated_at=? WHERE mission_id=?",
-                        (State.TEST, now(), mission_id))
-        self.event(mission_id, "pass_reopened_for_new_head", {"reason": reason})
-        self.db.commit()
 
     def status(self, mission_id: str) -> Observation:
         row = self.mission(mission_id)
