@@ -210,12 +210,23 @@ class Journal:
         self.db.commit()
 
     def invalidate_reviews(self, mission_id: str, current_head: str) -> int:
-        result = self.db.execute("UPDATE receipts SET invalidated=1 WHERE mission_id=? AND head_sha<>? AND invalidated=0",
-                                 (mission_id, current_head))
-        if result.rowcount:
-            self.event(mission_id, "reviews_invalidated", {"current_head": current_head, "count": result.rowcount})
+        try:
+            result = self.db.execute(
+                "UPDATE receipts SET invalidated=1 WHERE mission_id=? AND head_sha<>? AND invalidated=0",
+                (mission_id, current_head),
+            )
+            if result.rowcount:
+                self.event(mission_id, "reviews_invalidated", {
+                    "current_head": current_head, "count": result.rowcount,
+                })
+            # Even a zero-row UPDATE opens sqlite3's implicit transaction.
+            # Commit every path so a later BEGIN IMMEDIATE cannot inherit a
+            # stale no-op transaction.
             self.db.commit()
-        return result.rowcount
+            return result.rowcount
+        except Exception:
+            self.db.rollback()
+            raise
 
     def reconcile_head(self, mission_id: str, head: str) -> bool:
         """Atomically replace cached HEAD and revoke all downstream acceptance facts."""
@@ -223,7 +234,10 @@ class Journal:
             self.db.execute("BEGIN IMMEDIATE")
             # Read after the writer lock: another controller cannot race a stale
             # state decision into a later terminal acceptance.
-            row = self.db.execute("SELECT current_head,current_state FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
+            row = self.db.execute(
+                "SELECT current_head,current_state,merge_claim_head FROM missions WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()
             if row is None:
                 raise KeyError(mission_id)
             if row["current_head"] == head:
@@ -237,6 +251,19 @@ class Journal:
                 self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',merge_claim_head=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=?",
                                 (State.TEST, now(), mission_id))
                 self.event(mission_id, "pass_reopened_for_new_head", {"reason": "canonical HEAD changed after PASS"})
+            elif source == State.MERGE and row["merge_claim_head"] is not None:
+                # HEAD drift invalidates source-bound acceptance, but an
+                # external merge may still be in flight behind this durable
+                # claim. Preserve it until canonical merge status and the
+                # recorded owner identity prove that retrying is safe.
+                self.db.execute(
+                    "UPDATE missions SET terminal_state=NULL,pending_gate=NULL,ci_state=NULL,"
+                    "approval_state='NONE',updated_at=? WHERE mission_id=?",
+                    (now(), mission_id),
+                )
+                self.event(mission_id, "merge_claim_preserved_on_head_drift", {
+                    "claim_head": row["merge_claim_head"], "current_head": head,
+                })
             elif source in {State.REVIEW, State.CI, State.MERGE, State.WAITING_APPROVAL, State.POST_MERGE, State.DELIVER}:
                 self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',merge_claim_head=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=?",
                                 (State.TEST, now(), mission_id))
@@ -349,27 +376,35 @@ class Journal:
 
     def record_codex_thread(self, mission_id: str, thread_id: str, owner_pid: int,
                             owner_start_ticks: str) -> None:
-        changed = self.db.execute(
-            "UPDATE missions SET codex_thread_id=?,updated_at=? WHERE mission_id=? "
-            "AND codex_turn_state='RUNNING' AND codex_turn_pid=? AND codex_turn_start_ticks=?",
-            (thread_id, now(), mission_id, owner_pid, owner_start_ticks),
-        ).rowcount
-        if changed != 1:
-            raise RuntimeError("Codex turn lease was lost before thread persistence")
-        self.db.commit()
+        try:
+            changed = self.db.execute(
+                "UPDATE missions SET codex_thread_id=?,updated_at=? WHERE mission_id=? "
+                "AND codex_turn_state='RUNNING' AND codex_turn_pid=? AND codex_turn_start_ticks=?",
+                (thread_id, now(), mission_id, owner_pid, owner_start_ticks),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("Codex turn lease was lost before thread persistence")
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
 
     def complete_codex_turn(self, mission_id: str, turn_id: str, owner_pid: int,
                             owner_start_ticks: str) -> None:
-        changed = self.db.execute(
-            "UPDATE missions SET codex_turn_id=?,codex_turn_state='COMPLETED',updated_at=? "
-            "WHERE mission_id=? AND codex_turn_state='RUNNING' AND codex_turn_pid=? "
-            "AND codex_turn_start_ticks=?",
-            (turn_id, now(), mission_id, owner_pid, owner_start_ticks),
-        ).rowcount
-        if changed != 1:
-            raise RuntimeError("Codex turn lease was lost before completion persistence")
-        self.event(mission_id, "codex_turn_completed", {"turn_id": turn_id})
-        self.db.commit()
+        try:
+            changed = self.db.execute(
+                "UPDATE missions SET codex_turn_id=?,codex_turn_state='COMPLETED',updated_at=? "
+                "WHERE mission_id=? AND codex_turn_state='RUNNING' AND codex_turn_pid=? "
+                "AND codex_turn_start_ticks=?",
+                (turn_id, now(), mission_id, owner_pid, owner_start_ticks),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("Codex turn lease was lost before completion persistence")
+            self.event(mission_id, "codex_turn_completed", {"turn_id": turn_id})
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
 
     def transition_after_codex_turn(self, mission_id: str, target: State, reason: str, *,
                                     expected_state: State, expected_head: str | None) -> None:
@@ -421,14 +456,18 @@ class Journal:
 
     def fail_codex_turn(self, mission_id: str, reason: str, owner_pid: int,
                         owner_start_ticks: str) -> None:
-        changed = self.db.execute(
-            "UPDATE missions SET codex_turn_state='FAILED',updated_at=? WHERE mission_id=? "
-            "AND codex_turn_state='RUNNING' AND codex_turn_pid=? AND codex_turn_start_ticks=?",
-            (now(), mission_id, owner_pid, owner_start_ticks),
-        ).rowcount
-        if changed:
-            self.event(mission_id, "codex_turn_failed", {"reason": reason})
+        try:
+            changed = self.db.execute(
+                "UPDATE missions SET codex_turn_state='FAILED',updated_at=? WHERE mission_id=? "
+                "AND codex_turn_state='RUNNING' AND codex_turn_pid=? AND codex_turn_start_ticks=?",
+                (now(), mission_id, owner_pid, owner_start_ticks),
+            ).rowcount
+            if changed:
+                self.event(mission_id, "codex_turn_failed", {"reason": reason})
             self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
 
     @staticmethod
     def _proc_start_ticks(pid: int) -> str | None:
@@ -467,7 +506,7 @@ class Journal:
             self.db.rollback()
             raise
 
-    def reclaim_merge_claim_if_stale(self, mission_id: str, head: str) -> str:
+    def reclaim_merge_claim_if_stale(self, mission_id: str, claim_head: str) -> str:
         """Reclaim only a claim whose recorded owner is definitely gone.
 
         A live owner remains authoritative even when canonical merge status is
@@ -482,8 +521,8 @@ class Journal:
                 "FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
             if row is None:
                 raise KeyError(mission_id)
-            if (State(row["current_state"]) != State.MERGE or row["current_head"] != head or
-                    row["merge_claim_head"] != head):
+            if (State(row["current_state"]) != State.MERGE or
+                    row["merge_claim_head"] != claim_head):
                 self.db.commit()
                 return "NO_CLAIM"
             pid, start_ticks = row["merge_claim_pid"], row["merge_claim_start_ticks"]
@@ -493,18 +532,32 @@ class Journal:
             if self._proc_start_ticks(pid) == start_ticks:
                 self.db.commit()
                 return "ACTIVE"
+            current_head = row["current_head"]
+            drifted = current_head != claim_head
+            target = State.TEST if drifted else State.MERGE
             changed = self.db.execute(
-                "UPDATE missions SET merge_claim_head=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? "
-                "WHERE mission_id=? AND current_state=? AND current_head=? AND merge_claim_head=? "
+                "UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,"
+                "approval_state='NONE',merge_claim_head=NULL,merge_claim_pid=NULL,"
+                "merge_claim_start_ticks=NULL,updated_at=? "
+                "WHERE mission_id=? AND current_state=? AND current_head IS ? AND merge_claim_head=? "
                 "AND merge_claim_pid=? AND merge_claim_start_ticks=?",
-                (now(), mission_id, State.MERGE, head, head, pid, start_ticks)).rowcount
+                (target, now(), mission_id, State.MERGE, current_head, claim_head, pid, start_ticks),
+            ).rowcount
             if changed != 1:
                 self.db.commit()
                 return "NO_CLAIM"
-            self.event(mission_id, "merge_claim_reclaimed", {"head": head, "owner_pid": pid,
-                                                               "owner_start_ticks": start_ticks})
+            self.event(mission_id, "merge_claim_reclaimed", {
+                "claim_head": claim_head, "current_head": current_head,
+                "owner_pid": pid, "owner_start_ticks": start_ticks,
+                "head_drifted": drifted,
+            })
+            if drifted:
+                self.event(mission_id, "state_reconciled_to_test", {
+                    "from": State.MERGE,
+                    "reason": "stale merge claim owner exited after canonical HEAD changed",
+                })
             self.db.commit()
-            return "RECLAIMED"
+            return "RECLAIMED_HEAD_DRIFT" if drifted else "RECLAIMED"
         except Exception:
             self.db.rollback()
             raise

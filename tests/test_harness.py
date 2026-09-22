@@ -124,6 +124,16 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(self.codex.turns, [])
         self.assertEqual(self.journal.mission(self.spec.mission_id)["codex_turn_state"], "CONSUMED")
 
+    def test_noop_journal_paths_leave_sqlite_transaction_clean(self):
+        """Lease-loss and zero-row invalidation paths must not poison the connection."""
+        self.journal.invalidate_reviews(self.spec.mission_id, "a" * 40)
+        with self.assertRaisesRegex(RuntimeError, "thread persistence"):
+            self.journal.record_codex_thread(self.spec.mission_id, "thread", 99999999, "gone")
+        with self.assertRaisesRegex(RuntimeError, "completion persistence"):
+            self.journal.complete_codex_turn(self.spec.mission_id, "turn", 99999999, "gone")
+        self.journal.fail_codex_turn(self.spec.mission_id, "stale owner", 99999999, "gone")
+        self.journal.transition(self.spec.mission_id, State.PREPARING, "transaction paths recovered")
+
     def test_atomic_mission_creation_persists_isolation_metadata(self):
         row = self.journal.mission(self.spec.mission_id)
         self.assertEqual(row["worktree"], str(self.worktree))
@@ -721,6 +731,77 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(second.step(self.spec.mission_id, self.spec), State.MERGE)
         self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_claim_head"], "a" * 40)
         self.assertEqual(self.adapter.merged_heads, set())
+
+    def test_head_drift_preserves_live_merge_claim_then_revalidates_after_safe_reclaim(self):
+        old_head, new_head = "a" * 40, "b" * 40
+        self.journal.update(
+            self.spec.mission_id,
+            current_head=old_head,
+            current_state=State.MERGE,
+            merge_claim_head=None,
+            merge_claim_pid=None,
+            merge_claim_start_ticks=None,
+        )
+        owner_pid, owner_start_ticks = self.supervisor._merge_owner()
+        self.assertTrue(
+            self.journal.claim_merge(
+                self.spec.mission_id, old_head, owner_pid, owner_start_ticks,
+            )
+        )
+
+        # A concurrent source update must not erase the live claim: its owner
+        # may still be between the durable claim and the external merge call.
+        self.adapter.heads = [new_head]
+        self.supervisor.reconcile(self.spec.mission_id)
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertEqual((row["current_state"], row["current_head"]), (State.MERGE, new_head))
+        self.assertEqual(row["merge_claim_head"], old_head)
+
+        second = Supervisor(
+            self.journal,
+            ProcessSupervisor(self.journal, Path(self.tmp.name) / "drifted-claim-logs"),
+            self.codex,
+            self.adapter,
+        )
+        self.assertEqual(second.step(self.spec.mission_id, self.spec), State.MERGE)
+        self.assertEqual(self.adapter.merged_heads, set())
+
+        # Once canonical status says NOT_STARTED and the recorded owner is
+        # definitely gone, reclaim atomically rewinds to TEST for the new HEAD;
+        # it still cannot merge the new HEAD in the same supervisor turn.
+        self.journal.update(
+            self.spec.mission_id,
+            merge_claim_pid=99999999,
+            merge_claim_start_ticks="dead-owner",
+        )
+        self.assertEqual(second.step(self.spec.mission_id, self.spec), State.TEST)
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertIsNone(row["merge_claim_head"])
+        self.assertEqual(row["current_head"], new_head)
+        self.assertEqual(self.adapter.merged_heads, set())
+
+    def test_completed_stale_head_merge_blocks_instead_of_merging_new_head(self):
+        old_head, new_head = "a" * 40, "b" * 40
+        self.journal.update(
+            self.spec.mission_id,
+            current_head=old_head,
+            current_state=State.MERGE,
+            merge_claim_head=old_head,
+            merge_claim_pid=99999999,
+            merge_claim_start_ticks="dead-owner",
+        )
+        self.adapter.merged_heads.add(old_head)
+        self.adapter.heads = [new_head]
+
+        self.supervisor.reconcile(self.spec.mission_id)
+        self.assertEqual(
+            self.supervisor.step(self.spec.mission_id, self.spec),
+            State.BLOCKED_EXTERNAL,
+        )
+        self.assertEqual(self.adapter.merged_heads, {old_head})
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertEqual(row["merge_claim_head"], old_head)
+        self.assertEqual(row["current_head"], new_head)
 
     def test_dead_merge_claim_is_reclaimed_only_after_canonical_not_started(self):
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,

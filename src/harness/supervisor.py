@@ -247,14 +247,21 @@ class Supervisor:
                 self.reconcile(mission_id)
                 return State(self.journal.mission(mission_id)["current_state"])
             if row["merge_claim_head"] is not None:
-                status = self.adapter.merge_status(row["worktree"], row["merge_claim_head"])
+                claim_head = row["merge_claim_head"]
+                status = self.adapter.merge_status(row["worktree"], claim_head)
                 if status.status == "PASS":
+                    if claim_head != row["current_head"]:
+                        advance(
+                            State.BLOCKED_EXTERNAL,
+                            "merge completed for a stale claimed HEAD after canonical HEAD drift",
+                        )
+                        return State.BLOCKED_EXTERNAL
                     advance(State.POST_MERGE, "canonical merge already completed")
                     return State.POST_MERGE
                 if status.status != "NOT_STARTED":
                     advance(State.BLOCKED_EXTERNAL, status.evidence)
                     return State.BLOCKED_EXTERNAL
-                reclaim = self.journal.reclaim_merge_claim_if_stale(mission_id, row["current_head"])
+                reclaim = self.journal.reclaim_merge_claim_if_stale(mission_id, claim_head)
                 if reclaim == "ACTIVE":
                     # A peer may be between its claim commit and its external
                     # merge call. Never erase or steal that live claim.
@@ -262,6 +269,13 @@ class Supervisor:
                 if reclaim == "UNKNOWN":
                     advance(State.BLOCKED_EXTERNAL, "merge claim owner identity is unavailable")
                     return State.BLOCKED_EXTERNAL
+                if reclaim == "RECLAIMED_HEAD_DRIFT":
+                    # The old owner is gone and canonical status proved the
+                    # stale merge never started. Revalidate the new HEAD before
+                    # any new merge claim is possible.
+                    return State.TEST
+                if reclaim != "RECLAIMED":
+                    return State(self.journal.mission(mission_id)["current_state"])
                 row = self.journal.mission(mission_id)
                 # Canonical adapter proved the previous claim never started; reclaim
                 # this exact HEAD in the same supervisor turn.
