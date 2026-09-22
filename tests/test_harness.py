@@ -107,11 +107,12 @@ class HarnessTest(unittest.TestCase):
         self.assertFalse(self.journal.approved(self.spec.mission_id, "merge", "b" * 40))
 
     def test_pass_is_reopened_when_canonical_head_changes(self):
-        self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.PASS, terminal_state=State.PASS)
+        self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.PASS, terminal_state=State.PASS, merge_claim_head="a" * 40)
         self.adapter.heads = ["b" * 40]
         self.supervisor.reconcile(self.spec.mission_id)
         self.assertEqual(self.journal.status(self.spec.mission_id).state, State.TEST)
         self.assertFalse(self.journal.status(self.spec.mission_id).terminal)
+        self.assertIsNone(self.journal.mission(self.spec.mission_id)["merge_claim_head"])
 
     def test_review_p1_and_ci_fail_are_repaired_not_blocked(self):
         self.adapter.reviews = ["FAIL", "PASS", "PASS"]

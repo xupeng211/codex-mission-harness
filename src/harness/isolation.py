@@ -24,8 +24,8 @@ class WorktreeManager:
         repo_path, worktree_path = Path(repo).resolve(), Path(path).resolve()
         if not worktree_path.is_dir() or Path(run("git", "-C", str(worktree_path), "rev-parse", "--show-toplevel")).resolve() != worktree_path:
             raise RuntimeError("recorded worktree identity is invalid")
-        common = Path(run("git", "-C", str(worktree_path), "rev-parse", "--git-common-dir", cwd=str(worktree_path))).resolve()
-        expected_common = Path(run("git", "-C", str(repo_path), "rev-parse", "--git-common-dir", cwd=str(repo_path))).resolve()
+        common = Path(run("git", "-C", str(worktree_path), "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+        expected_common = Path(run("git", "-C", str(repo_path), "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
         if common != expected_common or run("git", "-C", str(worktree_path), "branch", "--show-current") != branch:
             raise RuntimeError("recorded worktree repository or branch mismatch")
         return Worktree(str(repo_path), run("git", "-C", str(worktree_path), "rev-parse", "origin/main"), branch, str(worktree_path))
