@@ -129,8 +129,8 @@ class HarnessTest(unittest.TestCase):
 
     def test_process_reservation_prevents_duplicate_launch(self):
         process = self.supervisor.process
-        first = process.start(self.spec.mission_id, "one-gate", ["/bin/sh", "-c", "exit 0"], str(self.worktree), {})
-        second = process.start(self.spec.mission_id, "one-gate", ["/bin/sh", "-c", "exit 0"], str(self.worktree), {})
+        first = process.start(self.spec.mission_id, "one-gate", ["/bin/sh", "-c", "exit 0"], str(self.worktree), {}, "a" * 40)
+        second = process.start(self.spec.mission_id, "one-gate", ["/bin/sh", "-c", "exit 0"], str(self.worktree), {}, "a" * 40)
         self.assertEqual(first, second)
         self.assertEqual(self.journal.db.execute("SELECT count(*) FROM jobs WHERE name='one-gate'").fetchone()[0], 1)
         next(iter(process._children.values())).wait()

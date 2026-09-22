@@ -57,7 +57,8 @@ def main() -> None:
     spec = load_spec(args.mission)
     supervisor = build(args.root)
     try:
-        supervisor.journal.mission(spec.mission_id)
+        existing = supervisor.journal.mission(spec.mission_id)
+        WorktreeManager().validate(existing["repo"], existing["branch"], existing["worktree"])
     except KeyError:
         tree = WorktreeManager().ensure(spec.repository, spec.mission_id, args.root / "data" / "worktrees")
         supervisor.create(spec, tree.path, tree.base_sha, tree.branch)

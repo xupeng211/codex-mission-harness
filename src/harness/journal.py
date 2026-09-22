@@ -35,7 +35,7 @@ class Journal:
               FOREIGN KEY(mission_id) REFERENCES missions(mission_id));
             CREATE TABLE IF NOT EXISTS jobs (
               job_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, name TEXT NOT NULL, argv_json TEXT NOT NULL,
-              pid INTEGER, pgid INTEGER, start_ticks TEXT, state TEXT NOT NULL, exit_code INTEGER,
+              launch_head TEXT, pid INTEGER, pgid INTEGER, start_ticks TEXT, state TEXT NOT NULL, exit_code INTEGER,
               stdout_path TEXT, stderr_path TEXT, started_at TEXT NOT NULL, ended_at TEXT);
             CREATE TABLE IF NOT EXISTS receipts (
               id INTEGER PRIMARY KEY AUTOINCREMENT, mission_id TEXT NOT NULL, reviewer TEXT NOT NULL,

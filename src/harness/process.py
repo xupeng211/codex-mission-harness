@@ -21,6 +21,7 @@ class JobResult:
     job_id: str
     state: str
     exit_code: int | None
+    launch_head: str | None
 
 
 class ProcessSupervisor:
@@ -31,7 +32,7 @@ class ProcessSupervisor:
         self._children: dict[str, subprocess.Popen[bytes]] = {}
         log_root.mkdir(parents=True, exist_ok=True)
 
-    def start(self, mission_id: str, name: str, argv: list[str], cwd: str, env: dict[str, str]) -> str:
+    def start(self, mission_id: str, name: str, argv: list[str], cwd: str, env: dict[str, str], launch_head: str) -> str:
         job_id = uuid.uuid4().hex
         out, err = self.log_root / f"{job_id}.out", self.log_root / f"{job_id}.err"
         # Reserve before spawning: concurrent supervisors observe the same durable job, never launch twice.
@@ -43,8 +44,8 @@ class ProcessSupervisor:
                 self.journal.db.commit()
                 return old[0]
             self.journal.db.execute(
-                "INSERT INTO jobs(job_id,mission_id,name,argv_json,state,stdout_path,stderr_path,started_at) VALUES(?,?,?,?,?,?,?,?)",
-                (job_id, mission_id, name, str(argv), "STARTING", str(out), str(err), now()),
+                "INSERT INTO jobs(job_id,mission_id,name,argv_json,launch_head,state,stdout_path,stderr_path,started_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (job_id, mission_id, name, str(argv), launch_head, "STARTING", str(out), str(err), now()),
             )
             self.journal.db.commit()
         except Exception:
@@ -73,27 +74,26 @@ class ProcessSupervisor:
         results = []
         for row in rows:
             if row["state"] == "STARTING":
-                self.journal.db.execute("UPDATE jobs SET state='LOST',ended_at=? WHERE job_id=?", (now(), row["job_id"]))
-                self.journal.event(mission_id, "process_lost", {"job_id": row["job_id"], "reason": "crash during launch"})
-                results.append(JobResult(row["job_id"], "LOST", None))
+                # A different supervisor can observe the durable reservation before the launcher publishes PID.
+                results.append(JobResult(row["job_id"], "RUNNING", None, row["launch_head"]))
                 continue
             pid, ticks = row["pid"], row["start_ticks"]
             child = self._children.get(row["job_id"])
             if child is not None:
                 code = child.poll()
                 if code is None:
-                    results.append(JobResult(row["job_id"], "RUNNING", None))
+                    results.append(JobResult(row["job_id"], "RUNNING", None, row["launch_head"]))
                     continue
                 self._children.pop(row["job_id"], None)
                 state = "EXITED"
                 self.journal.db.execute("UPDATE jobs SET state=?,exit_code=?,ended_at=? WHERE job_id=?",
                                         (state, code, now(), row["job_id"]))
                 self.journal.event(mission_id, "process_exited", {"job_id": row["job_id"], "exit_code": code})
-                results.append(JobResult(row["job_id"], state, code))
+                results.append(JobResult(row["job_id"], state, code, row["launch_head"]))
                 continue
             current = proc_start_ticks(pid) if pid else None
             if current == ticks:
-                results.append(JobResult(row["job_id"], "RUNNING", None))
+                results.append(JobResult(row["job_id"], "RUNNING", None, row["launch_head"]))
                 continue
             # waitpid works for children; /proc absence after a restart is a safe, explicit LOST state.
             code = None
@@ -107,6 +107,6 @@ class ProcessSupervisor:
             self.journal.db.execute("UPDATE jobs SET state=?,exit_code=?,ended_at=? WHERE job_id=?",
                                     (state, code, now(), row["job_id"]))
             self.journal.event(mission_id, "process_" + state.lower(), {"job_id": row["job_id"], "exit_code": code})
-            results.append(JobResult(row["job_id"], state, code))
+            results.append(JobResult(row["job_id"], state, code, row["launch_head"]))
         self.journal.db.commit()
         return results

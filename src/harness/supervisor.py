@@ -7,7 +7,7 @@ from .codex import CodexAdapter
 from .domain import MissionSpec, State, TERMINAL
 from .isolation import docker_env
 from .journal import Journal
-from .policy import Decision, decide
+from .policy import Decision, decide, permitted
 from .process import ProcessSupervisor
 
 
@@ -31,8 +31,11 @@ class Supervisor:
         for result in self.process.poll(mission_id):
             if result.state == "EXITED" and result.exit_code == 0:
                 pending = self.journal.mission(mission_id)["pending_gate"]
-                if pending:
-                    self.journal.complete_gate(mission_id, pending, head)
+                current = self.adapter.exact_head(row["worktree"])
+                if pending and result.launch_head == current:
+                    self.journal.complete_gate(mission_id, pending, current)
+                elif pending:
+                    self.journal.event(mission_id, "gate_stale", {"gate": pending, "launch_head": result.launch_head, "current_head": current})
             elif result.state != "RUNNING":
                 self.journal.transition(mission_id, State.FAILED_FATAL,
                                         f"owned process {result.state}: {result.exit_code}")
@@ -58,13 +61,19 @@ class Supervisor:
         elif state == State.PREPARING:
             self.journal.transition(mission_id, State.IMPLEMENT, "worktree prepared")
         elif state == State.IMPLEMENT:
+            if not permitted("source_edit", spec.forbidden_actions):
+                self.journal.transition(mission_id, State.BLOCKED_POLICY, "mission forbids source_edit")
+                return State.BLOCKED_POLICY
             self._agent_turn(mission_id, "Continue the same mission. Inspect actual gates; do not declare terminal state from prose.")
             self.journal.transition(mission_id, State.TEST, "primary turn completed")
         elif state == State.TEST:
             for gate in spec.required_gates:
+                if not permitted(f"gate:{gate}", spec.forbidden_actions):
+                    self.journal.transition(mission_id, State.BLOCKED_POLICY, f"mission forbids gate:{gate}")
+                    return State.BLOCKED_POLICY
                 if not self.journal.gate_passed_at_head(mission_id, gate, row["current_head"]):
                     self.journal.update(mission_id, pending_gate=gate)
-                    self.process.start(mission_id, gate, self.adapter.gate_argv(gate), row["worktree"], docker_env(mission_id))
+                    self.process.start(mission_id, gate, self.adapter.gate_argv(gate), row["worktree"], docker_env(mission_id), row["current_head"])
                     return state
             self.journal.transition(mission_id, State.REVIEW, "local canonical gates pass")
         elif state == State.REVIEW:
