@@ -42,4 +42,4 @@ Source fixes, local gates and in-scope review/CI repairs auto-continue. Live pro
 
 No dashboard, worker cluster, workflow DSL, swarm, plugin marketplace or cloud platform. GitHub querying and project-specific merge/production execution require authenticated adapter implementations; missing canonical evidence remains pending/blocked rather than fabricated as PASS.
 
-Scenario-to-test evidence is explicit in [docs/SCENARIO_COVERAGE.md](docs/SCENARIO_COVERAGE.md); seven behavior/protocol tests cover the eight requested scenarios because two tests each cover a paired scenario.
+Scenario-to-test evidence is explicit in [docs/SCENARIO_COVERAGE.md](docs/SCENARIO_COVERAGE.md); the deterministic suite includes sixteen behavior, recovery, policy and protocol tests. The eight requested scenarios have explicit mappings; a test may cover more than one scenario.
