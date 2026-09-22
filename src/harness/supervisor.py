@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
-from .adapters import GateResult
+from .adapters import GateResult, SimulatedAdapter
 from .codex import CodexAdapter
 from .domain import MissionSpec, State, TERMINAL
 from .isolation import docker_env
@@ -83,7 +84,9 @@ class Supervisor:
         guarded_prompt = (
             f"{prompt}\nMission forbidden_actions deny-list: {policy_text}. "
             "Never attempt a denied action; if the requested work would require one, "
-            "stop and report the policy boundary."
+            "stop and report the policy boundary. Before completing a source-changing "
+            "turn, commit the intended changes so the exact source identity is clean "
+            "and can be validated by the canonical gates."
         )
         try:
             setter = getattr(self.codex, "set_policy", None)
@@ -101,6 +104,23 @@ class Supervisor:
                                                             "text": turn.text,
                                                             "forbidden_actions": list(forbidden_actions)})
             self.journal.db.commit()
+            # The production adapter's exact-head contract requires a clean
+            # committed worktree. Never advance a real mission into TEST with
+            # uncheckpointed model edits; leave an explicit, resumable block so
+            # a later owner turn can commit/reconcile instead of stranding TEST.
+            if not isinstance(self.adapter, SimulatedAdapter):
+                dirty = subprocess.run(
+                    ["git", "-C", row["worktree"], "status", "--porcelain=v1",
+                     "--untracked-files=all"],
+                    text=True, capture_output=True, check=False,
+                )
+                if dirty.returncode != 0 or dirty.stdout:
+                    self.journal.transition(
+                        mission_id, State.BLOCKED_EXTERNAL,
+                        "Codex turn did not leave a clean committed worktree; "
+                        "checkpoint required before canonical validation",
+                    )
+                    return False
             return True
         except Exception as exc:
             self.journal.fail_codex_turn(mission_id, str(exc), owner_pid, owner_start_ticks)
@@ -173,11 +193,13 @@ class Supervisor:
                             advance(State.IMPLEMENT, "review finding is auto-remediable")
                             return State.IMPLEMENT
                         return State(self.journal.mission(mission_id)["current_state"])
+                    self.journal.update(mission_id, pending_gate=None, ci_state=None)
                     return state
             advance(State.CI, "all exact-head reviews pass")
         elif state == State.CI:
             result = self.adapter.ci(row["worktree"], row["current_head"])
             if result.status == "PASS":
+                self.journal.update(mission_id, pending_gate=None, ci_state=None)
                 advance(State.MERGE, "canonical CI pass")
             elif result.status == "FAIL":
                 if self._agent_turn(mission_id, f"Repair canonical CI failure: {result.evidence}",

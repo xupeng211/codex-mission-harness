@@ -28,6 +28,16 @@ def reconcile_supplied_spec(journal: Journal, supplied: MissionSpec) -> tuple[Mi
     return persisted, True
 
 
+def approval_head(journal: Journal, spec: MissionSpec, row) -> str:
+    """Return the adapter-owned source identity used to bind an approval."""
+    if spec.adapter == "simulation":
+        # Simulation owns a synthetic identity; never replace it with a real
+        # repository SHA merely because the fixture has a worktree path.
+        return row["current_head"]
+    WorktreeManager().validate(row["repo"], row["branch"], row["worktree"])
+    return git_run("git", "-C", row["worktree"], "rev-parse", "HEAD")
+
+
 def build(root: Path, adapter_name: str = "footballprediction", codex=None,
           forbidden_actions: tuple[str, ...] = ()) -> Supervisor:
     journal = Journal(root / "data" / "harness.sqlite")
@@ -73,9 +83,9 @@ def main() -> None:
         return
     if args.command == "approve":
         journal = Journal(args.root / "data" / "harness.sqlite")
+        spec = journal.spec(args.mission_id)
         row = journal.mission(args.mission_id)
-        WorktreeManager().validate(row["repo"], row["branch"], row["worktree"])
-        observed_head = git_run("git", "-C", row["worktree"], "rev-parse", "HEAD")
+        observed_head = approval_head(journal, spec, row)
         journal.reconcile_head(args.mission_id, observed_head)
         journal.approve(args.mission_id, args.action, args.reason, observed_head=observed_head)
         print(f"MISSION={args.mission_id}\nAPPROVAL={args.action}:APPROVED")

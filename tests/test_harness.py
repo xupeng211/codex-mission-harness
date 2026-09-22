@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness.adapters import FootballPredictionAdapter, SimulatedAdapter
-from harness.cli import build, load_spec, reconcile_supplied_spec
+from harness.cli import approval_head, build, load_spec, reconcile_supplied_spec
 from harness.codex import AppServerCodex, FixtureCodex, Turn
 from harness.domain import InvalidTransition, MissionSpec, State
 from harness.isolation import WorktreeManager, compose_namespace, docker_env
@@ -116,6 +116,15 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(params["approvalPolicy"], "on-request")
         self.assertFalse(params["sandboxPolicy"]["networkAccess"])
         self.assertEqual(params["sandboxPolicy"]["writableRoots"], ["/tmp/mission-worktree"])
+
+    def test_codex_policy_baseline_is_not_optional(self):
+        adapter = AppServerCodex.__new__(AppServerCodex)
+        adapter._configured_forbidden_actions = adapter._effective_policy(())
+        adapter._forbidden_actions = adapter._effective_policy(())
+        adapter._policy_cwd = "/tmp/mission-worktree"
+        params = adapter._policy_params("/ignored")
+        self.assertEqual(params["approvalPolicy"], "on-request")
+        self.assertFalse(params["sandboxPolicy"]["networkAccess"])
 
     def test_production_build_injects_immutable_mission_codex_policy(self):
         denied = ("live_provider_request", "quota_consumption")
@@ -297,6 +306,60 @@ class HarnessTest(unittest.TestCase):
         row = self.journal.mission(self.spec.mission_id)
         self.assertEqual(row["current_state"], State.TEST)
         self.assertIsNone(row["terminal_state"])
+
+    def test_pending_review_marker_is_cleared_when_reviewer_resolves(self):
+        self.journal.update(self.spec.mission_id, current_head="a" * 40,
+                            current_state=State.REVIEW,
+                            pending_gate="review:codex", ci_state="PENDING")
+        self.adapter.reviews = ["PASS"]
+        self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.REVIEW)
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertIsNone(row["pending_gate"])
+        self.assertIsNone(row["ci_state"])
+
+    def test_pending_ci_marker_is_cleared_when_ci_resolves(self):
+        self.journal.update(self.spec.mission_id, current_head="a" * 40,
+                            current_state=State.CI,
+                            pending_gate="github-ci", ci_state="PENDING")
+        self.adapter.ci_results = ["PASS"]
+        self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.MERGE)
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertIsNone(row["pending_gate"])
+        self.assertIsNone(row["ci_state"])
+
+    def test_simulation_approval_uses_synthetic_head_not_git(self):
+        spec = replace(self.spec, merge_policy="owner_approval")
+        self.journal.db.execute("UPDATE missions SET spec_json=?,current_head=?,current_state=?,approval_state=?,pending_gate=? WHERE mission_id=?",
+                                (json.dumps(spec.__dict__), "a" * 40, State.WAITING_APPROVAL,
+                                 "PENDING", "owner-merge", spec.mission_id))
+        self.journal.db.commit()
+        with patch("harness.cli.git_run", side_effect=AssertionError("simulation must not query Git")):
+            self.assertEqual(approval_head(self.journal, spec, self.journal.mission(spec.mission_id)), "a" * 40)
+
+    def test_production_codex_dirty_checkpoint_fails_closed_before_test(self):
+        repo = Path(self.tmp.name) / "dirty-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Harness Test"], check=True)
+        (repo / "tracked.txt").write_text("clean\n")
+        subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+
+        class DirtyCodex(FakeCodex):
+            def turn(self, thread_id, prompt, cwd):
+                Path(cwd, "uncheckpointed.txt").write_text("model edit\n")
+                return super().turn(thread_id, prompt, cwd)
+
+        spec = replace(self.spec, adapter="footballprediction")
+        journal = Journal(Path(self.tmp.name) / "dirty.sqlite")
+        supervisor = Supervisor(journal, ProcessSupervisor(journal, Path(self.tmp.name) / "dirty-logs"),
+                                DirtyCodex(), FootballPredictionAdapter())
+        supervisor.create(spec, str(repo), "b" * 40, "harness/dirty")
+        supervisor.step(spec.mission_id, spec)
+        supervisor.step(spec.mission_id, spec)
+        self.assertEqual(supervisor.step(spec.mission_id, spec), State.BLOCKED_EXTERNAL)
+        self.assertNotEqual(journal.status(spec.mission_id).state, State.TEST)
 
     def test_review_p1_and_ci_fail_are_repaired_not_blocked(self):
         self.adapter.reviews = ["FAIL", "PASS", "PASS"]

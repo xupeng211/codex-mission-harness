@@ -5,6 +5,8 @@ import subprocess
 from dataclasses import dataclass
 from typing import Protocol
 
+from .policy import SENSITIVE
+
 
 @dataclass(frozen=True)
 class Turn:
@@ -25,8 +27,8 @@ class AppServerCodex:
         # The mission deny-list is injected before the real App Server is
         # constructed.  A later turn may bind the worktree, but it may not
         # replace the policy selected by the persisted mission contract.
-        self._forbidden_actions = tuple(forbidden_actions)
-        self._configured_forbidden_actions = tuple(forbidden_actions)
+        self._forbidden_actions = self._effective_policy(forbidden_actions)
+        self._configured_forbidden_actions = self._effective_policy(forbidden_actions)
         self._policy_cwd: str | None = None
         self.proc = subprocess.Popen([executable, "app-server", "--stdio"], stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, text=True, bufsize=1)
@@ -41,12 +43,17 @@ class AppServerCodex:
         deny-list.  Approval requests are deliberately not auto-approved by
         this adapter, so an attempted forbidden escape fails closed.
         """
-        requested = tuple(forbidden_actions)
+        requested = self._effective_policy(forbidden_actions)
         configured = getattr(self, "_configured_forbidden_actions", requested)
         if requested != configured:
             raise RuntimeError("Codex policy differs from the configured mission deny-list")
         self._forbidden_actions = requested
         self._policy_cwd = cwd
+
+    @staticmethod
+    def _effective_policy(forbidden_actions: tuple[str, ...]) -> tuple[str, ...]:
+        """Always apply the sensitive-action baseline, even for an omitted deny-list."""
+        return tuple(sorted(set(forbidden_actions) | set(SENSITIVE)))
 
     def _policy_params(self, cwd: str) -> dict:
         if not self._forbidden_actions:
@@ -150,7 +157,7 @@ class FixtureCodex:
         self.policy: tuple[str, ...] = ()
 
     def set_policy(self, forbidden_actions: tuple[str, ...], cwd: str) -> None:
-        self.policy = tuple(forbidden_actions)
+        self.policy = tuple(sorted(set(forbidden_actions) | set(SENSITIVE)))
     def start_or_resume(self, thread_id: str | None, cwd: str) -> str:
         return thread_id or "fixture-thread"
     def turn(self, thread_id: str, prompt: str, cwd: str) -> Turn:
