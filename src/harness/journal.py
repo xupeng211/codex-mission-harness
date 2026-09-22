@@ -192,7 +192,12 @@ class Journal:
     @staticmethod
     def _proc_start_ticks(pid: int) -> str | None:
         try:
-            return Path(f"/proc/{pid}/stat").read_text().split()[21]
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            comm_end = stat.rfind(")")
+            if comm_end < 0:
+                return None
+            fields = stat[comm_end + 2 :].split()
+            return fields[19] if len(fields) > 19 else None
         except (FileNotFoundError, IndexError, ValueError):
             return None
 

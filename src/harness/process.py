@@ -24,8 +24,16 @@ except BaseException as exc:
 
 def proc_start_ticks(pid: int) -> str | None:
     try:
-        return Path(f"/proc/{pid}/stat").read_text().split()[21]
-    except (FileNotFoundError, IndexError):
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        # ``comm`` is parenthesized and may itself contain spaces or ')'.
+        # Locate its final delimiter, then field 22 (starttime) is index 19
+        # in the remaining fields beginning with state (field 3).
+        comm_end = stat.rfind(")")
+        if comm_end < 0:
+            return None
+        fields = stat[comm_end + 2 :].split()
+        return fields[19] if len(fields) > 19 else None
+    except (FileNotFoundError, IndexError, ValueError):
         return None
 
 
@@ -102,7 +110,9 @@ class ProcessSupervisor:
             if row["state"] == "STARTING":
                 # Only the recorded launcher may publish a PID. A dead launcher means the
                 # bootstrap was never released, so retrying is safe and deterministic.
-                launcher_alive = (proc_start_ticks(row["launcher_pid"]) == row["launcher_start_ticks"])
+                observed = proc_start_ticks(row["launcher_pid"]) if row["launcher_pid"] else None
+                launcher_alive = (observed is not None and row["launcher_start_ticks"] is not None and
+                                  observed == row["launcher_start_ticks"])
                 if launcher_alive:
                     results.append(JobResult(row["job_id"], "RUNNING", None, row["launch_head"]))
                     continue
@@ -126,14 +136,14 @@ class ProcessSupervisor:
                 results.append(JobResult(row["job_id"], state, code, row["launch_head"]))
                 continue
             current = proc_start_ticks(pid) if pid else None
-            if current == ticks:
+            if ticks is not None and current is not None and current == ticks:
                 results.append(JobResult(row["job_id"], "RUNNING", None, row["launch_head"]))
                 continue
             # waitpid works for children; /proc absence after a restart is a safe, explicit LOST state.
             code = None
             try:
-                _, status = os.waitpid(pid, os.WNOHANG)
-                if status:
+                waited_pid, status = os.waitpid(pid, os.WNOHANG)
+                if waited_pid == pid:
                     code = os.waitstatus_to_exitcode(status)
             except ChildProcessError:
                 pass

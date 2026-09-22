@@ -5,6 +5,7 @@ import unittest
 import json
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 from harness.adapters import FootballPredictionAdapter, SimulatedAdapter
 from harness.cli import build, load_spec
@@ -129,12 +130,20 @@ class HarnessTest(unittest.TestCase):
         old_process = self.supervisor.process
         child = next(iter(old_process._children.values()))
         child.wait()  # deterministic controlled interruption point: command ended before supervisor restart
-        self.supervisor.reconcile(self.spec.mission_id)
         replacement = Supervisor(self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "logs"), self.codex, self.adapter)
+        # The replacement observes the persisted RUNNING row and the reaped PID,
+        # marks that unjournaled outcome LOST, and resumes the same mission at TEST.
+        replacement.reconcile(self.spec.mission_id)
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertEqual(row["current_state"], State.TEST)
+        self.assertEqual(row["current_head"], "a" * 40)
+        self.assertEqual(row["codex_thread_id"], "thread-1")
+        self.assertEqual(self.journal.db.execute("SELECT count(*) FROM events WHERE kind='mission_created'").fetchone()[0], 1)
+        self.assertEqual(self.journal.db.execute("SELECT count(*) FROM jobs WHERE state='LOST'").fetchone()[0], 1)
         replacement.collect_jobs(self.spec.mission_id)
         self.supervisor = replacement
         self.assertEqual(self.drain(), State.PASS)
-        self.assertIsNotNone(old_process)
+        self.assertEqual(self.journal.db.execute("SELECT count(*) FROM jobs WHERE name='verify-pr'").fetchone()[0], 2)
 
     def test_agent_prose_is_not_terminal_and_invalid_transition_fails_closed(self):
         self.advance_to_test()
@@ -165,6 +174,22 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(self.journal.db.execute("SELECT count(*) FROM jobs WHERE name='one-gate'").fetchone()[0], 1)
         next(iter(process._children.values())).wait()
         process.poll(self.spec.mission_id)
+
+    def test_restart_poll_records_zero_exit_from_reaped_child(self):
+        job_id = "reaped-zero"
+        self.journal.db.execute(
+            "INSERT INTO jobs(job_id,mission_id,name,argv_json,launch_head,pid,pgid,start_ticks,state,stdout_path,stderr_path,started_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (job_id, self.spec.mission_id, "verify-pr", "[]", "a" * 40, 123, 123, "old-ticks", "RUNNING", "", "", "now"),
+        )
+        self.journal.db.commit()
+        replacement = ProcessSupervisor(self.journal, Path(self.tmp.name) / "reaped-logs")
+        with patch("harness.process.proc_start_ticks", return_value=None), patch(
+                "harness.process.os.waitpid", return_value=(123, 0)):
+            result = replacement.poll(self.spec.mission_id)
+        self.assertEqual([(item.state, item.exit_code) for item in result], [("EXITED", 0)])
+        self.assertEqual(tuple(self.journal.db.execute(
+            "SELECT state,exit_code FROM jobs WHERE job_id=?", (job_id,)).fetchone()), ("EXITED", 0))
 
     def test_stale_starting_lease_is_recoverable_without_a_second_launch(self):
         """A crash before PID publication is safe: bootstrap had no release payload."""
