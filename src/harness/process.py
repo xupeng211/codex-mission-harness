@@ -33,7 +33,7 @@ def proc_start_ticks(pid: int) -> str | None:
             return None
         fields = stat[comm_end + 2 :].split()
         return fields[19] if len(fields) > 19 else None
-    except (FileNotFoundError, IndexError, ValueError):
+    except (OSError, IndexError, ValueError):
         return None
 
 
@@ -93,6 +93,18 @@ class ProcessSupervisor:
         ).rowcount
         if updated != 1:
             proc.terminate()
+            # The bootstrap has not received its release payload yet, so no
+            # gate can be running.  Retire the reservation explicitly; leaving
+            # it STARTING would make the partial unique index block recovery.
+            self.journal.db.execute(
+                "UPDATE jobs SET state='LOST',ended_at=? "
+                "WHERE job_id=? AND state='STARTING' AND lease_token=?",
+                (now(), job_id, lease),
+            )
+            self.journal.event(mission_id, "process_lost", {
+                "job_id": job_id, "reason": "launch lease lost before release",
+            })
+            self.journal.db.commit()
             raise RuntimeError("launch lease was lost before gate release")
         self.journal.db.commit()
         assert proc.stdin is not None

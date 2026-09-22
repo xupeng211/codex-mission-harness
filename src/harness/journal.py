@@ -133,16 +133,52 @@ class Journal:
         payload = self.mission(mission_id)["spec_json"].encode()
         return hashlib.sha256(payload).hexdigest()
 
-    def transition(self, mission_id: str, target: State, reason: str) -> None:
-        row = self.mission(mission_id)
-        source = State(row["current_state"])
-        if source in TERMINAL or target not in ALLOWED.get(source, set()):
-            raise InvalidTransition(f"{source} -> {target} is forbidden")
-        terminal = target if target in TERMINAL else None
-        self.db.execute("UPDATE missions SET current_state=?,terminal_state=?,updated_at=? WHERE mission_id=?",
-                        (target, terminal, now(), mission_id))
-        self.event(mission_id, "state_transition", {"from": source, "to": target, "reason": reason})
-        self.db.commit()
+    def transition(self, mission_id: str, target: State, reason: str, *,
+                   expected_state: State | None = None,
+                   expected_head: str | None = None) -> None:
+        """Commit one state transition from a writer-locked exact snapshot.
+
+        The state and HEAD predicates are repeated in the UPDATE so a stale
+        controller cannot publish a decision after another controller has
+        reconciled either value.  ``expected_head=None`` means that the caller
+        has no stronger HEAD assertion; the locked journal HEAD is still part
+        of the compare-and-swap predicate.
+        """
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT current_state,current_head FROM missions WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(mission_id)
+            source = State(row["current_state"])
+            head = row["current_head"]
+            if expected_state is not None and source != expected_state:
+                raise InvalidTransition(
+                    f"stale transition expected state {expected_state}, observed {source}"
+                )
+            if expected_head is not None and head != expected_head:
+                raise InvalidTransition(
+                    f"stale transition expected HEAD {expected_head}, observed {head}"
+                )
+            if source in TERMINAL or target not in ALLOWED.get(source, set()):
+                raise InvalidTransition(f"{source} -> {target} is forbidden")
+            terminal = target if target in TERMINAL else None
+            changed = self.db.execute(
+                "UPDATE missions SET current_state=?,terminal_state=?,updated_at=? "
+                "WHERE mission_id=? AND current_state=? AND current_head IS ?",
+                (target, terminal, now(), mission_id, source, head),
+            ).rowcount
+            if changed != 1:
+                raise InvalidTransition("state or HEAD changed during transition")
+            self.event(mission_id, "state_transition", {
+                "from": source, "to": target, "head": head, "reason": reason,
+            })
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
 
     def update(self, mission_id: str, **fields: Any) -> None:
         if not fields:
@@ -202,7 +238,7 @@ class Journal:
                                 (State.TEST, now(), mission_id))
                 self.event(mission_id, "pass_reopened_for_new_head", {"reason": "canonical HEAD changed after PASS"})
             elif source in {State.REVIEW, State.CI, State.MERGE, State.WAITING_APPROVAL, State.POST_MERGE, State.DELIVER}:
-                self.db.execute("UPDATE missions SET current_state=?,pending_gate=NULL,ci_state=NULL,approval_state='NONE',merge_claim_head=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=?",
+                self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',merge_claim_head=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=?",
                                 (State.TEST, now(), mission_id))
                 self.event(mission_id, "state_reconciled_to_test", {"from": source, "reason": "canonical HEAD changed"})
             self.event(mission_id, "canonical_head_reconciled", {"head": head, "invalidated_reviews": invalidated})
@@ -345,7 +381,7 @@ class Journal:
                 return None
             fields = stat[comm_end + 2 :].split()
             return fields[19] if len(fields) > 19 else None
-        except (FileNotFoundError, IndexError, ValueError):
+        except (OSError, IndexError, ValueError):
             return None
 
     def claim_merge(self, mission_id: str, head: str, owner_pid: int | None = None,

@@ -34,7 +34,9 @@ def build(root: Path, adapter_name: str = "footballprediction", codex=None,
     if adapter_name == "simulation":
         adapter, selected_codex = SimulatedAdapter(), (codex or FixtureCodex())
     elif adapter_name == "footballprediction":
-        adapter, selected_codex = FootballPredictionAdapter(), (codex or AppServerCodex())
+        adapter, selected_codex = FootballPredictionAdapter(), (
+            codex or AppServerCodex(forbidden_actions=forbidden_actions)
+        )
     else:
         raise ValueError("adapter must be exactly footballprediction or simulation")
     return Supervisor(journal, ProcessSupervisor(journal, root / "data" / "logs"), selected_codex, adapter)

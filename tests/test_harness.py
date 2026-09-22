@@ -15,7 +15,7 @@ from harness.codex import AppServerCodex, FixtureCodex, Turn
 from harness.domain import InvalidTransition, MissionSpec, State
 from harness.isolation import WorktreeManager, compose_namespace, docker_env
 from harness.journal import Journal
-from harness.process import JobResult, ProcessSupervisor
+from harness.process import JobResult, ProcessSupervisor, proc_start_ticks
 from harness.supervisor import Supervisor
 
 
@@ -116,6 +116,22 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(params["approvalPolicy"], "on-request")
         self.assertFalse(params["sandboxPolicy"]["networkAccess"])
         self.assertEqual(params["sandboxPolicy"]["writableRoots"], ["/tmp/mission-worktree"])
+
+    def test_production_build_injects_immutable_mission_codex_policy(self):
+        denied = ("live_provider_request", "quota_consumption")
+        fake = FakeCodex()
+        with patch("harness.cli.AppServerCodex", return_value=fake) as constructor:
+            supervisor = build(Path(self.tmp.name), "footballprediction",
+                               forbidden_actions=denied)
+        constructor.assert_called_once_with(forbidden_actions=denied)
+        self.assertIs(supervisor.codex, fake)
+
+        adapter = AppServerCodex.__new__(AppServerCodex)
+        adapter._configured_forbidden_actions = denied
+        adapter._forbidden_actions = denied
+        adapter._policy_cwd = None
+        with self.assertRaisesRegex(RuntimeError, "configured mission deny-list"):
+            adapter.set_policy(("merge",), "/tmp/mission-worktree")
 
     def test_football_adapter_rejects_dirty_worktree_before_head_evidence(self):
         repo = Path(self.tmp.name) / "git-repo"
@@ -273,6 +289,15 @@ class HarnessTest(unittest.TestCase):
         self.assertFalse(self.journal.status(self.spec.mission_id).terminal)
         self.assertIsNone(self.journal.mission(self.spec.mission_id)["merge_claim_head"])
 
+    def test_head_reconciliation_clears_stale_terminal_marker_from_nonpass_state(self):
+        self.journal.update(self.spec.mission_id, current_head="a" * 40,
+                            current_state=State.REVIEW, terminal_state=State.PASS)
+        self.adapter.heads = ["b" * 40]
+        self.supervisor.reconcile(self.spec.mission_id)
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertEqual(row["current_state"], State.TEST)
+        self.assertIsNone(row["terminal_state"])
+
     def test_review_p1_and_ci_fail_are_repaired_not_blocked(self):
         self.adapter.reviews = ["FAIL", "PASS", "PASS"]
         self.adapter.ci_results = ["FAIL", "PASS"]
@@ -308,6 +333,37 @@ class HarnessTest(unittest.TestCase):
         with self.assertRaises(InvalidTransition):
             self.journal.transition(self.spec.mission_id, State.PASS, "agent prose")
 
+    def test_transition_is_exact_state_and_head_compare_and_swap(self):
+        self.journal.update(self.spec.mission_id, current_state=State.REVIEW,
+                            current_head="a" * 40)
+        other = Journal(Path(self.tmp.name) / "harness.sqlite")
+        other.reconcile_head(self.spec.mission_id, "b" * 40)
+        with self.assertRaisesRegex(InvalidTransition, "expected state|expected HEAD"):
+            self.journal.transition(
+                self.spec.mission_id, State.CI, "stale review decision",
+                expected_state=State.REVIEW, expected_head="a" * 40,
+            )
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertEqual((row["current_state"], row["current_head"]),
+                         (State.TEST, "b" * 40))
+
+    def test_run_until_wait_stably_returns_blocked_external(self):
+        self.adapter.reviews = ["BLOCKED_EXTERNAL"]
+        self.journal.update(self.spec.mission_id, current_head="a" * 40,
+                            current_state=State.REVIEW)
+        self.assertEqual(
+            self.supervisor.run_until_wait(self.spec.mission_id, self.spec),
+            State.BLOCKED_EXTERNAL,
+        )
+        # Re-entry is terminal and must not consume another reviewer result or
+        # fall through the progress loop.
+        review_index = self.adapter.review_index
+        self.assertEqual(
+            self.supervisor.run_until_wait(self.spec.mission_id, self.spec),
+            State.BLOCKED_EXTERNAL,
+        )
+        self.assertEqual(self.adapter.review_index, review_index)
+
     def test_app_server_turn_requires_completed_notification(self):
         adapter = AppServerCodex.__new__(AppServerCodex)
         adapter.proc = type("Process", (), {"stdout": StringIO(
@@ -317,6 +373,26 @@ class HarnessTest(unittest.TestCase):
         )})()
         turn = adapter._turn_completed("t", "x")
         self.assertEqual(turn["status"], "completed")
+
+    def test_app_server_eof_fails_closed(self):
+        adapter = AppServerCodex.__new__(AppServerCodex)
+        adapter.seq = 0
+        adapter.proc = type("Process", (), {"stdin": StringIO(), "stdout": StringIO()})()
+        with self.assertRaisesRegex(RuntimeError, "exited before"):
+            adapter._request("ping", {})
+
+    def test_app_server_rejects_unsolicited_server_request(self):
+        adapter = AppServerCodex.__new__(AppServerCodex)
+        adapter.seq = 0
+        adapter.proc = type("Process", (), {
+            "stdin": StringIO(),
+            "stdout": StringIO(
+                '{"id":99,"method":"item/commandExecution/requestApproval","params":{}}\n'
+                '{"id":1,"result":{"ok":true}}\n'
+            ),
+        })()
+        self.assertEqual(adapter._request("ping", {}), {"ok": True})
+        self.assertIn("request denied by mission harness policy", adapter.proc.stdin.getvalue())
 
     def test_gate_pass_is_bound_to_exact_head(self):
         self.journal.complete_gate(self.spec.mission_id, "verify-pr", "a" * 40)
@@ -348,6 +424,12 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(tuple(self.journal.db.execute(
             "SELECT state,exit_code FROM jobs WHERE job_id=?", (job_id,)).fetchone()), ("EXITED", 0))
 
+    def test_proc_identity_permission_error_fails_closed(self):
+        with patch("harness.process.Path.read_text", side_effect=PermissionError):
+            self.assertIsNone(proc_start_ticks(123))
+        with patch("harness.journal.Path.read_text", side_effect=PermissionError):
+            self.assertIsNone(Journal._proc_start_ticks(123))
+
     def test_stale_gate_failure_cannot_trigger_repair_for_new_head(self):
         self.adapter.heads = ["b" * 40]
         self.journal.update(self.spec.mission_id, current_head="b" * 40, current_state=State.TEST,
@@ -365,8 +447,8 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(payload["current_head"], "b" * 40)
         self.assertEqual(payload["exit_code"], 17)
 
-    def test_stale_starting_lease_is_recoverable_without_a_second_launch(self):
-        """A crash before PID publication is safe: bootstrap had no release payload."""
+    def test_stale_starting_lease_is_recoverable_before_a_replacement_launch(self):
+        """A crash before PID publication is marked lost before a replacement launch."""
         job_id = "reserved-only"
         self.journal.db.execute(
             "INSERT INTO jobs(job_id,mission_id,name,argv_json,launch_head,state,stdout_path,stderr_path,started_at,launcher_pid,launcher_start_ticks,lease_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",

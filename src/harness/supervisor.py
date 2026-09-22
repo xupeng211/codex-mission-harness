@@ -116,33 +116,44 @@ class Supervisor:
         self.reconcile(mission_id)
         row = self.journal.mission(mission_id)
         state = State(row["current_state"])
+        expected_head = row["current_head"]
+
+        def advance(target: State, reason: str) -> None:
+            # Every decision in this step is bound to the state/HEAD snapshot
+            # reconciled above.  A concurrent controller that changes either
+            # value wins; this stale decision then fails its journal CAS.
+            self.journal.transition(
+                mission_id, target, reason,
+                expected_state=state, expected_head=expected_head,
+            )
+
         if state in TERMINAL:
             return state
         if self.journal.status(mission_id).background_jobs:
             return state  # a running owned process is pending, never terminal or duplicate work
         if state == State.CREATED:
-            self.journal.transition(mission_id, State.PREPARING, "mission accepted")
+            advance(State.PREPARING, "mission accepted")
         elif state == State.PREPARING:
-            self.journal.transition(mission_id, State.IMPLEMENT, "worktree prepared")
+            advance(State.IMPLEMENT, "worktree prepared")
         elif state == State.IMPLEMENT:
             if not permitted("source_edit", spec.forbidden_actions):
-                self.journal.transition(mission_id, State.BLOCKED_POLICY, "mission forbids source_edit")
+                advance(State.BLOCKED_POLICY, "mission forbids source_edit")
                 return State.BLOCKED_POLICY
             if self._agent_turn(mission_id,
                                 f"Continue mission objective: {spec.objective}. Inspect actual gates; do not declare terminal state from prose.",
                                 spec.forbidden_actions):
-                self.journal.transition(mission_id, State.TEST, "primary turn completed")
+                advance(State.TEST, "primary turn completed")
             return State(self.journal.mission(mission_id)["current_state"])
         elif state == State.TEST:
             for gate in spec.required_gates:
                 if not permitted(f"gate:{gate}", spec.forbidden_actions):
-                    self.journal.transition(mission_id, State.BLOCKED_POLICY, f"mission forbids gate:{gate}")
+                    advance(State.BLOCKED_POLICY, f"mission forbids gate:{gate}")
                     return State.BLOCKED_POLICY
                 if not self.journal.gate_passed_at_head(mission_id, gate, row["current_head"]):
                     self.journal.update(mission_id, pending_gate=gate)
                     self.process.start(mission_id, gate, self.adapter.gate_argv(gate), row["worktree"], docker_env(mission_id), row["current_head"])
                     return state
-            self.journal.transition(mission_id, State.REVIEW, "local canonical gates pass")
+            advance(State.REVIEW, "local canonical gates pass")
         elif state == State.REVIEW:
             head = row["current_head"]
             valid = self.journal.valid_reviews(mission_id, head)
@@ -151,7 +162,7 @@ class Supervisor:
                     result: GateResult = self.adapter.review(reviewer, head)
                     self.journal.record_receipt(mission_id, reviewer, head, result.status)
                     if result.status == "BLOCKED_EXTERNAL":
-                        self.journal.transition(mission_id, State.BLOCKED_EXTERNAL, result.evidence)
+                        advance(State.BLOCKED_EXTERNAL, result.evidence)
                         return State.BLOCKED_EXTERNAL
                     if result.status == "PENDING":
                         self.journal.update(mission_id, pending_gate=f"review:{reviewer}", ci_state="PENDING")
@@ -159,26 +170,26 @@ class Supervisor:
                     if result.status != "PASS":
                         if self._agent_turn(mission_id, f"Repair reviewer {reviewer} findings: {result.evidence}",
                                             spec.forbidden_actions):
-                            self.journal.transition(mission_id, State.IMPLEMENT, "review finding is auto-remediable")
+                            advance(State.IMPLEMENT, "review finding is auto-remediable")
                             return State.IMPLEMENT
                         return State(self.journal.mission(mission_id)["current_state"])
                     return state
-            self.journal.transition(mission_id, State.CI, "all exact-head reviews pass")
+            advance(State.CI, "all exact-head reviews pass")
         elif state == State.CI:
             result = self.adapter.ci(row["worktree"], row["current_head"])
             if result.status == "PASS":
-                self.journal.transition(mission_id, State.MERGE, "canonical CI pass")
+                advance(State.MERGE, "canonical CI pass")
             elif result.status == "FAIL":
                 if self._agent_turn(mission_id, f"Repair canonical CI failure: {result.evidence}",
                                     spec.forbidden_actions):
-                    self.journal.transition(mission_id, State.IMPLEMENT, "CI failure is auto-remediable")
+                    advance(State.IMPLEMENT, "CI failure is auto-remediable")
             elif result.status == "BLOCKED_EXTERNAL":
-                self.journal.transition(mission_id, State.BLOCKED_EXTERNAL, result.evidence)
+                advance(State.BLOCKED_EXTERNAL, result.evidence)
             else:
                 self.journal.update(mission_id, pending_gate="github-ci", ci_state=result.status)
         elif state == State.MERGE:
             if "merge" in spec.forbidden_actions:
-                self.journal.transition(mission_id, State.BLOCKED_POLICY, "mission forbids merge")
+                advance(State.BLOCKED_POLICY, "mission forbids merge")
                 return State.BLOCKED_POLICY
             # Re-read canonical Git immediately before a durable one-owner claim.
             if self.adapter.exact_head(row["worktree"]) != row["current_head"]:
@@ -187,10 +198,10 @@ class Supervisor:
             if row["merge_claim_head"] is not None:
                 status = self.adapter.merge_status(row["worktree"], row["merge_claim_head"])
                 if status.status == "PASS":
-                    self.journal.transition(mission_id, State.POST_MERGE, "canonical merge already completed")
+                    advance(State.POST_MERGE, "canonical merge already completed")
                     return State.POST_MERGE
                 if status.status != "NOT_STARTED":
-                    self.journal.transition(mission_id, State.BLOCKED_EXTERNAL, status.evidence)
+                    advance(State.BLOCKED_EXTERNAL, status.evidence)
                     return State.BLOCKED_EXTERNAL
                 reclaim = self.journal.reclaim_merge_claim_if_stale(mission_id, row["current_head"])
                 if reclaim == "ACTIVE":
@@ -198,8 +209,7 @@ class Supervisor:
                     # merge call. Never erase or steal that live claim.
                     return State.MERGE
                 if reclaim == "UNKNOWN":
-                    self.journal.transition(mission_id, State.BLOCKED_EXTERNAL,
-                                            "merge claim owner identity is unavailable")
+                    advance(State.BLOCKED_EXTERNAL, "merge claim owner identity is unavailable")
                     return State.BLOCKED_EXTERNAL
                 row = self.journal.mission(mission_id)
                 # Canonical adapter proved the previous claim never started; reclaim
@@ -209,14 +219,14 @@ class Supervisor:
                     return State.MERGE
                 result = self.adapter.merge(row["worktree"], row["current_head"])
                 if result.status != "PASS":
-                    self.journal.transition(mission_id, State.BLOCKED_POLICY, result.evidence)
+                    advance(State.BLOCKED_POLICY, result.evidence)
                 else:
-                    self.journal.transition(mission_id, State.POST_MERGE, result.evidence)
+                    advance(State.POST_MERGE, result.evidence)
                 return State(self.journal.mission(mission_id)["current_state"])
             if decide("merge", spec.merge_policy) == Decision.OWNER_APPROVAL_REQUIRED:
                 if not self.journal.approved(mission_id, "merge", row["current_head"]):
                     self.journal.update(mission_id, approval_state="PENDING", pending_gate="owner-merge")
-                    self.journal.transition(mission_id, State.WAITING_APPROVAL, "owner merge approval required")
+                    advance(State.WAITING_APPROVAL, "owner merge approval required")
                     return State.WAITING_APPROVAL
                 self.journal.update(mission_id, approval_state="APPROVED", pending_gate=None)
                 owner_pid, owner_start_ticks = self._merge_owner()
@@ -224,32 +234,32 @@ class Supervisor:
                     return State.MERGE
                 result = self.adapter.merge(row["worktree"], row["current_head"])
                 if result.status != "PASS":
-                    self.journal.transition(mission_id, State.BLOCKED_POLICY, result.evidence)
+                    advance(State.BLOCKED_POLICY, result.evidence)
                 else:
-                    self.journal.transition(mission_id, State.POST_MERGE, result.evidence)
+                    advance(State.POST_MERGE, result.evidence)
             else:
                 owner_pid, owner_start_ticks = self._merge_owner()
                 if not self.journal.claim_merge(mission_id, row["current_head"], owner_pid, owner_start_ticks):
                     return State.MERGE
                 result = self.adapter.merge(row["worktree"], row["current_head"])
                 if result.status != "PASS":
-                    self.journal.transition(mission_id, State.BLOCKED_POLICY, result.evidence)
+                    advance(State.BLOCKED_POLICY, result.evidence)
                 else:
-                    self.journal.transition(mission_id, State.POST_MERGE, result.evidence)
+                    advance(State.POST_MERGE, result.evidence)
         elif state == State.WAITING_APPROVAL:
             if self.journal.approved(mission_id, "merge", row["current_head"]):
-                self.journal.transition(mission_id, State.MERGE, "persisted owner merge approval")
+                advance(State.MERGE, "persisted owner merge approval")
             else:
                 return state
         elif state == State.POST_MERGE:
             for gate in spec.post_merge_gates:
                 result = self.adapter.post_merge(gate, row["current_head"])
                 if result.status != "PASS":
-                    self.journal.transition(mission_id, State.BLOCKED_EXTERNAL, result.evidence)
+                    advance(State.BLOCKED_EXTERNAL, result.evidence)
                     return State.BLOCKED_EXTERNAL
-            self.journal.transition(mission_id, State.DELIVER, "post merge gates pass")
+            advance(State.DELIVER, "post merge gates pass")
         elif state == State.DELIVER:
-            self.journal.transition(mission_id, State.PASS, "terminal acceptance conditions verified")
+            advance(State.PASS, "terminal acceptance conditions verified")
         return State(self.journal.mission(mission_id)["current_state"])
 
     def run_until_wait(self, mission_id: str, spec: MissionSpec, limit: int = 50) -> State:
@@ -259,7 +269,7 @@ class Supervisor:
             row = self.journal.mission(mission_id)
             active_turn = row["codex_turn_state"] == "RUNNING"
             pending_review = after == State.REVIEW and str(row["pending_gate"] or "").startswith("review:")
-            if after in TERMINAL or self.journal.status(mission_id).background_jobs or (
+            if after in TERMINAL or after == State.BLOCKED_EXTERNAL or self.journal.status(mission_id).background_jobs or (
                     before.state == after and after in {State.CI, State.MERGE, State.WAITING_APPROVAL}
                     ) or pending_review or (before.state == after and after in {State.IMPLEMENT, State.REVIEW, State.CI}
                                             and active_turn):

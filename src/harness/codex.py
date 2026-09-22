@@ -20,8 +20,13 @@ class CodexAdapter(Protocol):
 
 class AppServerCodex:
     """Thin JSON-RPC adapter for the locally installed App Server; protocol stays here."""
-    def __init__(self, executable: str = "codex"):
-        self._forbidden_actions: tuple[str, ...] = ()
+    def __init__(self, executable: str = "codex", *,
+                 forbidden_actions: tuple[str, ...] = ()):
+        # The mission deny-list is injected before the real App Server is
+        # constructed.  A later turn may bind the worktree, but it may not
+        # replace the policy selected by the persisted mission contract.
+        self._forbidden_actions = tuple(forbidden_actions)
+        self._configured_forbidden_actions = tuple(forbidden_actions)
         self._policy_cwd: str | None = None
         self.proc = subprocess.Popen([executable, "app-server", "--stdio"], stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, text=True, bufsize=1)
@@ -36,7 +41,11 @@ class AppServerCodex:
         deny-list.  Approval requests are deliberately not auto-approved by
         this adapter, so an attempted forbidden escape fails closed.
         """
-        self._forbidden_actions = tuple(forbidden_actions)
+        requested = tuple(forbidden_actions)
+        configured = getattr(self, "_configured_forbidden_actions", requested)
+        if requested != configured:
+            raise RuntimeError("Codex policy differs from the configured mission deny-list")
+        self._forbidden_actions = requested
         self._policy_cwd = cwd
 
     def _policy_params(self, cwd: str) -> dict:
@@ -52,13 +61,41 @@ class AppServerCodex:
             },
         }
 
+    def _read_message(self) -> dict:
+        """Read one JSON-RPC message and fail closed on EOF/protocol damage."""
+        assert self.proc.stdout
+        line = self.proc.stdout.readline()
+        if line == "":
+            raise RuntimeError("Codex App Server exited before sending a response")
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Codex App Server emitted malformed JSON") from exc
+        if not isinstance(message, dict):
+            raise RuntimeError("Codex App Server emitted a non-object message")
+        return message
+
+    def _reject_server_request(self, message: dict) -> bool:
+        """Reject unsolicited approval/tool requests instead of hanging forever."""
+        if "method" not in message or "id" not in message:
+            return False
+        assert self.proc.stdin
+        self.proc.stdin.write(json.dumps({
+            "id": message["id"],
+            "error": {"code": -32001, "message": "request denied by mission harness policy"},
+        }) + "\n")
+        self.proc.stdin.flush()
+        return True
+
     def _request(self, method: str, params: dict) -> dict:
         self.seq += 1
         assert self.proc.stdin and self.proc.stdout
         self.proc.stdin.write(json.dumps({"id": self.seq, "method": method, "params": params}) + "\n")
         self.proc.stdin.flush()
         while True:
-            message = json.loads(self.proc.stdout.readline())
+            message = self._read_message()
+            if self._reject_server_request(message):
+                continue
             if message.get("id") == self.seq:
                 if "error" in message:
                     raise RuntimeError(message["error"])
@@ -68,7 +105,9 @@ class AppServerCodex:
         """Wait for the App Server completion notification; acceptance is never turn completion."""
         assert self.proc.stdout
         while True:
-            message = json.loads(self.proc.stdout.readline())
+            message = self._read_message()
+            if self._reject_server_request(message):
+                continue
             if message.get("method") != "turn/completed":
                 continue
             params = message.get("params", {})
