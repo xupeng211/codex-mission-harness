@@ -129,12 +129,17 @@ class Journal:
 
     def reconcile_head(self, mission_id: str, head: str) -> bool:
         """Atomically replace cached HEAD and revoke all downstream acceptance facts."""
-        row = self.mission(mission_id)
-        if row["current_head"] == head:
-            return False
-        source = State(row["current_state"])
         try:
             self.db.execute("BEGIN IMMEDIATE")
+            # Read after the writer lock: another controller cannot race a stale
+            # state decision into a later terminal acceptance.
+            row = self.db.execute("SELECT current_head,current_state FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
+            if row is None:
+                raise KeyError(mission_id)
+            if row["current_head"] == head:
+                self.db.commit()
+                return False
+            source = State(row["current_state"])
             self.db.execute("UPDATE missions SET current_head=?,updated_at=? WHERE mission_id=?", (head, now(), mission_id))
             invalidated = self.db.execute("UPDATE receipts SET invalidated=1 WHERE mission_id=? AND head_sha<>? AND invalidated=0",
                                           (mission_id, head)).rowcount
