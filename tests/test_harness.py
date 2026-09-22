@@ -124,6 +124,69 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(self.codex.turns, [])
         self.assertEqual(self.journal.mission(self.spec.mission_id)["codex_turn_state"], "CONSUMED")
 
+    def test_completed_production_turn_rechecks_dirty_checkpoint_after_restart(self):
+        """Durable completion cannot bypass a post-reconcile worktree mutation."""
+        repo = Path(self.tmp.name) / "completed-dirty-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Harness Test"], check=True)
+        (repo / "tracked.txt").write_text("clean\n")
+        subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+        head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+
+        class DirtyAfterReconcileAdapter(FootballPredictionAdapter):
+            def exact_head(self, worktree):
+                Path(worktree, "uncheckpointed.txt").write_text("late model edit\n")
+                return head
+
+        spec = replace(self.spec, adapter="footballprediction")
+        journal = Journal(Path(self.tmp.name) / "completed-dirty.sqlite")
+        journal.create(spec, worktree=str(repo), base_sha="b" * 40,
+                       branch="harness/completed-dirty")
+        journal.update(spec.mission_id, current_head=head, current_state=State.IMPLEMENT)
+        owner_pid, owner_start = self.supervisor._merge_owner()
+        self.assertEqual(journal.claim_codex_turn(spec.mission_id, owner_pid, owner_start), "CLAIMED")
+        journal.record_codex_thread(spec.mission_id, "thread-1", owner_pid, owner_start)
+        journal.complete_codex_turn(spec.mission_id, "turn-1", owner_pid, owner_start)
+
+        replacement = Supervisor(
+            journal,
+            ProcessSupervisor(journal, Path(self.tmp.name) / "completed-dirty-logs"),
+            self.codex,
+            DirtyAfterReconcileAdapter(),
+        )
+        self.assertEqual(replacement.step(spec.mission_id, spec), State.BLOCKED_EXTERNAL)
+        self.assertEqual(self.codex.turns, [])
+        self.assertEqual(journal.mission(spec.mission_id)["codex_turn_state"], "COMPLETED")
+
+    def test_completed_production_turn_blocks_when_checkpoint_inspection_fails(self):
+        """An unavailable Git checkpoint inspection is not treated as clean."""
+        spec = replace(self.spec, adapter="footballprediction")
+        self.journal.db.execute(
+            "UPDATE missions SET spec_json=?,current_head=?,current_state=? WHERE mission_id=?",
+            (json.dumps(spec.__dict__), "a" * 40, State.IMPLEMENT, spec.mission_id),
+        )
+        self.journal.db.commit()
+        owner_pid, owner_start = self.supervisor._merge_owner()
+        self.assertEqual(
+            self.journal.claim_codex_turn(spec.mission_id, owner_pid, owner_start),
+            "CLAIMED",
+        )
+        self.journal.record_codex_thread(spec.mission_id, "thread-1", owner_pid, owner_start)
+        self.journal.complete_codex_turn(spec.mission_id, "turn-1", owner_pid, owner_start)
+        replacement = Supervisor(
+            self.journal,
+            ProcessSupervisor(self.journal, Path(self.tmp.name) / "checkpoint-error-logs"),
+            self.codex,
+            FootballPredictionAdapter(),
+        )
+        with patch("harness.supervisor.subprocess.run", side_effect=OSError("git unavailable")):
+            self.assertFalse(replacement._agent_turn(spec.mission_id, "resume", ()))
+        self.assertEqual(self.journal.status(spec.mission_id).state, State.BLOCKED_EXTERNAL)
+        self.assertEqual(self.codex.turns, [])
+
     def test_noop_journal_paths_leave_sqlite_transaction_clean(self):
         """Lease-loss and zero-row invalidation paths must not poison the connection."""
         self.journal.invalidate_reviews(self.spec.mission_id, "a" * 40)
@@ -652,6 +715,32 @@ class HarnessTest(unittest.TestCase):
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,
                             merge_claim_head=None, merge_claim_pid=None, merge_claim_start_ticks=None)
         self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
+
+    def test_merge_exception_after_claim_blocks_without_retrying_unknown_outcome(self):
+        class RaisingMergeAdapter(SimulatedAdapter):
+            def merge(self, worktree, head):
+                self.merged_heads.add(head)
+                raise RuntimeError("transport disconnected after request")
+
+        adapter = RaisingMergeAdapter()
+        supervisor = Supervisor(
+            self.journal,
+            ProcessSupervisor(self.journal, Path(self.tmp.name) / "merge-exception-logs"),
+            self.codex,
+            adapter,
+        )
+        head = "a" * 40
+        self.journal.update(
+            self.spec.mission_id,
+            current_head=head,
+            current_state=State.MERGE,
+            merge_claim_head=None,
+            merge_claim_pid=None,
+            merge_claim_start_ticks=None,
+        )
+        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
+        self.assertEqual(adapter.merged_heads, {head})
+        self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_claim_head"], head)
 
     def test_unknown_merge_decision_fails_closed_before_claim(self):
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,

@@ -29,6 +29,31 @@ class Supervisor:
             raise RuntimeError("cannot execute merge without controller start-time identity")
         return self.process.launcher_pid, start_ticks
 
+    def _codex_checkpoint_ready(self, mission_id: str, worktree: str) -> bool:
+        """Require production Codex turns to leave only committed source state."""
+        if isinstance(self.adapter, SimulatedAdapter):
+            return True
+        try:
+            dirty = subprocess.run(
+                ["git", "-C", worktree, "status", "--porcelain=v1",
+                 "--untracked-files=all"],
+                text=True, capture_output=True, check=False,
+            )
+        except OSError as exc:
+            self.journal.transition(
+                mission_id, State.BLOCKED_EXTERNAL,
+                f"cannot inspect Codex worktree checkpoint: {exc}",
+            )
+            return False
+        if dirty.returncode != 0 or dirty.stdout:
+            self.journal.transition(
+                mission_id, State.BLOCKED_EXTERNAL,
+                "Codex turn did not leave a clean committed worktree; "
+                "checkpoint required before canonical validation",
+            )
+            return False
+        return True
+
     def reconcile(self, mission_id: str) -> None:
         row = self.journal.mission(mission_id)
         head = self.adapter.exact_head(row["worktree"])
@@ -82,7 +107,8 @@ class Supervisor:
             # before publishing the state transition.  The caller consumes
             # this marker atomically with that transition; never invoke Codex
             # a second time for the same mission turn.
-            return True
+            row = self.journal.mission(mission_id)
+            return self._codex_checkpoint_ready(mission_id, row["worktree"])
         if claim != "CLAIMED":
             return False
         row = self.journal.mission(mission_id)
@@ -110,24 +136,10 @@ class Supervisor:
                                                             "text": turn.text,
                                                             "forbidden_actions": list(forbidden_actions)})
             self.journal.db.commit()
-            # The production adapter's exact-head contract requires a clean
-            # committed worktree. Never advance a real mission into TEST with
-            # uncheckpointed model edits; leave an explicit, resumable block so
-            # a later owner turn can commit/reconcile instead of stranding TEST.
-            if not isinstance(self.adapter, SimulatedAdapter):
-                dirty = subprocess.run(
-                    ["git", "-C", row["worktree"], "status", "--porcelain=v1",
-                     "--untracked-files=all"],
-                    text=True, capture_output=True, check=False,
-                )
-                if dirty.returncode != 0 or dirty.stdout:
-                    self.journal.transition(
-                        mission_id, State.BLOCKED_EXTERNAL,
-                        "Codex turn did not leave a clean committed worktree; "
-                        "checkpoint required before canonical validation",
-                    )
-                    return False
-            return True
+            # Check both freshly completed and crash-recovered durable turns.
+            # Otherwise a restart could consume COMPLETED and bypass the
+            # production adapter's committed-worktree boundary.
+            return self._codex_checkpoint_ready(mission_id, row["worktree"])
         except Exception as exc:
             self.journal.fail_codex_turn(mission_id, str(exc), owner_pid, owner_start_ticks)
             self.journal.transition(mission_id, State.BLOCKED_EXTERNAL,
@@ -165,6 +177,17 @@ class Supervisor:
                 advance(State.BLOCKED_EXTERNAL, result.evidence or
                         f"merge returned unsupported status: {result.status}")
             return State(self.journal.mission(mission_id)["current_state"])
+
+        def execute_claimed_merge(worktree: str, head: str) -> State:
+            """Execute once after a durable claim; unknown exceptions never permit retry."""
+            try:
+                result = self.adapter.merge(worktree, head)
+            except Exception as exc:
+                result = GateResult(
+                    "BLOCKED_EXTERNAL",
+                    f"merge execution outcome is unknown after exception: {exc}",
+                )
+            return finish_merge(result)
 
         if state in TERMINAL:
             return state
@@ -282,8 +305,7 @@ class Supervisor:
                 owner_pid, owner_start_ticks = self._merge_owner()
                 if not self.journal.claim_merge(mission_id, row["current_head"], owner_pid, owner_start_ticks):
                     return State.MERGE
-                result = self.adapter.merge(row["worktree"], row["current_head"])
-                return finish_merge(result)
+                return execute_claimed_merge(row["worktree"], row["current_head"])
             decision = decide("merge", spec.merge_policy)
             if decision == Decision.OWNER_APPROVAL_REQUIRED:
                 if not self.journal.approved(mission_id, "merge", row["current_head"]):
@@ -294,8 +316,7 @@ class Supervisor:
                 owner_pid, owner_start_ticks = self._merge_owner()
                 if not self.journal.claim_merge(mission_id, row["current_head"], owner_pid, owner_start_ticks):
                     return State.MERGE
-                result = self.adapter.merge(row["worktree"], row["current_head"])
-                finish_merge(result)
+                execute_claimed_merge(row["worktree"], row["current_head"])
             else:
                 if decision != Decision.AUTO_CONTINUE:
                     advance(State.BLOCKED_POLICY, "unknown merge policy decision; fail closed")
@@ -303,8 +324,7 @@ class Supervisor:
                 owner_pid, owner_start_ticks = self._merge_owner()
                 if not self.journal.claim_merge(mission_id, row["current_head"], owner_pid, owner_start_ticks):
                     return State.MERGE
-                result = self.adapter.merge(row["worktree"], row["current_head"])
-                finish_merge(result)
+                execute_claimed_merge(row["worktree"], row["current_head"])
         elif state == State.WAITING_APPROVAL:
             if self.journal.approved(mission_id, "merge", row["current_head"]):
                 advance(State.MERGE, "persisted owner merge approval")
