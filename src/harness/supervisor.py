@@ -75,6 +75,10 @@ class Supervisor:
         self.journal.db.commit()
 
     def step(self, mission_id: str, spec: MissionSpec) -> State:
+        persisted_spec = self.journal.spec(mission_id)
+        if spec != persisted_spec:
+            raise RuntimeError("runtime mission spec differs from the persisted mission contract")
+        spec = persisted_spec
         self.reconcile(mission_id)
         row = self.journal.mission(mission_id)
         state = State(row["current_state"])

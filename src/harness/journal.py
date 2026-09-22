@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import re
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .domain import InvalidTransition, MissionSpec, Observation, State, TERMINAL, ALLOWED
+from .policy import Decision, SENSITIVE, decide
 
 
 def now() -> str:
@@ -48,7 +51,7 @@ class Journal:
               created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS approvals (
               id INTEGER PRIMARY KEY AUTOINCREMENT, mission_id TEXT NOT NULL, action TEXT NOT NULL,
-              decision TEXT NOT NULL, reason TEXT, head_sha TEXT, created_at TEXT NOT NULL);
+              decision TEXT NOT NULL, reason TEXT, head_sha TEXT, spec_sha256 TEXT, created_at TEXT NOT NULL);
             CREATE UNIQUE INDEX IF NOT EXISTS one_active_job_per_gate
               ON jobs(mission_id,name) WHERE state IN ('STARTING','RUNNING');
             """
@@ -62,6 +65,8 @@ class Journal:
         approval_columns = {row[1] for row in self.db.execute("PRAGMA table_info(approvals)")}
         if "head_sha" not in approval_columns:
             self.db.execute("ALTER TABLE approvals ADD COLUMN head_sha TEXT")
+        if "spec_sha256" not in approval_columns:
+            self.db.execute("ALTER TABLE approvals ADD COLUMN spec_sha256 TEXT")
         mission_columns = {row[1] for row in self.db.execute("PRAGMA table_info(missions)")}
         if "merge_claim_head" not in mission_columns:
             self.db.execute("ALTER TABLE missions ADD COLUMN merge_claim_head TEXT")
@@ -88,6 +93,30 @@ class Journal:
         if row is None:
             raise KeyError(mission_id)
         return row
+
+    def spec(self, mission_id: str) -> MissionSpec:
+        """Return the persisted mission contract; caller input is never authority."""
+        row = self.mission(mission_id)
+        try:
+            value = json.loads(row["spec_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("persisted mission spec is invalid") from exc
+        if not isinstance(value, dict):
+            raise RuntimeError("persisted mission spec is invalid")
+        try:
+            spec = MissionSpec.from_mapping(value)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("persisted mission spec is invalid") from exc
+        if spec.mission_id != mission_id or spec.repository != row["repo"]:
+            raise RuntimeError("persisted mission identity does not match journal identity")
+        return spec
+
+    def _spec_digest(self, mission_id: str) -> str:
+        # Validate before hashing so corrupt or schema-drifted contracts can
+        # never authorize a sensitive action.
+        self.spec(mission_id)
+        payload = self.mission(mission_id)["spec_json"].encode()
+        return hashlib.sha256(payload).hexdigest()
 
     def transition(self, mission_id: str, target: State, reason: str) -> None:
         row = self.mission(mission_id)
@@ -173,21 +202,42 @@ class Journal:
                                (mission_id, head)).fetchall()
         return {row[0] for row in rows}
 
-    def approve(self, mission_id: str, action: str, reason: str = "") -> None:
+    def approve(self, mission_id: str, action: str, reason: str = "", observed_head: str | None = None) -> None:
         mission = self.mission(mission_id)  # fail closed for an unknown mission
+        spec = self.spec(mission_id)
+        if action not in SENSITIVE:
+            raise ValueError(f"unknown or non-sensitive approval action: {action}")
+        if action in spec.forbidden_actions:
+            raise PermissionError(f"mission forbids action: {action}")
+        if decide(action, spec.merge_policy) != Decision.OWNER_APPROVAL_REQUIRED:
+            raise ValueError(f"mission policy does not require approval for action: {action}")
         head = mission["current_head"]
-        if not head:
+        if not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None:
             raise RuntimeError("cannot approve before canonical HEAD reconciliation")
-        self.db.execute("INSERT INTO approvals(mission_id,action,decision,reason,head_sha,created_at) VALUES(?,?,?,?,?,?)",
-                        (mission_id, action, "APPROVED", reason, head, now()))
+        if observed_head is not None and observed_head != head:
+            raise RuntimeError("observed canonical HEAD differs from journal HEAD")
+        if (State(mission["current_state"]) != State.WAITING_APPROVAL or
+                mission["approval_state"] != "PENDING" or mission["pending_gate"] != f"owner-{action}"):
+            raise RuntimeError(f"mission is not waiting for approval of action: {action}")
+        spec_digest = self._spec_digest(mission_id)
+        self.db.execute("INSERT INTO approvals(mission_id,action,decision,reason,head_sha,spec_sha256,created_at) VALUES(?,?,?,?,?,?,?)",
+                        (mission_id, action, "APPROVED", reason, head, spec_digest, now()))
         self.update(mission_id, approval_state="APPROVED")
-        self.event(mission_id, "approval_granted", {"action": action, "head": head, "reason": reason})
+        self.event(mission_id, "approval_granted", {"action": action, "head": head,
+                                                      "spec_sha256": spec_digest, "reason": reason})
         self.db.commit()
 
     def approved(self, mission_id: str, action: str, head: str) -> bool:
-        row = self.db.execute("SELECT decision FROM approvals WHERE mission_id=? AND action=? AND head_sha=? ORDER BY id DESC LIMIT 1",
-                              (mission_id, action, head)).fetchone()
-        return row is not None and row[0] == "APPROVED"
+        mission = self.mission(mission_id)
+        spec = self.spec(mission_id)
+        if (action not in SENSITIVE or action in spec.forbidden_actions or
+                decide(action, spec.merge_policy) != Decision.OWNER_APPROVAL_REQUIRED or
+                mission["current_head"] != head):
+            return False
+        row = self.db.execute(
+            "SELECT decision,spec_sha256 FROM approvals WHERE mission_id=? AND action=? AND head_sha=? "
+            "ORDER BY id DESC LIMIT 1", (mission_id, action, head)).fetchone()
+        return row is not None and row[0] == "APPROVED" and row[1] == self._spec_digest(mission_id)
 
     @staticmethod
     def _proc_start_ticks(pid: int) -> str | None:

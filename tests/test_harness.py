@@ -3,12 +3,13 @@ from __future__ import annotations
 import tempfile
 import unittest
 import json
+from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
 from harness.adapters import FootballPredictionAdapter, SimulatedAdapter
-from harness.cli import build, load_spec
+from harness.cli import build, load_spec, reconcile_supplied_spec
 from harness.codex import AppServerCodex, FixtureCodex, Turn
 from harness.domain import InvalidTransition, MissionSpec, State
 from harness.isolation import WorktreeManager, compose_namespace, docker_env
@@ -85,6 +86,32 @@ class HarnessTest(unittest.TestCase):
             "worktree /tmp/mission path", "HEAD " + "a" * 40, "detached", "bare"
         ]), {"worktree": "/tmp/mission path", "HEAD": "a" * 40})
 
+    def test_existing_mission_path_rejects_detached_and_foreign_worktrees(self):
+        repo = Path(self.tmp.name) / "repo"
+        (repo / ".git").mkdir(parents=True)
+        root = Path(self.tmp.name) / "trees"
+        expected = str((root / "safe-demo").resolve())
+
+        def fake_run(*argv, cwd=None):
+            if argv[-1] == "origin/main":
+                return "b" * 40
+            if argv[-2:] == ("list", "--porcelain"):
+                return fake_run.listing
+            raise AssertionError(argv)
+
+        manager = WorktreeManager()
+        for metadata in ("detached", "branch refs/heads/harness/another-mission"):
+            with self.subTest(metadata=metadata):
+                fake_run.listing = f"worktree {expected}\nHEAD {'a' * 40}\n{metadata}"
+                with patch("harness.isolation.run", side_effect=fake_run):
+                    with self.assertRaisesRegex(RuntimeError, "detached or belongs to another branch"):
+                        manager.ensure(str(repo), "safe-demo", root)
+
+        fake_run.listing = f"worktree {expected}\nHEAD {'a' * 40}\nbranch refs/heads/harness/safe-demo"
+        with patch("harness.isolation.run", side_effect=fake_run):
+            tree = manager.ensure(str(repo), "safe-demo", root)
+        self.assertEqual(tree.branch, "harness/safe-demo")
+
     def test_head_change_invalidates_both_reviews(self):
         self.advance_to_test()
         self.drain()  # first run establishes receipts for A
@@ -108,10 +135,75 @@ class HarnessTest(unittest.TestCase):
         self.assertFalse(self.journal.gate_passed_at_head(self.spec.mission_id, "verify-pr", "b" * 40))
 
     def test_head_change_invalidates_owner_approval_and_requires_new_grant(self):
-        self.journal.update(self.spec.mission_id, current_head="a" * 40)
+        owner_spec = replace(self.spec, merge_policy="owner_approval")
+        self.journal.db.execute("UPDATE missions SET spec_json=? WHERE mission_id=?",
+                                (json.dumps(owner_spec.__dict__), self.spec.mission_id))
+        self.journal.db.commit()
+        self.journal.update(self.spec.mission_id, current_head="a" * 40,
+                            current_state=State.WAITING_APPROVAL,
+                            approval_state="PENDING", pending_gate="owner-merge")
         self.journal.approve(self.spec.mission_id, "merge", "head A only")
         self.assertTrue(self.journal.approved(self.spec.mission_id, "merge", "a" * 40))
         self.assertFalse(self.journal.approved(self.spec.mission_id, "merge", "b" * 40))
+
+    def test_existing_mission_spec_is_durable_authority_for_cli_and_supervisor(self):
+        persisted, exists = reconcile_supplied_spec(self.journal, self.spec)
+        self.assertTrue(exists)
+        self.assertEqual(persisted, self.spec)
+        for changed in (
+            replace(self.spec, adapter="footballprediction"),
+            replace(self.spec, required_gates=("other-gate",)),
+            replace(self.spec, merge_policy="owner_approval"),
+            replace(self.spec, forbidden_actions=("merge",)),
+        ):
+            with self.subTest(changed=changed):
+                with self.assertRaisesRegex(ValueError, "persisted mission contract"):
+                    reconcile_supplied_spec(self.journal, changed)
+                with self.assertRaisesRegex(RuntimeError, "persisted mission contract"):
+                    self.supervisor.step(self.spec.mission_id, changed)
+
+    def test_corrupt_persisted_spec_fails_closed(self):
+        self.journal.db.execute("UPDATE missions SET spec_json='{}' WHERE mission_id=?", (self.spec.mission_id,))
+        self.journal.db.commit()
+        with self.assertRaisesRegex(RuntimeError, "persisted mission spec is invalid"):
+            self.journal.spec(self.spec.mission_id)
+
+    def test_approval_is_bound_to_known_action_policy_head_and_pending_state(self):
+        self.journal.update(self.spec.mission_id, current_head="a" * 40,
+                            current_state=State.WAITING_APPROVAL,
+                            approval_state="PENDING", pending_gate="owner-merge")
+        with self.assertRaisesRegex(ValueError, "unknown or non-sensitive"):
+            self.journal.approve(self.spec.mission_id, "typo")
+        with self.assertRaisesRegex(ValueError, "does not require approval"):
+            self.journal.approve(self.spec.mission_id, "merge")
+
+        owner_spec = replace(self.spec, merge_policy="owner_approval")
+        self.journal.db.execute("UPDATE missions SET spec_json=? WHERE mission_id=?",
+                                (json.dumps(owner_spec.__dict__), self.spec.mission_id))
+        self.journal.db.commit()
+        with self.assertRaisesRegex(RuntimeError, "observed canonical HEAD differs"):
+            self.journal.approve(self.spec.mission_id, "merge", observed_head="b" * 40)
+        self.journal.approve(self.spec.mission_id, "merge", observed_head="a" * 40)
+        self.assertTrue(self.journal.approved(self.spec.mission_id, "merge", "a" * 40))
+
+        denied_spec = replace(owner_spec, forbidden_actions=("merge",))
+        self.journal.db.execute("UPDATE missions SET spec_json=? WHERE mission_id=?",
+                                (json.dumps(denied_spec.__dict__), self.spec.mission_id))
+        self.journal.db.commit()
+        self.assertFalse(self.journal.approved(self.spec.mission_id, "merge", "a" * 40))
+        with self.assertRaisesRegex(PermissionError, "mission forbids action"):
+            self.journal.approve(self.spec.mission_id, "merge", observed_head="a" * 40)
+
+    def test_approval_cannot_be_pregranted_or_bound_to_missing_head(self):
+        owner_spec = replace(self.spec, merge_policy="owner_approval")
+        self.journal.db.execute("UPDATE missions SET spec_json=? WHERE mission_id=?",
+                                (json.dumps(owner_spec.__dict__), self.spec.mission_id))
+        self.journal.db.commit()
+        with self.assertRaisesRegex(RuntimeError, "canonical HEAD reconciliation"):
+            self.journal.approve(self.spec.mission_id, "merge")
+        self.journal.update(self.spec.mission_id, current_head="a" * 40)
+        with self.assertRaisesRegex(RuntimeError, "not waiting for approval"):
+            self.journal.approve(self.spec.mission_id, "merge")
 
     def test_pass_is_reopened_when_canonical_head_changes(self):
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.PASS, terminal_state=State.PASS, merge_claim_head="a" * 40)

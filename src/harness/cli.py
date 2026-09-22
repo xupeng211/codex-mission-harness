@@ -7,24 +7,25 @@ from pathlib import Path
 from .adapters import FootballPredictionAdapter, SimulatedAdapter
 from .codex import AppServerCodex, FixtureCodex
 from .domain import MissionSpec
-from .isolation import WorktreeManager
+from .isolation import WorktreeManager, run as git_run
 from .journal import Journal
 from .process import ProcessSupervisor
 from .supervisor import Supervisor
 
 
 def load_spec(path: Path) -> MissionSpec:
-    data = json.loads(path.read_text())
-    required = {"schema_version", "mission_id", "repository", "objective"}
-    if data.get("schema_version") != 1 or not required <= data.keys():
-        raise ValueError("mission spec must be v1 and include mission_id, repository, objective")
-    for field in ("required_gates", "reviews", "post_merge_gates", "forbidden_actions"):
-        if field in data:
-            data[field] = tuple(data[field])
-    adapter = data.get("adapter", "footballprediction")
-    if not isinstance(adapter, str) or adapter not in {"footballprediction", "simulation"}:
-        raise ValueError("adapter must be exactly footballprediction or simulation")
-    return MissionSpec(**data)
+    return MissionSpec.from_mapping(json.loads(path.read_text()))
+
+
+def reconcile_supplied_spec(journal: Journal, supplied: MissionSpec) -> tuple[MissionSpec, bool]:
+    """Existing missions are governed only by their immutable durable contract."""
+    try:
+        persisted = journal.spec(supplied.mission_id)
+    except KeyError:
+        return supplied, False
+    if persisted != supplied:
+        raise ValueError("supplied mission spec differs from the persisted mission contract")
+    return persisted, True
 
 
 def build(root: Path, adapter_name: str = "footballprediction", codex=None) -> Supervisor:
@@ -69,15 +70,21 @@ def main() -> None:
         return
     if args.command == "approve":
         journal = Journal(args.root / "data" / "harness.sqlite")
-        journal.approve(args.mission_id, args.action, args.reason)
+        row = journal.mission(args.mission_id)
+        WorktreeManager().validate(row["repo"], row["branch"], row["worktree"])
+        observed_head = git_run("git", "-C", row["worktree"], "rev-parse", "HEAD")
+        journal.reconcile_head(args.mission_id, observed_head)
+        journal.approve(args.mission_id, args.action, args.reason, observed_head=observed_head)
         print(f"MISSION={args.mission_id}\nAPPROVAL={args.action}:APPROVED")
         return
-    spec = load_spec(args.mission)
+    supplied_spec = load_spec(args.mission)
+    journal = Journal(args.root / "data" / "harness.sqlite")
+    spec, exists = reconcile_supplied_spec(journal, supplied_spec)
     supervisor = build(args.root, spec.adapter)
-    try:
+    if exists:
         existing = supervisor.journal.mission(spec.mission_id)
         WorktreeManager().validate(existing["repo"], existing["branch"], existing["worktree"])
-    except KeyError:
+    else:
         tree = WorktreeManager().ensure(spec.repository, spec.mission_id, args.root / "data" / "worktrees")
         supervisor.create(spec, tree.path, tree.base_sha, tree.branch)
     supervisor.run_until_wait(spec.mission_id, spec)

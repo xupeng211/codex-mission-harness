@@ -53,8 +53,8 @@ class WorktreeManager:
         for lines in records:
             values = self._record_values(lines)
             if values.get("worktree") == expected:
-                if values.get("branch") not in {f"refs/heads/{branch}", None}:
-                    raise RuntimeError(f"mission path belongs to another branch: {expected}")
+                if values.get("branch") != f"refs/heads/{branch}":
+                    raise RuntimeError(f"mission path is detached or belongs to another branch: {expected}")
                 return Worktree(repo, base, branch, expected)
         if path.exists():
             raise RuntimeError(f"refusing non-mission-owned path: {path}")
