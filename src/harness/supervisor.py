@@ -147,6 +147,19 @@ class Supervisor:
                 expected_state=state, expected_head=expected_head,
             )
 
+        def finish_merge(result: GateResult) -> State:
+            """Classify merge outcomes without treating provider failure as policy denial."""
+            if result.status == "PASS":
+                advance(State.POST_MERGE, result.evidence)
+            elif result.status == "BLOCKED_POLICY":
+                advance(State.BLOCKED_POLICY, result.evidence)
+            else:
+                # External/transient/unknown merge outcomes are never silently
+                # accepted and must not be mislabeled as a policy decision.
+                advance(State.BLOCKED_EXTERNAL, result.evidence or
+                        f"merge returned unsupported status: {result.status}")
+            return State(self.journal.mission(mission_id)["current_state"])
+
         if state in TERMINAL:
             return state
         if self.journal.status(mission_id).background_jobs:
@@ -240,12 +253,9 @@ class Supervisor:
                 if not self.journal.claim_merge(mission_id, row["current_head"], owner_pid, owner_start_ticks):
                     return State.MERGE
                 result = self.adapter.merge(row["worktree"], row["current_head"])
-                if result.status != "PASS":
-                    advance(State.BLOCKED_POLICY, result.evidence)
-                else:
-                    advance(State.POST_MERGE, result.evidence)
-                return State(self.journal.mission(mission_id)["current_state"])
-            if decide("merge", spec.merge_policy) == Decision.OWNER_APPROVAL_REQUIRED:
+                return finish_merge(result)
+            decision = decide("merge", spec.merge_policy)
+            if decision == Decision.OWNER_APPROVAL_REQUIRED:
                 if not self.journal.approved(mission_id, "merge", row["current_head"]):
                     self.journal.update(mission_id, approval_state="PENDING", pending_gate="owner-merge")
                     advance(State.WAITING_APPROVAL, "owner merge approval required")
@@ -255,19 +265,16 @@ class Supervisor:
                 if not self.journal.claim_merge(mission_id, row["current_head"], owner_pid, owner_start_ticks):
                     return State.MERGE
                 result = self.adapter.merge(row["worktree"], row["current_head"])
-                if result.status != "PASS":
-                    advance(State.BLOCKED_POLICY, result.evidence)
-                else:
-                    advance(State.POST_MERGE, result.evidence)
+                finish_merge(result)
             else:
+                if decision != Decision.AUTO_CONTINUE:
+                    advance(State.BLOCKED_POLICY, "unknown merge policy decision; fail closed")
+                    return State.BLOCKED_POLICY
                 owner_pid, owner_start_ticks = self._merge_owner()
                 if not self.journal.claim_merge(mission_id, row["current_head"], owner_pid, owner_start_ticks):
                     return State.MERGE
                 result = self.adapter.merge(row["worktree"], row["current_head"])
-                if result.status != "PASS":
-                    advance(State.BLOCKED_POLICY, result.evidence)
-                else:
-                    advance(State.POST_MERGE, result.evidence)
+                finish_merge(result)
         elif state == State.WAITING_APPROVAL:
             if self.journal.approved(mission_id, "merge", row["current_head"]):
                 advance(State.MERGE, "persisted owner merge approval")

@@ -9,7 +9,7 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from harness.adapters import FootballPredictionAdapter, SimulatedAdapter
+from harness.adapters import FootballPredictionAdapter, GateResult, SimulatedAdapter
 from harness.cli import approval_head, build, load_spec, reconcile_supplied_spec
 from harness.codex import AppServerCodex, FixtureCodex, Turn
 from harness.domain import InvalidTransition, MissionSpec, State
@@ -608,6 +608,25 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
         self.assertEqual(self.adapter.merged_heads, {"a" * 40})
         self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_claim_head"], "a" * 40)
+
+    def test_merge_failure_is_external_not_policy_denial(self):
+        class FailingMergeAdapter(SimulatedAdapter):
+            def merge(self, worktree, head):
+                return GateResult("FAIL", "remote merge service rejected request")
+
+        adapter = FailingMergeAdapter()
+        supervisor = Supervisor(self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "merge-fail-logs"),
+                                self.codex, adapter)
+        self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,
+                            merge_claim_head=None, merge_claim_pid=None, merge_claim_start_ticks=None)
+        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
+
+    def test_unknown_merge_decision_fails_closed_before_claim(self):
+        self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,
+                            merge_claim_head=None, merge_claim_pid=None, merge_claim_start_ticks=None)
+        with patch("harness.supervisor.decide", return_value="UNRECOGNIZED"):
+            self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.BLOCKED_POLICY)
+        self.assertIsNone(self.journal.mission(self.spec.mission_id)["merge_claim_head"])
 
     def test_head_drift_during_deliver_rewinds_and_merge_claim_recovers(self):
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.DELIVER)
