@@ -61,7 +61,7 @@ class MissionSpec:
         data = dict(raw)
         required = {"schema_version", "mission_id", "repository", "objective"}
         allowed = set(cls.__dataclass_fields__)
-        if data.get("schema_version") != 1 or not required <= data.keys():
+        if type(data.get("schema_version")) is not int or data.get("schema_version") != 1 or not required <= data.keys():
             raise ValueError("mission spec must be v1 and include mission_id, repository, objective")
         if unknown := set(data) - allowed:
             raise ValueError(f"unknown mission spec fields: {sorted(unknown)}")

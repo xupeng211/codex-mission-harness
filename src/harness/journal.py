@@ -30,6 +30,8 @@ class Journal:
             CREATE TABLE IF NOT EXISTS missions (
               mission_id TEXT PRIMARY KEY, spec_json TEXT NOT NULL, repo TEXT NOT NULL,
               base_sha TEXT, branch TEXT, worktree TEXT, current_head TEXT, codex_thread_id TEXT,
+              codex_turn_id TEXT, codex_turn_state TEXT, codex_turn_pid INTEGER,
+              codex_turn_start_ticks TEXT,
               current_state TEXT NOT NULL, pending_gate TEXT, completed_gates_json TEXT NOT NULL DEFAULT '{}',
               ci_state TEXT, approval_state TEXT NOT NULL DEFAULT 'NONE', terminal_state TEXT,
               merge_claim_head TEXT,
@@ -68,6 +70,11 @@ class Journal:
         if "spec_sha256" not in approval_columns:
             self.db.execute("ALTER TABLE approvals ADD COLUMN spec_sha256 TEXT")
         mission_columns = {row[1] for row in self.db.execute("PRAGMA table_info(missions)")}
+        for name, definition in (("codex_turn_id", "TEXT"), ("codex_turn_state", "TEXT"),
+                                 ("codex_turn_pid", "INTEGER"), ("codex_turn_start_ticks", "TEXT")):
+            if name not in mission_columns:
+                self.db.execute(f"ALTER TABLE missions ADD COLUMN {name} {definition}")
+        mission_columns = {row[1] for row in self.db.execute("PRAGMA table_info(missions)")}
         if "merge_claim_head" not in mission_columns:
             self.db.execute("ALTER TABLE missions ADD COLUMN merge_claim_head TEXT")
         for name, definition in (("merge_claim_pid", "INTEGER"), ("merge_claim_start_ticks", "TEXT")):
@@ -75,14 +82,22 @@ class Journal:
                 self.db.execute(f"ALTER TABLE missions ADD COLUMN {name} {definition}")
         self.db.commit()
 
-    def create(self, spec: MissionSpec) -> None:
+    def create(self, spec: MissionSpec, *, worktree: str | None = None,
+               base_sha: str | None = None, branch: str | None = None) -> None:
         stamp = now()
-        self.db.execute(
-            "INSERT INTO missions(mission_id,spec_json,repo,current_state,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-            (spec.mission_id, json.dumps(spec.__dict__), spec.repository, State.CREATED, stamp, stamp),
-        )
-        self.event(spec.mission_id, "mission_created", {"schema_version": spec.schema_version})
-        self.db.commit()
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            self.db.execute(
+                "INSERT INTO missions(mission_id,spec_json,repo,base_sha,branch,worktree,current_state,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (spec.mission_id, json.dumps(spec.__dict__), spec.repository, base_sha, branch,
+                 worktree, State.CREATED, stamp, stamp),
+            )
+            self.event(spec.mission_id, "mission_created", {"schema_version": spec.schema_version})
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
 
     def event(self, mission_id: str, kind: str, payload: dict[str, Any]) -> None:
         self.db.execute("INSERT INTO events(mission_id,kind,payload_json,created_at) VALUES(?,?,?,?)",
@@ -238,6 +253,88 @@ class Journal:
             "SELECT decision,spec_sha256 FROM approvals WHERE mission_id=? AND action=? AND head_sha=? "
             "ORDER BY id DESC LIMIT 1", (mission_id, action, head)).fetchone()
         return row is not None and row[0] == "APPROVED" and row[1] == self._spec_digest(mission_id)
+
+    def claim_codex_turn(self, mission_id: str, owner_pid: int | None = None,
+                         owner_start_ticks: str | None = None) -> str:
+        """Durably serialize one primary Codex turn per mission.
+
+        A live claim is returned to the caller as ``ACTIVE`` and can never be
+        stolen.  A claim whose owner is gone has an unknown turn outcome, so it
+        is reported as ``UNKNOWN`` and must fail closed instead of replaying a
+        possibly completed turn.
+        """
+        owner_pid = os.getpid() if owner_pid is None else owner_pid
+        owner_start_ticks = self._proc_start_ticks(owner_pid) if owner_start_ticks is None else owner_start_ticks
+        if owner_start_ticks is None:
+            raise RuntimeError("cannot claim Codex turn without owner start-time identity")
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT current_state,codex_turn_state,codex_turn_pid,codex_turn_start_ticks "
+                "FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
+            if row is None:
+                raise KeyError(mission_id)
+            if State(row["current_state"]) not in {State.IMPLEMENT, State.REVIEW, State.CI}:
+                self.db.commit()
+                return "NOT_IMPLEMENT"
+            if row["codex_turn_state"] == "RUNNING":
+                pid, start = row["codex_turn_pid"], row["codex_turn_start_ticks"]
+                if isinstance(pid, int) and start and self._proc_start_ticks(pid) == start:
+                    self.db.commit()
+                    return "ACTIVE"
+                self.db.commit()
+                return "UNKNOWN"
+            changed = self.db.execute(
+                "UPDATE missions SET codex_turn_state='RUNNING',codex_turn_id=NULL,"
+                "codex_turn_pid=?,codex_turn_start_ticks=?,updated_at=? "
+                "WHERE mission_id=? AND current_state IN (?,?,?) AND COALESCE(codex_turn_state,'')<>'RUNNING'",
+                (owner_pid, owner_start_ticks, now(), mission_id, State.IMPLEMENT, State.REVIEW, State.CI),
+            ).rowcount
+            if changed != 1:
+                self.db.commit()
+                return "ACTIVE"
+            self.event(mission_id, "codex_turn_claimed", {"owner_pid": owner_pid,
+                                                             "owner_start_ticks": owner_start_ticks})
+            self.db.commit()
+            return "CLAIMED"
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def record_codex_thread(self, mission_id: str, thread_id: str, owner_pid: int,
+                            owner_start_ticks: str) -> None:
+        changed = self.db.execute(
+            "UPDATE missions SET codex_thread_id=?,updated_at=? WHERE mission_id=? "
+            "AND codex_turn_state='RUNNING' AND codex_turn_pid=? AND codex_turn_start_ticks=?",
+            (thread_id, now(), mission_id, owner_pid, owner_start_ticks),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError("Codex turn lease was lost before thread persistence")
+        self.db.commit()
+
+    def complete_codex_turn(self, mission_id: str, turn_id: str, owner_pid: int,
+                            owner_start_ticks: str) -> None:
+        changed = self.db.execute(
+            "UPDATE missions SET codex_turn_id=?,codex_turn_state='COMPLETED',updated_at=? "
+            "WHERE mission_id=? AND codex_turn_state='RUNNING' AND codex_turn_pid=? "
+            "AND codex_turn_start_ticks=?",
+            (turn_id, now(), mission_id, owner_pid, owner_start_ticks),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError("Codex turn lease was lost before completion persistence")
+        self.event(mission_id, "codex_turn_completed", {"turn_id": turn_id})
+        self.db.commit()
+
+    def fail_codex_turn(self, mission_id: str, reason: str, owner_pid: int,
+                        owner_start_ticks: str) -> None:
+        changed = self.db.execute(
+            "UPDATE missions SET codex_turn_state='FAILED',updated_at=? WHERE mission_id=? "
+            "AND codex_turn_state='RUNNING' AND codex_turn_pid=? AND codex_turn_start_ticks=?",
+            (now(), mission_id, owner_pid, owner_start_ticks),
+        ).rowcount
+        if changed:
+            self.event(mission_id, "codex_turn_failed", {"reason": reason})
+            self.db.commit()
 
     @staticmethod
     def _proc_start_ticks(pid: int) -> str | None:

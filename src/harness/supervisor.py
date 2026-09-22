@@ -17,8 +17,9 @@ class Supervisor:
         self.journal, self.process, self.codex, self.adapter = journal, process, codex, adapter
 
     def create(self, spec: MissionSpec, worktree: str, base_sha: str, branch: str) -> None:
-        self.journal.create(spec)
-        self.journal.update(spec.mission_id, worktree=worktree, base_sha=base_sha, branch=branch)
+        # Mission identity and its isolation metadata are one journal record;
+        # a restart can never observe a half-created mission.
+        self.journal.create(spec, worktree=worktree, base_sha=base_sha, branch=branch)
 
     def _merge_owner(self) -> tuple[int, str]:
         """Return this controller's pid/start-time identity for durable claims."""
@@ -66,13 +67,46 @@ class Supervisor:
             elif result.state != "RUNNING":
                 self.journal.transition(mission_id, State.FAILED_FATAL, f"owned process {result.state}: {result.exit_code}")
 
-    def _agent_turn(self, mission_id: str, prompt: str) -> None:
+    def _agent_turn(self, mission_id: str, prompt: str, forbidden_actions: tuple[str, ...]) -> bool:
+        owner_pid, owner_start_ticks = self._merge_owner()
+        claim = self.journal.claim_codex_turn(mission_id, owner_pid, owner_start_ticks)
+        if claim == "ACTIVE":
+            return False
+        if claim == "UNKNOWN":
+            self.journal.transition(mission_id, State.BLOCKED_EXTERNAL,
+                                    "previous Codex turn outcome is unknown after owner loss")
+            return False
+        if claim != "CLAIMED":
+            return False
         row = self.journal.mission(mission_id)
-        thread = self.codex.start_or_resume(row["codex_thread_id"], row["worktree"])
-        turn = self.codex.turn(thread, prompt, row["worktree"])
-        self.journal.update(mission_id, codex_thread_id=thread)
-        self.journal.event(mission_id, "codex_turn", {"thread_id": thread, "turn_id": turn.turn_id, "text": turn.text})
-        self.journal.db.commit()
+        policy_text = ", ".join(forbidden_actions) if forbidden_actions else "(none)"
+        guarded_prompt = (
+            f"{prompt}\nMission forbidden_actions deny-list: {policy_text}. "
+            "Never attempt a denied action; if the requested work would require one, "
+            "stop and report the policy boundary."
+        )
+        try:
+            setter = getattr(self.codex, "set_policy", None)
+            if setter is not None:
+                setter(forbidden_actions, row["worktree"])
+            # The thread id is journaled before the model turn starts.  A crash
+            # after this point leaves a durable RUNNING claim, so resume will
+            # fail closed instead of issuing a duplicate turn.
+            thread = self.codex.start_or_resume(row["codex_thread_id"], row["worktree"])
+            self.journal.record_codex_thread(mission_id, thread, owner_pid, owner_start_ticks)
+            turn = self.codex.turn(thread, guarded_prompt, row["worktree"])
+            self.journal.complete_codex_turn(mission_id, turn.turn_id, owner_pid, owner_start_ticks)
+            self.journal.event(mission_id, "codex_turn", {"thread_id": thread,
+                                                            "turn_id": turn.turn_id,
+                                                            "text": turn.text,
+                                                            "forbidden_actions": list(forbidden_actions)})
+            self.journal.db.commit()
+            return True
+        except Exception as exc:
+            self.journal.fail_codex_turn(mission_id, str(exc), owner_pid, owner_start_ticks)
+            self.journal.transition(mission_id, State.BLOCKED_EXTERNAL,
+                                    f"Codex turn failed closed: {exc}")
+            return False
 
     def step(self, mission_id: str, spec: MissionSpec) -> State:
         persisted_spec = self.journal.spec(mission_id)
@@ -94,8 +128,11 @@ class Supervisor:
             if not permitted("source_edit", spec.forbidden_actions):
                 self.journal.transition(mission_id, State.BLOCKED_POLICY, "mission forbids source_edit")
                 return State.BLOCKED_POLICY
-            self._agent_turn(mission_id, f"Continue mission objective: {spec.objective}. Inspect actual gates; do not declare terminal state from prose.")
-            self.journal.transition(mission_id, State.TEST, "primary turn completed")
+            if self._agent_turn(mission_id,
+                                f"Continue mission objective: {spec.objective}. Inspect actual gates; do not declare terminal state from prose.",
+                                spec.forbidden_actions):
+                self.journal.transition(mission_id, State.TEST, "primary turn completed")
+            return State(self.journal.mission(mission_id)["current_state"])
         elif state == State.TEST:
             for gate in spec.required_gates:
                 if not permitted(f"gate:{gate}", spec.forbidden_actions):
@@ -116,10 +153,15 @@ class Supervisor:
                     if result.status == "BLOCKED_EXTERNAL":
                         self.journal.transition(mission_id, State.BLOCKED_EXTERNAL, result.evidence)
                         return State.BLOCKED_EXTERNAL
+                    if result.status == "PENDING":
+                        self.journal.update(mission_id, pending_gate=f"review:{reviewer}", ci_state="PENDING")
+                        return state
                     if result.status != "PASS":
-                        self._agent_turn(mission_id, f"Repair reviewer {reviewer} findings: {result.evidence}")
-                        self.journal.transition(mission_id, State.IMPLEMENT, "review finding is auto-remediable")
-                        return State.IMPLEMENT
+                        if self._agent_turn(mission_id, f"Repair reviewer {reviewer} findings: {result.evidence}",
+                                            spec.forbidden_actions):
+                            self.journal.transition(mission_id, State.IMPLEMENT, "review finding is auto-remediable")
+                            return State.IMPLEMENT
+                        return State(self.journal.mission(mission_id)["current_state"])
                     return state
             self.journal.transition(mission_id, State.CI, "all exact-head reviews pass")
         elif state == State.CI:
@@ -127,8 +169,9 @@ class Supervisor:
             if result.status == "PASS":
                 self.journal.transition(mission_id, State.MERGE, "canonical CI pass")
             elif result.status == "FAIL":
-                self._agent_turn(mission_id, f"Repair canonical CI failure: {result.evidence}")
-                self.journal.transition(mission_id, State.IMPLEMENT, "CI failure is auto-remediable")
+                if self._agent_turn(mission_id, f"Repair canonical CI failure: {result.evidence}",
+                                    spec.forbidden_actions):
+                    self.journal.transition(mission_id, State.IMPLEMENT, "CI failure is auto-remediable")
             elif result.status == "BLOCKED_EXTERNAL":
                 self.journal.transition(mission_id, State.BLOCKED_EXTERNAL, result.evidence)
             else:
@@ -213,10 +256,39 @@ class Supervisor:
         for _ in range(limit):
             before = self.journal.status(mission_id)
             after = self.step(mission_id, spec)
+            row = self.journal.mission(mission_id)
+            active_turn = row["codex_turn_state"] == "RUNNING"
+            pending_review = after == State.REVIEW and str(row["pending_gate"] or "").startswith("review:")
             if after in TERMINAL or self.journal.status(mission_id).background_jobs or (
-                    before.state == after and after in {State.CI, State.MERGE, State.WAITING_APPROVAL}):
+                    before.state == after and after in {State.CI, State.MERGE, State.WAITING_APPROVAL}
+                    ) or pending_review or (before.state == after and after in {State.IMPLEMENT, State.REVIEW, State.CI}
+                                            and active_turn):
                 return after
         raise RuntimeError("supervisor progress limit reached")
+
+    def run_until_terminal(self, mission_id: str, spec: MissionSpec, limit: int = 100) -> State:
+        """Keep this controller alive long enough to journal owned child exits."""
+        for _ in range(limit):
+            state = self.run_until_wait(mission_id, spec)
+            if state in TERMINAL or state in {State.WAITING_APPROVAL, State.BLOCKED_EXTERNAL}:
+                return state
+            status = self.journal.status(mission_id)
+            if status.background_jobs:
+                if not self.process.wait_for_mission(mission_id):
+                    # A process owned by a previous controller cannot be waited
+                    # by this one; reconciliation remains the only safe truth.
+                    return state
+                self.collect_jobs(mission_id)
+                continue
+            if state == State.IMPLEMENT and self.journal.mission(mission_id)["codex_turn_state"] == "RUNNING":
+                return state
+            if state in {State.REVIEW, State.CI} and self.journal.mission(mission_id)["codex_turn_state"] == "RUNNING":
+                return state
+            if state == State.REVIEW and str(self.journal.mission(mission_id)["pending_gate"] or "").startswith("review:"):
+                return state
+            if state in {State.CI, State.MERGE}:
+                return state
+        raise RuntimeError("supervisor terminal progress limit reached")
 
     def collect_jobs(self, mission_id: str) -> None:
         self.reconcile(mission_id)

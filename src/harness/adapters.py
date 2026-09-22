@@ -20,6 +20,12 @@ class FootballPredictionAdapter:
     }
 
     def exact_head(self, worktree: str) -> str:
+        dirty = subprocess.check_output(
+            ["git", "-C", worktree, "status", "--porcelain=v1", "--untracked-files=all"],
+            text=True,
+        )
+        if dirty:
+            raise RuntimeError("canonical evidence requires a clean committed worktree")
         return subprocess.check_output(["git", "-C", worktree, "rev-parse", "HEAD"], text=True).strip()
 
     def gate_argv(self, gate: str) -> list[str]:

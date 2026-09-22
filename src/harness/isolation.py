@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +43,8 @@ class WorktreeManager:
 
     def ensure(self, repo: str, mission_id: str, root: Path) -> Worktree:
         repo = str(Path(repo).resolve())
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", mission_id):
+            raise ValueError("mission_id must be a safe worktree identifier")
         if not Path(repo, ".git").exists() and not Path(repo).joinpath(".git").is_file():
             raise ValueError(f"not a git repository: {repo}")
         base = run("git", "-C", repo, "rev-parse", "origin/main")
@@ -64,7 +67,8 @@ class WorktreeManager:
 
 
 def compose_namespace(mission_id: str) -> str:
-    safe = "".join(ch if ch.isalnum() else "-" for ch in mission_id.lower()).strip("-")
+    safe = "".join(ch if ("a" <= ch <= "z" or "0" <= ch <= "9") else "-"
+                    for ch in mission_id.lower()).strip("-") or "mission"
     return f"cmh-{safe[:36]}-{hashlib.sha256(mission_id.encode()).hexdigest()[:8]}"
 
 

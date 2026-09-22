@@ -18,8 +18,9 @@ def decide(action: str, merge_policy: str = "owner_approval") -> Decision:
     return Decision.OWNER_APPROVAL_REQUIRED if action in SENSITIVE else Decision.AUTO_CONTINUE
 
 
-def permitted(action: str, forbidden_actions: tuple[str, ...], approved: bool = False) -> bool:
+def permitted(action: str, forbidden_actions: tuple[str, ...], approved: bool = False,
+              merge_policy: str = "owner_approval") -> bool:
     """Deny explicitly forbidden actions and every sensitive action without a persisted approval."""
     if action in forbidden_actions:
         return False
-    return approved or decide(action) == Decision.AUTO_CONTINUE
+    return approved or decide(action, merge_policy) == Decision.AUTO_CONTINUE

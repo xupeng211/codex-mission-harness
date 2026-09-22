@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import json
+import subprocess
 from dataclasses import replace
 from io import StringIO
 from pathlib import Path
@@ -77,9 +78,68 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(self.drain(), State.PASS)
         self.assertEqual(self.codex.thread, "thread-1")
 
+    def test_cli_style_supervision_waits_for_owned_gate_and_finishes(self):
+        self.advance_to_test()
+        self.assertEqual(self.supervisor.run_until_terminal(self.spec.mission_id, self.spec), State.PASS)
+        self.assertFalse(self.journal.status(self.spec.mission_id).background_jobs)
+
+    def test_pending_review_stays_pending_without_repair_turn(self):
+        self.adapter.reviews = ["PENDING"]
+        self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.REVIEW)
+        self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.REVIEW)
+        self.assertEqual(self.journal.mission(self.spec.mission_id)["pending_gate"], "review:codex")
+        self.assertEqual(self.codex.turns, [])
+
+    def test_codex_turn_claim_serializes_controllers_and_unknown_outcome_fails_closed(self):
+        self.supervisor.step(self.spec.mission_id, self.spec)  # CREATED -> PREPARING
+        self.supervisor.step(self.spec.mission_id, self.spec)  # PREPARING -> IMPLEMENT
+        owner_pid, owner_start = self.supervisor._merge_owner()
+        self.assertEqual(self.journal.claim_codex_turn(self.spec.mission_id, owner_pid, owner_start), "CLAIMED")
+        second = Supervisor(self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "second-turn-logs"),
+                            self.codex, self.adapter)
+        self.assertEqual(second.step(self.spec.mission_id, self.spec), State.IMPLEMENT)
+        self.assertEqual(self.codex.turns, [])
+        self.journal.update(self.spec.mission_id, codex_turn_pid=99999999, codex_turn_start_ticks="gone")
+        self.assertEqual(second.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
+
+    def test_atomic_mission_creation_persists_isolation_metadata(self):
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertEqual(row["worktree"], str(self.worktree))
+        self.assertEqual(row["base_sha"], "b" * 40)
+        self.assertEqual(row["branch"], "harness/safe-demo")
+
+    def test_codex_policy_boundary_disables_network_and_limits_writes(self):
+        adapter = AppServerCodex.__new__(AppServerCodex)
+        adapter._forbidden_actions = ("live_provider_request", "quota_consumption")
+        adapter._policy_cwd = "/tmp/mission-worktree"
+        params = adapter._policy_params("/ignored")
+        self.assertEqual(params["approvalPolicy"], "on-request")
+        self.assertFalse(params["sandboxPolicy"]["networkAccess"])
+        self.assertEqual(params["sandboxPolicy"]["writableRoots"], ["/tmp/mission-worktree"])
+
+    def test_football_adapter_rejects_dirty_worktree_before_head_evidence(self):
+        repo = Path(self.tmp.name) / "git-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Harness Test"], check=True)
+        (repo / "tracked.txt").write_text("clean\n")
+        subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+        adapter = FootballPredictionAdapter()
+        self.assertEqual(len(adapter.exact_head(str(repo))), 40)
+        (repo / "tracked.txt").write_text("dirty\n")
+        with self.assertRaisesRegex(RuntimeError, "clean committed worktree"):
+            adapter.exact_head(str(repo))
+
     def test_docker_namespace_is_unique_and_non_destructive(self):
         self.assertNotEqual(compose_namespace("same mission"), compose_namespace("same/mission"))
         self.assertTrue(docker_env("m1")["COMPOSE_PROJECT_NAME"].startswith("cmh-"))
+        self.assertTrue(compose_namespace("任务-1").isascii())
+
+    def test_mission_id_cannot_escape_worktree_root(self):
+        with self.assertRaisesRegex(ValueError, "safe worktree identifier"):
+            WorktreeManager().ensure("/safe/repo", "../../escape", Path(self.tmp.name) / "trees")
 
     def test_worktree_porcelain_parser_ignores_space_less_metadata(self):
         self.assertEqual(WorktreeManager._record_values([
@@ -371,6 +431,9 @@ class HarnessTest(unittest.TestCase):
     def test_invalid_adapter_names_fail_closed_and_simulation_does_not_start_app_server(self):
         path = Path(self.tmp.name) / "bad.json"
         path.write_text(json.dumps({"schema_version": 1, "mission_id": "x", "repository": "/r", "objective": "x", "adapter": "sim"}))
+        with self.assertRaises(ValueError):
+            load_spec(path)
+        path.write_text(json.dumps({"schema_version": True, "mission_id": "x", "repository": "/r", "objective": "x"}))
         with self.assertRaises(ValueError):
             load_spec(path)
         supervisor = build(Path(self.tmp.name), "simulation")

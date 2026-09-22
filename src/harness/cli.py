@@ -28,7 +28,8 @@ def reconcile_supplied_spec(journal: Journal, supplied: MissionSpec) -> tuple[Mi
     return persisted, True
 
 
-def build(root: Path, adapter_name: str = "footballprediction", codex=None) -> Supervisor:
+def build(root: Path, adapter_name: str = "footballprediction", codex=None,
+          forbidden_actions: tuple[str, ...] = ()) -> Supervisor:
     journal = Journal(root / "data" / "harness.sqlite")
     if adapter_name == "simulation":
         adapter, selected_codex = SimulatedAdapter(), (codex or FixtureCodex())
@@ -80,14 +81,14 @@ def main() -> None:
     supplied_spec = load_spec(args.mission)
     journal = Journal(args.root / "data" / "harness.sqlite")
     spec, exists = reconcile_supplied_spec(journal, supplied_spec)
-    supervisor = build(args.root, spec.adapter)
+    supervisor = build(args.root, spec.adapter, forbidden_actions=spec.forbidden_actions)
     if exists:
         existing = supervisor.journal.mission(spec.mission_id)
         WorktreeManager().validate(existing["repo"], existing["branch"], existing["worktree"])
     else:
         tree = WorktreeManager().ensure(spec.repository, spec.mission_id, args.root / "data" / "worktrees")
         supervisor.create(spec, tree.path, tree.base_sha, tree.branch)
-    supervisor.run_until_wait(spec.mission_id, spec)
+    supervisor.run_until_terminal(spec.mission_id, spec)
     describe(supervisor, spec.mission_id)
 
 

@@ -21,10 +21,36 @@ class CodexAdapter(Protocol):
 class AppServerCodex:
     """Thin JSON-RPC adapter for the locally installed App Server; protocol stays here."""
     def __init__(self, executable: str = "codex"):
+        self._forbidden_actions: tuple[str, ...] = ()
+        self._policy_cwd: str | None = None
         self.proc = subprocess.Popen([executable, "app-server", "--stdio"], stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, text=True, bufsize=1)
         self.seq = 0
         self._request("initialize", {"clientInfo": {"name": "codex-mission-harness", "version": "0.1"}})
+
+    def set_policy(self, forbidden_actions: tuple[str, ...], cwd: str) -> None:
+        """Apply mission deny-list controls before a turn is started.
+
+        App Server's workspace-write sandbox is restricted to the mission
+        worktree and has no network access whenever the mission carries a
+        deny-list.  Approval requests are deliberately not auto-approved by
+        this adapter, so an attempted forbidden escape fails closed.
+        """
+        self._forbidden_actions = tuple(forbidden_actions)
+        self._policy_cwd = cwd
+
+    def _policy_params(self, cwd: str) -> dict:
+        if not self._forbidden_actions:
+            return {}
+        root = self._policy_cwd or cwd
+        return {
+            "approvalPolicy": "on-request",
+            "sandboxPolicy": {
+                "type": "workspaceWrite",
+                "writableRoots": [root],
+                "networkAccess": False,
+            },
+        }
 
     def _request(self, method: str, params: dict) -> dict:
         self.seq += 1
@@ -54,13 +80,21 @@ class AppServerCodex:
 
     def start_or_resume(self, thread_id: str | None, cwd: str) -> str:
         if thread_id:
-            result = self._request("thread/resume", {"threadId": thread_id})
+            params = {"threadId": thread_id}
+            if self._forbidden_actions:
+                params.update({"approvalPolicy": "on-request", "sandbox": "workspace-write"})
+            result = self._request("thread/resume", params)
         else:
-            result = self._request("thread/start", {"cwd": cwd})
+            params = {"cwd": cwd}
+            if self._forbidden_actions:
+                params.update({"approvalPolicy": "on-request", "sandbox": "workspace-write"})
+            result = self._request("thread/start", params)
         return result["thread"]["id"]
 
     def turn(self, thread_id: str, prompt: str, cwd: str) -> Turn:
-        result = self._request("turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": prompt}], "cwd": cwd})
+        params = {"threadId": thread_id, "input": [{"type": "text", "text": prompt}], "cwd": cwd}
+        params.update(self._policy_params(cwd))
+        result = self._request("turn/start", params)
         turn_id = result["turn"]["id"]
         completed = self._turn_completed(thread_id, turn_id)
         text = ""
@@ -74,6 +108,10 @@ class FixtureCodex:
     """Deterministic Codex contract for explicitly simulation-only missions."""
     def __init__(self):
         self.turns = 0
+        self.policy: tuple[str, ...] = ()
+
+    def set_policy(self, forbidden_actions: tuple[str, ...], cwd: str) -> None:
+        self.policy = tuple(forbidden_actions)
     def start_or_resume(self, thread_id: str | None, cwd: str) -> str:
         return thread_id or "fixture-thread"
     def turn(self, thread_id: str, prompt: str, cwd: str) -> Turn:

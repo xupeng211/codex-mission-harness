@@ -154,3 +154,21 @@ class ProcessSupervisor:
             results.append(JobResult(row["job_id"], state, code, row["launch_head"]))
         self.journal.db.commit()
         return results
+
+    def wait_for_mission(self, mission_id: str) -> bool:
+        """Wait only for children registered by this controller.
+
+        A restarted controller has no child handle and must not guess or wait
+        on an unrelated PID; it returns False so the caller can reconcile the
+        durable process identity instead.
+        """
+        rows = self.journal.db.execute(
+            "SELECT job_id FROM jobs WHERE mission_id=? AND state IN ('STARTING','RUNNING')",
+            (mission_id,),
+        ).fetchall()
+        children = [self._children[row["job_id"]] for row in rows if row["job_id"] in self._children]
+        if len(children) != len(rows):
+            return False
+        for child in children:
+            child.wait()
+        return True
