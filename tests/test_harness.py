@@ -238,6 +238,88 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(self.journal.status(spec.mission_id).state, State.BLOCKED_EXTERNAL)
         self.assertEqual(self.codex.turns, [])
 
+    def test_checkpoint_failure_cannot_block_a_concurrently_advanced_source(self):
+        old_head, new_head = "a" * 40, "b" * 40
+        self.journal.update(
+            self.spec.mission_id, current_head=old_head, current_state=State.IMPLEMENT,
+        )
+        replacement = Supervisor(
+            self.journal,
+            ProcessSupervisor(self.journal, Path(self.tmp.name) / "checkpoint-race-logs"),
+            self.codex,
+            FootballPredictionAdapter(),
+        )
+
+        def advance_then_fail(*args, **kwargs):
+            self.journal.update(
+                self.spec.mission_id, current_head=new_head, current_state=State.REVIEW,
+            )
+            raise OSError("git unavailable after concurrent progress")
+
+        with patch("harness.supervisor.subprocess.run", side_effect=advance_then_fail), \
+                self.assertRaisesRegex(InvalidTransition, "stale transition"):
+            replacement._codex_checkpoint_ready(
+                self.spec.mission_id, str(self.worktree),
+                expected_state=State.IMPLEMENT, expected_head=old_head,
+            )
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertEqual((row["current_state"], row["current_head"]), (State.REVIEW, new_head))
+
+    def test_unknown_or_stale_codex_claim_cannot_clobber_concurrent_progress(self):
+        old_head, new_head = "a" * 40, "b" * 40
+        for claim_result in ("UNKNOWN", "STALE"):
+            with self.subTest(claim_result=claim_result):
+                self.journal.update(
+                    self.spec.mission_id,
+                    current_head=old_head,
+                    current_state=State.IMPLEMENT,
+                    terminal_state=None,
+                )
+
+                def advance_then_return(*args):
+                    self.journal.update(
+                        self.spec.mission_id,
+                        current_head=new_head,
+                        current_state=State.REVIEW,
+                    )
+                    return claim_result
+
+                with patch.object(
+                        self.journal, "claim_codex_turn", side_effect=advance_then_return), \
+                        self.assertRaisesRegex(InvalidTransition, "stale transition"):
+                    self.supervisor._agent_turn(self.spec.mission_id, "work", ())
+                row = self.journal.mission(self.spec.mission_id)
+                self.assertEqual(
+                    (row["current_state"], row["current_head"]),
+                    (State.REVIEW, new_head),
+                )
+
+    def test_codex_exception_cannot_block_a_concurrently_advanced_source(self):
+        old_head, new_head = "a" * 40, "b" * 40
+        self.journal.update(
+            self.spec.mission_id, current_head=old_head, current_state=State.IMPLEMENT,
+        )
+
+        class RacingCodex(FakeCodex):
+            def turn(inner_self, thread_id, prompt, cwd):
+                self.journal.update(
+                    self.spec.mission_id,
+                    current_head=new_head,
+                    current_state=State.REVIEW,
+                )
+                raise RuntimeError("provider failed after concurrent progress")
+
+        replacement = Supervisor(
+            self.journal,
+            ProcessSupervisor(self.journal, Path(self.tmp.name) / "codex-race-logs"),
+            RacingCodex(),
+            self.adapter,
+        )
+        with self.assertRaisesRegex(InvalidTransition, "stale transition"):
+            replacement._agent_turn(self.spec.mission_id, "work", ())
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertEqual((row["current_state"], row["current_head"]), (State.REVIEW, new_head))
+
     def test_noop_journal_paths_leave_sqlite_transaction_clean(self):
         """Lease-loss and zero-row invalidation paths must not poison the connection."""
         self.journal.invalidate_reviews(self.spec.mission_id, "a" * 40)
@@ -915,6 +997,55 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(payload["launch_head"], "a" * 40)
         self.assertEqual(payload["current_head"], "b" * 40)
         self.assertEqual(payload["exit_code"], 17)
+
+    def test_stale_non_exit_process_result_cannot_fail_the_new_source(self):
+        old_head, new_head = "a" * 40, "b" * 40
+        self.adapter.heads = [new_head]
+        self.journal.update(
+            self.spec.mission_id, current_head=new_head, current_state=State.TEST,
+            pending_gate="verify-pr",
+        )
+        stale = JobResult("old-job", "FAILED_LAUNCH", None, old_head)
+        with patch.object(self.supervisor.process, "poll", return_value=[stale]):
+            self.supervisor.reconcile(self.spec.mission_id)
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertEqual((row["current_state"], row["current_head"]), (State.TEST, new_head))
+        event = self.journal.db.execute(
+            "SELECT payload_json FROM events WHERE kind='process_result_stale' "
+            "ORDER BY seq DESC LIMIT 1",
+        ).fetchone()
+        self.assertIsNotNone(event)
+        payload = json.loads(event[0])
+        self.assertEqual(payload["launch_head"], old_head)
+        self.assertEqual(payload["current_head"], new_head)
+
+    def test_current_process_failure_transition_is_bound_to_guarded_snapshot(self):
+        head, concurrent_head = "a" * 40, "b" * 40
+        self.adapter.heads = [head]
+        self.journal.update(
+            self.spec.mission_id, current_head=head, current_state=State.TEST,
+            pending_gate=None,
+        )
+        failed = JobResult("current-job", "FAILED_LAUNCH", None, head)
+        transition = self.journal.transition
+
+        def race_before_transition(*args, **kwargs):
+            self.journal.update(
+                self.spec.mission_id,
+                current_head=concurrent_head,
+                current_state=State.REVIEW,
+            )
+            return transition(*args, **kwargs)
+
+        with patch.object(self.supervisor.process, "poll", return_value=[failed]), \
+                patch.object(self.journal, "transition", side_effect=race_before_transition), \
+                self.assertRaisesRegex(InvalidTransition, "stale transition"):
+            self.supervisor.reconcile(self.spec.mission_id)
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertEqual(
+            (row["current_state"], row["current_head"]),
+            (State.REVIEW, concurrent_head),
+        )
 
     def test_stale_starting_lease_is_recoverable_before_a_replacement_launch(self):
         """A crash before PID publication is marked lost before a replacement launch."""

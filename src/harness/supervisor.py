@@ -29,7 +29,8 @@ class Supervisor:
             raise RuntimeError("cannot execute merge without controller start-time identity")
         return self.process.launcher_pid, start_ticks
 
-    def _codex_checkpoint_ready(self, mission_id: str, worktree: str) -> bool:
+    def _codex_checkpoint_ready(self, mission_id: str, worktree: str, *,
+                                expected_state: State, expected_head: str | None) -> bool:
         """Require production Codex turns to leave only committed source state."""
         if isinstance(self.adapter, SimulatedAdapter):
             return True
@@ -43,6 +44,7 @@ class Supervisor:
             self.journal.transition(
                 mission_id, State.BLOCKED_EXTERNAL,
                 f"cannot inspect Codex worktree checkpoint: {exc}",
+                expected_state=expected_state, expected_head=expected_head,
             )
             return False
         if dirty.returncode != 0 or dirty.stdout:
@@ -50,19 +52,19 @@ class Supervisor:
                 mission_id, State.BLOCKED_EXTERNAL,
                 "Codex turn did not leave a clean committed worktree; "
                 "checkpoint required before canonical validation",
+                expected_state=expected_state, expected_head=expected_head,
             )
             return False
         return True
 
     def reconcile(self, mission_id: str) -> None:
-        def reconcile_transition(target: State, reason: str) -> None:
+        def reconcile_transition(target: State, reason: str, snapshot) -> None:
             """Publish a polled-process decision only against its fresh snapshot.
 
             Reconciliation can race another controller's HEAD/state update.  The
             journal CAS is the authority; never let an old child-exit result
             overwrite a newer source identity or state.
             """
-            snapshot = self.journal.mission(mission_id)
             self.journal.transition(
                 mission_id,
                 target,
@@ -78,59 +80,77 @@ class Supervisor:
             # a fully reopened mission; SQLite cache can never accept a hybrid.
             self.journal.reconcile_head(mission_id, head)
         for result in self.process.poll(mission_id):
+            if result.state == "RUNNING":
+                continue
+            snapshot = self.journal.mission(mission_id)
+            current = self.adapter.exact_head(snapshot["worktree"])
+            if current != snapshot["current_head"]:
+                self.journal.reconcile_head(mission_id, current)
+                snapshot = self.journal.mission(mission_id)
+            if result.launch_head != current:
+                if result.state == "EXITED" and result.exit_code != 0:
+                    kind = "gate_failure_stale"
+                elif result.state == "EXITED":
+                    kind = "gate_stale"
+                else:
+                    kind = "process_result_stale"
+                self.journal.event(mission_id, kind, {
+                    "job_id": result.job_id,
+                    "gate": snapshot["pending_gate"],
+                    "state": result.state,
+                    "launch_head": result.launch_head,
+                    "current_head": current,
+                    "exit_code": result.exit_code,
+                })
+                continue
             if result.state == "EXITED" and result.exit_code == 0:
-                pending = self.journal.mission(mission_id)["pending_gate"]
-                current = self.adapter.exact_head(row["worktree"])
-                if pending and result.launch_head == current:
+                pending = snapshot["pending_gate"]
+                if pending:
                     self.journal.complete_gate(mission_id, pending, current)
-                elif pending:
-                    self.journal.event(mission_id, "gate_stale", {"gate": pending, "launch_head": result.launch_head, "current_head": current})
             elif result.state == "LOST":
                 # Canonical validation commands are idempotent: resume retries an unobserved outcome.
                 self.journal.event(mission_id, "process_retry_required", {"job_id": result.job_id})
             elif result.state == "EXITED" and result.exit_code != 0:
-                pending = self.journal.mission(mission_id)["pending_gate"]
-                current = self.adapter.exact_head(self.journal.mission(mission_id)["worktree"])
-                if result.launch_head != current:
-                    # A failure from an older source identity is evidence about
-                    # neither the current gate nor the current repair cycle.
-                    # Keep the current journal state and force the normal
-                    # exact-head validation path instead of attributing it to
-                    # the new HEAD.
-                    self.journal.event(mission_id, "gate_failure_stale", {
-                        "gate": pending, "launch_head": result.launch_head, "current_head": current,
-                        "exit_code": result.exit_code,
-                    })
-                elif pending and State(self.journal.mission(mission_id)["current_state"]) == State.TEST:
+                pending = snapshot["pending_gate"]
+                if pending and State(snapshot["current_state"]) == State.TEST:
                     self.journal.event(mission_id, "gate_failed_auto_repair", {"gate": pending, "exit_code": result.exit_code})
                     reconcile_transition(
                         State.IMPLEMENT,
                         f"canonical gate {pending} failed; repair required",
+                        snapshot,
                     )
                 else:
                     reconcile_transition(
                         State.FAILED_FATAL,
                         f"owned process {result.state}: {result.exit_code}",
+                        snapshot,
                     )
-            elif result.state != "RUNNING":
+            else:
                 reconcile_transition(
                     State.FAILED_FATAL,
                     f"owned process {result.state}: {result.exit_code}",
+                    snapshot,
                 )
 
     def _agent_turn(self, mission_id: str, prompt: str, forbidden_actions: tuple[str, ...]) -> bool:
         owner_pid, owner_start_ticks = self._merge_owner()
+        source = self.journal.mission(mission_id)
+        expected_state = State(source["current_state"])
+        expected_head = source["current_head"]
         claim = self.journal.claim_codex_turn(mission_id, owner_pid, owner_start_ticks)
         if claim == "ACTIVE":
             return False
         if claim == "UNKNOWN":
             self.journal.transition(mission_id, State.BLOCKED_EXTERNAL,
-                                    "previous Codex turn outcome is unknown after owner loss")
+                                    "previous Codex turn outcome is unknown after owner loss",
+                                    expected_state=expected_state,
+                                    expected_head=expected_head)
             return False
         if claim == "STALE":
             self.journal.transition(
                 mission_id, State.BLOCKED_EXTERNAL,
                 "completed Codex turn is stale for the current source state or HEAD",
+                expected_state=expected_state, expected_head=expected_head,
             )
             return False
         if claim == "COMPLETED":
@@ -139,7 +159,10 @@ class Supervisor:
             # this marker atomically with that transition; never invoke Codex
             # a second time for the same mission turn.
             row = self.journal.mission(mission_id)
-            return self._codex_checkpoint_ready(mission_id, row["worktree"])
+            return self._codex_checkpoint_ready(
+                mission_id, row["worktree"],
+                expected_state=expected_state, expected_head=expected_head,
+            )
         if claim != "CLAIMED":
             return False
         row = self.journal.mission(mission_id)
@@ -170,11 +193,16 @@ class Supervisor:
             # Check both freshly completed and crash-recovered durable turns.
             # Otherwise a restart could consume COMPLETED and bypass the
             # production adapter's committed-worktree boundary.
-            return self._codex_checkpoint_ready(mission_id, row["worktree"])
+            return self._codex_checkpoint_ready(
+                mission_id, row["worktree"],
+                expected_state=expected_state, expected_head=expected_head,
+            )
         except Exception as exc:
             self.journal.fail_codex_turn(mission_id, str(exc), owner_pid, owner_start_ticks)
             self.journal.transition(mission_id, State.BLOCKED_EXTERNAL,
-                                    f"Codex turn failed closed: {exc}")
+                                    f"Codex turn failed closed: {exc}",
+                                    expected_state=expected_state,
+                                    expected_head=expected_head)
             return False
 
     def step(self, mission_id: str, spec: MissionSpec) -> State:
