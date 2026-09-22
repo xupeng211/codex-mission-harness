@@ -20,6 +20,13 @@ class Supervisor:
         self.journal.create(spec)
         self.journal.update(spec.mission_id, worktree=worktree, base_sha=base_sha, branch=branch)
 
+    def _merge_owner(self) -> tuple[int, str]:
+        """Return this controller's pid/start-time identity for durable claims."""
+        start_ticks = self.process.launcher_start_ticks
+        if start_ticks is None:
+            raise RuntimeError("cannot execute merge without controller start-time identity")
+        return self.process.launcher_pid, start_ticks
+
     def reconcile(self, mission_id: str) -> None:
         row = self.journal.mission(mission_id)
         head = self.adapter.exact_head(row["worktree"])
@@ -127,11 +134,20 @@ class Supervisor:
                 if status.status != "NOT_STARTED":
                     self.journal.transition(mission_id, State.BLOCKED_EXTERNAL, status.evidence)
                     return State.BLOCKED_EXTERNAL
-                self.journal.update(mission_id, merge_claim_head=None)
+                reclaim = self.journal.reclaim_merge_claim_if_stale(mission_id, row["current_head"])
+                if reclaim == "ACTIVE":
+                    # A peer may be between its claim commit and its external
+                    # merge call. Never erase or steal that live claim.
+                    return State.MERGE
+                if reclaim == "UNKNOWN":
+                    self.journal.transition(mission_id, State.BLOCKED_EXTERNAL,
+                                            "merge claim owner identity is unavailable")
+                    return State.BLOCKED_EXTERNAL
                 row = self.journal.mission(mission_id)
                 # Canonical adapter proved the previous claim never started; reclaim
                 # this exact HEAD in the same supervisor turn.
-                if not self.journal.claim_merge(mission_id, row["current_head"]):
+                owner_pid, owner_start_ticks = self._merge_owner()
+                if not self.journal.claim_merge(mission_id, row["current_head"], owner_pid, owner_start_ticks):
                     return State.MERGE
                 result = self.adapter.merge(row["worktree"], row["current_head"])
                 if result.status != "PASS":
@@ -145,7 +161,8 @@ class Supervisor:
                     self.journal.transition(mission_id, State.WAITING_APPROVAL, "owner merge approval required")
                     return State.WAITING_APPROVAL
                 self.journal.update(mission_id, approval_state="APPROVED", pending_gate=None)
-                if not self.journal.claim_merge(mission_id, row["current_head"]):
+                owner_pid, owner_start_ticks = self._merge_owner()
+                if not self.journal.claim_merge(mission_id, row["current_head"], owner_pid, owner_start_ticks):
                     return State.MERGE
                 result = self.adapter.merge(row["worktree"], row["current_head"])
                 if result.status != "PASS":
@@ -153,7 +170,8 @@ class Supervisor:
                 else:
                     self.journal.transition(mission_id, State.POST_MERGE, result.evidence)
             else:
-                if not self.journal.claim_merge(mission_id, row["current_head"]):
+                owner_pid, owner_start_ticks = self._merge_owner()
+                if not self.journal.claim_merge(mission_id, row["current_head"], owner_pid, owner_start_ticks):
                     return State.MERGE
                 result = self.adapter.merge(row["worktree"], row["current_head"])
                 if result.status != "PASS":

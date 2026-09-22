@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,6 +30,8 @@ class Journal:
               current_state TEXT NOT NULL, pending_gate TEXT, completed_gates_json TEXT NOT NULL DEFAULT '{}',
               ci_state TEXT, approval_state TEXT NOT NULL DEFAULT 'NONE', terminal_state TEXT,
               merge_claim_head TEXT,
+              merge_claim_pid INTEGER,
+              merge_claim_start_ticks TEXT,
               created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS events (
               seq INTEGER PRIMARY KEY AUTOINCREMENT, mission_id TEXT NOT NULL, kind TEXT NOT NULL,
@@ -62,6 +65,9 @@ class Journal:
         mission_columns = {row[1] for row in self.db.execute("PRAGMA table_info(missions)")}
         if "merge_claim_head" not in mission_columns:
             self.db.execute("ALTER TABLE missions ADD COLUMN merge_claim_head TEXT")
+        for name, definition in (("merge_claim_pid", "INTEGER"), ("merge_claim_start_ticks", "TEXT")):
+            if name not in mission_columns:
+                self.db.execute(f"ALTER TABLE missions ADD COLUMN {name} {definition}")
         self.db.commit()
 
     def create(self, spec: MissionSpec) -> None:
@@ -148,11 +154,11 @@ class Journal:
             invalidated = self.db.execute("UPDATE receipts SET invalidated=1 WHERE mission_id=? AND head_sha<>? AND invalidated=0",
                                           (mission_id, head)).rowcount
             if source == State.PASS:
-                self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',merge_claim_head=NULL,updated_at=? WHERE mission_id=?",
+                self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',merge_claim_head=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=?",
                                 (State.TEST, now(), mission_id))
                 self.event(mission_id, "pass_reopened_for_new_head", {"reason": "canonical HEAD changed after PASS"})
             elif source in {State.REVIEW, State.CI, State.MERGE, State.WAITING_APPROVAL, State.POST_MERGE, State.DELIVER}:
-                self.db.execute("UPDATE missions SET current_state=?,pending_gate=NULL,ci_state=NULL,approval_state='NONE',merge_claim_head=NULL,updated_at=? WHERE mission_id=?",
+                self.db.execute("UPDATE missions SET current_state=?,pending_gate=NULL,ci_state=NULL,approval_state='NONE',merge_claim_head=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=?",
                                 (State.TEST, now(), mission_id))
                 self.event(mission_id, "state_reconciled_to_test", {"from": source, "reason": "canonical HEAD changed"})
             self.event(mission_id, "canonical_head_reconciled", {"head": head, "invalidated_reviews": invalidated})
@@ -183,8 +189,20 @@ class Journal:
                               (mission_id, action, head)).fetchone()
         return row is not None and row[0] == "APPROVED"
 
-    def claim_merge(self, mission_id: str, head: str) -> bool:
+    @staticmethod
+    def _proc_start_ticks(pid: int) -> str | None:
+        try:
+            return Path(f"/proc/{pid}/stat").read_text().split()[21]
+        except (FileNotFoundError, IndexError, ValueError):
+            return None
+
+    def claim_merge(self, mission_id: str, head: str, owner_pid: int | None = None,
+                    owner_start_ticks: str | None = None) -> bool:
         """One durable claimant may invoke an external merge for one exact HEAD."""
+        owner_pid = os.getpid() if owner_pid is None else owner_pid
+        owner_start_ticks = self._proc_start_ticks(owner_pid) if owner_start_ticks is None else owner_start_ticks
+        if owner_start_ticks is None:
+            raise RuntimeError("cannot claim merge without an owner start-time identity")
         try:
             self.db.execute("BEGIN IMMEDIATE")
             row = self.db.execute("SELECT current_state,current_head,merge_claim_head FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
@@ -193,11 +211,54 @@ class Journal:
             if State(row["current_state"]) != State.MERGE or row["current_head"] != head or row["merge_claim_head"] is not None:
                 self.db.commit()
                 return False
-            self.db.execute("UPDATE missions SET merge_claim_head=?,updated_at=? WHERE mission_id=? AND merge_claim_head IS NULL",
-                            (head, now(), mission_id))
-            self.event(mission_id, "merge_claimed", {"head": head})
+            self.db.execute("UPDATE missions SET merge_claim_head=?,merge_claim_pid=?,merge_claim_start_ticks=?,updated_at=? WHERE mission_id=? AND merge_claim_head IS NULL",
+                            (head, owner_pid, owner_start_ticks, now(), mission_id))
+            self.event(mission_id, "merge_claimed", {"head": head, "owner_pid": owner_pid,
+                                                      "owner_start_ticks": owner_start_ticks})
             self.db.commit()
             return True
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def reclaim_merge_claim_if_stale(self, mission_id: str, head: str) -> str:
+        """Reclaim only a claim whose recorded owner is definitely gone.
+
+        A live owner remains authoritative even when canonical merge status is
+        ``NOT_STARTED``; another controller must never erase that claim between
+        its status check and its external merge call. Unknown owner identity is
+        fail-closed for pre-migration or malformed claims.
+        """
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT current_state,current_head,merge_claim_head,merge_claim_pid,merge_claim_start_ticks "
+                "FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
+            if row is None:
+                raise KeyError(mission_id)
+            if (State(row["current_state"]) != State.MERGE or row["current_head"] != head or
+                    row["merge_claim_head"] != head):
+                self.db.commit()
+                return "NO_CLAIM"
+            pid, start_ticks = row["merge_claim_pid"], row["merge_claim_start_ticks"]
+            if not isinstance(pid, int) or not start_ticks:
+                self.db.commit()
+                return "UNKNOWN"
+            if self._proc_start_ticks(pid) == start_ticks:
+                self.db.commit()
+                return "ACTIVE"
+            changed = self.db.execute(
+                "UPDATE missions SET merge_claim_head=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? "
+                "WHERE mission_id=? AND current_state=? AND current_head=? AND merge_claim_head=? "
+                "AND merge_claim_pid=? AND merge_claim_start_ticks=?",
+                (now(), mission_id, State.MERGE, head, head, pid, start_ticks)).rowcount
+            if changed != 1:
+                self.db.commit()
+                return "NO_CLAIM"
+            self.event(mission_id, "merge_claim_reclaimed", {"head": head, "owner_pid": pid,
+                                                               "owner_start_ticks": start_ticks})
+            self.db.commit()
+            return "RECLAIMED"
         except Exception:
             self.db.rollback()
             raise

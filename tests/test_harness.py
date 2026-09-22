@@ -251,12 +251,40 @@ class HarnessTest(unittest.TestCase):
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.DELIVER)
         self.adapter.heads = ["b" * 40]
         self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.TEST)
-        self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE, merge_claim_head="a" * 40)
+        self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,
+                            merge_claim_head=None, merge_claim_pid=None, merge_claim_start_ticks=None)
         self.adapter.heads = ["a" * 40]
+        owner_pid, owner_start_ticks = self.supervisor._merge_owner()
+        self.assertTrue(self.journal.claim_merge(self.spec.mission_id, "a" * 40, owner_pid, owner_start_ticks))
         first = self.supervisor.step(self.spec.mission_id, self.spec)
         if first == State.MERGE:
             first = self.supervisor.step(self.spec.mission_id, self.spec)
         self.assertIn(first, {State.MERGE, State.POST_MERGE})
+
+    def test_live_merge_claim_cannot_be_stolen_by_second_controller(self):
+        self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,
+                            merge_claim_head=None, merge_claim_pid=None, merge_claim_start_ticks=None)
+        owner_pid, owner_start_ticks = self.supervisor._merge_owner()
+        self.assertTrue(self.journal.claim_merge(self.spec.mission_id, "a" * 40, owner_pid, owner_start_ticks))
+        second = Supervisor(self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "second-logs"),
+                            self.codex, self.adapter)
+        self.assertEqual(second.step(self.spec.mission_id, self.spec), State.MERGE)
+        self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_claim_head"], "a" * 40)
+        self.assertEqual(self.adapter.merged_heads, set())
+
+    def test_dead_merge_claim_is_reclaimed_only_after_canonical_not_started(self):
+        self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,
+                            merge_claim_head="a" * 40, merge_claim_pid=99999999,
+                            merge_claim_start_ticks="dead-owner")
+        self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
+        self.assertEqual(self.adapter.merged_heads, {"a" * 40})
+        self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_claim_head"], "a" * 40)
+
+    def test_unknown_merge_claim_identity_fails_closed(self):
+        self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,
+                            merge_claim_head="a" * 40, merge_claim_pid=None, merge_claim_start_ticks=None)
+        self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
+        self.assertEqual(self.adapter.merged_heads, set())
 
     def test_football_adapter_review_fails_closed_instead_of_crashing(self):
         result = FootballPredictionAdapter().review("codex", "a" * 40)
