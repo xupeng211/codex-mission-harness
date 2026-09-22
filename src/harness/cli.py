@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .adapters import FootballPredictionAdapter
+from .adapters import FootballPredictionAdapter, SimulatedAdapter
 from .codex import AppServerCodex
 from .domain import MissionSpec
 from .isolation import WorktreeManager
@@ -24,9 +24,10 @@ def load_spec(path: Path) -> MissionSpec:
     return MissionSpec(**data)
 
 
-def build(root: Path) -> Supervisor:
+def build(root: Path, adapter_name: str = "footballprediction") -> Supervisor:
     journal = Journal(root / "data" / "harness.sqlite")
-    return Supervisor(journal, ProcessSupervisor(journal, root / "data" / "logs"), AppServerCodex(), FootballPredictionAdapter())
+    adapter = SimulatedAdapter() if adapter_name == "simulation" else FootballPredictionAdapter()
+    return Supervisor(journal, ProcessSupervisor(journal, root / "data" / "logs"), AppServerCodex(), adapter)
 
 
 def describe(supervisor: Supervisor, mission_id: str) -> None:
@@ -55,7 +56,7 @@ def main() -> None:
         print(f"APPROVAL={row['approval_state']}\nTERMINAL={'YES' if observed.terminal else 'NO'}")
         return
     spec = load_spec(args.mission)
-    supervisor = build(args.root)
+    supervisor = build(args.root, spec.adapter)
     try:
         existing = supervisor.journal.mission(spec.mission_id)
         WorktreeManager().validate(existing["repo"], existing["branch"], existing["worktree"])

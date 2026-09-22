@@ -36,9 +36,11 @@ class Supervisor:
                     self.journal.complete_gate(mission_id, pending, current)
                 elif pending:
                     self.journal.event(mission_id, "gate_stale", {"gate": pending, "launch_head": result.launch_head, "current_head": current})
+            elif result.state == "LOST":
+                # Canonical validation commands are idempotent: resume retries an unobserved outcome.
+                self.journal.event(mission_id, "process_retry_required", {"job_id": result.job_id})
             elif result.state != "RUNNING":
-                self.journal.transition(mission_id, State.FAILED_FATAL,
-                                        f"owned process {result.state}: {result.exit_code}")
+                self.journal.transition(mission_id, State.FAILED_FATAL, f"owned process {result.state}: {result.exit_code}")
 
     def _agent_turn(self, mission_id: str, prompt: str) -> None:
         row = self.journal.mission(mission_id)
