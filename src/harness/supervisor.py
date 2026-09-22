@@ -38,6 +38,13 @@ class Supervisor:
             elif result.state == "LOST":
                 # Canonical validation commands are idempotent: resume retries an unobserved outcome.
                 self.journal.event(mission_id, "process_retry_required", {"job_id": result.job_id})
+            elif result.state == "EXITED" and result.exit_code != 0:
+                pending = self.journal.mission(mission_id)["pending_gate"]
+                if pending and State(self.journal.mission(mission_id)["current_state"]) == State.TEST:
+                    self.journal.event(mission_id, "gate_failed_auto_repair", {"gate": pending, "exit_code": result.exit_code})
+                    self.journal.transition(mission_id, State.IMPLEMENT, f"canonical gate {pending} failed; repair required")
+                else:
+                    self.journal.transition(mission_id, State.FAILED_FATAL, f"owned process {result.state}: {result.exit_code}")
             elif result.state != "RUNNING":
                 self.journal.transition(mission_id, State.FAILED_FATAL, f"owned process {result.state}: {result.exit_code}")
 
@@ -124,7 +131,8 @@ class Supervisor:
                 row = self.journal.mission(mission_id)
                 # Canonical adapter proved the previous claim never started; reclaim
                 # this exact HEAD in the same supervisor turn.
-                self.journal.claim_merge(mission_id, row["current_head"])
+                if not self.journal.claim_merge(mission_id, row["current_head"]):
+                    return State.MERGE
                 result = self.adapter.merge(row["worktree"], row["current_head"])
                 if result.status != "PASS":
                     self.journal.transition(mission_id, State.BLOCKED_POLICY, result.evidence)
