@@ -31,7 +31,9 @@ class Supervisor:
             self.journal.db.commit()
             # A source change after local validation invalidates every downstream
             # acceptance fact, including an owner merge decision for the old HEAD.
-            if previous_state in {State.REVIEW, State.CI, State.MERGE, State.WAITING_APPROVAL}:
+            if previous_state == State.PASS:
+                self.journal.reopen_pass_for_new_head(mission_id, "canonical HEAD changed after PASS")
+            elif previous_state in {State.REVIEW, State.CI, State.MERGE, State.WAITING_APPROVAL}:
                 self.journal.rewind_to_test(mission_id, "canonical HEAD changed")
         for result in self.process.poll(mission_id):
             if result.state == "EXITED" and result.exit_code == 0:

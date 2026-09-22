@@ -159,6 +159,16 @@ class Journal:
         self.event(mission_id, "state_reconciled_to_test", {"from": source, "reason": reason})
         self.db.commit()
 
+    def reopen_pass_for_new_head(self, mission_id: str, reason: str) -> None:
+        """PASS describes one immutable HEAD, never every later worktree mutation."""
+        row = self.mission(mission_id)
+        if State(row["current_state"]) != State.PASS:
+            raise InvalidTransition("only PASS can be reopened by canonical HEAD reconciliation")
+        self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',updated_at=? WHERE mission_id=?",
+                        (State.TEST, now(), mission_id))
+        self.event(mission_id, "pass_reopened_for_new_head", {"reason": reason})
+        self.db.commit()
+
     def status(self, mission_id: str) -> Observation:
         row = self.mission(mission_id)
         jobs = self.db.execute("SELECT count(*) FROM jobs WHERE mission_id=? AND state IN ('STARTING','RUNNING')", (mission_id,)).fetchone()[0]
