@@ -6,6 +6,7 @@ import json
 import queue
 import subprocess
 import sys
+import threading
 from dataclasses import replace
 from io import StringIO
 from pathlib import Path
@@ -536,6 +537,32 @@ class HarnessTest(unittest.TestCase):
         invalid = self.journal.db.execute("SELECT count(*) FROM receipts WHERE invalidated=1").fetchone()[0]
         self.assertEqual(invalid, 2)
 
+    def test_latest_exact_head_reviewer_verdict_supersedes_older_pass(self):
+        head, other_head = "a" * 40, "b" * 40
+        self.journal.record_receipt(self.spec.mission_id, "codex", head, "PASS")
+        self.journal.record_receipt(self.spec.mission_id, "deepseek", head, "PASS")
+        self.journal.record_receipt(self.spec.mission_id, "codex", other_head, "PASS")
+        self.assertEqual(
+            self.journal.valid_reviews(self.spec.mission_id, head),
+            {"codex", "deepseek"},
+        )
+
+        self.journal.record_receipt(self.spec.mission_id, "codex", head, "FAIL")
+        self.assertEqual(
+            self.journal.valid_reviews(self.spec.mission_id, head),
+            {"deepseek"},
+        )
+        self.assertEqual(
+            self.journal.valid_reviews(self.spec.mission_id, other_head),
+            {"codex"},
+        )
+
+        self.journal.record_receipt(self.spec.mission_id, "codex", head, "PASS")
+        self.assertEqual(
+            self.journal.valid_reviews(self.spec.mission_id, head),
+            {"codex", "deepseek"},
+        )
+
     def test_head_change_after_gates_rewinds_to_fresh_exact_head_validation(self):
         self.advance_to_test()
         self.supervisor.run_until_wait(self.spec.mission_id, self.spec)
@@ -905,9 +932,73 @@ class HarnessTest(unittest.TestCase):
         adapter.close()
 
     def test_gate_pass_is_bound_to_exact_head(self):
+        self.journal.update(
+            self.spec.mission_id, current_state=State.TEST,
+            current_head="a" * 40, pending_gate="verify-pr",
+        )
         self.journal.complete_gate(self.spec.mission_id, "verify-pr", "a" * 40)
         self.assertTrue(self.journal.gate_passed_at_head(self.spec.mission_id, "verify-pr", "a" * 40))
         self.assertFalse(self.journal.gate_passed_at_head(self.spec.mission_id, "verify-pr", "b" * 40))
+
+    def test_complete_gate_serializes_concurrent_gate_writers(self):
+        head = "a" * 40
+        self.journal.update(
+            self.spec.mission_id, current_state=State.TEST,
+            current_head=head, pending_gate="gate-a",
+        )
+        database = Path(self.tmp.name) / "harness.sqlite"
+        first_has_lock = threading.Event()
+        second_attempted_lock = threading.Event()
+        outcomes = {}
+        original_loads = json.loads
+
+        def pause_first_writer(payload, *args, **kwargs):
+            if threading.current_thread().name == "gate-writer-a":
+                first_has_lock.set()
+                if not second_attempted_lock.wait(timeout=2):
+                    raise AssertionError("second gate writer never attempted its writer lock")
+            return original_loads(payload, *args, **kwargs)
+
+        def first_writer():
+            journal = Journal(database)
+            try:
+                journal.complete_gate(self.spec.mission_id, "gate-a", head)
+                outcomes["first"] = "PASS"
+            except Exception as exc:
+                outcomes["first"] = exc
+            finally:
+                journal.db.close()
+
+        def second_writer():
+            journal = Journal(database)
+            journal.db.set_trace_callback(
+                lambda sql: second_attempted_lock.set()
+                if sql == "BEGIN IMMEDIATE" else None
+            )
+            try:
+                if not first_has_lock.wait(timeout=2):
+                    raise AssertionError("first gate writer never acquired its writer lock")
+                journal.complete_gate(self.spec.mission_id, "gate-b", head)
+                outcomes["second"] = "PASS"
+            except Exception as exc:
+                outcomes["second"] = exc
+            finally:
+                journal.db.close()
+
+        with patch("harness.journal.json.loads", side_effect=pause_first_writer):
+            second = threading.Thread(target=second_writer, name="gate-writer-b")
+            first = threading.Thread(target=first_writer, name="gate-writer-a")
+            second.start()
+            first.start()
+            first.join(timeout=3)
+            second.join(timeout=3)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(outcomes["first"], "PASS")
+        self.assertIsInstance(outcomes["second"], InvalidTransition)
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertEqual(json.loads(row["completed_gates_json"]), {"gate-a": head})
+        self.assertIsNone(row["pending_gate"])
 
     def test_process_reservation_prevents_duplicate_launch(self):
         process = self.supervisor.process
@@ -916,6 +1007,41 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(self.journal.db.execute("SELECT count(*) FROM jobs WHERE name='one-gate'").fetchone()[0], 1)
         next(iter(process._children.values())).wait()
+        process.poll(self.spec.mission_id)
+
+    def test_log_open_failure_retires_starting_reservation_and_allows_retry(self):
+        process = self.supervisor.process
+        with patch("harness.process.Path.open", side_effect=PermissionError("logs denied")):
+            with self.assertRaisesRegex(PermissionError, "logs denied"):
+                process.start(
+                    self.spec.mission_id, "log-open-fails", ["/bin/sh", "-c", "exit 0"],
+                    str(self.worktree), {}, "a" * 40,
+                )
+        failed = self.journal.db.execute(
+            "SELECT job_id,state,ended_at FROM jobs WHERE mission_id=? AND name=?",
+            (self.spec.mission_id, "log-open-fails"),
+        ).fetchone()
+        self.assertEqual(failed["state"], "FAILED_LAUNCH")
+        self.assertIsNotNone(failed["ended_at"])
+        self.assertEqual(
+            self.journal.db.execute(
+                "SELECT count(*) FROM jobs WHERE mission_id=? AND name=? "
+                "AND state IN ('STARTING','RUNNING')",
+                (self.spec.mission_id, "log-open-fails"),
+            ).fetchone()[0],
+            0,
+        )
+        self.assertIsNotNone(self.journal.db.execute(
+            "SELECT 1 FROM events WHERE mission_id=? AND kind='process_launch_failed'",
+            (self.spec.mission_id,),
+        ).fetchone())
+
+        retried = process.start(
+            self.spec.mission_id, "log-open-fails", ["/bin/sh", "-c", "exit 0"],
+            str(self.worktree), {}, "a" * 40,
+        )
+        self.assertNotEqual(retried, failed["job_id"])
+        process._children[retried].wait()
         process.poll(self.spec.mission_id)
 
     def test_release_pipe_failure_keeps_child_registered_and_reapable(self):

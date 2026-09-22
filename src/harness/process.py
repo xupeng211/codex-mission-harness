@@ -64,6 +64,7 @@ class ProcessSupervisor:
 
     def start(self, mission_id: str, name: str, argv: list[str], cwd: str, env: dict[str, str], launch_head: str) -> str:
         job_id = uuid.uuid4().hex
+        lease = uuid.uuid4().hex
         out, err = self.log_root / f"{job_id}.out", self.log_root / f"{job_id}.err"
         # Reserve before spawning: concurrent supervisors observe the same durable job, never launch twice.
         try:
@@ -76,24 +77,35 @@ class ProcessSupervisor:
             self.journal.db.execute(
                 "INSERT INTO jobs(job_id,mission_id,name,argv_json,launch_head,state,stdout_path,stderr_path,started_at,launcher_pid,launcher_start_ticks,lease_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job_id, mission_id, name, json.dumps(argv), launch_head, "STARTING", str(out), str(err), now(),
-                 self.launcher_pid, self.launcher_start_ticks, uuid.uuid4().hex),
+                 self.launcher_pid, self.launcher_start_ticks, lease),
             )
             self.journal.db.commit()
         except Exception:
             self.journal.db.rollback()
             raise
-        lease = self.journal.db.execute("SELECT lease_token FROM jobs WHERE job_id=?", (job_id,)).fetchone()[0]
-        with out.open("wb") as stdout, err.open("wb") as stderr:
-            try:
+        try:
+            with out.open("wb") as stdout, err.open("wb") as stderr:
                 # The bootstrap cannot run the gate until its PID has been journaled. If
                 # this controller dies before publication its stdin closes and no gate runs.
                 proc = subprocess.Popen([sys.executable, "-c", BOOTSTRAP], stdin=subprocess.PIPE, stdout=stdout, stderr=stderr,
                                         start_new_session=True)
-            except OSError as exc:
-                self.journal.db.execute("UPDATE jobs SET state='FAILED_LAUNCH',ended_at=? WHERE job_id=?", (now(), job_id))
-                self.journal.event(mission_id, "process_launch_failed", {"job_id": job_id, "error": str(exc)})
+        except OSError as exc:
+            try:
+                changed = self.journal.db.execute(
+                    "UPDATE jobs SET state='FAILED_LAUNCH',ended_at=? "
+                    "WHERE job_id=? AND state='STARTING' AND lease_token=? "
+                    "AND launcher_pid=? AND launcher_start_ticks IS ?",
+                    (now(), job_id, lease, self.launcher_pid, self.launcher_start_ticks),
+                ).rowcount
+                if changed:
+                    self.journal.event(mission_id, "process_launch_failed", {
+                        "job_id": job_id, "error": str(exc),
+                    })
                 self.journal.db.commit()
+            except Exception:
+                self.journal.db.rollback()
                 raise
+            raise
         # Register the handle before any durable RUNNING publication or pipe
         # release. Every later failure can then be polled/reaped deterministically.
         self._children[job_id] = proc

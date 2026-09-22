@@ -193,14 +193,39 @@ class Journal:
         self.db.commit()
 
     def complete_gate(self, mission_id: str, gate: str, head: str) -> None:
-        row = self.mission(mission_id)
-        gates = json.loads(row["completed_gates_json"])
-        if isinstance(gates, list):  # v0.1 pre-release journal migration
-            gates = {name: None for name in gates}
-        gates[gate] = head
-        self.update(mission_id, completed_gates_json=json.dumps(gates), pending_gate=None)
-        self.event(mission_id, "gate_pass", {"gate": gate, "head": head})
-        self.db.commit()
+        """Atomically publish one gate result against its exact launch snapshot."""
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT current_state,current_head,pending_gate,completed_gates_json "
+                "FROM missions WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(mission_id)
+            if (State(row["current_state"]) != State.TEST or
+                    row["current_head"] != head or row["pending_gate"] != gate):
+                raise InvalidTransition(
+                    "gate completion is stale for current state, HEAD, or pending gate"
+                )
+            gates = json.loads(row["completed_gates_json"])
+            if isinstance(gates, list):  # v0.1 pre-release journal migration
+                gates = {name: None for name in gates}
+            if not isinstance(gates, dict):
+                raise RuntimeError("completed gate journal is invalid")
+            gates[gate] = head
+            changed = self.db.execute(
+                "UPDATE missions SET completed_gates_json=?,pending_gate=NULL,updated_at=? "
+                "WHERE mission_id=? AND current_state=? AND current_head=? AND pending_gate=?",
+                (json.dumps(gates), now(), mission_id, State.TEST, head, gate),
+            ).rowcount
+            if changed != 1:
+                raise InvalidTransition("gate completion lost its source snapshot")
+            self.event(mission_id, "gate_pass", {"gate": gate, "head": head})
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
 
     def gate_passed_at_head(self, mission_id: str, gate: str, head: str) -> bool:
         gates = json.loads(self.mission(mission_id)["completed_gates_json"])
@@ -306,8 +331,15 @@ class Journal:
         return True
 
     def valid_reviews(self, mission_id: str, head: str) -> set[str]:
-        rows = self.db.execute("SELECT reviewer FROM receipts WHERE mission_id=? AND head_sha=? AND result='PASS' AND invalidated=0",
-                               (mission_id, head)).fetchall()
+        rows = self.db.execute(
+            "SELECT receipt.reviewer FROM receipts AS receipt "
+            "WHERE receipt.mission_id=? AND receipt.head_sha=? "
+            "AND receipt.result='PASS' AND receipt.invalidated=0 "
+            "AND receipt.id=(SELECT MAX(latest.id) FROM receipts AS latest "
+            "WHERE latest.mission_id=receipt.mission_id "
+            "AND latest.head_sha=receipt.head_sha AND latest.reviewer=receipt.reviewer)",
+            (mission_id, head),
+        ).fetchall()
         return {row[0] for row in rows}
 
     def approve(self, mission_id: str, action: str, reason: str = "", observed_head: str | None = None) -> None:
