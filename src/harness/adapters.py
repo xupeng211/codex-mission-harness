@@ -82,9 +82,23 @@ class FootballPredictionAdapter:
                 evidence["integrity_sha256"] = observed
                 if observed != expected:
                     return GateResult("BLOCKED_EXTERNAL", "DeepSeek receipt integrity mismatch", receipt)
-            required = {"base_sha", "head_sha", "mission_id", "diff_sha256", "review_result", "findings", "integrity"}
+                required = {"version", "base_sha", "head_sha", "mission_id", "diff_sha256", "manifest_sha256", "chunks", "review_result", "findings", "integrity_sha256"}
+            elif evidence.get("receipt_version") == "independent-review-receipt/v1":
+                # FootballPrediction's project-owned runner validates this
+                # generic receipt (including integrity/chunk evidence) before
+                # commit-last publication. Harness still binds its immutable
+                # identity and rejects every unknown receipt version.
+                required = {"receipt_version", "base_sha", "head_sha", "mission_id", "diff_sha256", "review_result", "findings", "integrity"}
+            else:
+                return GateResult("BLOCKED_EXTERNAL", "unknown DeepSeek receipt contract", receipt)
             if not required <= set(evidence) or evidence.get("base_sha") != base or evidence.get("head_sha") != head or evidence.get("mission_id") != mission_id:
                 return GateResult("BLOCKED_EXTERNAL", "DeepSeek receipt binding is incomplete or stale", receipt)
+            if evidence.get("version") == "cmh-deepseek-review/v1":
+                chunks = evidence.get("chunks")
+                if (not isinstance(chunks, list) or not chunks or
+                        [chunk.get("index") for chunk in chunks if isinstance(chunk, dict)] != list(range(len(chunks))) or
+                        any(chunk.get("result", {}).get("review_result") not in {"PASS", "FAIL"} for chunk in chunks)):
+                    return GateResult("BLOCKED_EXTERNAL", "DeepSeek chunk evidence is incomplete", receipt)
             blocking = any(isinstance(finding, dict) and finding.get("severity") in {"P0", "P1", "P2"}
                            for finding in evidence.get("findings", []))
             if evidence.get("review_result") != "PASS" or blocking:

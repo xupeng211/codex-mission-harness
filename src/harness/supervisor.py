@@ -482,7 +482,7 @@ class Supervisor:
             if not isinstance(self.adapter, SimulatedAdapter) and (not row["merge_sha"] or not row["pr_number"]):
                 advance(State.BLOCKED_EXTERNAL, "post-merge requires durable PR and merge SHA")
                 return State.BLOCKED_EXTERNAL
-            if row["merge_sha"] and row["pr_number"]:
+            if not isinstance(self.adapter, SimulatedAdapter) and row["merge_sha"] and row["pr_number"]:
                 production = self.adapter.post_merge(
                     row["worktree"], row["merge_sha"], row["pr_number"], row["branch"],
                 )
