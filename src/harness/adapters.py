@@ -75,9 +75,12 @@ class FootballPredictionAdapter:
                 evidence = json.loads(Path(receipt).read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 return GateResult("BLOCKED_EXTERNAL", "DeepSeek receipt is unreadable", receipt)
-            if evidence.get("base_sha") != base or evidence.get("head_sha") != head or evidence.get("mission_id") != mission_id:
+            required = {"base_sha", "head_sha", "mission_id", "diff_sha256", "review_result", "findings", "integrity"}
+            if not required <= set(evidence) or evidence.get("base_sha") != base or evidence.get("head_sha") != head or evidence.get("mission_id") != mission_id:
                 return GateResult("BLOCKED_EXTERNAL", "DeepSeek receipt binding is incomplete or stale", receipt)
-            if evidence.get("review_result") != "PASS":
+            blocking = any(isinstance(finding, dict) and finding.get("severity") in {"P0", "P1", "P2"}
+                           for finding in evidence.get("findings", []))
+            if evidence.get("review_result") != "PASS" or blocking:
                 return GateResult("FAIL", "canonical DeepSeek receipt reports findings", receipt, evidence)
             return GateResult("PASS", "canonical DeepSeek aggregate receipt validated", receipt, evidence)
         else: return GateResult("BLOCKED_EXTERNAL", f"unknown reviewer {reviewer}")
@@ -211,4 +214,5 @@ class SimulatedAdapter(FootballPredictionAdapter):
         self.merged_heads.add(head); value=self.merge_results[min(self.merge_index,len(self.merge_results)-1)]; self.merge_index+=1; return GateResult(value, f"fixture merge {head}", data={"pr":1,"merge_sha":"c"*40})
     def merge_status(self, worktree, reviewed_head, pr_number=None): return GateResult("PASS" if reviewed_head in self.merged_heads else "NOT_STARTED", f"fixture merge status {reviewed_head}")
     def post_merge(self, *args):
-        value=self.post_results[min(self.post_index,len(self.post_results)-1)]; self.post_index+=1; return GateResult(value, "fixture post merge")
+        value=self.post_results[min(self.post_index,len(self.post_results)-1)]; self.post_index+=1
+        return GateResult(value, "fixture post merge", data={"main_sha":"d"*40,"tree_sha":"e"*40})

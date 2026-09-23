@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import subprocess
 from pathlib import Path
 
@@ -409,12 +410,9 @@ class Supervisor:
                     return State.BLOCKED_EXTERNAL
                 if recovery != "RECOVERY_CLAIMED":
                     return State(self.journal.mission(mission_id)["current_state"])
-                try:
-                    status = self.adapter.merge_status(row["worktree"], claim_head, row["pr_number"])
-                except TypeError:
-                    # Compatibility for v0.1 test/dummy adapters; the real
-                    # adapter receives the durable PR identity above.
-                    status = self.adapter.merge_status(row["worktree"], claim_head)
+                parameters = inspect.signature(self.adapter.merge_status).parameters
+                status = (self.adapter.merge_status(row["worktree"], claim_head, row["pr_number"])
+                          if len(parameters) >= 3 else self.adapter.merge_status(row["worktree"], claim_head))
                 if status.status == "PASS":
                     if claim_head != row["current_head"]:
                         advance(
@@ -488,8 +486,10 @@ class Supervisor:
                     advance(State.BLOCKED_EXTERNAL, production.evidence)
                     return State.BLOCKED_EXTERNAL
                 facts = production.data or {}
-                if facts.get("main_sha") and facts.get("tree_sha"):
-                    self.journal.update(mission_id, main_sha=facts["main_sha"], tree_sha=facts["tree_sha"], pending_gate=None, ci_state=None)
+                if not facts.get("main_sha") or not facts.get("tree_sha"):
+                    advance(State.BLOCKED_EXTERNAL, "Production Gate PASS omitted main/tree truth")
+                    return State.BLOCKED_EXTERNAL
+                self.journal.update(mission_id, main_sha=facts["main_sha"], tree_sha=facts["tree_sha"], pending_gate=None, ci_state=None)
             for gate in spec.post_merge_gates:
                 result = self.adapter.post_merge(gate, row["current_head"])
                 if result.status != "PASS":
