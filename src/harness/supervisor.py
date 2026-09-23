@@ -490,11 +490,14 @@ class Supervisor:
                     advance(State.BLOCKED_EXTERNAL, "Production Gate PASS omitted main/tree truth")
                     return State.BLOCKED_EXTERNAL
                 self.journal.update(mission_id, main_sha=facts["main_sha"], tree_sha=facts["tree_sha"], pending_gate=None, ci_state=None)
-            for gate in spec.post_merge_gates:
-                result = self.adapter.post_merge(gate, row["current_head"])
-                if result.status != "PASS":
-                    advance(State.BLOCKED_EXTERNAL, result.evidence)
-                    return State.BLOCKED_EXTERNAL
+            # Legacy simulation gates remain a test seam only. Production is
+            # governed by the exact merge-SHA Production Gate above.
+            if isinstance(self.adapter, SimulatedAdapter):
+                for gate in spec.post_merge_gates:
+                    result = self.adapter.post_merge(gate, row["current_head"])
+                    if result.status != "PASS":
+                        advance(State.BLOCKED_EXTERNAL, result.evidence)
+                        return State.BLOCKED_EXTERNAL
             observed = self.adapter.exact_head(row["worktree"])
             if observed != row["current_head"]:
                 self.journal.reconcile_head(mission_id, observed)

@@ -156,8 +156,8 @@ class FootballPredictionAdapter:
         if data.get("verdict") == "PASS":
             try:
                 self._run(["git", "fetch", "origin", "main"], cwd=worktree)
-                main_sha = self._run(["git", "rev-parse", "origin/main"], cwd=worktree).lower()
-                tree_sha = self._run(["git", "rev-parse", "origin/main^{tree}"], cwd=worktree).lower()
+                main_sha = self._run(["git", "rev-parse", "origin/main"], cwd=worktree).strip().lower()
+                tree_sha = self._run(["git", "rev-parse", "origin/main^{tree}"], cwd=worktree).strip().lower()
                 reachable = self._call(["git", "merge-base", "--is-ancestor", merge_sha, "origin/main"], cwd=worktree)
             except (subprocess.SubprocessError, OSError) as exc:
                 return GateResult("BLOCKED_EXTERNAL", f"cannot record post-merge main truth: {exc}")
@@ -176,9 +176,10 @@ class FootballPredictionAdapter:
     def _json_last_line(path):
         try:
             for line in reversed(Path(path).read_text(encoding="utf-8").splitlines()):
-                value = json.loads(line)
+                try: value = json.loads(line)
+                except json.JSONDecodeError: continue
                 if isinstance(value, dict): return value
-        except (OSError, json.JSONDecodeError): pass
+        except OSError: pass
         return {}
 
     @staticmethod
@@ -212,7 +213,8 @@ class SimulatedAdapter(FootballPredictionAdapter):
         value=self.ci_results[min(self.ci_index,len(self.ci_results)-1)]; self.ci_index+=1; return GateResult(value, f"fixture CI {head}")
     def merge(self, worktree, head):
         self.merged_heads.add(head); value=self.merge_results[min(self.merge_index,len(self.merge_results)-1)]; self.merge_index+=1; return GateResult(value, f"fixture merge {head}", data={"pr":1,"merge_sha":"c"*40})
-    def merge_status(self, worktree, reviewed_head, pr_number=None): return GateResult("PASS" if reviewed_head in self.merged_heads else "NOT_STARTED", f"fixture merge status {reviewed_head}")
+    def merge_status(self, worktree, reviewed_head, pr_number=None):
+        return GateResult("PASS" if reviewed_head in self.merged_heads else "NOT_STARTED", f"fixture merge status {reviewed_head}", data={"pr":1,"merge_sha":"c"*40})
     def post_merge(self, *args):
         value=self.post_results[min(self.post_index,len(self.post_results)-1)]; self.post_index+=1
         return GateResult(value, "fixture post merge", data={"main_sha":"d"*40,"tree_sha":"e"*40})
