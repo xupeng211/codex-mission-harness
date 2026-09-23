@@ -33,15 +33,18 @@ class FootballPredictionAdapter:
 
     def review_argv(self, reviewer: str, *, worktree: str, base: str, head: str, mission_id: str,
                     scope_file: str, evidence_dir: str) -> list[str]:
-        programs = {"codex": "scripts/devops/codex_independent_review.py",
-                    "deepseek": "scripts/devops/claude_deepseek_independent_review.py"}
-        if reviewer not in programs: raise ValueError(f"unsupported independent reviewer: {reviewer}")
-        command = ["python3", programs[reviewer]]
         if reviewer == "codex":
-            command.append("run")
-        return command + ["--repo-root", worktree, "--base-sha", base,
-                "--head-sha", head, "--mission-id", mission_id, "--mission-scope-file", scope_file,
-                "--evidence-dir", evidence_dir]
+            target = "agent-review"
+        elif reviewer == "deepseek":
+            target = "agent-deepseek-review"
+        else:
+            raise ValueError(f"unsupported independent reviewer: {reviewer}")
+        # Delegate model selection, isolation, auth and receipt generation to
+        # the target project's public canonical entrypoint.  In particular no
+        # model selector is passed here: the project policy owns it.
+        return ["make", target, f"BASE_SHA={base}", f"HEAD_SHA={head}",
+                f"MISSION_ID={mission_id}", f"MISSION_SCOPE_FILE={scope_file}",
+                f"EVIDENCE_DIR={evidence_dir}"]
 
     def review(self, reviewer: str, head: str) -> GateResult:
         """Compatibility guard: production review needs bound scope/context.
@@ -59,7 +62,7 @@ class FootballPredictionAdapter:
         if not isinstance(receipt, str) or not Path(receipt).is_file():
             return GateResult("BLOCKED_EXTERNAL", "canonical review did not publish a receipt")
         if reviewer == "codex":
-            argv = ["python3", "scripts/devops/codex_independent_review.py", "validate", "--repo-root", worktree,
+            argv = ["python3", "scripts/devops/codex_independent_review.py", "classify", "--repo-root", worktree,
                     "--receipt", receipt, "--current-head", head, "--base-sha", base, "--mission-id", mission_id,
                     "--mission-scope-file", scope_file, "--json"]
         elif reviewer == "deepseek":
@@ -72,7 +75,7 @@ class FootballPredictionAdapter:
                 evidence = json.loads(Path(receipt).read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 return GateResult("BLOCKED_EXTERNAL", "DeepSeek receipt is unreadable", receipt)
-            if evidence.get("base_sha") != base or evidence.get("reviewed_head_sha") != head or evidence.get("mission_id") != mission_id:
+            if evidence.get("base_sha") != base or evidence.get("head_sha") != head or evidence.get("mission_id") != mission_id:
                 return GateResult("BLOCKED_EXTERNAL", "DeepSeek receipt binding is incomplete or stale", receipt)
             if evidence.get("review_result") != "PASS":
                 return GateResult("FAIL", "canonical DeepSeek receipt reports findings", receipt, evidence)
@@ -81,6 +84,9 @@ class FootballPredictionAdapter:
         result = self._call(argv, cwd=worktree)
         if result.returncode != 0:
             return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or result.stdout.strip(), receipt)
+        classification = self._json_last_text(result.stdout)
+        if classification.get("classification", {}).get("classification") != "VALID_CURRENT":
+            return GateResult("BLOCKED_EXTERNAL", "canonical Codex receipt is not VALID_CURRENT", receipt, classification)
         if payload.get("status") != "PASS":
             return GateResult("FAIL", "canonical receipt reports findings", receipt, payload)
         return GateResult("PASS", "canonical exact-head receipt validated", receipt, payload)
@@ -159,6 +165,17 @@ class FootballPredictionAdapter:
                 value = json.loads(line)
                 if isinstance(value, dict): return value
         except (OSError, json.JSONDecodeError): pass
+        return {}
+
+    @staticmethod
+    def _json_last_text(text: str) -> dict[str, Any]:
+        for line in reversed(text.splitlines()):
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                return value
         return {}
 
 

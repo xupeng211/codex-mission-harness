@@ -108,7 +108,7 @@ class Supervisor:
                 reviewer = str(job["name"]).split(":", 1)[1]
                 spec = self.journal.spec(mission_id)
                 scope = spec.mission_scope_file
-                if result.state == "EXITED" and scope:
+                if result.state in {"EXITED", "LOST"} and scope:
                     reviewed = self.adapter.review_result(
                         reviewer, worktree=snapshot["worktree"], base=snapshot["base_sha"], head=current,
                         mission_id=mission_id, scope_file=str(Path(snapshot["worktree"], scope)),
@@ -120,11 +120,6 @@ class Supervisor:
                         reconcile_transition(State.IMPLEMENT, f"canonical {reviewer} review findings", snapshot)
                     elif reviewed.status != "PASS":
                         reconcile_transition(State.BLOCKED_EXTERNAL, reviewed.evidence, snapshot)
-                    continue
-                if result.state == "LOST":
-                    # A durable external receipt may still appear later, but a
-                    # missing owned writer is never replayed automatically.
-                    reconcile_transition(State.BLOCKED_EXTERNAL, "independent review writer outcome is unknown", snapshot)
                     continue
             if result.state == "EXITED" and result.exit_code == 0:
                 pending = snapshot["pending_gate"]
