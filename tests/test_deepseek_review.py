@@ -1,7 +1,11 @@
 import importlib.util
+import contextlib
+import io
 import json
+import subprocess
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -107,9 +111,52 @@ class DeepSeekReceiptTest(unittest.TestCase):
     def test_run_scoped_artifact_paths_cannot_overwrite_prior_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            first = root / "run-one"; second = root / "run-two"
-            first.mkdir(); second.mkdir()
-            (first / "chunk-000.json").write_text("first")
-            (second / "chunk-000.json").write_text("second")
-            self.assertEqual((first / "chunk-000.json").read_text(), "first")
-            self.assertNotEqual(first / "chunk-000.json", second / "chunk-000.json")
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Harness Test"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "harness-test@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(repo), "remote", "add", "origin",
+                            "git@github.com:fixture/repo.git"], check=True)
+            source = repo / "tracked.txt"
+            source.write_text("base\n")
+            subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+            base = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            source.write_text("head\n")
+            subprocess.run(["git", "-C", str(repo), "commit", "-qam", "head"], check=True)
+            head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            token_file = root / "review-token"
+            token_file.write_text("unit-test-token")
+            evidence = root / "evidence"
+            args = Namespace(repo=str(repo), base=base, head=head, mission_id="fixture",
+                             evidence=str(evidence), token_file=str(token_file), timeout=1)
+            raw = json.dumps({"review_result": "PASS", "findings": []})
+            completed = subprocess.CompletedProcess(["claude"], 0, raw, "")
+            with patch.object(review, "invoke_reviewer", return_value=completed), \
+                    contextlib.redirect_stdout(io.StringIO()) as captured:
+                review.run(args)
+                first_result = json.loads(captured.getvalue())
+                first_receipt = Path(first_result["receipt"])
+                first_chunk = first_receipt.parent / "chunk-000.json"
+                first_receipt_before = first_receipt.read_bytes()
+                first_chunk_before = first_chunk.read_bytes()
+                captured.seek(0); captured.truncate(0)
+                review.run(args)
+                second_result = json.loads(captured.getvalue())
+
+            second_receipt = Path(second_result["receipt"])
+            self.assertNotEqual(first_receipt.parent, second_receipt.parent)
+            self.assertTrue(first_receipt.is_file())
+            self.assertTrue(second_receipt.is_file())
+            self.assertIn(head[:12], first_receipt.name)
+            second_chunk = second_receipt.parent / "chunk-000.json"
+            self.assertNotEqual(first_chunk, second_chunk)
+            self.assertEqual(first_receipt.read_bytes(), first_receipt_before)
+            self.assertEqual(first_chunk.read_bytes(), first_chunk_before)
+            for receipt_path in (first_receipt, second_receipt):
+                self.assertEqual(
+                    review.validate(json.loads(receipt_path.read_text()), base, head, repo,
+                                    receipt_path, "fixture", "git@github.com:fixture/repo.git")["review_result"],
+                    "PASS",
+                )

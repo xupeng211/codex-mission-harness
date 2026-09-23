@@ -1878,6 +1878,7 @@ class HarnessTest(unittest.TestCase):
             merge_claim_pid=old_pid,
             merge_claim_start_ticks=old_start,
             merge_invocation_started=1,
+            pending_gate="merge-outcome-unknown",
         )
         real_proc_identity = journal._proc_identity
 

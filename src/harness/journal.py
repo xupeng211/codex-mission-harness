@@ -974,19 +974,20 @@ class Journal:
         try:
             self.db.execute("BEGIN IMMEDIATE")
             row = self.db.execute(
-                "SELECT merge_claim_pid,merge_claim_start_ticks FROM missions "
+                "SELECT merge_claim_pid,merge_claim_start_ticks,merge_invocation_started FROM missions "
                 "WHERE mission_id=? AND current_state=? AND merge_claim_head=? "
                 "AND pending_gate='merge-outcome-unknown'",
                 (mission_id, State.MERGE, claim_head),
             ).fetchone()
-            if row is None:
+            if row is None or row["merge_invocation_started"]:
                 self.db.commit()
                 return False
             changed = self.db.execute(
                 "UPDATE missions SET merge_claim_pid=?,merge_claim_start_ticks=?,"
                 "pending_gate='merge-reconciling',updated_at=? WHERE mission_id=? "
                 "AND current_state=? AND merge_claim_head=? AND merge_claim_pid IS ? "
-                "AND merge_claim_start_ticks IS ? AND pending_gate='merge-outcome-unknown'",
+                "AND merge_claim_start_ticks IS ? AND pending_gate='merge-outcome-unknown' "
+                "AND merge_invocation_started=0",
                 (owner_pid, owner_start_ticks, now(), mission_id, State.MERGE,
                  claim_head, row["merge_claim_pid"], row["merge_claim_start_ticks"]),
             ).rowcount

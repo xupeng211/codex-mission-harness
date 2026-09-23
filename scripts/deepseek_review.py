@@ -92,6 +92,10 @@ def prompt(base, head, diff_hash, manifest_hash, chunk, source):
             "PASS only when P0/P1/P2 are absent.\n"
             f"Base={base}\nHead={head}\nDiffSHA256={diff_hash}\nManifestSHA256={manifest_hash}\n"
             f"Chunk={chunk['index']} range={chunk['start']}:{chunk['end']} SHA256={chunk['sha256']}\n"+rendered)
+
+def invoke_reviewer(command, prompt_text, env, timeout):
+    return subprocess.run(command+[prompt_text],env=env,capture_output=True,text=True,timeout=timeout)
+
 def run(args):
     root=Path(args.repo).resolve(); base=full_sha(args.base); head=full_sha(args.head)
     if git(root,"rev-parse","HEAD").decode().strip().lower()!=head: raise ValueError("worktree HEAD differs from requested HEAD")
@@ -106,7 +110,8 @@ def run(args):
     try:
         env={"HOME":"/nonexistent","PATH":os.environ.get("PATH","")+":/usr/bin:/bin","LANG":"C.UTF-8","ANTHROPIC_API_KEY":token,"ANTHROPIC_AUTH_TOKEN":token,"ANTHROPIC_BASE_URL":ENDPOINT,"CLAUDE_CODE_SIMPLE":"1"}
         for chunk in plan:
-            source=diff[chunk["start"]:chunk["end"]]; completed=subprocess.run(command+[prompt(base,head,diff_hash,manifest_hash,chunk,source)],env=env,capture_output=True,text=True,timeout=args.timeout)
+            source=diff[chunk["start"]:chunk["end"]]
+            completed=invoke_reviewer(command,prompt(base,head,diff_hash,manifest_hash,chunk,source),env,args.timeout)
             if completed.returncode: raise RuntimeError(f"DeepSeek reviewer infrastructure failure: exit={completed.returncode}")
             raw=completed.stdout.encode(); (evidence/f"chunk-{chunk['index']:03d}.json").write_bytes(raw)
             result=reviewer_result(completed.stdout)

@@ -482,6 +482,12 @@ class Supervisor:
                     mission_id, claim_head, owner_pid, owner_start_ticks,
                 )
                 if recovery == "ACTIVE":
+                    row = self.journal.mission(mission_id)
+                    # The durable started flag wins even when an older
+                    # unknown-outcome marker is present: a live owner may
+                    # still be inside the external invocation.
+                    if row["merge_invocation_started"]:
+                        return State.MERGE
                     # A completed-but-unknown invocation publishes a durable
                     # marker. Consume it with a writer-locked ownership handoff;
                     # otherwise a live owner remains strictly non-stealable.
@@ -495,11 +501,6 @@ class Supervisor:
                 if recovery not in {"RECOVERY_CLAIMED", "ACTIVE"}:
                     return State(self.journal.mission(mission_id)["current_state"])
                 row = self.journal.mission(mission_id)
-                # A live owner may still be between the durable invocation
-                # marker and the external call (or still awaiting its result).
-                # Never query status or retry while that owner is active.
-                if recovery == "ACTIVE" and row["merge_invocation_started"]:
-                    return State.MERGE
                 invocation_uncertain = (bool(row["merge_invocation_started"])
                                         or row["pending_gate"] in {
                                             "merge-outcome-unknown", "merge-reconciling",
