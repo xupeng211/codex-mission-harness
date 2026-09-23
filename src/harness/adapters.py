@@ -99,14 +99,7 @@ class FootballPredictionAdapter:
                 evidence = json.loads(Path(receipt).read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 return GateResult("BLOCKED_EXTERNAL", "DeepSeek receipt is unreadable", receipt)
-            if evidence.get("version") == "cmh-deepseek-review/v1":
-                observed = evidence.pop("integrity_sha256", None)
-                expected = hashlib.sha256(json.dumps(evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
-                evidence["integrity_sha256"] = observed
-                if observed != expected:
-                    return GateResult("BLOCKED_EXTERNAL", "DeepSeek receipt integrity mismatch", receipt)
-                required = {"version", "base_sha", "head_sha", "mission_id", "diff_sha256", "manifest_sha256", "chunks", "review_result", "findings", "integrity_sha256"}
-            elif evidence.get("receipt_version") == "independent-review-receipt/v1":
+            if evidence.get("receipt_version") == "independent-review-receipt/v1":
                 # Re-run the target's canonical evidence consumer. Its code is
                 # accepted only after review_preflight proves it is unchanged
                 # from the trusted base.
@@ -137,12 +130,6 @@ class FootballPredictionAdapter:
                     return GateResult("BLOCKED_EXTERNAL", checked.stderr.strip() or "canonical DeepSeek receipt validation failed", receipt)
                 if canonical.get("result") != evidence.get("review_result"):
                     return GateResult("BLOCKED_EXTERNAL", "canonical DeepSeek verdict mismatch", receipt)
-            if evidence.get("version") == "cmh-deepseek-review/v1":
-                chunks = evidence.get("chunks")
-                if (not isinstance(chunks, list) or not chunks or
-                        [chunk.get("index") for chunk in chunks if isinstance(chunk, dict)] != list(range(len(chunks))) or
-                        any(chunk.get("result", {}).get("review_result") not in {"PASS", "FAIL"} for chunk in chunks)):
-                    return GateResult("BLOCKED_EXTERNAL", "DeepSeek chunk evidence is incomplete", receipt)
             blocking = any(isinstance(finding, dict) and finding.get("severity") in {"P0", "P1", "P2"}
                            for finding in evidence.get("findings", []))
             if evidence.get("review_result") != "PASS" or blocking:
@@ -233,7 +220,8 @@ class FootballPredictionAdapter:
                 return GateResult("BLOCKED_EXTERNAL", "merged SHA is not reachable from origin/main")
             data.update({"main_sha": main_sha, "tree_sha": tree_sha})
             return GateResult("PASS", "canonical Production Gate passed", data=data)
-        if str(data.get("ci_status")) in {"queued", "in_progress", "requested", ""}: return GateResult("PENDING", json.dumps(data), data=data)
+        if str(data.get("ci_status")) in {"queued", "in_progress", "requested"}: return GateResult("PENDING", json.dumps(data), data=data)
+        if not data.get("ci_status"): return GateResult("BLOCKED_EXTERNAL", "Production Gate omitted CI status", data=data)
         return GateResult("FAIL", json.dumps(data), data=data)
 
     @staticmethod

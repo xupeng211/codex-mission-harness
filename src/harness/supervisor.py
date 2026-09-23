@@ -418,12 +418,14 @@ class Supervisor:
                 recovery = self.journal.claim_merge_recovery(
                     mission_id, claim_head, owner_pid, owner_start_ticks,
                 )
-                if recovery == "ACTIVE" and row["pending_gate"] != "merge-outcome-unknown":
-                    # Status observed while the original owner is still alive
-                    # can become stale before reclaim and authorize a duplicate
-                    # merge. Never query status until the dead claim is frozen
-                    # under this recovery controller's durable identity.
-                    return State.MERGE
+                if recovery == "ACTIVE":
+                    # A completed-but-unknown invocation publishes a durable
+                    # marker. Consume it with a writer-locked ownership handoff;
+                    # otherwise a live owner remains strictly non-stealable.
+                    if row["pending_gate"] != "merge-outcome-unknown" or not self.journal.claim_uncertain_merge_reconciliation(
+                            mission_id, claim_head, owner_pid, owner_start_ticks):
+                        return State.MERGE
+                    recovery = "RECOVERY_CLAIMED"
                 if recovery == "UNKNOWN":
                     advance(State.BLOCKED_EXTERNAL, "merge claim owner identity is unavailable")
                     return State.BLOCKED_EXTERNAL
@@ -440,8 +442,7 @@ class Supervisor:
                         )
                         return State.BLOCKED_EXTERNAL
                     self.journal.update(mission_id, pending_gate=None)
-                    advance(State.POST_MERGE, "canonical merge already completed")
-                    return State.POST_MERGE
+                    return finish_merge(status)
                 if status.status != "NOT_STARTED":
                     advance(State.BLOCKED_EXTERNAL, status.evidence)
                     return State.BLOCKED_EXTERNAL

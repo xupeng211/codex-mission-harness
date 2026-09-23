@@ -1566,6 +1566,44 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
         self.assertEqual(adapter.merged_heads, {head})
 
+    def test_unknown_merge_reconciliation_marker_has_one_durable_consumer(self):
+        head = "a" * 40
+        self.journal.update(
+            self.spec.mission_id, current_head=head, current_state=State.MERGE,
+            merge_claim_head=head, merge_claim_pid=12345,
+            merge_claim_start_ticks="old-owner", pending_gate="merge-outcome-unknown",
+        )
+        owner_pid, owner_ticks = self.supervisor._merge_owner()
+        self.assertTrue(self.journal.claim_uncertain_merge_reconciliation(
+            self.spec.mission_id, head, owner_pid, owner_ticks,
+        ))
+        self.assertFalse(self.journal.claim_uncertain_merge_reconciliation(
+            self.spec.mission_id, head, owner_pid, owner_ticks,
+        ))
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertEqual(row["pending_gate"], "merge-reconciling")
+
+    def test_recovered_production_merge_persists_pr_and_merge_sha(self):
+        head, merge_sha = "a" * 40, "c" * 40
+
+        class RecoveredProductionAdapter(FootballPredictionAdapter):
+            def exact_head(self, worktree): return head
+            def merge_status(self, worktree, reviewed_head, pr_number=None):
+                return GateResult("PASS", "merged", data={"pr": pr_number, "merge_sha": merge_sha})
+
+        supervisor = Supervisor(
+            self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "recovered-production"),
+            self.codex, RecoveredProductionAdapter(),
+        )
+        self.journal.update(
+            self.spec.mission_id, current_head=head, current_state=State.MERGE,
+            pr_number=7, merge_claim_head=head, merge_claim_pid=99999999,
+            merge_claim_start_ticks="dead-owner",
+        )
+        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertEqual((row["pr_number"], row["merge_sha"]), (7, merge_sha))
+
     def test_unknown_merge_decision_fails_closed_before_claim(self):
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,
                             merge_claim_head=None, merge_claim_pid=None, merge_claim_start_ticks=None)

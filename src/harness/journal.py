@@ -816,6 +816,44 @@ class Journal:
             self.db.rollback()
             raise
 
+    def claim_uncertain_merge_reconciliation(self, mission_id: str, claim_head: str,
+                                             owner_pid: int, owner_start_ticks: str) -> bool:
+        """Atomically consume an unknown-outcome marker before querying status.
+
+        The external merge call has returned, but its result was indeterminate.
+        Exactly one controller may replace the prior owner and change the marker
+        to ``merge-reconciling``; peers then observe an active non-stealable claim.
+        """
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT merge_claim_pid,merge_claim_start_ticks FROM missions "
+                "WHERE mission_id=? AND current_state=? AND merge_claim_head=? "
+                "AND pending_gate='merge-outcome-unknown'",
+                (mission_id, State.MERGE, claim_head),
+            ).fetchone()
+            if row is None:
+                self.db.commit()
+                return False
+            changed = self.db.execute(
+                "UPDATE missions SET merge_claim_pid=?,merge_claim_start_ticks=?,"
+                "pending_gate='merge-reconciling',updated_at=? WHERE mission_id=? "
+                "AND current_state=? AND merge_claim_head=? AND merge_claim_pid IS ? "
+                "AND merge_claim_start_ticks IS ? AND pending_gate='merge-outcome-unknown'",
+                (owner_pid, owner_start_ticks, now(), mission_id, State.MERGE,
+                 claim_head, row["merge_claim_pid"], row["merge_claim_start_ticks"]),
+            ).rowcount
+            if changed:
+                self.event(mission_id, "merge_uncertain_reconciliation_claimed", {
+                    "claim_head": claim_head, "owner_pid": owner_pid,
+                    "owner_start_ticks": owner_start_ticks,
+                })
+            self.db.commit()
+            return changed == 1
+        except Exception:
+            self.db.rollback()
+            raise
+
 
     def status(self, mission_id: str) -> Observation:
         row = self.mission(mission_id)
