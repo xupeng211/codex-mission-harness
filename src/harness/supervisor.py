@@ -110,11 +110,14 @@ class Supervisor:
                 spec = self.journal.spec(mission_id)
                 scope = spec.mission_scope_file
                 if result.state in {"EXITED", "LOST"} and scope:
-                    reviewed = self.adapter.review_result(
-                        reviewer, worktree=snapshot["worktree"], base=snapshot["base_sha"], head=current,
-                        mission_id=mission_id, scope_file=str(Path(snapshot["worktree"], scope)),
-                        stdout_path=job["stdout_path"],
-                    )
+                    try:
+                        reviewed = self.adapter.review_result(
+                            reviewer, worktree=snapshot["worktree"], base=snapshot["base_sha"], head=current,
+                            mission_id=mission_id, scope_file=str(Path(snapshot["worktree"], scope)),
+                            stdout_path=job["stdout_path"],
+                        )
+                    except Exception as exc:
+                        reviewed = GateResult("BLOCKED_EXTERNAL", f"canonical review receipt validation failed: {exc}")
                     self.journal.record_receipt(mission_id, reviewer, current, reviewed.status, reviewed.artifact)
                     self.journal.update(mission_id, pending_gate=None)
                     if reviewed.status == "FAIL":
@@ -323,8 +326,10 @@ class Supervisor:
                         if not spec.mission_scope_file:
                             advance(State.BLOCKED_EXTERNAL, "FootballPrediction review requires mission_scope_file")
                             return State.BLOCKED_EXTERNAL
-                        scope = Path(row["worktree"], spec.mission_scope_file)
-                        if not scope.is_file():
+                        root = Path(row["worktree"]).resolve()
+                        scope = (root / spec.mission_scope_file).resolve()
+                        tracked = subprocess.run(["git", "-C", str(root), "ls-files", "--error-unmatch", "--", str(scope.relative_to(root))], capture_output=True, text=True, check=False) if root in scope.parents else None
+                        if not scope.is_file() or tracked is None or tracked.returncode != 0:
                             advance(State.BLOCKED_EXTERNAL, f"mission scope contract is unavailable: {scope}")
                             return State.BLOCKED_EXTERNAL
                         evidence = Path(row["worktree"]).parent / ".cmh-review-evidence" / mission_id / reviewer / head

@@ -160,6 +160,9 @@ class FootballPredictionAdapter:
         except (KeyError, json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
             return GateResult("BLOCKED_EXTERNAL", f"cannot reconcile merge state: {exc}")
         if data.get("merged") is True:
+            merged_head = str((data.get("head") or {}).get("sha", "")).lower()
+            if merged_head != reviewed_head.lower():
+                return GateResult("BLOCKED_EXTERNAL", f"merged PR head {merged_head or 'MISSING'} differs from reviewed head {reviewed_head}")
             merge_sha = str(data.get("merge_commit_sha") or "").lower()
             if len(merge_sha) != 40: return GateResult("BLOCKED_EXTERNAL", "merged PR lacks a full merge SHA")
             return GateResult("PASS", f"merged PR #{pr_number}", data={"pr": pr_number, "merge_sha": merge_sha, "repo": repo})
