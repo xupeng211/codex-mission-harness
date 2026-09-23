@@ -63,6 +63,8 @@ class ProcessSupervisor:
         log_root.mkdir(parents=True, exist_ok=True)
 
     def start(self, mission_id: str, name: str, argv: list[str], cwd: str, env: dict[str, str], launch_head: str) -> str:
+        if self.launcher_start_ticks is None:
+            raise RuntimeError("cannot reserve a gate without launcher process identity")
         job_id = uuid.uuid4().hex
         lease = uuid.uuid4().hex
         out, err = self.log_root / f"{job_id}.out", self.log_root / f"{job_id}.err"
@@ -89,7 +91,7 @@ class ProcessSupervisor:
                 # this controller dies before publication its stdin closes and no gate runs.
                 proc = subprocess.Popen([sys.executable, "-c", BOOTSTRAP], stdin=subprocess.PIPE, stdout=stdout, stderr=stderr,
                                         start_new_session=True)
-        except OSError as exc:
+        except Exception as exc:
             try:
                 changed = self.journal.db.execute(
                     "UPDATE jobs SET state='FAILED_LAUNCH',ended_at=? "
@@ -109,26 +111,51 @@ class ProcessSupervisor:
         # Register the handle before any durable RUNNING publication or pipe
         # release. Every later failure can then be polled/reaped deterministically.
         self._children[job_id] = proc
-        updated = self.journal.db.execute(
-            "UPDATE jobs SET pid=?,pgid=?,start_ticks=?,state='RUNNING' WHERE job_id=? AND state='STARTING' AND lease_token=? AND launcher_pid=? AND launcher_start_ticks IS ?",
-            (proc.pid, os.getpgid(proc.pid), proc_start_ticks(proc.pid), job_id, lease, self.launcher_pid, self.launcher_start_ticks),
-        ).rowcount
-        if updated != 1:
-            proc.terminate()
-            proc.wait()
-            self._children.pop(job_id, None)
-            # The bootstrap has not received its release payload yet, so no
-            # gate can be running.  Retire the reservation explicitly; leaving
-            # it STARTING would make the partial unique index block recovery.
-            self.journal.db.execute(
-                "UPDATE jobs SET state='LOST',ended_at=? "
+        try:
+            pgid = os.getpgid(proc.pid)
+            child_start_ticks = proc_start_ticks(proc.pid)
+            if child_start_ticks is None:
+                raise RuntimeError("cannot publish gate without child process identity")
+            updated = self.journal.db.execute(
+                "UPDATE jobs SET pid=?,pgid=?,start_ticks=?,state='RUNNING' "
                 "WHERE job_id=? AND state='STARTING' AND lease_token=? "
                 "AND launcher_pid=? AND launcher_start_ticks IS ?",
-                (now(), job_id, lease, self.launcher_pid, self.launcher_start_ticks),
+                (proc.pid, pgid, child_start_ticks, job_id, lease,
+                 self.launcher_pid, self.launcher_start_ticks),
             ).rowcount
+            if updated != 1:
+                raise RuntimeError("launch lease was lost before gate release")
             self.journal.db.commit()
-            raise RuntimeError("launch lease was lost before gate release")
-        self.journal.db.commit()
+        except Exception as exc:
+            # stdin has not received the release payload, so terminating this
+            # bootstrap cannot interrupt a gate. Always retire our exact
+            # reservation, even when identity lookup or RUNNING publication
+            # itself raised before a normal polling path existed.
+            self.journal.db.rollback()
+            try:
+                proc.terminate()
+                proc.wait()
+            except Exception:
+                pass
+            self._children.pop(job_id, None)
+            try:
+                changed = self.journal.db.execute(
+                    "UPDATE jobs SET state='FAILED_LAUNCH',ended_at=? "
+                    "WHERE job_id=? AND state='STARTING' AND lease_token=? "
+                    "AND launcher_pid=? AND launcher_start_ticks IS ?",
+                    (now(), job_id, lease, self.launcher_pid,
+                     self.launcher_start_ticks),
+                ).rowcount
+                if changed:
+                    self.journal.event(mission_id, "process_launch_failed", {
+                        "job_id": job_id, "error": str(exc),
+                        "phase": "publish",
+                    })
+                self.journal.db.commit()
+            except Exception:
+                self.journal.db.rollback()
+                raise
+            raise
         assert proc.stdin is not None
         payload = json.dumps({"argv": argv, "cwd": cwd,
                               "env": {**os.environ, **env}}).encode()

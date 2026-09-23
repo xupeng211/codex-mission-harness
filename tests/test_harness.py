@@ -128,8 +128,8 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(self.codex.turns, [])
         self.assertEqual(self.journal.mission(self.spec.mission_id)["codex_turn_state"], "CONSUMED")
 
-    def test_completed_codex_turn_is_stale_after_head_reconciliation(self):
-        """A durable completion for source A cannot authorize source B."""
+    def test_completed_codex_turn_stale_marker_is_discarded_before_fresh_turn(self):
+        """A durable completion for A cannot authorize B or permanently block B."""
         self.supervisor.step(self.spec.mission_id, self.spec)
         self.supervisor.step(self.spec.mission_id, self.spec)
         owner_pid, owner_start = self.supervisor._merge_owner()
@@ -149,11 +149,29 @@ class HarnessTest(unittest.TestCase):
             self.codex,
             self.adapter,
         )
-        self.assertEqual(replacement.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
+        self.assertEqual(replacement.step(self.spec.mission_id, self.spec), State.IMPLEMENT)
         row = self.journal.mission(self.spec.mission_id)
-        self.assertEqual(row["codex_turn_state"], "STALE")
+        self.assertEqual(row["codex_turn_state"], "DISCARDED")
         self.assertEqual(row["codex_turn_source_head"], "a" * 40)
         self.assertEqual(row["current_head"], new_head)
+        self.assertEqual(self.codex.turns, [])
+        self.assertEqual(replacement.step(self.spec.mission_id, self.spec), State.TEST)
+        self.assertEqual(len(self.codex.turns), 1)
+
+    def test_corrupt_stale_codex_turn_remains_fail_closed(self):
+        self.journal.update(
+            self.spec.mission_id,
+            current_head="a" * 40,
+            current_state=State.IMPLEMENT,
+            codex_turn_state="STALE",
+            codex_turn_id=None,
+            codex_turn_source_state=State.IMPLEMENT,
+            codex_turn_source_head="b" * 40,
+        )
+        self.assertEqual(
+            self.supervisor.step(self.spec.mission_id, self.spec),
+            State.BLOCKED_EXTERNAL,
+        )
         self.assertEqual(self.codex.turns, [])
 
     def test_running_codex_turn_cannot_complete_after_source_head_changes(self):
@@ -287,7 +305,7 @@ class HarnessTest(unittest.TestCase):
 
                 with patch.object(
                         self.journal, "claim_codex_turn", side_effect=advance_then_return), \
-                        self.assertRaisesRegex(InvalidTransition, "stale transition"):
+                        self.assertRaisesRegex(InvalidTransition, "stale"):
                     self.supervisor._agent_turn(self.spec.mission_id, "work", ())
                 row = self.journal.mission(self.spec.mission_id)
                 self.assertEqual(
@@ -583,7 +601,9 @@ class HarnessTest(unittest.TestCase):
         self.journal.update(self.spec.mission_id, current_head="a" * 40,
                             current_state=State.WAITING_APPROVAL,
                             approval_state="PENDING", pending_gate="owner-merge")
-        self.journal.approve(self.spec.mission_id, "merge", "head A only")
+        self.journal.approve(
+            self.spec.mission_id, "merge", "head A only", observed_head="a" * 40,
+        )
         self.assertTrue(self.journal.approved(self.spec.mission_id, "merge", "a" * 40))
         self.assertFalse(self.journal.approved(self.spec.mission_id, "merge", "b" * 40))
 
@@ -614,9 +634,9 @@ class HarnessTest(unittest.TestCase):
                             current_state=State.WAITING_APPROVAL,
                             approval_state="PENDING", pending_gate="owner-merge")
         with self.assertRaisesRegex(ValueError, "unknown or non-sensitive"):
-            self.journal.approve(self.spec.mission_id, "typo")
+            self.journal.approve(self.spec.mission_id, "typo", observed_head="a" * 40)
         with self.assertRaisesRegex(ValueError, "does not require approval"):
-            self.journal.approve(self.spec.mission_id, "merge")
+            self.journal.approve(self.spec.mission_id, "merge", observed_head="a" * 40)
 
         owner_spec = replace(self.spec, merge_policy="owner_approval")
         self.journal.db.execute("UPDATE missions SET spec_json=? WHERE mission_id=?",
@@ -640,11 +660,59 @@ class HarnessTest(unittest.TestCase):
         self.journal.db.execute("UPDATE missions SET spec_json=? WHERE mission_id=?",
                                 (json.dumps(owner_spec.__dict__), self.spec.mission_id))
         self.journal.db.commit()
-        with self.assertRaisesRegex(RuntimeError, "canonical HEAD reconciliation"):
+        with self.assertRaisesRegex(RuntimeError, "explicitly observed"):
             self.journal.approve(self.spec.mission_id, "merge")
+        with self.assertRaisesRegex(RuntimeError, "canonical HEAD reconciliation"):
+            self.journal.approve(
+                self.spec.mission_id, "merge", observed_head="a" * 40,
+            )
         self.journal.update(self.spec.mission_id, current_head="a" * 40)
         with self.assertRaisesRegex(RuntimeError, "not waiting for approval"):
+            self.journal.approve(
+                self.spec.mission_id, "merge", observed_head="a" * 40,
+            )
+
+    def test_approval_rejections_are_atomic_and_do_not_persist_a_decision(self):
+        head = "a" * 40
+        owner_spec = replace(self.spec, merge_policy="owner_approval")
+        self.journal.update(
+            self.spec.mission_id,
+            spec_json=json.dumps(owner_spec.__dict__),
+            current_head=head,
+            current_state=State.WAITING_APPROVAL,
+            approval_state="PENDING",
+            pending_gate="owner-merge",
+        )
+        with self.assertRaisesRegex(RuntimeError, "explicitly observed"):
             self.journal.approve(self.spec.mission_id, "merge")
+        with self.assertRaisesRegex(RuntimeError, "differs"):
+            self.journal.approve(
+                self.spec.mission_id, "merge", observed_head="b" * 40,
+            )
+        self.assertEqual(
+            self.journal.db.execute(
+                "SELECT count(*) FROM approvals WHERE mission_id=?",
+                (self.spec.mission_id,),
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.journal.mission(self.spec.mission_id)["approval_state"],
+            "PENDING",
+        )
+
+        self.journal.approve(
+            self.spec.mission_id, "merge", observed_head=head,
+        )
+        approval = self.journal.db.execute(
+            "SELECT head_sha FROM approvals WHERE mission_id=?",
+            (self.spec.mission_id,),
+        ).fetchone()
+        self.assertEqual(approval["head_sha"], head)
+        self.assertEqual(
+            self.journal.mission(self.spec.mission_id)["approval_state"],
+            "APPROVED",
+        )
 
     def test_cli_approve_unknown_mission_exits_cleanly(self):
         argv = ["harness", "--root", self.tmp.name, "approve", "missing",
@@ -1110,6 +1178,48 @@ class HarnessTest(unittest.TestCase):
             "EXITED",
         )
 
+    def test_prepublication_identity_failure_retires_starting_reservation(self):
+        class UnreleasedChild:
+            pid = 23456
+
+            def __init__(self):
+                self.stdin = StringIO()
+                self.terminated = False
+                self.waited = False
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self):
+                self.waited = True
+                return -15
+
+        child = UnreleasedChild()
+        process = self.supervisor.process
+        with patch("harness.process.subprocess.Popen", return_value=child), \
+                patch("harness.process.os.getpgid", side_effect=PermissionError("pgid denied")):
+            with self.assertRaisesRegex(PermissionError, "pgid denied"):
+                process.start(
+                    self.spec.mission_id, "publish-fails", ["/bin/true"],
+                    str(self.worktree), {}, "a" * 40,
+                )
+        row = self.journal.db.execute(
+            "SELECT state,ended_at FROM jobs WHERE mission_id=? AND name=?",
+            (self.spec.mission_id, "publish-fails"),
+        ).fetchone()
+        self.assertEqual(row["state"], "FAILED_LAUNCH")
+        self.assertIsNotNone(row["ended_at"])
+        self.assertTrue(child.terminated)
+        self.assertTrue(child.waited)
+        self.assertEqual(process._children, {})
+
+        replacement = process.start(
+            self.spec.mission_id, "publish-fails", ["/bin/sh", "-c", "exit 0"],
+            str(self.worktree), {}, "a" * 40,
+        )
+        process._children[replacement].wait()
+        process.poll(self.spec.mission_id)
+
     def test_restart_poll_records_zero_exit_from_reaped_child(self):
         job_id = "reaped-zero"
         self.journal.db.execute(
@@ -1278,7 +1388,10 @@ class HarnessTest(unittest.TestCase):
         self.assertFalse(self.journal.approved(spec.mission_id, "merge", "a" * 40))
         resumed = Supervisor(self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "approval-restart"), self.codex, supervisor.adapter)
         self.assertEqual(resumed.step(spec.mission_id, spec), State.WAITING_APPROVAL)
-        self.journal.approve(spec.mission_id, "merge", "explicit owner command")
+        self.journal.approve(
+            spec.mission_id, "merge", "explicit owner command",
+            observed_head="a" * 40,
+        )
         for _ in range(10):
             state = resumed.run_until_wait(spec.mission_id, spec)
             if state == State.PASS:
@@ -1592,6 +1705,28 @@ class HarnessTest(unittest.TestCase):
             )
         self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_claim_head"], head)
         self.assertEqual(self.adapter.merged_heads, set())
+
+    def test_journal_reclaim_returns_unknown_without_mutating_unverifiable_claim(self):
+        head = "a" * 40
+        self.journal.update(
+            self.spec.mission_id,
+            current_head=head,
+            current_state=State.MERGE,
+            merge_claim_head=head,
+            merge_claim_pid=12345,
+            merge_claim_start_ticks="owner-start",
+        )
+        with patch.object(
+                self.journal, "_proc_identity", return_value=("UNKNOWN", None)):
+            self.assertEqual(
+                self.journal.reclaim_merge_claim_if_stale(
+                    self.spec.mission_id, head,
+                ),
+                "UNKNOWN",
+            )
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertEqual(row["merge_claim_head"], head)
+        self.assertEqual(row["merge_claim_pid"], 12345)
 
     def test_football_adapter_review_fails_closed_instead_of_crashing(self):
         result = FootballPredictionAdapter().review("codex", "a" * 40)

@@ -343,29 +343,49 @@ class Journal:
         return {row[0] for row in rows}
 
     def approve(self, mission_id: str, action: str, reason: str = "", observed_head: str | None = None) -> None:
-        mission = self.mission(mission_id)  # fail closed for an unknown mission
-        spec = self.spec(mission_id)
-        if action not in SENSITIVE:
-            raise ValueError(f"unknown or non-sensitive approval action: {action}")
-        if action in spec.forbidden_actions:
-            raise PermissionError(f"mission forbids action: {action}")
-        if decide(action, spec.merge_policy) != Decision.OWNER_APPROVAL_REQUIRED:
-            raise ValueError(f"mission policy does not require approval for action: {action}")
-        head = mission["current_head"]
-        if not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None:
-            raise RuntimeError("cannot approve before canonical HEAD reconciliation")
-        if observed_head is not None and observed_head != head:
-            raise RuntimeError("observed canonical HEAD differs from journal HEAD")
-        if (State(mission["current_state"]) != State.WAITING_APPROVAL or
-                mission["approval_state"] != "PENDING" or mission["pending_gate"] != f"owner-{action}"):
-            raise RuntimeError(f"mission is not waiting for approval of action: {action}")
-        spec_digest = self._spec_digest(mission_id)
-        self.db.execute("INSERT INTO approvals(mission_id,action,decision,reason,head_sha,spec_sha256,created_at) VALUES(?,?,?,?,?,?,?)",
-                        (mission_id, action, "APPROVED", reason, head, spec_digest, now()))
-        self.update(mission_id, approval_state="APPROVED")
-        self.event(mission_id, "approval_granted", {"action": action, "head": head,
-                                                      "spec_sha256": spec_digest, "reason": reason})
-        self.db.commit()
+        if observed_head is None:
+            raise RuntimeError("approval requires an explicitly observed canonical HEAD")
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            mission = self.mission(mission_id)  # fail closed for an unknown mission
+            spec = self.spec(mission_id)
+            if action not in SENSITIVE:
+                raise ValueError(f"unknown or non-sensitive approval action: {action}")
+            if action in spec.forbidden_actions:
+                raise PermissionError(f"mission forbids action: {action}")
+            if decide(action, spec.merge_policy) != Decision.OWNER_APPROVAL_REQUIRED:
+                raise ValueError(f"mission policy does not require approval for action: {action}")
+            head = mission["current_head"]
+            if not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None:
+                raise RuntimeError("cannot approve before canonical HEAD reconciliation")
+            if observed_head != head:
+                raise RuntimeError("observed canonical HEAD differs from journal HEAD")
+            if (State(mission["current_state"]) != State.WAITING_APPROVAL or
+                    mission["approval_state"] != "PENDING" or
+                    mission["pending_gate"] != f"owner-{action}"):
+                raise RuntimeError(f"mission is not waiting for approval of action: {action}")
+            spec_digest = self._spec_digest(mission_id)
+            self.db.execute(
+                "INSERT INTO approvals(mission_id,action,decision,reason,head_sha,spec_sha256,created_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (mission_id, action, "APPROVED", reason, head, spec_digest, now()),
+            )
+            changed = self.db.execute(
+                "UPDATE missions SET approval_state='APPROVED',updated_at=? "
+                "WHERE mission_id=? AND current_head=? AND current_state=? "
+                "AND approval_state='PENDING' AND pending_gate=?",
+                (now(), mission_id, head, State.WAITING_APPROVAL, f"owner-{action}"),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("approval source state or canonical HEAD changed")
+            self.event(mission_id, "approval_granted", {
+                "action": action, "head": head,
+                "spec_sha256": spec_digest, "reason": reason,
+            })
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
 
     def approved(self, mission_id: str, action: str, head: str) -> bool:
         mission = self.mission(mission_id)
@@ -458,6 +478,58 @@ class Journal:
             })
             self.db.commit()
             return "CLAIMED"
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def discard_stale_codex_turn(self, mission_id: str, *,
+                                 expected_state: State,
+                                 expected_head: str | None) -> bool:
+        """Discard only a provably completed turn for an obsolete source snapshot.
+
+        STALE is not replayable evidence.  A valid completed turn may be retired
+        once its recorded source state or HEAD differs from the current guarded
+        snapshot, allowing a later controller iteration to claim a fresh turn.
+        Missing completion identity or a matching source snapshot remains
+        fail-closed as journal corruption/ambiguity.
+        """
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT current_state,current_head,codex_turn_state,codex_turn_id,"
+                "codex_turn_source_state,codex_turn_source_head "
+                "FROM missions WHERE mission_id=?", (mission_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(mission_id)
+            source = State(row["current_state"])
+            head = row["current_head"]
+            if source != expected_state or head != expected_head:
+                raise InvalidTransition("stale turn reset lost its source state or HEAD")
+            obsolete = (row["codex_turn_source_state"] != source or
+                        row["codex_turn_source_head"] != head)
+            if (row["codex_turn_state"] != "STALE" or
+                    not row["codex_turn_id"] or not obsolete):
+                self.db.commit()
+                return False
+            changed = self.db.execute(
+                "UPDATE missions SET codex_turn_state='DISCARDED',updated_at=? "
+                "WHERE mission_id=? AND current_state=? AND current_head IS ? "
+                "AND codex_turn_state='STALE' AND codex_turn_id=? "
+                "AND codex_turn_source_state IS ? AND codex_turn_source_head IS ?",
+                (now(), mission_id, source, head, row["codex_turn_id"],
+                 row["codex_turn_source_state"], row["codex_turn_source_head"]),
+            ).rowcount
+            if changed != 1:
+                raise InvalidTransition("stale turn reset lost its completion snapshot")
+            self.event(mission_id, "codex_turn_stale_discarded", {
+                "turn_id": row["codex_turn_id"],
+                "source_state": row["codex_turn_source_state"],
+                "source_head": row["codex_turn_source_head"],
+                "current_state": source, "current_head": head,
+            })
+            self.db.commit()
+            return True
         except Exception:
             self.db.rollback()
             raise

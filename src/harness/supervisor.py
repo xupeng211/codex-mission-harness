@@ -147,9 +147,16 @@ class Supervisor:
                                     expected_head=expected_head)
             return False
         if claim == "STALE":
+            if self.journal.discard_stale_codex_turn(
+                    mission_id, expected_state=expected_state,
+                    expected_head=expected_head):
+                # Retire the obsolete completion in its own durable step.  A
+                # subsequent controller iteration may claim a fresh turn for
+                # the current exact source snapshot.
+                return False
             self.journal.transition(
                 mission_id, State.BLOCKED_EXTERNAL,
-                "completed Codex turn is stale for the current source state or HEAD",
+                "stale Codex turn lacks a safely discardable completion identity",
                 expected_state=expected_state, expected_head=expected_head,
             )
             return False
