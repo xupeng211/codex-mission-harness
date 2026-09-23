@@ -46,33 +46,37 @@ class FootballPredictionAdapter:
         return self.GATES[gate]
 
     def review_preflight(self, worktree: str, base: str, head: str) -> GateResult:
-        """Anchor executable review policy to the trusted base, not reviewed code."""
+        """Prove both immutable commits exist; policy executes from base checkout."""
         for revision in (base, head):
-            for path in self.REVIEW_CONTRACT_PATHS:
-                present = self._call(["git", "cat-file", "-e", f"{revision}:{path}"], cwd=worktree)
-                if present.returncode != 0:
-                    return GateResult("BLOCKED_EXTERNAL", f"canonical review contract path is missing at {revision}: {path}")
-        result = self._call(["git", "diff", "--quiet", f"{base}..{head}", "--", *self.REVIEW_CONTRACT_PATHS], cwd=worktree)
-        if result.returncode == 0:
-            return GateResult("PASS", "canonical review contract unchanged from trusted base")
-        if result.returncode == 1:
-            return GateResult("BLOCKED_EXTERNAL", "mission changes its own canonical review contract; use a separately authorized policy migration")
-        return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "cannot bind canonical review contract to trusted base")
+            present = self._call(["git", "cat-file", "-e", f"{revision}^{{commit}}"], cwd=worktree)
+            if present.returncode != 0:
+                return GateResult("BLOCKED_EXTERNAL", f"canonical review commit is unavailable: {revision}")
+        return GateResult("PASS", "canonical policy will execute from trusted base")
+
+    def _trusted_base_checkout(self, worktree: str, base: str, evidence_dir: str) -> Path:
+        root = Path(evidence_dir).resolve().parents[2] / "trusted-base" / base
+        if not root.exists():
+            root.parent.mkdir(parents=True, exist_ok=True)
+            added = self._call(["git", "worktree", "add", "--detach", str(root), base], cwd=worktree)
+            if added.returncode != 0:
+                raise RuntimeError(added.stderr.strip() or "cannot create trusted base checkout")
+        observed = self._run(["git", "rev-parse", "HEAD"], cwd=str(root)).strip().lower()
+        dirty = self._run(["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=str(root))
+        if observed != base.lower() or dirty:
+            raise RuntimeError("trusted base checkout identity is invalid")
+        return root
 
     def review_argv(self, reviewer: str, *, worktree: str, base: str, head: str, mission_id: str,
                     scope_file: str, evidence_dir: str) -> list[str]:
+        trusted = self._trusted_base_checkout(worktree, base, evidence_dir)
+        common = ["--repo-root", worktree, "--base-sha", base, "--head-sha", head,
+                  "--mission-id", mission_id, "--mission-scope-file", scope_file,
+                  "--evidence-dir", evidence_dir]
         if reviewer == "codex":
-            target = "agent-review"
-        elif reviewer == "deepseek":
-            target = "agent-deepseek-review"
-        else:
-            raise ValueError(f"unsupported independent reviewer: {reviewer}")
-        # Delegate model selection, isolation, auth and receipt generation to
-        # the target project's public canonical entrypoint.  In particular no
-        # model selector is passed here: the project policy owns it.
-        return ["make", target, f"BASE_SHA={base}", f"HEAD_SHA={head}",
-                f"MISSION_ID={mission_id}", f"MISSION_SCOPE_FILE={scope_file}",
-                f"EVIDENCE_DIR={evidence_dir}"]
+            return ["python3", str(trusted / "scripts/devops/codex_independent_review.py"), "run", *common]
+        if reviewer == "deepseek":
+            return ["python3", str(trusted / "scripts/devops/claude_deepseek_independent_review.py"), *common]
+        raise ValueError(f"unsupported independent reviewer: {reviewer}")
 
     def review(self, reviewer: str, head: str) -> GateResult:
         """Compatibility guard: production review needs bound scope/context.
@@ -93,7 +97,8 @@ class FootballPredictionAdapter:
         if not isinstance(receipt, str) or not Path(receipt).is_file():
             return GateResult("BLOCKED_EXTERNAL", "canonical review did not publish a receipt")
         if reviewer == "codex":
-            argv = ["python3", "scripts/devops/codex_independent_review.py", "classify", "--repo-root", worktree,
+            trusted = self._trusted_base_checkout(worktree, base, str(Path(receipt).parent))
+            argv = ["python3", str(trusted / "scripts/devops/codex_independent_review.py"), "classify", "--repo-root", worktree,
                     "--receipt", receipt, "--current-head", head, "--base-sha", base, "--mission-id", mission_id,
                     "--mission-scope-file", scope_file, "--json"]
         elif reviewer == "deepseek":
@@ -107,6 +112,7 @@ class FootballPredictionAdapter:
             except (OSError, json.JSONDecodeError):
                 return GateResult("BLOCKED_EXTERNAL", "DeepSeek receipt is unreadable", receipt)
             if evidence.get("receipt_version") == "independent-review-receipt/v1":
+                trusted = self._trusted_base_checkout(worktree, base, str(Path(receipt).parent))
                 # Re-run the target's canonical evidence consumer. Its code is
                 # accepted only after review_preflight proves it is unchanged
                 # from the trusted base.
@@ -131,7 +137,7 @@ class FootballPredictionAdapter:
                     "print(json.dumps(asdict(v(Path(sys.argv[1]),repo_root=Path(sys.argv[2]),"
                     "expected_base=sys.argv[3],expected_head=sys.argv[4],expected_mission_id=sys.argv[5],expected_scope_hash=sys.argv[6]))))"
                 )
-                checked = self._call(["python3", "-c", validator, receipt, worktree, base, head, mission_id, scope_hash], cwd=worktree)
+                checked = self._call(["python3", "-c", validator, receipt, worktree, base, head, mission_id, scope_hash], cwd=str(trusted))
                 canonical = self._json_last_text(checked.stdout)
                 if checked.returncode != 0 or canonical.get("trusted") is not True:
                     return GateResult("BLOCKED_EXTERNAL", checked.stderr.strip() or "canonical DeepSeek receipt validation failed", receipt)
@@ -182,12 +188,13 @@ class FootballPredictionAdapter:
             return GateResult("PENDING", messages, data=data)
         return GateResult("FAIL", messages, data=data)
 
-    def merge(self, worktree: str, head: str) -> GateResult:
-        pr = self.discover_pr(worktree, head)
-        if pr.status != "PASS": return pr
-        result = self._call(["gh", "pr", "merge", str(pr.data["number"]), "--squash", "--match-head-commit", head], cwd=worktree)
+    def merge(self, worktree: str, head: str, pr_number: int | None = None) -> GateResult:
+        if pr_number is None: return GateResult("BLOCKED_EXTERNAL", "merge claim has no durable PR identity")
+        before = self.merge_status(worktree, head, pr_number)
+        if before.status != "NOT_STARTED": return before
+        result = self._call(["gh", "pr", "merge", str(pr_number), "--squash", "--match-head-commit", head], cwd=worktree)
         if result.returncode != 0: return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "merge command failed")
-        return self.merge_status(worktree, head, pr.data["number"])
+        return self.merge_status(worktree, head, pr_number)
 
     def merge_status(self, worktree: str, reviewed_head: str, pr_number: int | None = None) -> GateResult:
         if pr_number is None:
@@ -208,8 +215,9 @@ class FootballPredictionAdapter:
             return GateResult("NOT_STARTED", f"PR #{pr_number} is still open at the reviewed HEAD; merge retry is safe", data={"pr": pr_number})
         return GateResult("BLOCKED_EXTERNAL", f"ambiguous merge state for PR #{pr_number}")
 
-    def post_merge(self, worktree: str, merge_sha: str, pr_number: int, branch: str) -> GateResult:
-        result = self._call(["python3", "scripts/devops/pr_post_merge_check.py", "--pr", str(pr_number),
+    def post_merge(self, worktree: str, merge_sha: str, pr_number: int, branch: str, base: str) -> GateResult:
+        trusted = self._trusted_base_checkout(worktree, base, str(Path(worktree).parent / ".cmh-review-evidence" / "post-merge" / merge_sha))
+        result = self._call(["python3", str(trusted / "scripts/devops/pr_post_merge_check.py"), "--pr", str(pr_number),
                              "--merge-commit", merge_sha, "--branch", branch, "--json"], cwd=worktree)
         try: data = json.loads(result.stdout)
         except json.JSONDecodeError: return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "Production Gate check returned no JSON")
@@ -274,7 +282,7 @@ class SimulatedAdapter(FootballPredictionAdapter):
         value=self.reviews[min(self.review_index,len(self.reviews)-1)]; self.review_index+=1; return GateResult(value, f"fixture {reviewer}", "/tmp/fake")
     def ci(self, worktree, head):
         value=self.ci_results[min(self.ci_index,len(self.ci_results)-1)]; self.ci_index+=1; return GateResult(value, f"fixture CI {head}")
-    def merge(self, worktree, head):
+    def merge(self, worktree, head, pr_number=None):
         self.merged_heads.add(head); value=self.merge_results[min(self.merge_index,len(self.merge_results)-1)]; self.merge_index+=1; return GateResult(value, f"fixture merge {head}", data={"pr":1,"merge_sha":"c"*40})
     def merge_status(self, worktree, reviewed_head, pr_number=None):
         return GateResult("PASS" if reviewed_head in self.merged_heads else "NOT_STARTED", f"fixture merge status {reviewed_head}", data={"pr":1,"merge_sha":"c"*40})

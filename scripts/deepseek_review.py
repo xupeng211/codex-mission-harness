@@ -7,7 +7,7 @@ commit-last: an incomplete run has no receipt and is never an approval.
 """
 from __future__ import annotations
 
-import argparse, hashlib, json, os, subprocess, sys, tempfile, time, uuid
+import argparse, base64, hashlib, json, os, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 
 VERSION = "cmh-deepseek-review/v1"
@@ -20,6 +20,10 @@ SCHEMA = {"type":"object","additionalProperties":False,"required":["review_resul
 def canon(value): return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 def digest(value): return hashlib.sha256(value).hexdigest()
 def sha(path): return digest(Path(path).read_bytes())
+def reviewer_result(raw):
+    value=json.loads(raw); result=value.get("structured_output") or value.get("result") or value
+    if not isinstance(result,dict) or result.get("review_result") not in {"PASS","FAIL"} or not isinstance(result.get("findings"),list): raise ValueError("invalid reviewer output")
+    return result
 def git(root, *args): return subprocess.check_output(["git", "-C", str(root), *args])
 def full_sha(value):
     if len(value) != 40 or any(c not in "0123456789abcdef" for c in value.lower()): raise ValueError("full SHA required")
@@ -62,14 +66,17 @@ def validate(receipt, base, head, root=None, receipt_path=None):
             for chunk in chunks_:
                 artifact=evidence/f"chunk-{chunk['index']:03d}.json"
                 if not artifact.is_file() or sha(artifact)!=chunk["output_sha256"]: raise ValueError("chunk artifact mismatch")
+                if reviewer_result(artifact.read_text())!=chunk["result"]: raise ValueError("chunk result does not match durable artifact")
     blocking=any(f.get("severity") in {"P0","P1","P2"} for f in aggregate)
     if (receipt["review_result"] == "PASS") != (not blocking): raise ValueError("aggregate verdict mismatch")
     return receipt
 def prompt(base, head, diff_hash, manifest_hash, chunk, source):
+    try: rendered="UTF-8 DIFF:\n"+source.decode("utf-8")
+    except UnicodeDecodeError: rendered="BASE64-ENCODED EXACT DIFF BYTES:\n"+base64.b64encode(source).decode("ascii")
     return ("You are an independent restricted code reviewer. Do not use tools or filesystem. Return only JSON matching the schema. "
             "PASS only when P0/P1/P2 are absent.\n"
             f"Base={base}\nHead={head}\nDiffSHA256={diff_hash}\nManifestSHA256={manifest_hash}\n"
-            f"Chunk={chunk['index']} range={chunk['start']}:{chunk['end']} SHA256={chunk['sha256']}\nDIFF:\n"+source.decode("utf-8","replace"))
+            f"Chunk={chunk['index']} range={chunk['start']}:{chunk['end']} SHA256={chunk['sha256']}\n"+rendered)
 def run(args):
     root=Path(args.repo).resolve(); base=full_sha(args.base); head=full_sha(args.head)
     if git(root,"rev-parse","HEAD").decode().strip().lower()!=head: raise ValueError("worktree HEAD differs from requested HEAD")
@@ -86,8 +93,7 @@ def run(args):
             source=diff[chunk["start"]:chunk["end"]]; completed=subprocess.run(command+[prompt(base,head,diff_hash,manifest_hash,chunk,source)],env=env,capture_output=True,text=True,timeout=args.timeout)
             if completed.returncode: raise RuntimeError(f"DeepSeek reviewer infrastructure failure: exit={completed.returncode}")
             raw=completed.stdout.encode(); (evidence/f"chunk-{chunk['index']:03d}.json").write_bytes(raw)
-            value=json.loads(completed.stdout); result=value.get("structured_output") or value.get("result") or value
-            if not isinstance(result,dict) or result.get("review_result") not in {"PASS","FAIL"}: raise ValueError("invalid reviewer output")
+            result=reviewer_result(completed.stdout)
             chunk["result"]=result; chunk["output_sha256"]=digest(raw); results.extend(result.get("findings",[]))
     finally:
         Path(settings.name).unlink(missing_ok=True)

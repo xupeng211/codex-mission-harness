@@ -276,7 +276,7 @@ class Supervisor:
         def execute_claimed_merge(worktree: str, head: str) -> State:
             """Execute once after a durable claim; unknown outcomes remain reconcilable."""
             try:
-                result = self.adapter.merge(worktree, head)
+                result = self.adapter.merge(worktree, head, self.journal.mission(mission_id)["pr_number"])
             except Exception as exc:
                 self.journal.event(mission_id, "merge_outcome_unknown", {"head": head, "error": str(exc)})
                 self.journal.update(mission_id, pending_gate="merge-outcome-unknown")
@@ -502,7 +502,7 @@ class Supervisor:
                 return State.BLOCKED_EXTERNAL
             if not isinstance(self.adapter, SimulatedAdapter) and row["merge_sha"] and row["pr_number"]:
                 production = self.adapter.post_merge(
-                    row["worktree"], row["merge_sha"], row["pr_number"], row["branch"],
+                    row["worktree"], row["merge_sha"], row["pr_number"], row["branch"], row["base_sha"],
                 )
                 if production.status == "PENDING":
                     self.journal.update(mission_id, pending_gate="production-gate", ci_state="PENDING")

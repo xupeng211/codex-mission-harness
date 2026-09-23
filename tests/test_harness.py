@@ -1528,7 +1528,7 @@ class HarnessTest(unittest.TestCase):
 
     def test_merge_failure_is_external_not_policy_denial(self):
         class FailingMergeAdapter(SimulatedAdapter):
-            def merge(self, worktree, head):
+            def merge(self, worktree, head, pr_number=None):
                 return GateResult("FAIL", "remote merge service rejected request")
 
         adapter = FailingMergeAdapter()
@@ -1540,7 +1540,7 @@ class HarnessTest(unittest.TestCase):
 
     def test_merge_exception_after_claim_remains_reconcilable_without_duplicate(self):
         class RaisingMergeAdapter(SimulatedAdapter):
-            def merge(self, worktree, head):
+            def merge(self, worktree, head, pr_number=None):
                 self.merged_heads.add(head)
                 raise RuntimeError("transport disconnected after request")
 
@@ -1693,7 +1693,7 @@ class HarnessTest(unittest.TestCase):
         journal = self.journal
 
         class RacingMergeAdapter(SimulatedAdapter):
-            def merge_status(self, worktree, claimed_head):
+            def merge_status(self, worktree, claimed_head, pr_number=None):
                 row = journal.mission(self_spec.mission_id)
                 status_claim_owners.append(
                     (row["merge_claim_pid"], row["merge_claim_start_ticks"]),
@@ -1706,7 +1706,7 @@ class HarnessTest(unittest.TestCase):
                     owner_alive["value"] = False
                 return GateResult("NOT_STARTED", "canonical merge not started")
 
-            def merge(self, worktree, claimed_head):
+            def merge(self, worktree, claimed_head, pr_number=None):
                 external_calls.append("recovery-owner")
                 return GateResult("PASS", "recovery merge")
 
@@ -1904,23 +1904,61 @@ class HarnessTest(unittest.TestCase):
         result = FootballPredictionAdapter().review("codex", "a" * 40)
         self.assertEqual(result.status, "BLOCKED_EXTERNAL")
 
-    def test_football_review_contract_must_match_trusted_base(self):
+    def test_football_review_preflight_requires_both_commits(self):
         adapter = FootballPredictionAdapter()
         completed = subprocess.CompletedProcess([], 1, "", "")
         with patch.object(adapter, "_call", return_value=completed):
             result = adapter.review_preflight("/fixture", "a" * 40, "b" * 40)
         self.assertEqual(result.status, "BLOCKED_EXTERNAL")
-        self.assertIn("path is missing", result.evidence)
+        self.assertIn("commit is unavailable", result.evidence)
 
-    def test_football_review_contract_change_requires_separate_migration(self):
+    def test_football_review_preflight_accepts_available_commits(self):
         adapter = FootballPredictionAdapter()
         present = subprocess.CompletedProcess([], 0, "", "")
-        changed = subprocess.CompletedProcess([], 1, "", "")
-        with patch.object(adapter, "_call", side_effect=[
-                *([present] * (2 * len(adapter.REVIEW_CONTRACT_PATHS))), changed]):
+        with patch.object(adapter, "_call", side_effect=[present, present]):
             result = adapter.review_preflight("/fixture", "a" * 40, "b" * 40)
-        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
-        self.assertIn("policy migration", result.evidence)
+        self.assertEqual(result.status, "PASS")
+        self.assertIn("trusted base", result.evidence)
+
+    def test_football_review_executes_policy_from_trusted_base_checkout(self):
+        adapter = FootballPredictionAdapter()
+        trusted = Path(self.tmp.name) / "trusted-base"
+        with patch.object(adapter, "_trusted_base_checkout", return_value=trusted):
+            argv = adapter.review_argv(
+                "codex", worktree="/candidate", base="a" * 40, head="b" * 40,
+                mission_id="mission", scope_file="/candidate/scope.json",
+                evidence_dir="/evidence/mission/codex/head",
+            )
+        self.assertEqual(argv[:3], [
+            "python3", str(trusted / "scripts/devops/codex_independent_review.py"), "run",
+        ])
+        self.assertEqual(argv[argv.index("--repo-root") + 1], "/candidate")
+
+    def test_trusted_base_checkout_rejects_wrong_or_dirty_checkout(self):
+        adapter = FootballPredictionAdapter()
+        evidence = Path(self.tmp.name) / "evidence" / "mission" / "codex" / ("b" * 40)
+        trusted = evidence.resolve().parents[2] / "trusted-base" / ("a" * 40)
+        trusted.mkdir(parents=True)
+        with patch.object(adapter, "_run", side_effect=["c" * 40, ""]):
+            with self.assertRaisesRegex(RuntimeError, "identity is invalid"):
+                adapter._trusted_base_checkout("/candidate", "a" * 40, str(evidence))
+        with patch.object(adapter, "_run", side_effect=["a" * 40, "dirty\n"]):
+            with self.assertRaisesRegex(RuntimeError, "identity is invalid"):
+                adapter._trusted_base_checkout("/candidate", "a" * 40, str(evidence))
+
+    def test_merge_uses_durable_pr_identity_without_rediscovery(self):
+        adapter = FootballPredictionAdapter()
+        not_started = GateResult("NOT_STARTED", "safe")
+        merged = GateResult("PASS", "merged", data={"pr": 17, "merge_sha": "c" * 40})
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with patch.object(adapter, "discover_pr") as discover, \
+                patch.object(adapter, "merge_status", side_effect=[not_started, merged]) as status, \
+                patch.object(adapter, "_call", return_value=completed) as call:
+            result = adapter.merge("/candidate", "a" * 40, 17)
+        self.assertEqual(result.status, "PASS")
+        discover.assert_not_called()
+        self.assertEqual(status.call_args_list[0].args, ("/candidate", "a" * 40, 17))
+        self.assertEqual(call.call_args.args[0][:4], ["gh", "pr", "merge", "17"])
 
     def test_open_exact_head_pr_proves_merge_not_started(self):
         adapter = FootballPredictionAdapter()
