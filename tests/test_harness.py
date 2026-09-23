@@ -835,6 +835,18 @@ class HarnessTest(unittest.TestCase):
         events = [row[0] for row in self.journal.db.execute("SELECT kind FROM events").fetchall()]
         self.assertGreaterEqual(events.count("codex_turn"), 3)
 
+    def test_ci_failure_repair_honors_source_edit_deny_list(self):
+        spec = replace(self.spec, forbidden_actions=("source_edit",))
+        self.journal.update(
+            spec.mission_id,
+            spec_json=json.dumps(spec.__dict__),
+            current_head="a" * 40,
+            current_state=State.CI,
+        )
+        self.adapter.ci_results = ["FAIL"]
+        self.assertEqual(self.supervisor.step(spec.mission_id, spec), State.BLOCKED_POLICY)
+        self.assertEqual(self.codex.turns, [])
+
     def test_restart_resume_reconciles_not_restart_zero(self):
         self.advance_to_test()
         self.supervisor.run_until_wait(self.spec.mission_id, self.spec)

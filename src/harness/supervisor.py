@@ -324,6 +324,10 @@ class Supervisor:
                 self.journal.update(mission_id, pending_gate=None, ci_state=None)
                 advance(State.MERGE, "canonical CI pass")
             elif result.status == "FAIL":
+                if not permitted("source_edit", spec.forbidden_actions):
+                    advance(State.BLOCKED_POLICY,
+                            "mission forbids source-edit repair for CI failure")
+                    return State.BLOCKED_POLICY
                 if self._agent_turn(mission_id, f"Repair canonical CI failure: {result.evidence}",
                                     spec.forbidden_actions):
                     self.journal.transition_after_codex_turn(
