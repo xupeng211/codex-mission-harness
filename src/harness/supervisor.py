@@ -320,6 +320,28 @@ class Supervisor:
 
         def execute_claimed_merge(worktree: str, head: str) -> State:
             """Execute once after a durable claim; unknown outcomes remain reconcilable."""
+            def reconcile_unknown(reason: str) -> State:
+                # Publish the uncertainty before querying canonical GitHub
+                # state.  A controller death during this query leaves an
+                # armed claim that a fresh controller can reconcile, but can
+                # never safely re-invoke the merge.
+                self.journal.update(mission_id, pending_gate="merge-outcome-unknown")
+                try:
+                    status = self._invoke_pr_adapter(
+                        self.adapter.merge_status, worktree, head,
+                        self.journal.mission(mission_id)["merge_claim_pr_number"],
+                        self.journal.mission(mission_id)["merge_claim_pr_repo"],
+                    )
+                except Exception as exc:
+                    advance(State.BLOCKED_EXTERNAL,
+                            f"cannot reconcile ambiguous merge outcome: {reason}; {exc}")
+                    return State.BLOCKED_EXTERNAL
+                if status.status == "PASS":
+                    return finish_merge(status)
+                advance(State.BLOCKED_EXTERNAL,
+                        status.evidence or f"ambiguous merge outcome: {reason}")
+                return State.BLOCKED_EXTERNAL
+
             try:
                 identity = self.journal.mission(mission_id)
                 claimed_pr = identity["merge_claim_pr_number"]
@@ -334,13 +356,11 @@ class Supervisor:
             except Exception as exc:
                 self.journal.event(mission_id, "merge_outcome_unknown", {"head": head, "error": str(exc)})
                 self.journal.db.commit()
-                advance(State.BLOCKED_EXTERNAL, f"merge outcome is ambiguous after invocation: {exc}")
-                return State.BLOCKED_EXTERNAL
+                return reconcile_unknown(f"merge invocation failed: {exc}")
             if result.status == "BLOCKED_EXTERNAL":
                 self.journal.event(mission_id, "merge_outcome_unknown", {"head": head, "error": result.evidence})
                 self.journal.db.commit()
-                advance(State.BLOCKED_EXTERNAL, result.evidence or "merge outcome is ambiguous after invocation")
-                return State.BLOCKED_EXTERNAL
+                return reconcile_unknown(result.evidence or "merge outcome is ambiguous after invocation")
             self.journal.update(mission_id, pending_gate=None)
             return finish_merge(result)
 
@@ -482,29 +502,17 @@ class Supervisor:
                     mission_id, claim_head, owner_pid, owner_start_ticks,
                 )
                 if recovery == "ACTIVE":
-                    row = self.journal.mission(mission_id)
-                    # The durable started flag wins even when an older
-                    # unknown-outcome marker is present: a live owner may
-                    # still be inside the external invocation.
-                    if row["merge_invocation_started"]:
-                        return State.MERGE
-                    # A completed-but-unknown invocation publishes a durable
-                    # marker. Consume it with a writer-locked ownership handoff;
-                    # otherwise a live owner remains strictly non-stealable.
-                    if row["pending_gate"] != "merge-outcome-unknown" or not self.journal.claim_uncertain_merge_reconciliation(
-                            mission_id, claim_head, owner_pid, owner_start_ticks):
-                        return State.MERGE
-                    recovery = "RECOVERY_CLAIMED"
+                    # A live owner remains strictly non-stealable. It may be
+                    # inside the external invocation or its status query.
+                    return State.MERGE
                 if recovery == "UNKNOWN":
                     advance(State.BLOCKED_EXTERNAL, "merge claim owner identity is unavailable")
                     return State.BLOCKED_EXTERNAL
-                if recovery not in {"RECOVERY_CLAIMED", "ACTIVE"}:
+                if recovery != "RECOVERY_CLAIMED":
                     return State(self.journal.mission(mission_id)["current_state"])
                 row = self.journal.mission(mission_id)
                 invocation_uncertain = (bool(row["merge_invocation_started"])
-                                        or row["pending_gate"] in {
-                                            "merge-outcome-unknown", "merge-reconciling",
-                                        })
+                                        or row["pending_gate"] == "merge-outcome-unknown")
                 if invocation_uncertain:
                     try:
                         status = self._invoke_pr_adapter(
@@ -523,8 +531,6 @@ class Supervisor:
                     advance(State.BLOCKED_EXTERNAL, status.evidence or
                             "merge invocation may have started; outcome remains ambiguous")
                     return State.BLOCKED_EXTERNAL
-                if recovery == "ACTIVE":
-                    return State.MERGE
                 retry = self.journal.confirm_merge_retry_safe(
                     mission_id, claim_head, owner_pid, owner_start_ticks,
                 )

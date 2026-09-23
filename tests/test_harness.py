@@ -1562,7 +1562,7 @@ class HarnessTest(unittest.TestCase):
                             merge_claim_head=None, merge_claim_pid=None, merge_claim_start_ticks=None)
         self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
 
-    def test_merge_exception_after_invocation_blocks_without_retry(self):
+    def test_merge_exception_after_invocation_reconciles_without_retry(self):
         class RaisingMergeAdapter(SimulatedAdapter):
             def __init__(self):
                 super().__init__()
@@ -1589,10 +1589,10 @@ class HarnessTest(unittest.TestCase):
             merge_claim_pid=None,
             merge_claim_start_ticks=None,
         )
-        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
+        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
         self.assertEqual(adapter.merged_heads, {head})
-        self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_claim_head"], head)
-        self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_invocation_started"], 1)
+        self.assertIsNone(self.journal.mission(self.spec.mission_id)["merge_claim_head"])
+        self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_invocation_started"], 0)
         self.assertEqual(adapter.merge_calls, 1)
 
     def test_merge_failure_after_invocation_is_not_retried(self):
@@ -1707,22 +1707,20 @@ class HarnessTest(unittest.TestCase):
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.CI)
         self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.MERGE)
 
-    def test_unknown_merge_reconciliation_marker_has_one_durable_consumer(self):
+    def test_live_unknown_merge_claim_is_not_stolen(self):
         head = "a" * 40
+        owner_pid, owner_ticks = self.supervisor._merge_owner()
         self.journal.update(
             self.spec.mission_id, current_head=head, current_state=State.MERGE,
-            merge_claim_head=head, merge_claim_pid=12345,
-            merge_claim_start_ticks="old-owner", pending_gate="merge-outcome-unknown",
+            pr_number=1, pr_repo="fixture/repo", merge_claim_head=head,
+            merge_claim_pr_number=1, merge_claim_pr_repo="fixture/repo",
+            merge_claim_pid=owner_pid, merge_claim_start_ticks=owner_ticks,
+            merge_invocation_started=1, pending_gate="merge-outcome-unknown",
         )
-        owner_pid, owner_ticks = self.supervisor._merge_owner()
-        self.assertTrue(self.journal.claim_uncertain_merge_reconciliation(
-            self.spec.mission_id, head, owner_pid, owner_ticks,
-        ))
-        self.assertFalse(self.journal.claim_uncertain_merge_reconciliation(
-            self.spec.mission_id, head, owner_pid, owner_ticks,
-        ))
         row = self.journal.mission(self.spec.mission_id)
-        self.assertEqual(row["pending_gate"], "merge-reconciling")
+        self.assertEqual(row["pending_gate"], "merge-outcome-unknown")
+        self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.MERGE)
+        self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_claim_pid"], owner_pid)
 
     def test_recovered_production_merge_persists_pr_and_merge_sha(self):
         head, merge_sha = "a" * 40, "c" * 40
@@ -2068,11 +2066,15 @@ class HarnessTest(unittest.TestCase):
 
     def test_football_review_preflight_requires_both_commits(self):
         adapter = FootballPredictionAdapter()
-        completed = subprocess.CompletedProcess([], 1, "", "")
-        with patch.object(adapter, "_call", return_value=completed):
-            result = adapter.review_preflight("/fixture", "a" * 40, "b" * 40)
-        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
-        self.assertIn("commit is unavailable", result.evidence)
+        missing = subprocess.CompletedProcess([], 1, "", "")
+        present = subprocess.CompletedProcess([], 0, "", "")
+        for probes in ((missing, present), (present, missing)):
+            with self.subTest(missing="base" if probes[0] is missing else "head"), \
+                    patch.object(adapter, "_call", side_effect=probes) as call:
+                result = adapter.review_preflight("/fixture", "a" * 40, "b" * 40)
+            self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+            self.assertIn("commit is unavailable", result.evidence)
+            self.assertEqual(call.call_count, 1 if probes[0] is missing else 2)
 
     def test_football_review_preflight_accepts_available_commits(self):
         adapter = FootballPredictionAdapter()
