@@ -60,7 +60,9 @@ class DeepSeekReceiptTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             evidence = Path(tmp)
             artifact = evidence / "chunk-000.json"
-            artifact.write_text(json.dumps({"review_result": "FAIL", "findings": []}))
+            artifact.write_text(json.dumps({"review_result": "PASS", "findings": [
+                {"severity": "P3", "title": "artifact finding", "evidence": "durable"},
+            ]}))
             value = receipt()
             value["chunks"][0]["output_sha256"] = review.sha(artifact)
             source = b"fixture diff\n"
@@ -88,3 +90,26 @@ class DeepSeekReceiptTest(unittest.TestCase):
     def test_reviewer_result_rejects_invalid_shape(self):
         with self.assertRaisesRegex(ValueError, "invalid reviewer output"):
             review.reviewer_result('{"review_result":"PASS","findings":"not-a-list"}')
+        with self.assertRaisesRegex(ValueError, "invalid reviewer output"):
+            review.reviewer_result('{"review_result":"PASS","findings":[{"severity":"CRITICAL","title":"x","evidence":"y"}]}')
+        with self.assertRaisesRegex(ValueError, "reviewer verdict mismatch"):
+            review.reviewer_result('{"review_result":"PASS","findings":[{"severity":"P1","title":"x","evidence":"y"}]}')
+    def test_mission_and_repository_binding_are_required_when_expected(self):
+        value = receipt(repository="git@example/repo", mission_id="mission-a")
+        self.assertEqual(review.validate(value, BASE, HEAD, mission_id="mission-a",
+                                         repository="git@example/repo")["review_result"], "PASS")
+        with self.assertRaisesRegex(ValueError, "mission binding"):
+            review.validate(value, BASE, HEAD, mission_id="mission-b",
+                            repository="git@example/repo")
+        with self.assertRaisesRegex(ValueError, "repository binding"):
+            review.validate(value, BASE, HEAD, mission_id="mission-a",
+                            repository="git@example/other")
+    def test_run_scoped_artifact_paths_cannot_overwrite_prior_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "run-one"; second = root / "run-two"
+            first.mkdir(); second.mkdir()
+            (first / "chunk-000.json").write_text("first")
+            (second / "chunk-000.json").write_text("second")
+            self.assertEqual((first / "chunk-000.json").read_text(), "first")
+            self.assertNotEqual(first / "chunk-000.json", second / "chunk-000.json")

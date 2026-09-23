@@ -378,7 +378,12 @@ class Supervisor:
                     return state
             advance(State.CI, "all exact-head reviews pass")
         elif state == State.CI:
-            result = self.adapter.ci(row["worktree"], row["current_head"])
+            result = self.adapter.ci(row["worktree"], row["current_head"], row["pr_number"])
+            facts = result.data or {}
+            if facts.get("pr_number") is not None:
+                if not self.journal.bind_pr_identity(mission_id, row["current_head"], int(facts["pr_number"])):
+                    advance(State.BLOCKED_EXTERNAL, "CI PR identity changed or lost its exact source snapshot")
+                    return State.BLOCKED_EXTERNAL
             if result.status == "PASS":
                 self.journal.update(mission_id, pending_gate=None, ci_state=None)
                 advance(State.MERGE, "canonical CI pass")
@@ -472,6 +477,10 @@ class Supervisor:
                 # second external invocation for this exact claim.
                 self.journal.update(mission_id, pending_gate=None)
                 return execute_claimed_merge(row["worktree"], claim_head)
+            technical = self.adapter.ci(row["worktree"], row["current_head"], row["pr_number"])
+            if technical.status != "PASS":
+                advance(State.BLOCKED_EXTERNAL, technical.evidence or "pre-merge canonical CI recheck failed")
+                return State.BLOCKED_EXTERNAL
             decision = decide("merge", spec.merge_policy)
             if decision == Decision.OWNER_APPROVAL_REQUIRED:
                 if not self.journal.approved(mission_id, "merge", row["current_head"]):

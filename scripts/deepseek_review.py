@@ -20,9 +20,19 @@ SCHEMA = {"type":"object","additionalProperties":False,"required":["review_resul
 def canon(value): return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 def digest(value): return hashlib.sha256(value).hexdigest()
 def sha(path): return digest(Path(path).read_bytes())
+def finding(value):
+    return (isinstance(value,dict) and set(value)=={"severity","title","evidence"}
+            and value.get("severity") in {"P0","P1","P2","P3"}
+            and isinstance(value.get("title"),str) and bool(value["title"])
+            and isinstance(value.get("evidence"),str) and bool(value["evidence"]))
 def reviewer_result(raw):
     value=json.loads(raw); result=value.get("structured_output") or value.get("result") or value
-    if not isinstance(result,dict) or result.get("review_result") not in {"PASS","FAIL"} or not isinstance(result.get("findings"),list): raise ValueError("invalid reviewer output")
+    if (not isinstance(result,dict) or set(result)!={"review_result","findings"}
+            or result.get("review_result") not in {"PASS","FAIL"}
+            or not isinstance(result.get("findings"),list)
+            or not all(finding(item) for item in result["findings"])): raise ValueError("invalid reviewer output")
+    blocking=any(item["severity"] in {"P0","P1","P2"} for item in result["findings"])
+    if (result["review_result"] == "PASS") != (not blocking): raise ValueError("reviewer verdict mismatch")
     return result
 def git(root, *args): return subprocess.check_output(["git", "-C", str(root), *args])
 def full_sha(value):
@@ -36,13 +46,18 @@ def chunks(diff):
         if cut > start: end=cut+1
         source=diff[start:end]; out.append({"index":len(out),"start":start,"end":end,"sha256":digest(source)}) ; start=end
     return out
-def validate(receipt, base, head, root=None, receipt_path=None):
+def validate(receipt, base, head, root=None, receipt_path=None, mission_id=None, repository=None):
     required={"version","repository","mission_id","base_sha","head_sha","diff_sha256","manifest_sha256","chunks","provider","model","command_sha256","review_result","findings","integrity_sha256"}
-    if not required <= set(receipt): raise ValueError("incomplete receipt")
+    optional={"started_at","completed_at"}
+    if not isinstance(receipt,dict) or not required <= set(receipt) or set(receipt)-required-optional: raise ValueError("incomplete or unknown receipt fields")
     if receipt["version"] != VERSION or receipt["base_sha"] != base or receipt["head_sha"] != head: raise ValueError("receipt exact-head binding mismatch")
+    if not isinstance(receipt["repository"],str) or not receipt["repository"] or not isinstance(receipt["mission_id"],str) or not receipt["mission_id"]: raise ValueError("invalid receipt identity")
+    if mission_id is not None and receipt["mission_id"] != mission_id: raise ValueError("receipt mission binding mismatch")
+    if repository is not None and receipt["repository"] != repository: raise ValueError("receipt repository binding mismatch")
     copy=dict(receipt); observed=copy.pop("integrity_sha256")
     if digest(canon(copy)) != observed: raise ValueError("receipt integrity mismatch")
-    if receipt["provider"] != "deepseek" or receipt["model"] != MODEL: raise ValueError("reviewer provenance mismatch")
+    if (receipt["provider"] != "deepseek" or receipt["model"] != MODEL
+            or not isinstance(receipt["command_sha256"],str) or len(receipt["command_sha256"])!=64): raise ValueError("reviewer provenance mismatch")
     chunks_=receipt["chunks"]
     if not isinstance(chunks_,list) or not chunks_ or [c.get("index") for c in chunks_ if isinstance(c,dict)] != list(range(len(chunks_))): raise ValueError("missing or duplicate chunks")
     position=0; aggregate=[]; descriptors=[]
@@ -51,7 +66,7 @@ def validate(receipt, base, head, root=None, receipt_path=None):
         if not isinstance(start,int) or not isinstance(end,int) or start!=position or end<=start: raise ValueError("invalid chunk coverage")
         if not isinstance(chunk.get("sha256"),str) or len(chunk["sha256"])!=64: raise ValueError("invalid chunk identity")
         if not isinstance(chunk.get("output_sha256"),str) or len(chunk["output_sha256"])!=64: raise ValueError("invalid chunk output identity")
-        if not isinstance(result,dict) or result.get("review_result") not in {"PASS","FAIL"} or not isinstance(result.get("findings"),list): raise ValueError("invalid chunk result")
+        reviewer_result(json.dumps(result))
         descriptors.append({"index":chunk["index"],"start":start,"end":end,"sha256":chunk["sha256"]})
         aggregate.extend(result["findings"]); position=end
     if aggregate != receipt["findings"]: raise ValueError("aggregate findings mismatch")
@@ -82,7 +97,8 @@ def run(args):
     if git(root,"rev-parse","HEAD").decode().strip().lower()!=head: raise ValueError("worktree HEAD differs from requested HEAD")
     diff=git(root,"diff","--no-ext-diff","--binary",f"{base}..{head}"); plan=chunks(diff); diff_hash=digest(diff)
     manifest={"version":"cmh-deepseek-chunks/v1","base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"chunks":[dict(chunk) for chunk in plan]}; manifest_hash=digest(canon(manifest))
-    evidence=Path(args.evidence).resolve(); evidence.mkdir(parents=True,exist_ok=True); os.chmod(evidence,0o700)
+    evidence_root=Path(args.evidence).resolve(); evidence_root.mkdir(parents=True,exist_ok=True); os.chmod(evidence_root,0o700)
+    run_id=uuid.uuid4().hex; evidence=evidence_root/run_id; evidence.mkdir(mode=0o700)
     token=Path(args.token_file).read_text().strip()
     if not token: raise ValueError("empty DeepSeek token file")
     settings=tempfile.NamedTemporaryFile(mode="w",delete=False); settings.write('{"permissions":{"allow":[],"deny":["Bash","Edit","Write","Read","Glob","Grep","WebFetch","WebSearch"]}}'); settings.close()
@@ -104,11 +120,13 @@ def run(args):
 def main():
     p=argparse.ArgumentParser(); sub=p.add_subparsers(dest="cmd",required=True)
     r=sub.add_parser("run"); r.add_argument("--repo",default="."); r.add_argument("--mission-id",default="codex-mission-harness"); r.add_argument("--base",required=True); r.add_argument("--head",required=True); r.add_argument("--evidence",required=True); r.add_argument("--token-file",required=True); r.add_argument("--timeout",type=int,default=900)
-    c=sub.add_parser("validate"); c.add_argument("--receipt",required=True); c.add_argument("--base",required=True); c.add_argument("--head",required=True); c.add_argument("--repo",default=".")
+    c=sub.add_parser("validate"); c.add_argument("--receipt",required=True); c.add_argument("--base",required=True); c.add_argument("--head",required=True); c.add_argument("--repo",default="."); c.add_argument("--mission-id",default="codex-mission-harness")
     a=p.parse_args()
     try:
         if a.cmd=="run": run(a)
-        else: print(json.dumps({"status":validate(json.loads(Path(a.receipt).read_text()),full_sha(a.base),full_sha(a.head),a.repo,a.receipt)["review_result"]}))
+        else:
+            repository=git(Path(a.repo).resolve(),"config","--get","remote.origin.url").decode().strip()
+            print(json.dumps({"status":validate(json.loads(Path(a.receipt).read_text()),full_sha(a.base),full_sha(a.head),a.repo,a.receipt,a.mission_id,repository)["review_result"]}))
     except Exception as exc: print(json.dumps({"status":"BLOCKED_EXTERNAL","error":str(exc)})); return 1
     return 0
 if __name__=="__main__": raise SystemExit(main())
