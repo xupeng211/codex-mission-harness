@@ -158,9 +158,13 @@ class FootballPredictionAdapter:
         classification = self._json_last_text(result.stdout)
         if classification.get("classification", {}).get("classification") != "VALID_CURRENT":
             return GateResult("BLOCKED_EXTERNAL", "canonical Codex receipt is not VALID_CURRENT", receipt, classification)
-        if payload.get("status") != "PASS":
-            return GateResult("FAIL", "canonical receipt reports findings", receipt, payload)
-        return GateResult("PASS", "canonical exact-head receipt validated", receipt, payload)
+        validated = classification.get("receipt")
+        verdict = validated.get("review_result") if isinstance(validated, dict) else None
+        if verdict not in {"PASS", "FAIL"}:
+            return GateResult("BLOCKED_EXTERNAL", "canonical Codex classifier omitted a valid receipt verdict", receipt, classification)
+        if verdict == "FAIL":
+            return GateResult("FAIL", "canonical receipt reports findings", receipt, validated)
+        return GateResult("PASS", "canonical exact-head receipt validated", receipt, validated)
 
     def discover_pr(self, worktree: str, head: str) -> GateResult:
         try:
