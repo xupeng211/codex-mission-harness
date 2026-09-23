@@ -32,7 +32,7 @@ def chunks(diff):
         if cut > start: end=cut+1
         source=diff[start:end]; out.append({"index":len(out),"start":start,"end":end,"sha256":digest(source)}) ; start=end
     return out
-def validate(receipt, base, head):
+def validate(receipt, base, head, root=None, receipt_path=None):
     required={"version","repository","mission_id","base_sha","head_sha","diff_sha256","manifest_sha256","chunks","provider","model","command_sha256","review_result","findings","integrity_sha256"}
     if not required <= set(receipt): raise ValueError("incomplete receipt")
     if receipt["version"] != VERSION or receipt["base_sha"] != base or receipt["head_sha"] != head: raise ValueError("receipt exact-head binding mismatch")
@@ -40,9 +40,29 @@ def validate(receipt, base, head):
     if digest(canon(copy)) != observed: raise ValueError("receipt integrity mismatch")
     if receipt["provider"] != "deepseek" or receipt["model"] != MODEL: raise ValueError("reviewer provenance mismatch")
     chunks_=receipt["chunks"]
-    if not chunks_ or [c.get("index") for c in chunks_] != list(range(len(chunks_))): raise ValueError("missing or duplicate chunks")
-    if any(c.get("result",{}).get("review_result") not in {"PASS","FAIL"} for c in chunks_): raise ValueError("invalid chunk result")
-    blocking=any(f.get("severity") in {"P0","P1","P2"} for f in receipt["findings"])
+    if not isinstance(chunks_,list) or not chunks_ or [c.get("index") for c in chunks_ if isinstance(c,dict)] != list(range(len(chunks_))): raise ValueError("missing or duplicate chunks")
+    position=0; aggregate=[]; descriptors=[]
+    for chunk in chunks_:
+        start,end=chunk.get("start"),chunk.get("end"); result=chunk.get("result")
+        if not isinstance(start,int) or not isinstance(end,int) or start!=position or end<=start: raise ValueError("invalid chunk coverage")
+        if not isinstance(chunk.get("sha256"),str) or len(chunk["sha256"])!=64: raise ValueError("invalid chunk identity")
+        if not isinstance(chunk.get("output_sha256"),str) or len(chunk["output_sha256"])!=64: raise ValueError("invalid chunk output identity")
+        if not isinstance(result,dict) or result.get("review_result") not in {"PASS","FAIL"} or not isinstance(result.get("findings"),list): raise ValueError("invalid chunk result")
+        descriptors.append({"index":chunk["index"],"start":start,"end":end,"sha256":chunk["sha256"]})
+        aggregate.extend(result["findings"]); position=end
+    if aggregate != receipt["findings"]: raise ValueError("aggregate findings mismatch")
+    if root is not None:
+        diff=git(Path(root).resolve(),"diff","--no-ext-diff","--binary",f"{base}..{head}")
+        if position!=len(diff) or digest(diff)!=receipt["diff_sha256"]: raise ValueError("receipt diff coverage mismatch")
+        if descriptors!=chunks(diff): raise ValueError("chunk manifest does not match exact diff")
+        manifest={"version":"cmh-deepseek-chunks/v1","base_sha":base,"head_sha":head,"diff_sha256":digest(diff),"chunks":descriptors}
+        if digest(canon(manifest))!=receipt["manifest_sha256"]: raise ValueError("chunk manifest hash mismatch")
+        if receipt_path is not None:
+            evidence=Path(receipt_path).resolve().parent
+            for chunk in chunks_:
+                artifact=evidence/f"chunk-{chunk['index']:03d}.json"
+                if not artifact.is_file() or sha(artifact)!=chunk["output_sha256"]: raise ValueError("chunk artifact mismatch")
+    blocking=any(f.get("severity") in {"P0","P1","P2"} for f in aggregate)
     if (receipt["review_result"] == "PASS") != (not blocking): raise ValueError("aggregate verdict mismatch")
     return receipt
 def prompt(base, head, diff_hash, manifest_hash, chunk, source):
@@ -78,11 +98,11 @@ def run(args):
 def main():
     p=argparse.ArgumentParser(); sub=p.add_subparsers(dest="cmd",required=True)
     r=sub.add_parser("run"); r.add_argument("--repo",default="."); r.add_argument("--mission-id",default="codex-mission-harness"); r.add_argument("--base",required=True); r.add_argument("--head",required=True); r.add_argument("--evidence",required=True); r.add_argument("--token-file",required=True); r.add_argument("--timeout",type=int,default=900)
-    c=sub.add_parser("validate"); c.add_argument("--receipt",required=True); c.add_argument("--base",required=True); c.add_argument("--head",required=True)
+    c=sub.add_parser("validate"); c.add_argument("--receipt",required=True); c.add_argument("--base",required=True); c.add_argument("--head",required=True); c.add_argument("--repo",default=".")
     a=p.parse_args()
     try:
         if a.cmd=="run": run(a)
-        else: print(json.dumps({"status":validate(json.loads(Path(a.receipt).read_text()),full_sha(a.base),full_sha(a.head))["review_result"]}))
+        else: print(json.dumps({"status":validate(json.loads(Path(a.receipt).read_text()),full_sha(a.base),full_sha(a.head),a.repo,a.receipt)["review_result"]}))
     except Exception as exc: print(json.dumps({"status":"BLOCKED_EXTERNAL","error":str(exc)})); return 1
     return 0
 if __name__=="__main__": raise SystemExit(main())

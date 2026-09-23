@@ -274,14 +274,20 @@ class Supervisor:
             return State(self.journal.mission(mission_id)["current_state"])
 
         def execute_claimed_merge(worktree: str, head: str) -> State:
-            """Execute once after a durable claim; unknown exceptions never permit retry."""
+            """Execute once after a durable claim; unknown outcomes remain reconcilable."""
             try:
                 result = self.adapter.merge(worktree, head)
             except Exception as exc:
-                result = GateResult(
-                    "BLOCKED_EXTERNAL",
-                    f"merge execution outcome is unknown after exception: {exc}",
-                )
+                self.journal.event(mission_id, "merge_outcome_unknown", {"head": head, "error": str(exc)})
+                self.journal.update(mission_id, pending_gate="merge-outcome-unknown")
+                self.journal.db.commit()
+                return State.MERGE
+            if result.status == "BLOCKED_EXTERNAL":
+                self.journal.event(mission_id, "merge_outcome_unknown", {"head": head, "error": result.evidence})
+                self.journal.update(mission_id, pending_gate="merge-outcome-unknown")
+                self.journal.db.commit()
+                return State.MERGE
+            self.journal.update(mission_id, pending_gate=None)
             return finish_merge(result)
 
         if state in TERMINAL:
@@ -331,6 +337,10 @@ class Supervisor:
                         tracked = subprocess.run(["git", "-C", str(root), "ls-files", "--error-unmatch", "--", str(scope.relative_to(root))], capture_output=True, text=True, check=False) if root in scope.parents else None
                         if not scope.is_file() or tracked is None or tracked.returncode != 0:
                             advance(State.BLOCKED_EXTERNAL, f"mission scope contract is unavailable: {scope}")
+                            return State.BLOCKED_EXTERNAL
+                        preflight = self.adapter.review_preflight(row["worktree"], row["base_sha"], head)
+                        if preflight.status != "PASS":
+                            advance(State.BLOCKED_EXTERNAL, preflight.evidence)
                             return State.BLOCKED_EXTERNAL
                         evidence = Path(row["worktree"]).parent / ".cmh-review-evidence" / mission_id / reviewer / head
                         evidence.mkdir(parents=True, exist_ok=True)
@@ -408,7 +418,7 @@ class Supervisor:
                 recovery = self.journal.claim_merge_recovery(
                     mission_id, claim_head, owner_pid, owner_start_ticks,
                 )
-                if recovery == "ACTIVE":
+                if recovery == "ACTIVE" and row["pending_gate"] != "merge-outcome-unknown":
                     # Status observed while the original owner is still alive
                     # can become stale before reclaim and authorize a duplicate
                     # merge. Never query status until the dead claim is frozen
@@ -417,7 +427,7 @@ class Supervisor:
                 if recovery == "UNKNOWN":
                     advance(State.BLOCKED_EXTERNAL, "merge claim owner identity is unavailable")
                     return State.BLOCKED_EXTERNAL
-                if recovery != "RECOVERY_CLAIMED":
+                if recovery not in {"RECOVERY_CLAIMED", "ACTIVE"}:
                     return State(self.journal.mission(mission_id)["current_state"])
                 parameters = inspect.signature(self.adapter.merge_status).parameters
                 status = (self.adapter.merge_status(row["worktree"], claim_head, row["pr_number"])
@@ -429,6 +439,7 @@ class Supervisor:
                             "merge completed for a stale claimed HEAD after canonical HEAD drift",
                         )
                         return State.BLOCKED_EXTERNAL
+                    self.journal.update(mission_id, pending_gate=None)
                     advance(State.POST_MERGE, "canonical merge already completed")
                     return State.POST_MERGE
                 if status.status != "NOT_STARTED":
@@ -458,6 +469,7 @@ class Supervisor:
                 # The post-death NOT_STARTED observation is now bound to the
                 # one live recovery lease, so no other controller can race a
                 # second external invocation for this exact claim.
+                self.journal.update(mission_id, pending_gate=None)
                 return execute_claimed_merge(row["worktree"], claim_head)
             decision = decide("merge", spec.merge_policy)
             if decision == Decision.OWNER_APPROVAL_REQUIRED:

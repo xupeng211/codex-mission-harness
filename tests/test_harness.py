@@ -1538,7 +1538,7 @@ class HarnessTest(unittest.TestCase):
                             merge_claim_head=None, merge_claim_pid=None, merge_claim_start_ticks=None)
         self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
 
-    def test_merge_exception_after_claim_blocks_without_retrying_unknown_outcome(self):
+    def test_merge_exception_after_claim_remains_reconcilable_without_duplicate(self):
         class RaisingMergeAdapter(SimulatedAdapter):
             def merge(self, worktree, head):
                 self.merged_heads.add(head)
@@ -1560,9 +1560,11 @@ class HarnessTest(unittest.TestCase):
             merge_claim_pid=None,
             merge_claim_start_ticks=None,
         )
-        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
+        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.MERGE)
         self.assertEqual(adapter.merged_heads, {head})
         self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_claim_head"], head)
+        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
+        self.assertEqual(adapter.merged_heads, {head})
 
     def test_unknown_merge_decision_fails_closed_before_claim(self):
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,
@@ -1863,3 +1865,21 @@ class HarnessTest(unittest.TestCase):
     def test_football_adapter_review_fails_closed_instead_of_crashing(self):
         result = FootballPredictionAdapter().review("codex", "a" * 40)
         self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+
+    def test_football_review_contract_must_match_trusted_base(self):
+        adapter = FootballPredictionAdapter()
+        completed = subprocess.CompletedProcess([], 1, "", "")
+        with patch.object(adapter, "_call", return_value=completed):
+            result = adapter.review_preflight("/fixture", "a" * 40, "b" * 40)
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+        self.assertIn("policy migration", result.evidence)
+
+    def test_open_exact_head_pr_proves_merge_not_started(self):
+        adapter = FootballPredictionAdapter()
+        responses = iter([
+            json.dumps({"nameWithOwner": "fixture/repo"}),
+            json.dumps({"state": "open", "merged": False, "head": {"sha": "a" * 40}}),
+        ])
+        with patch.object(adapter, "_run", side_effect=lambda *args, **kwargs: next(responses)):
+            result = adapter.merge_status("/fixture", "a" * 40, 7)
+        self.assertEqual(result.status, "NOT_STARTED")

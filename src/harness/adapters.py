@@ -21,6 +21,17 @@ class FootballPredictionAdapter:
     """Call project commands/GitHub; never duplicate their safety policy."""
     GATES = {"verify-targeted": ["make", "verify-targeted"], "verify-pr": ["make", "verify-pr"],
              "verify-strict": ["make", "verify-strict"], "agent-preflight": ["make", "agent-preflight"]}
+    REVIEW_CONTRACT_PATHS = (
+        "Makefile", "scripts/devops/codex_independent_review.py",
+        "scripts/devops/codex_review_classification.py", "scripts/devops/codex_review_contract.py",
+        "scripts/devops/codex_review_output.py", "scripts/devops/codex_review_provenance.py",
+        "scripts/devops/codex_review_receipt.py", "scripts/devops/claude_deepseek_independent_review.py",
+        "scripts/devops/deepseek_chunk_receipt_validation.py", "scripts/devops/deepseek_receipt_evidence.py",
+        "scripts/devops/independent_review_protocol.py", "scripts/devops/independent_review_receipt.py",
+        "scripts/devops/review_policy.py", "docs/agentic/independent_review_backends.json",
+        "schemas/agentic/codex_review_result.schema.json", "schemas/agentic/codex_review_receipt.schema.json",
+        "schemas/agentic/independent_review_result.schema.json", "schemas/agentic/independent_review_receipt.schema.json",
+    )
 
     def exact_head(self, worktree: str) -> str:
         dirty = self._run(["git", "-C", worktree, "status", "--porcelain=v1", "--untracked-files=all"])
@@ -31,6 +42,15 @@ class FootballPredictionAdapter:
     def gate_argv(self, gate: str) -> list[str]:
         if gate not in self.GATES: raise ValueError(f"unsupported canonical gate: {gate}")
         return self.GATES[gate]
+
+    def review_preflight(self, worktree: str, base: str, head: str) -> GateResult:
+        """Anchor executable review policy to the trusted base, not reviewed code."""
+        result = self._call(["git", "diff", "--quiet", f"{base}..{head}", "--", *self.REVIEW_CONTRACT_PATHS], cwd=worktree)
+        if result.returncode == 0:
+            return GateResult("PASS", "canonical review contract unchanged from trusted base")
+        if result.returncode == 1:
+            return GateResult("BLOCKED_EXTERNAL", "mission changes its own canonical review contract; use a separately authorized policy migration")
+        return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "cannot bind canonical review contract to trusted base")
 
     def review_argv(self, reviewer: str, *, worktree: str, base: str, head: str, mission_id: str,
                     scope_file: str, evidence_dir: str) -> list[str]:
@@ -58,6 +78,9 @@ class FootballPredictionAdapter:
     def review_result(self, reviewer: str, *, worktree: str, base: str, head: str, mission_id: str,
                       scope_file: str, stdout_path: str) -> GateResult:
         """Accept only a canonical receipt, revalidated against exact inputs."""
+        preflight = self.review_preflight(worktree, base, head)
+        if preflight.status != "PASS":
+            return preflight
         payload = self._json_last_line(stdout_path)
         receipt = payload.get("review_receipt") if payload else None
         if not isinstance(receipt, str) or not Path(receipt).is_file():
@@ -84,15 +107,36 @@ class FootballPredictionAdapter:
                     return GateResult("BLOCKED_EXTERNAL", "DeepSeek receipt integrity mismatch", receipt)
                 required = {"version", "base_sha", "head_sha", "mission_id", "diff_sha256", "manifest_sha256", "chunks", "review_result", "findings", "integrity_sha256"}
             elif evidence.get("receipt_version") == "independent-review-receipt/v1":
-                # FootballPrediction's project-owned runner validates this
-                # generic receipt (including integrity/chunk evidence) before
-                # commit-last publication. Harness still binds its immutable
-                # identity and rejects every unknown receipt version.
+                # Re-run the target's canonical evidence consumer. Its code is
+                # accepted only after review_preflight proves it is unchanged
+                # from the trusted base.
                 required = {"receipt_version", "base_sha", "head_sha", "mission_id", "diff_sha256", "review_result", "findings", "integrity"}
             else:
                 return GateResult("BLOCKED_EXTERNAL", "unknown DeepSeek receipt contract", receipt)
             if not required <= set(evidence) or evidence.get("base_sha") != base or evidence.get("head_sha") != head or evidence.get("mission_id") != mission_id:
                 return GateResult("BLOCKED_EXTERNAL", "DeepSeek receipt binding is incomplete or stale", receipt)
+            if evidence.get("receipt_version") == "independent-review-receipt/v1":
+                try:
+                    relative_scope = Path(scope_file).resolve().relative_to(Path(worktree).resolve()).as_posix()
+                    scope_bytes = subprocess.check_output(
+                        ["git", "show", f"{head}:{relative_scope}"], cwd=worktree,
+                        stderr=subprocess.PIPE, timeout=60,
+                    )
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    return GateResult("BLOCKED_EXTERNAL", f"cannot bind reviewed mission scope: {exc}", receipt)
+                scope_hash = hashlib.sha256(scope_bytes).hexdigest()
+                validator = (
+                    "from dataclasses import asdict; import json,sys; from pathlib import Path; "
+                    "from scripts.devops.deepseek_receipt_evidence import _deepseek_receipt_evidence as v; "
+                    "print(json.dumps(asdict(v(Path(sys.argv[1]),repo_root=Path(sys.argv[2]),"
+                    "expected_base=sys.argv[3],expected_head=sys.argv[4],expected_mission_id=sys.argv[5],expected_scope_hash=sys.argv[6]))))"
+                )
+                checked = self._call(["python3", "-c", validator, receipt, worktree, base, head, mission_id, scope_hash], cwd=worktree)
+                canonical = self._json_last_text(checked.stdout)
+                if checked.returncode != 0 or canonical.get("trusted") is not True:
+                    return GateResult("BLOCKED_EXTERNAL", checked.stderr.strip() or "canonical DeepSeek receipt validation failed", receipt)
+                if canonical.get("result") != evidence.get("review_result"):
+                    return GateResult("BLOCKED_EXTERNAL", "canonical DeepSeek verdict mismatch", receipt)
             if evidence.get("version") == "cmh-deepseek-review/v1":
                 chunks = evidence.get("chunks")
                 if (not isinstance(chunks, list) or not chunks or
@@ -167,7 +211,7 @@ class FootballPredictionAdapter:
             if len(merge_sha) != 40: return GateResult("BLOCKED_EXTERNAL", "merged PR lacks a full merge SHA")
             return GateResult("PASS", f"merged PR #{pr_number}", data={"pr": pr_number, "merge_sha": merge_sha, "repo": repo})
         if str(data.get("state", "")).upper() == "OPEN" and str((data.get("head") or {}).get("sha", "")).lower() == reviewed_head.lower():
-            return GateResult("PENDING", f"PR #{pr_number} is still open; merge provably not completed", data={"pr": pr_number})
+            return GateResult("NOT_STARTED", f"PR #{pr_number} is still open at the reviewed HEAD; merge retry is safe", data={"pr": pr_number})
         return GateResult("BLOCKED_EXTERNAL", f"ambiguous merge state for PR #{pr_number}")
 
     def post_merge(self, worktree: str, merge_sha: str, pr_number: int, branch: str) -> GateResult:
