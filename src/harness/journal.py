@@ -38,6 +38,7 @@ class Journal:
               merge_claim_head TEXT,
               merge_claim_pr_number INTEGER,
               merge_claim_pr_repo TEXT,
+              merge_invocation_started INTEGER NOT NULL DEFAULT 0,
               merge_claim_pid INTEGER,
               merge_claim_start_ticks TEXT,
               pr_number INTEGER, pr_repo TEXT, merge_sha TEXT, main_sha TEXT, tree_sha TEXT,
@@ -89,6 +90,7 @@ class Journal:
         if "merge_claim_head" not in mission_columns:
             self.db.execute("ALTER TABLE missions ADD COLUMN merge_claim_head TEXT")
         for name, definition in (("merge_claim_pr_number", "INTEGER"), ("merge_claim_pr_repo", "TEXT"),
+                                 ("merge_invocation_started", "INTEGER NOT NULL DEFAULT 0"),
                                  ("merge_claim_pid", "INTEGER"), ("merge_claim_start_ticks", "TEXT")):
             if name not in mission_columns:
                 self.db.execute(f"ALTER TABLE missions ADD COLUMN {name} {definition}")
@@ -191,6 +193,55 @@ class Journal:
                 raise InvalidTransition("state or HEAD changed during transition")
             self.event(mission_id, "state_transition", {
                 "from": source, "to": target, "head": head, "reason": reason,
+            })
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def complete_merge(self, mission_id: str, reviewed_head: str, *,
+                       pr_number: int, pr_repo: str, merge_sha: str | None,
+                       reason: str) -> None:
+        """Atomically publish merge evidence and leave MERGE.
+
+        Keeping the claim until this transaction prevents a crash between
+        recording the external result and advancing the state from making a
+        second merge invocation appear safe.
+        """
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT current_state,current_head,merge_claim_head,merge_claim_pr_number,"
+                "merge_claim_pr_repo FROM missions WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(mission_id)
+            if (State(row["current_state"]) != State.MERGE
+                    or row["current_head"] != reviewed_head
+                    or row["merge_claim_head"] != reviewed_head
+                    or row["merge_claim_pr_number"] != pr_number
+                    or row["merge_claim_pr_repo"] != pr_repo):
+                raise InvalidTransition("merge completion lost its exact claim or PR identity")
+            changed = self.db.execute(
+                "UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,"
+                "pr_number=?,pr_repo=?,merge_sha=?,merge_claim_head=NULL,"
+                "merge_claim_pr_number=NULL,merge_claim_pr_repo=NULL,merge_invocation_started=0,"
+                "merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? "
+                "WHERE mission_id=? AND current_state=? AND current_head=? AND merge_claim_head=? "
+                "AND merge_claim_pr_number=? AND merge_claim_pr_repo=?",
+                (State.POST_MERGE, pr_number, pr_repo, merge_sha, now(), mission_id,
+                 State.MERGE, reviewed_head, reviewed_head, pr_number, pr_repo),
+            ).rowcount
+            if changed != 1:
+                raise InvalidTransition("merge completion lost its exact state snapshot")
+            self.event(mission_id, "merge_completed", {
+                "reviewed_head": reviewed_head, "pr_number": pr_number,
+                "pr_repo": pr_repo, "merge_sha": merge_sha,
+            })
+            self.event(mission_id, "state_transition", {
+                "from": State.MERGE, "to": State.POST_MERGE,
+                "head": reviewed_head, "reason": reason,
             })
             self.db.commit()
         except Exception:
@@ -341,7 +392,7 @@ class Journal:
             invalidated = self.db.execute("UPDATE receipts SET invalidated=1 WHERE mission_id=? AND head_sha<>? AND invalidated=0",
                                           (mission_id, head)).rowcount
             if source == State.PASS:
-                changed = self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',pr_number=NULL,pr_repo=NULL,merge_sha=NULL,main_sha=NULL,tree_sha=NULL,merge_claim_head=NULL,merge_claim_pr_number=NULL,merge_claim_pr_repo=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=? AND current_state=? AND current_head=?",
+                changed = self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',pr_number=NULL,pr_repo=NULL,merge_sha=NULL,main_sha=NULL,tree_sha=NULL,merge_claim_head=NULL,merge_claim_pr_number=NULL,merge_claim_pr_repo=NULL,merge_invocation_started=0,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=? AND current_state=? AND current_head=?",
                                           (State.TEST, now(), mission_id, source, head)).rowcount
                 if changed != 1:
                     raise InvalidTransition("PASS reopen lost its reconciled source snapshot")
@@ -363,7 +414,7 @@ class Journal:
                     "claim_head": row["merge_claim_head"], "current_head": head,
                 })
             elif source in {State.REVIEW, State.CI, State.MERGE, State.WAITING_APPROVAL, State.POST_MERGE, State.DELIVER}:
-                changed = self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',pr_number=NULL,pr_repo=NULL,merge_sha=NULL,main_sha=NULL,tree_sha=NULL,merge_claim_head=NULL,merge_claim_pr_number=NULL,merge_claim_pr_repo=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=? AND current_state=? AND current_head=?",
+                changed = self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',pr_number=NULL,pr_repo=NULL,merge_sha=NULL,main_sha=NULL,tree_sha=NULL,merge_claim_head=NULL,merge_claim_pr_number=NULL,merge_claim_pr_repo=NULL,merge_invocation_started=0,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=? AND current_state=? AND current_head=?",
                                           (State.TEST, now(), mission_id, source, head)).rowcount
                 if changed != 1:
                     raise InvalidTransition("state rewind lost its reconciled source snapshot")
@@ -719,7 +770,8 @@ class Journal:
                 self.db.commit()
                 return False
             changed = self.db.execute(
-                "UPDATE missions SET merge_claim_head=?,merge_claim_pr_number=?,merge_claim_pr_repo=?,merge_claim_pid=?,"
+                "UPDATE missions SET merge_claim_head=?,merge_claim_pr_number=?,merge_claim_pr_repo=?,"
+                "merge_invocation_started=0,merge_claim_pid=?,"
                 "merge_claim_start_ticks=?,updated_at=? WHERE mission_id=? "
                 "AND current_state=? AND current_head=? AND merge_claim_head IS NULL "
                 "AND pr_number=? AND pr_repo=?",
@@ -738,6 +790,45 @@ class Journal:
             self.db.rollback()
             raise
 
+    def mark_merge_invocation_started(self, mission_id: str, claim_head: str,
+                                      owner_pid: int, owner_start_ticks: str) -> bool:
+        """Durably mark the point after which an external merge may have started."""
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT current_state,current_head,merge_claim_head,merge_claim_pid,"
+                "merge_claim_start_ticks,merge_claim_pr_number,merge_claim_pr_repo,"
+                "merge_invocation_started FROM missions WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()
+            if (row is None or State(row["current_state"]) != State.MERGE
+                    or row["current_head"] != claim_head or row["merge_claim_head"] != claim_head
+                    or row["merge_claim_pid"] != owner_pid
+                    or row["merge_claim_start_ticks"] != owner_start_ticks):
+                self.db.commit()
+                return False
+            status, ticks = self._proc_identity(owner_pid)
+            if status != "PRESENT" or ticks != owner_start_ticks:
+                self.db.commit()
+                return False
+            changed = self.db.execute(
+                "UPDATE missions SET merge_invocation_started=1,updated_at=? WHERE mission_id=? "
+                "AND current_state=? AND current_head=? AND merge_claim_head=? "
+                "AND merge_claim_pid=? AND merge_claim_start_ticks=? AND merge_invocation_started=0",
+                (now(), mission_id, State.MERGE, claim_head, claim_head, owner_pid, owner_start_ticks),
+            ).rowcount
+            if changed == 1:
+                self.event(mission_id, "merge_invocation_started", {
+                    "head": claim_head, "pr": row["merge_claim_pr_number"],
+                    "repo": row["merge_claim_pr_repo"], "owner_pid": owner_pid,
+                    "owner_start_ticks": owner_start_ticks,
+                })
+            self.db.commit()
+            return changed == 1
+        except Exception:
+            self.db.rollback()
+            raise
+
     def claim_merge_recovery(self, mission_id: str, claim_head: str,
                              recovery_pid: int, recovery_start_ticks: str) -> str:
         """Freeze a dead owner's claim under one live recovery controller.
@@ -752,7 +843,8 @@ class Journal:
         try:
             self.db.execute("BEGIN IMMEDIATE")
             row = self.db.execute(
-                "SELECT current_state,current_head,merge_claim_head,merge_claim_pid,merge_claim_start_ticks "
+                "SELECT current_state,current_head,merge_claim_head,merge_claim_pid,merge_claim_start_ticks,"
+                "merge_claim_pr_number,merge_claim_pr_repo,merge_invocation_started "
                 "FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
             if row is None:
                 raise KeyError(mission_id)
@@ -760,6 +852,13 @@ class Journal:
                     row["merge_claim_head"] != claim_head):
                 self.db.commit()
                 return "NO_CLAIM"
+            claim_pr = row["merge_claim_pr_number"]
+            claim_repo = row["merge_claim_pr_repo"]
+            if (not isinstance(claim_pr, int) or claim_pr <= 0 or
+                    not isinstance(claim_repo, str) or
+                    re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", claim_repo) is None):
+                self.db.commit()
+                return "UNKNOWN"
             pid, start_ticks = row["merge_claim_pid"], row["merge_claim_start_ticks"]
             if not isinstance(pid, int) or not start_ticks:
                 self.db.commit()
@@ -806,7 +905,7 @@ class Journal:
             self.db.execute("BEGIN IMMEDIATE")
             row = self.db.execute(
                 "SELECT current_state,current_head,merge_claim_head,merge_claim_pid,"
-                "merge_claim_start_ticks FROM missions WHERE mission_id=?",
+                "merge_claim_start_ticks,merge_invocation_started FROM missions WHERE mission_id=?",
                 (mission_id,),
             ).fetchone()
             if row is None:
@@ -817,6 +916,9 @@ class Journal:
                     row["merge_claim_start_ticks"] != recovery_start_ticks):
                 self.db.commit()
                 return "NO_CLAIM"
+            if row["merge_invocation_started"]:
+                self.db.commit()
+                return "INVOCATION_STARTED"
             owner_status, observed_ticks = self._proc_identity(recovery_pid)
             if owner_status == "UNKNOWN":
                 self.db.commit()
@@ -829,7 +931,7 @@ class Journal:
                 changed = self.db.execute(
                     "UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,"
                     "ci_state=NULL,approval_state='NONE',pr_number=NULL,pr_repo=NULL,merge_sha=NULL,main_sha=NULL,tree_sha=NULL,merge_claim_head=NULL,"
-                    "merge_claim_pr_number=NULL,merge_claim_pr_repo=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? "
+                    "merge_claim_pr_number=NULL,merge_claim_pr_repo=NULL,merge_invocation_started=0,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? "
                     "WHERE mission_id=? AND current_state=? AND current_head IS ? "
                     "AND merge_claim_head=? AND merge_claim_pid=? "
                     "AND merge_claim_start_ticks=?",

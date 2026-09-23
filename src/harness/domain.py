@@ -85,7 +85,7 @@ class MissionSpec:
         if adapter == "footballprediction":
             path = PurePosixPath(scope) if isinstance(scope, str) and scope else None
             if (path is None or path.is_absolute() or "\\" in scope
-                    or any(part in {"", ".", ".."} for part in path.parts)):
+                    or any(part in {"", ".", ".."} for part in scope.split("/"))):
                 raise ValueError("footballprediction mission_scope_file must be a safe relative path")
         if data.get("merge_policy", "owner_approval") not in {"owner_approval", "auto"}:
             raise ValueError("merge_policy must be exactly owner_approval or auto")

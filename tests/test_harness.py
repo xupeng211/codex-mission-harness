@@ -1546,7 +1546,9 @@ class HarnessTest(unittest.TestCase):
                             merge_claim_head=None, merge_claim_pid=None, merge_claim_start_ticks=None)
         self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
         self.assertEqual(self.adapter.merged_heads, {"a" * 40})
-        self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_claim_head"], "a" * 40)
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertIsNone(row["merge_claim_head"])
+        self.assertEqual(row["merge_sha"], "c" * 40)
 
     def test_merge_failure_is_external_not_policy_denial(self):
         class FailingMergeAdapter(SimulatedAdapter):
@@ -1560,9 +1562,14 @@ class HarnessTest(unittest.TestCase):
                             merge_claim_head=None, merge_claim_pid=None, merge_claim_start_ticks=None)
         self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
 
-    def test_merge_exception_after_claim_remains_reconcilable_without_duplicate(self):
+    def test_merge_exception_after_invocation_blocks_without_retry(self):
         class RaisingMergeAdapter(SimulatedAdapter):
+            def __init__(self):
+                super().__init__()
+                self.merge_calls = 0
+
             def merge(self, worktree, head, pr_number=None):
+                self.merge_calls += 1
                 self.merged_heads.add(head)
                 raise RuntimeError("transport disconnected after request")
 
@@ -1582,15 +1589,20 @@ class HarnessTest(unittest.TestCase):
             merge_claim_pid=None,
             merge_claim_start_ticks=None,
         )
-        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.MERGE)
+        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
         self.assertEqual(adapter.merged_heads, {head})
         self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_claim_head"], head)
-        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
-        self.assertEqual(adapter.merged_heads, {head})
+        self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_invocation_started"], 1)
+        self.assertEqual(adapter.merge_calls, 1)
 
-    def test_merge_retry_failure_blocks_instead_of_rearming_unknown_outcome(self):
+    def test_merge_failure_after_invocation_is_not_retried(self):
         class AlwaysUnavailable(SimulatedAdapter):
+            def __init__(self):
+                super().__init__()
+                self.merge_calls = 0
+
             def merge(self, worktree, head):
+                self.merge_calls += 1
                 raise RuntimeError("transport unavailable")
 
         adapter = AlwaysUnavailable()
@@ -1601,8 +1613,87 @@ class HarnessTest(unittest.TestCase):
         head = "a" * 40
         self.journal.update(self.spec.mission_id, current_head=head, current_state=State.MERGE,
                             merge_claim_head=None, merge_claim_pid=None, merge_claim_start_ticks=None)
-        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.MERGE)
         self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
+        self.assertEqual(adapter.merge_calls, 1)
+
+    def test_invoked_merge_not_started_status_is_ambiguous_and_never_retried(self):
+        class SimulatedCrash(BaseException):
+            pass
+
+        class CrashingMergeAdapter(SimulatedAdapter):
+            def __init__(self):
+                super().__init__()
+                self.merge_calls = 0
+                self.status_calls = 0
+
+            def merge(self, worktree, head, pr_number=None, pr_repo=None):
+                self.merge_calls += 1
+                self.merged_heads.add(head)
+                raise SimulatedCrash("process died after external request")
+
+            def merge_status(self, worktree, head, pr_number=None, pr_repo=None):
+                self.status_calls += 1
+                return GateResult("NOT_STARTED", "stale canonical observation")
+
+        adapter = CrashingMergeAdapter()
+        first = Supervisor(
+            self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "merge-crash-first"),
+            self.codex, adapter,
+        )
+        head = "a" * 40
+        old_pid, old_ticks = 424242, "old-merge-owner"
+        owner_alive = {"value": True}
+        real_identity = self.journal._proc_identity
+
+        def proc_identity(pid):
+            if pid == old_pid:
+                return ("PRESENT", old_ticks) if owner_alive["value"] else ("ABSENT", None)
+            return real_identity(pid)
+
+        self.journal.update(self.spec.mission_id, current_head=head, current_state=State.MERGE,
+                            merge_claim_head=None, merge_claim_pid=None, merge_claim_start_ticks=None)
+        with patch.object(first, "_merge_owner", return_value=(old_pid, old_ticks)), \
+                patch.object(self.journal, "_proc_identity", side_effect=proc_identity), \
+                self.assertRaises(SimulatedCrash):
+            first.step(self.spec.mission_id, self.spec)
+
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertEqual(row["current_state"], State.MERGE)
+        self.assertEqual(row["merge_invocation_started"], 1)
+        self.assertEqual(adapter.merge_calls, 1)
+
+        owner_alive["value"] = False
+        restarted = Supervisor(
+            self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "merge-crash-restart"),
+            self.codex, adapter,
+        )
+        with patch.object(self.journal, "_proc_identity", side_effect=proc_identity):
+            self.assertEqual(restarted.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
+        self.assertEqual(adapter.status_calls, 1)
+        self.assertEqual(adapter.merge_calls, 1)
+
+    def test_keyword_only_pr_adapter_arguments_are_dispatched(self):
+        seen = {}
+
+        class KeywordOnlyAdapter(SimulatedAdapter):
+            def ci(self, worktree, head, *, pr_number=None, pr_repo=None):
+                seen["ci"] = (pr_number, pr_repo)
+                return GateResult("PASS", "keyword-only CI")
+
+            def merge(self, worktree, head, *, pr_number=None, pr_repo=None):
+                seen["merge"] = (pr_number, pr_repo)
+                return GateResult("PASS", "keyword-only merge", data={
+                    "pr": pr_number, "repo": pr_repo, "merge_sha": "c" * 40,
+                })
+
+        adapter = KeywordOnlyAdapter()
+        supervisor = Supervisor(
+            self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "keyword-only-pr-adapter"),
+            self.codex, adapter,
+        )
+        self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE)
+        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
+        self.assertEqual(seen, {"ci": (1, "fixture/repo"), "merge": (1, "fixture/repo")})
 
     def test_legacy_two_argument_ci_adapter_is_dispatched_without_crash(self):
         class TwoArgumentCI(SimulatedAdapter):
@@ -1650,7 +1741,7 @@ class HarnessTest(unittest.TestCase):
             self.spec.mission_id, current_head=head, current_state=State.MERGE,
             pr_number=7, pr_repo="fixture/repo", merge_claim_head=head,
             merge_claim_pr_number=7, merge_claim_pr_repo="fixture/repo", merge_claim_pid=99999999,
-            merge_claim_start_ticks="dead-owner",
+            merge_claim_start_ticks="dead-owner", merge_invocation_started=1,
         )
         self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
         row = self.journal.mission(self.spec.mission_id)
@@ -1672,7 +1763,9 @@ class HarnessTest(unittest.TestCase):
             child.wait()
         self.supervisor.collect_jobs(self.spec.mission_id)
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,
+                            pr_number=1, pr_repo="fixture/repo",
                             merge_claim_head="a" * 40, merge_claim_pid=99999999,
+                            merge_claim_pr_number=1, merge_claim_pr_repo="fixture/repo",
                             merge_claim_start_ticks="dead-owner")
         self.adapter.heads = ["a" * 40]
         self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
@@ -1740,8 +1833,8 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_claim_head"], "a" * 40)
         self.assertEqual(self.adapter.merged_heads, set())
 
-    def test_merge_status_is_queried_only_after_dead_owner_claim_is_frozen(self):
-        """A live owner cannot merge after a stale NOT_STARTED observation."""
+    def test_invoked_merge_status_is_queried_after_dead_owner_and_not_started_blocks(self):
+        """An invoked merge with NOT_STARTED remains ambiguous and is never repeated."""
         head = "a" * 40
         old_pid, old_start = 424242, "original-owner-start"
         owner_alive = {"value": True}
@@ -1780,8 +1873,11 @@ class HarnessTest(unittest.TestCase):
             current_head=head,
             current_state=State.MERGE,
             merge_claim_head=head,
+            pr_number=1, pr_repo="fixture/repo",
+            merge_claim_pr_number=1, merge_claim_pr_repo="fixture/repo",
             merge_claim_pid=old_pid,
             merge_claim_start_ticks=old_start,
+            merge_invocation_started=1,
         )
         real_proc_identity = journal._proc_identity
 
@@ -1798,13 +1894,14 @@ class HarnessTest(unittest.TestCase):
             self.assertEqual(external_calls, [])
 
             # Once the old owner is definitely dead, its claim is transferred
-            # before status is queried, and exactly one recovery merge occurs.
+            # before status is queried; NOT_STARTED is still ambiguous after
+            # an invocation may have begun, so it must not be retried.
             owner_alive["value"] = False
-            self.assertEqual(recovery.step(self_spec.mission_id, self_spec), State.POST_MERGE)
+            self.assertEqual(recovery.step(self_spec.mission_id, self_spec), State.BLOCKED_EXTERNAL)
 
         recovery_owner = recovery._merge_owner()
         self.assertEqual(status_claim_owners, [recovery_owner])
-        self.assertEqual(external_calls, ["recovery-owner"])
+        self.assertEqual(external_calls, [])
 
     def test_head_drift_preserves_live_merge_claim_then_revalidates_after_safe_reclaim(self):
         old_head, new_head = "a" * 40, "b" * 40
@@ -1887,8 +1984,11 @@ class HarnessTest(unittest.TestCase):
             current_head=old_head,
             current_state=State.MERGE,
             merge_claim_head=old_head,
+            pr_number=1, pr_repo="fixture/repo",
+            merge_claim_pr_number=1, merge_claim_pr_repo="fixture/repo",
             merge_claim_pid=99999999,
             merge_claim_start_ticks="dead-owner",
+            merge_invocation_started=1,
         )
         self.adapter.merged_heads.add(old_head)
         self.adapter.heads = [new_head]
@@ -1905,11 +2005,13 @@ class HarnessTest(unittest.TestCase):
 
     def test_dead_merge_claim_is_reclaimed_only_after_canonical_not_started(self):
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,
-                            merge_claim_head="a" * 40, merge_claim_pid=99999999,
+                            pr_number=1, pr_repo="fixture/repo",
+                            merge_claim_head="a" * 40, merge_claim_pr_number=1,
+                            merge_claim_pr_repo="fixture/repo", merge_claim_pid=99999999,
                             merge_claim_start_ticks="dead-owner")
         self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
         self.assertEqual(self.adapter.merged_heads, {"a" * 40})
-        self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_claim_head"], "a" * 40)
+        self.assertIsNone(self.journal.mission(self.spec.mission_id)["merge_claim_head"])
 
     def test_unknown_merge_claim_identity_fails_closed(self):
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,

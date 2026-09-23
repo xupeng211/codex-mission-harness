@@ -30,6 +30,23 @@ class Supervisor:
             raise RuntimeError("cannot execute merge without controller start-time identity")
         return self.process.launcher_pid, start_ticks
 
+    @staticmethod
+    def _invoke_pr_adapter(method, worktree: str, head: str,
+                           pr_number: int | None, pr_repo: str | None):
+        """Support legacy and current signatures without positional-arity guesses."""
+        parameters = inspect.signature(method).parameters
+        positional = [worktree, head]
+        keywords = {}
+        accepts_extra_keywords = any(p.kind == inspect.Parameter.VAR_KEYWORD
+                                     for p in parameters.values())
+        for name, value in (("pr_number", pr_number), ("pr_repo", pr_repo)):
+            parameter = parameters.get(name)
+            if parameter is not None and parameter.kind == inspect.Parameter.POSITIONAL_ONLY:
+                positional.append(value)
+            elif parameter is not None or accepts_extra_keywords:
+                keywords[name] = value
+        return method(*positional, **keywords)
+
     def _codex_checkpoint_ready(self, mission_id: str, worktree: str, *,
                                 expected_state: State, expected_head: str | None) -> bool:
         """Require production Codex turns to leave only committed source state."""
@@ -268,21 +285,30 @@ class Supervisor:
             """Classify merge outcomes without treating provider failure as policy denial."""
             if result.status == "PASS":
                 data = result.data or {}
+                identity = self.journal.mission(mission_id)
+                expected_pr = identity["merge_claim_pr_number"] or identity["pr_number"]
+                expected_repo = identity["merge_claim_pr_repo"] or identity["pr_repo"]
                 if not data.get("pr") or not data.get("merge_sha"):
                     if not isinstance(self.adapter, SimulatedAdapter):
                         advance(State.BLOCKED_EXTERNAL, "merge PASS omitted PR or merge SHA")
                         return State.BLOCKED_EXTERNAL
-                else:
-                    identity = self.journal.mission(mission_id)
-                    expected_pr = identity["merge_claim_pr_number"] or identity["pr_number"]
-                    expected_repo = identity["merge_claim_pr_repo"] or identity["pr_repo"]
-                    if (not isinstance(self.adapter, SimulatedAdapter)
-                            and (data.get("repo") != expected_repo or int(data["pr"]) != expected_pr)):
-                        advance(State.BLOCKED_EXTERNAL, "merge PASS changed the durable PR repository identity")
-                        return State.BLOCKED_EXTERNAL
-                    self.journal.update(mission_id, pr_number=int(data["pr"]), pr_repo=expected_repo,
-                                        merge_sha=str(data["merge_sha"]))
-                advance(State.POST_MERGE, result.evidence)
+                elif (not isinstance(data.get("pr"), int) or isinstance(data.get("pr"), bool)
+                      or data.get("pr") != expected_pr or data.get("repo", expected_repo) != expected_repo):
+                    advance(State.BLOCKED_EXTERNAL, "merge PASS changed the durable PR repository identity")
+                    return State.BLOCKED_EXTERNAL
+                merge_sha = data.get("merge_sha")
+                if merge_sha is not None and (not isinstance(merge_sha, str)
+                        or len(merge_sha) != 40 or any(ch not in "0123456789abcdef" for ch in merge_sha.lower())):
+                    advance(State.BLOCKED_EXTERNAL, "merge PASS omitted a valid full merge SHA")
+                    return State.BLOCKED_EXTERNAL
+                if not expected_pr or not expected_repo:
+                    advance(State.BLOCKED_EXTERNAL, "merge claim has no durable PR identity")
+                    return State.BLOCKED_EXTERNAL
+                self.journal.complete_merge(
+                    mission_id, expected_head, pr_number=expected_pr,
+                    pr_repo=expected_repo, merge_sha=merge_sha,
+                    reason=result.evidence,
+                )
             elif result.status == "BLOCKED_POLICY":
                 advance(State.BLOCKED_POLICY, result.evidence)
             else:
@@ -292,30 +318,29 @@ class Supervisor:
                         f"merge returned unsupported status: {result.status}")
             return State(self.journal.mission(mission_id)["current_state"])
 
-        def execute_claimed_merge(worktree: str, head: str, *, retry: bool = False) -> State:
+        def execute_claimed_merge(worktree: str, head: str) -> State:
             """Execute once after a durable claim; unknown outcomes remain reconcilable."""
             try:
                 identity = self.journal.mission(mission_id)
                 claimed_pr = identity["merge_claim_pr_number"]
                 claimed_repo = identity["merge_claim_pr_repo"]
-                parameters = inspect.signature(self.adapter.merge).parameters
-                result = (self.adapter.merge(worktree, head, claimed_pr, claimed_repo)
-                          if len(parameters) >= 4 else self.adapter.merge(worktree, head, claimed_pr)
-                          if len(parameters) >= 3 else self.adapter.merge(worktree, head))
+                owner_pid, owner_ticks = self._merge_owner()
+                if not self.journal.mark_merge_invocation_started(
+                        mission_id, head, owner_pid, owner_ticks):
+                    return State(self.journal.mission(mission_id)["current_state"])
+                result = self._invoke_pr_adapter(
+                    self.adapter.merge, worktree, head, claimed_pr, claimed_repo,
+                )
             except Exception as exc:
-                if retry:
-                    return finish_merge(GateResult("BLOCKED_EXTERNAL", f"merge retry failed: {exc}"))
                 self.journal.event(mission_id, "merge_outcome_unknown", {"head": head, "error": str(exc)})
-                self.journal.update(mission_id, pending_gate="merge-outcome-unknown")
                 self.journal.db.commit()
-                return State.MERGE
+                advance(State.BLOCKED_EXTERNAL, f"merge outcome is ambiguous after invocation: {exc}")
+                return State.BLOCKED_EXTERNAL
             if result.status == "BLOCKED_EXTERNAL":
-                if retry:
-                    return finish_merge(result)
                 self.journal.event(mission_id, "merge_outcome_unknown", {"head": head, "error": result.evidence})
-                self.journal.update(mission_id, pending_gate="merge-outcome-unknown")
                 self.journal.db.commit()
-                return State.MERGE
+                advance(State.BLOCKED_EXTERNAL, result.evidence or "merge outcome is ambiguous after invocation")
+                return State.BLOCKED_EXTERNAL
             self.journal.update(mission_id, pending_gate=None)
             return finish_merge(result)
 
@@ -407,10 +432,10 @@ class Supervisor:
                     return state
             advance(State.CI, "all exact-head reviews pass")
         elif state == State.CI:
-            parameters = inspect.signature(self.adapter.ci).parameters
-            result = (self.adapter.ci(row["worktree"], row["current_head"], row["pr_number"], row["pr_repo"])
-                      if len(parameters) >= 4 else self.adapter.ci(row["worktree"], row["current_head"], row["pr_number"])
-                      if len(parameters) >= 3 else self.adapter.ci(row["worktree"], row["current_head"]))
+            result = self._invoke_pr_adapter(
+                self.adapter.ci, row["worktree"], row["current_head"],
+                row["pr_number"], row["pr_repo"],
+            )
             facts = result.data or {}
             if facts.get("pr_number") is not None:
                 if not self.journal.bind_pr_identity(mission_id, row["current_head"], int(facts["pr_number"]),
@@ -470,22 +495,35 @@ class Supervisor:
                 if recovery not in {"RECOVERY_CLAIMED", "ACTIVE"}:
                     return State(self.journal.mission(mission_id)["current_state"])
                 row = self.journal.mission(mission_id)
-                parameters = inspect.signature(self.adapter.merge_status).parameters
-                status = (self.adapter.merge_status(row["worktree"], claim_head, row["merge_claim_pr_number"], row["merge_claim_pr_repo"])
-                          if len(parameters) >= 4 else self.adapter.merge_status(row["worktree"], claim_head, row["merge_claim_pr_number"])
-                          if len(parameters) >= 3 else self.adapter.merge_status(row["worktree"], claim_head))
-                if status.status == "PASS":
-                    if claim_head != row["current_head"]:
-                        advance(
-                            State.BLOCKED_EXTERNAL,
-                            "merge completed for a stale claimed HEAD after canonical HEAD drift",
+                # A live owner may still be between the durable invocation
+                # marker and the external call (or still awaiting its result).
+                # Never query status or retry while that owner is active.
+                if recovery == "ACTIVE" and row["merge_invocation_started"]:
+                    return State.MERGE
+                invocation_uncertain = (bool(row["merge_invocation_started"])
+                                        or row["pending_gate"] in {
+                                            "merge-outcome-unknown", "merge-reconciling",
+                                        })
+                if invocation_uncertain:
+                    try:
+                        status = self._invoke_pr_adapter(
+                            self.adapter.merge_status, row["worktree"], claim_head,
+                            row["merge_claim_pr_number"], row["merge_claim_pr_repo"],
                         )
+                    except Exception as exc:
+                        advance(State.BLOCKED_EXTERNAL, f"cannot reconcile uncertain merge: {exc}")
                         return State.BLOCKED_EXTERNAL
-                    self.journal.update(mission_id, pending_gate=None)
-                    return finish_merge(status)
-                if status.status != "NOT_STARTED":
-                    advance(State.BLOCKED_EXTERNAL, status.evidence)
+                    if status.status == "PASS":
+                        if claim_head != row["current_head"]:
+                            advance(State.BLOCKED_EXTERNAL,
+                                    "merge completed for a stale claimed HEAD after canonical HEAD drift")
+                            return State.BLOCKED_EXTERNAL
+                        return finish_merge(status)
+                    advance(State.BLOCKED_EXTERNAL, status.evidence or
+                            "merge invocation may have started; outcome remains ambiguous")
                     return State.BLOCKED_EXTERNAL
+                if recovery == "ACTIVE":
+                    return State.MERGE
                 retry = self.journal.confirm_merge_retry_safe(
                     mission_id, claim_head, owner_pid, owner_start_ticks,
                 )
@@ -493,9 +531,8 @@ class Supervisor:
                     advance(State.BLOCKED_EXTERNAL, "merge recovery identity is unavailable")
                     return State.BLOCKED_EXTERNAL
                 if retry == "REWOUND_HEAD_DRIFT":
-                    # Post-owner-death canonical status proved the stale merge
-                    # never started. The recovery lease must atomically rewind
-                    # to TEST before any new merge claim is possible.
+                    # The durable invocation phase proved the stale merge was
+                    # never invoked. Rewind before any new merge claim.
                     reclaimed = self.journal.mission(mission_id)
                     if (State(reclaimed["current_state"]) != State.TEST or
                             reclaimed["merge_claim_head"] is not None):
@@ -507,36 +544,38 @@ class Supervisor:
                     return State(reclaimed["current_state"])
                 if retry != "RETRY_SAFE":
                     return State(self.journal.mission(mission_id)["current_state"])
-                # The post-death NOT_STARTED observation is now bound to the
-                # one live recovery lease, so no other controller can race a
-                # second external invocation for this exact claim.
                 self.journal.update(mission_id, pending_gate=None)
-                return execute_claimed_merge(row["worktree"], claim_head, retry=True)
-            parameters = inspect.signature(self.adapter.ci).parameters
-            technical = (self.adapter.ci(row["worktree"], row["current_head"], row["pr_number"], row["pr_repo"])
-                         if len(parameters) >= 4 else self.adapter.ci(row["worktree"], row["current_head"], row["pr_number"])
-                         if len(parameters) >= 3 else self.adapter.ci(row["worktree"], row["current_head"]))
+            technical = self._invoke_pr_adapter(
+                self.adapter.ci, row["worktree"], row["current_head"],
+                row["pr_number"], row["pr_repo"],
+            )
             if technical.status != "PASS":
                 advance(State.BLOCKED_EXTERNAL, technical.evidence or "pre-merge canonical CI recheck failed")
                 return State.BLOCKED_EXTERNAL
             decision = decide("merge", spec.merge_policy)
             if decision == Decision.OWNER_APPROVAL_REQUIRED:
                 if not self.journal.approved(mission_id, "merge", row["current_head"]):
+                    if row["merge_claim_head"] is not None:
+                        advance(State.BLOCKED_EXTERNAL,
+                                "recovered unstarted merge claim has no current owner approval")
+                        return State.BLOCKED_EXTERNAL
                     self.journal.update(mission_id, approval_state="PENDING", pending_gate="owner-merge")
                     advance(State.WAITING_APPROVAL, "owner merge approval required")
                     return State.WAITING_APPROVAL
                 self.journal.update(mission_id, approval_state="APPROVED", pending_gate=None)
-                owner_pid, owner_start_ticks = self._merge_owner()
-                if not self.journal.claim_merge(mission_id, row["current_head"], owner_pid, owner_start_ticks):
-                    return State.MERGE
+                if row["merge_claim_head"] is None:
+                    owner_pid, owner_start_ticks = self._merge_owner()
+                    if not self.journal.claim_merge(mission_id, row["current_head"], owner_pid, owner_start_ticks):
+                        return State.MERGE
                 execute_claimed_merge(row["worktree"], row["current_head"])
             else:
                 if decision != Decision.AUTO_CONTINUE:
                     advance(State.BLOCKED_POLICY, "unknown merge policy decision; fail closed")
                     return State.BLOCKED_POLICY
-                owner_pid, owner_start_ticks = self._merge_owner()
-                if not self.journal.claim_merge(mission_id, row["current_head"], owner_pid, owner_start_ticks):
-                    return State.MERGE
+                if row["merge_claim_head"] is None:
+                    owner_pid, owner_start_ticks = self._merge_owner()
+                    if not self.journal.claim_merge(mission_id, row["current_head"], owner_pid, owner_start_ticks):
+                        return State.MERGE
                 execute_claimed_merge(row["worktree"], row["current_head"])
         elif state == State.WAITING_APPROVAL:
             if self.journal.approved(mission_id, "merge", row["current_head"]):
