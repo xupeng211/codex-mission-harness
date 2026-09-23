@@ -262,7 +262,15 @@ class Supervisor:
                         advance(State.BLOCKED_EXTERNAL, "merge PASS omitted PR or merge SHA")
                         return State.BLOCKED_EXTERNAL
                 else:
-                    self.journal.update(mission_id, pr_number=int(data["pr"]), merge_sha=str(data["merge_sha"]))
+                    identity = self.journal.mission(mission_id)
+                    expected_pr = identity["merge_claim_pr_number"] or identity["pr_number"]
+                    expected_repo = identity["merge_claim_pr_repo"] or identity["pr_repo"]
+                    if (not isinstance(self.adapter, SimulatedAdapter)
+                            and (data.get("repo") != expected_repo or int(data["pr"]) != expected_pr)):
+                        advance(State.BLOCKED_EXTERNAL, "merge PASS changed the durable PR repository identity")
+                        return State.BLOCKED_EXTERNAL
+                    self.journal.update(mission_id, pr_number=int(data["pr"]), pr_repo=expected_repo,
+                                        merge_sha=str(data["merge_sha"]))
                 advance(State.POST_MERGE, result.evidence)
             elif result.status == "BLOCKED_POLICY":
                 advance(State.BLOCKED_POLICY, result.evidence)
@@ -276,7 +284,12 @@ class Supervisor:
         def execute_claimed_merge(worktree: str, head: str) -> State:
             """Execute once after a durable claim; unknown outcomes remain reconcilable."""
             try:
-                result = self.adapter.merge(worktree, head, self.journal.mission(mission_id)["pr_number"])
+                identity = self.journal.mission(mission_id)
+                claimed_pr = identity["merge_claim_pr_number"]
+                claimed_repo = identity["merge_claim_pr_repo"]
+                parameters = inspect.signature(self.adapter.merge).parameters
+                result = (self.adapter.merge(worktree, head, claimed_pr, claimed_repo)
+                          if len(parameters) >= 4 else self.adapter.merge(worktree, head, claimed_pr))
             except Exception as exc:
                 self.journal.event(mission_id, "merge_outcome_unknown", {"head": head, "error": str(exc)})
                 self.journal.update(mission_id, pending_gate="merge-outcome-unknown")
@@ -378,10 +391,13 @@ class Supervisor:
                     return state
             advance(State.CI, "all exact-head reviews pass")
         elif state == State.CI:
-            result = self.adapter.ci(row["worktree"], row["current_head"], row["pr_number"])
+            parameters = inspect.signature(self.adapter.ci).parameters
+            result = (self.adapter.ci(row["worktree"], row["current_head"], row["pr_number"], row["pr_repo"])
+                      if len(parameters) >= 4 else self.adapter.ci(row["worktree"], row["current_head"], row["pr_number"]))
             facts = result.data or {}
             if facts.get("pr_number") is not None:
-                if not self.journal.bind_pr_identity(mission_id, row["current_head"], int(facts["pr_number"])):
+                if not self.journal.bind_pr_identity(mission_id, row["current_head"], int(facts["pr_number"]),
+                                                     str(facts.get("pr_repo") or "")):
                     advance(State.BLOCKED_EXTERNAL, "CI PR identity changed or lost its exact source snapshot")
                     return State.BLOCKED_EXTERNAL
             if result.status == "PASS":
@@ -415,7 +431,7 @@ class Supervisor:
                 if pr.status != "PASS":
                     advance(State.BLOCKED_EXTERNAL, pr.evidence)
                     return State.BLOCKED_EXTERNAL
-                self.journal.update(mission_id, pr_number=int(pr.data["number"]))
+                self.journal.update(mission_id, pr_number=int(pr.data["number"]), pr_repo=str(pr.data["repo"]))
                 row = self.journal.mission(mission_id)
             if row["merge_claim_head"] is not None:
                 claim_head = row["merge_claim_head"]
@@ -436,8 +452,10 @@ class Supervisor:
                     return State.BLOCKED_EXTERNAL
                 if recovery not in {"RECOVERY_CLAIMED", "ACTIVE"}:
                     return State(self.journal.mission(mission_id)["current_state"])
+                row = self.journal.mission(mission_id)
                 parameters = inspect.signature(self.adapter.merge_status).parameters
-                status = (self.adapter.merge_status(row["worktree"], claim_head, row["pr_number"])
+                status = (self.adapter.merge_status(row["worktree"], claim_head, row["merge_claim_pr_number"], row["merge_claim_pr_repo"])
+                          if len(parameters) >= 4 else self.adapter.merge_status(row["worktree"], claim_head, row["merge_claim_pr_number"])
                           if len(parameters) >= 3 else self.adapter.merge_status(row["worktree"], claim_head))
                 if status.status == "PASS":
                     if claim_head != row["current_head"]:
@@ -477,7 +495,9 @@ class Supervisor:
                 # second external invocation for this exact claim.
                 self.journal.update(mission_id, pending_gate=None)
                 return execute_claimed_merge(row["worktree"], claim_head)
-            technical = self.adapter.ci(row["worktree"], row["current_head"], row["pr_number"])
+            parameters = inspect.signature(self.adapter.ci).parameters
+            technical = (self.adapter.ci(row["worktree"], row["current_head"], row["pr_number"], row["pr_repo"])
+                         if len(parameters) >= 4 else self.adapter.ci(row["worktree"], row["current_head"], row["pr_number"]))
             if technical.status != "PASS":
                 advance(State.BLOCKED_EXTERNAL, technical.evidence or "pre-merge canonical CI recheck failed")
                 return State.BLOCKED_EXTERNAL
@@ -506,12 +526,12 @@ class Supervisor:
             else:
                 return state
         elif state == State.POST_MERGE:
-            if not isinstance(self.adapter, SimulatedAdapter) and (not row["merge_sha"] or not row["pr_number"]):
+            if not isinstance(self.adapter, SimulatedAdapter) and (not row["merge_sha"] or not row["pr_number"] or not row["pr_repo"]):
                 advance(State.BLOCKED_EXTERNAL, "post-merge requires durable PR and merge SHA")
                 return State.BLOCKED_EXTERNAL
             if not isinstance(self.adapter, SimulatedAdapter) and row["merge_sha"] and row["pr_number"]:
                 production = self.adapter.post_merge(
-                    row["worktree"], row["merge_sha"], row["pr_number"], row["branch"], row["base_sha"],
+                    row["worktree"], row["merge_sha"], row["pr_number"], row["pr_repo"], row["branch"], row["base_sha"],
                 )
                 if production.status == "PENDING":
                     self.journal.update(mission_id, pending_gate="production-gate", ci_state="PENDING")

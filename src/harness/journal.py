@@ -36,9 +36,11 @@ class Journal:
               current_state TEXT NOT NULL, pending_gate TEXT, completed_gates_json TEXT NOT NULL DEFAULT '{}',
               ci_state TEXT, approval_state TEXT NOT NULL DEFAULT 'NONE', terminal_state TEXT,
               merge_claim_head TEXT,
+              merge_claim_pr_number INTEGER,
+              merge_claim_pr_repo TEXT,
               merge_claim_pid INTEGER,
               merge_claim_start_ticks TEXT,
-              pr_number INTEGER, merge_sha TEXT, main_sha TEXT, tree_sha TEXT,
+              pr_number INTEGER, pr_repo TEXT, merge_sha TEXT, main_sha TEXT, tree_sha TEXT,
               created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS events (
               seq INTEGER PRIMARY KEY AUTOINCREMENT, mission_id TEXT NOT NULL, kind TEXT NOT NULL,
@@ -55,7 +57,7 @@ class Journal:
               created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS approvals (
               id INTEGER PRIMARY KEY AUTOINCREMENT, mission_id TEXT NOT NULL, action TEXT NOT NULL,
-              decision TEXT NOT NULL, reason TEXT, head_sha TEXT, pr_number INTEGER,
+              decision TEXT NOT NULL, reason TEXT, head_sha TEXT, pr_number INTEGER, pr_repo TEXT,
               spec_sha256 TEXT, created_at TEXT NOT NULL);
             CREATE UNIQUE INDEX IF NOT EXISTS one_active_job_per_gate
               ON jobs(mission_id,name) WHERE state IN ('STARTING','RUNNING');
@@ -74,6 +76,8 @@ class Journal:
             self.db.execute("ALTER TABLE approvals ADD COLUMN spec_sha256 TEXT")
         if "pr_number" not in approval_columns:
             self.db.execute("ALTER TABLE approvals ADD COLUMN pr_number INTEGER")
+        if "pr_repo" not in approval_columns:
+            self.db.execute("ALTER TABLE approvals ADD COLUMN pr_repo TEXT")
         mission_columns = {row[1] for row in self.db.execute("PRAGMA table_info(missions)")}
         for name, definition in (("codex_turn_id", "TEXT"), ("codex_turn_state", "TEXT"),
                                  ("codex_turn_pid", "INTEGER"), ("codex_turn_start_ticks", "TEXT"),
@@ -84,11 +88,12 @@ class Journal:
         mission_columns = {row[1] for row in self.db.execute("PRAGMA table_info(missions)")}
         if "merge_claim_head" not in mission_columns:
             self.db.execute("ALTER TABLE missions ADD COLUMN merge_claim_head TEXT")
-        for name, definition in (("merge_claim_pid", "INTEGER"), ("merge_claim_start_ticks", "TEXT")):
+        for name, definition in (("merge_claim_pr_number", "INTEGER"), ("merge_claim_pr_repo", "TEXT"),
+                                 ("merge_claim_pid", "INTEGER"), ("merge_claim_start_ticks", "TEXT")):
             if name not in mission_columns:
                 self.db.execute(f"ALTER TABLE missions ADD COLUMN {name} {definition}")
         mission_columns = {row[1] for row in self.db.execute("PRAGMA table_info(missions)")}
-        for name, definition in (("pr_number", "INTEGER"), ("merge_sha", "TEXT"),
+        for name, definition in (("pr_number", "INTEGER"), ("pr_repo", "TEXT"), ("merge_sha", "TEXT"),
                                  ("main_sha", "TEXT"), ("tree_sha", "TEXT")):
             if name not in mission_columns:
                 self.db.execute(f"ALTER TABLE missions ADD COLUMN {name} {definition}")
@@ -240,28 +245,31 @@ class Journal:
         gates = json.loads(self.mission(mission_id)["completed_gates_json"])
         return isinstance(gates, dict) and gates.get(gate) == head
 
-    def bind_pr_identity(self, mission_id: str, head: str, pr_number: int) -> bool:
+    def bind_pr_identity(self, mission_id: str, head: str, pr_number: int, pr_repo: str) -> bool:
         """Persist CI's PR identity only for the current exact CI snapshot."""
-        if not isinstance(pr_number, int) or pr_number <= 0:
+        if (not isinstance(pr_number, int) or pr_number <= 0 or not isinstance(pr_repo, str)
+                or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", pr_repo) is None):
             return False
         try:
             self.db.execute("BEGIN IMMEDIATE")
             row = self.db.execute(
-                "SELECT current_state,current_head,pr_number FROM missions WHERE mission_id=?",
+                "SELECT current_state,current_head,pr_number,pr_repo FROM missions WHERE mission_id=?",
                 (mission_id,),
             ).fetchone()
             if (row is None or State(row["current_state"]) != State.CI
                     or row["current_head"] != head
-                    or row["pr_number"] not in {None, pr_number}):
+                    or row["pr_number"] not in {None, pr_number}
+                    or row["pr_repo"] not in {None, pr_repo}):
                 self.db.commit()
                 return False
             changed = self.db.execute(
-                "UPDATE missions SET pr_number=?,updated_at=? WHERE mission_id=? "
-                "AND current_state=? AND current_head=? AND (pr_number IS NULL OR pr_number=?)",
-                (pr_number, now(), mission_id, State.CI, head, pr_number),
+                "UPDATE missions SET pr_number=?,pr_repo=?,updated_at=? WHERE mission_id=? "
+                "AND current_state=? AND current_head=? AND (pr_number IS NULL OR pr_number=?) "
+                "AND (pr_repo IS NULL OR pr_repo=?)",
+                (pr_number, pr_repo, now(), mission_id, State.CI, head, pr_number, pr_repo),
             ).rowcount
             if changed == 1:
-                self.event(mission_id, "pr_identity_bound", {"head": head, "pr": pr_number})
+                self.event(mission_id, "pr_identity_bound", {"head": head, "pr": pr_number, "repo": pr_repo})
             self.db.commit()
             return changed == 1
         except Exception:
@@ -333,7 +341,7 @@ class Journal:
             invalidated = self.db.execute("UPDATE receipts SET invalidated=1 WHERE mission_id=? AND head_sha<>? AND invalidated=0",
                                           (mission_id, head)).rowcount
             if source == State.PASS:
-                changed = self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',pr_number=NULL,merge_sha=NULL,main_sha=NULL,tree_sha=NULL,merge_claim_head=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=? AND current_state=? AND current_head=?",
+                changed = self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',pr_number=NULL,pr_repo=NULL,merge_sha=NULL,main_sha=NULL,tree_sha=NULL,merge_claim_head=NULL,merge_claim_pr_number=NULL,merge_claim_pr_repo=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=? AND current_state=? AND current_head=?",
                                           (State.TEST, now(), mission_id, source, head)).rowcount
                 if changed != 1:
                     raise InvalidTransition("PASS reopen lost its reconciled source snapshot")
@@ -355,7 +363,7 @@ class Journal:
                     "claim_head": row["merge_claim_head"], "current_head": head,
                 })
             elif source in {State.REVIEW, State.CI, State.MERGE, State.WAITING_APPROVAL, State.POST_MERGE, State.DELIVER}:
-                changed = self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',pr_number=NULL,merge_sha=NULL,main_sha=NULL,tree_sha=NULL,merge_claim_head=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=? AND current_state=? AND current_head=?",
+                changed = self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',pr_number=NULL,pr_repo=NULL,merge_sha=NULL,main_sha=NULL,tree_sha=NULL,merge_claim_head=NULL,merge_claim_pr_number=NULL,merge_claim_pr_repo=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=? AND current_state=? AND current_head=?",
                                           (State.TEST, now(), mission_id, source, head)).rowcount
                 if changed != 1:
                     raise InvalidTransition("state rewind lost its reconciled source snapshot")
@@ -400,13 +408,13 @@ class Journal:
             if (State(mission["current_state"]) != State.WAITING_APPROVAL or
                     mission["approval_state"] != "PENDING" or
                     mission["pending_gate"] != f"owner-{action}" or
-                    (action == "merge" and mission["pr_number"] is None)):
+                    (action == "merge" and (mission["pr_number"] is None or mission["pr_repo"] is None))):
                 raise RuntimeError(f"mission is not waiting for approval of action: {action}")
             spec_digest = self._spec_digest(mission_id)
             self.db.execute(
-                "INSERT INTO approvals(mission_id,action,decision,reason,head_sha,pr_number,spec_sha256,created_at) "
-                "VALUES(?,?,?,?,?,?,?,?)",
-                (mission_id, action, "APPROVED", reason, head, mission["pr_number"], spec_digest, now()),
+                "INSERT INTO approvals(mission_id,action,decision,reason,head_sha,pr_number,pr_repo,spec_sha256,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (mission_id, action, "APPROVED", reason, head, mission["pr_number"], mission["pr_repo"], spec_digest, now()),
             )
             changed = self.db.execute(
                 "UPDATE missions SET approval_state='APPROVED',updated_at=? "
@@ -433,10 +441,10 @@ class Journal:
                 mission["current_head"] != head):
             return False
         row = self.db.execute(
-            "SELECT decision,spec_sha256,pr_number FROM approvals WHERE mission_id=? AND action=? AND head_sha=? "
+            "SELECT decision,spec_sha256,pr_number,pr_repo FROM approvals WHERE mission_id=? AND action=? AND head_sha=? "
             "ORDER BY id DESC LIMIT 1", (mission_id, action, head)).fetchone()
         return (row is not None and row[0] == "APPROVED" and row[1] == self._spec_digest(mission_id)
-                and (action != "merge" or row[2] == mission["pr_number"]))
+                and (action != "merge" or (row[2] == mission["pr_number"] and row[3] == mission["pr_repo"])))
 
     def claim_codex_turn(self, mission_id: str, owner_pid: int | None = None,
                          owner_start_ticks: str | None = None) -> str:
@@ -703,22 +711,26 @@ class Journal:
             raise RuntimeError("cannot claim merge without an owner start-time identity")
         try:
             self.db.execute("BEGIN IMMEDIATE")
-            row = self.db.execute("SELECT current_state,current_head,merge_claim_head FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
+            row = self.db.execute("SELECT current_state,current_head,merge_claim_head,pr_number,pr_repo FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
             if row is None:
                 raise KeyError(mission_id)
-            if State(row["current_state"]) != State.MERGE or row["current_head"] != head or row["merge_claim_head"] is not None:
+            if (State(row["current_state"]) != State.MERGE or row["current_head"] != head
+                    or row["merge_claim_head"] is not None or row["pr_number"] is None or not row["pr_repo"]):
                 self.db.commit()
                 return False
             changed = self.db.execute(
-                "UPDATE missions SET merge_claim_head=?,merge_claim_pid=?,"
+                "UPDATE missions SET merge_claim_head=?,merge_claim_pr_number=?,merge_claim_pr_repo=?,merge_claim_pid=?,"
                 "merge_claim_start_ticks=?,updated_at=? WHERE mission_id=? "
-                "AND current_state=? AND current_head=? AND merge_claim_head IS NULL",
-                (head, owner_pid, owner_start_ticks, now(), mission_id, State.MERGE, head),
+                "AND current_state=? AND current_head=? AND merge_claim_head IS NULL "
+                "AND pr_number=? AND pr_repo=?",
+                (head, row["pr_number"], row["pr_repo"], owner_pid, owner_start_ticks, now(),
+                 mission_id, State.MERGE, head, row["pr_number"], row["pr_repo"]),
             ).rowcount
             if changed != 1:
                 self.db.commit()
                 return False
-            self.event(mission_id, "merge_claimed", {"head": head, "owner_pid": owner_pid,
+            self.event(mission_id, "merge_claimed", {"head": head, "pr": row["pr_number"],
+                                                      "repo": row["pr_repo"], "owner_pid": owner_pid,
                                                       "owner_start_ticks": owner_start_ticks})
             self.db.commit()
             return True
@@ -816,8 +828,8 @@ class Journal:
             if current_head != claim_head:
                 changed = self.db.execute(
                     "UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,"
-                    "ci_state=NULL,approval_state='NONE',pr_number=NULL,merge_sha=NULL,main_sha=NULL,tree_sha=NULL,merge_claim_head=NULL,"
-                    "merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? "
+                    "ci_state=NULL,approval_state='NONE',pr_number=NULL,pr_repo=NULL,merge_sha=NULL,main_sha=NULL,tree_sha=NULL,merge_claim_head=NULL,"
+                    "merge_claim_pr_number=NULL,merge_claim_pr_repo=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? "
                     "WHERE mission_id=? AND current_state=? AND current_head IS ? "
                     "AND merge_claim_head=? AND merge_claim_pid=? "
                     "AND merge_claim_start_ticks=?",
