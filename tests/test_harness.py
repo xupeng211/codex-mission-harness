@@ -1578,6 +1578,72 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_claim_head"], "a" * 40)
         self.assertEqual(self.adapter.merged_heads, set())
 
+    def test_merge_status_is_queried_only_after_dead_owner_claim_is_frozen(self):
+        """A live owner cannot merge after a stale NOT_STARTED observation."""
+        head = "a" * 40
+        old_pid, old_start = 424242, "original-owner-start"
+        owner_alive = {"value": True}
+        external_calls: list[str] = []
+        status_claim_owners: list[tuple[int, str]] = []
+        journal = self.journal
+
+        class RacingMergeAdapter(SimulatedAdapter):
+            def merge_status(self, worktree, claimed_head):
+                row = journal.mission(self_spec.mission_id)
+                status_claim_owners.append(
+                    (row["merge_claim_pid"], row["merge_claim_start_ticks"]),
+                )
+                # This is the old failure window: if status is queried while
+                # the original owner is alive, it can issue the merge after
+                # NOT_STARTED was observed and then exit before reclaim.
+                if owner_alive["value"]:
+                    external_calls.append("original-owner")
+                    owner_alive["value"] = False
+                return GateResult("NOT_STARTED", "canonical merge not started")
+
+            def merge(self, worktree, claimed_head):
+                external_calls.append("recovery-owner")
+                return GateResult("PASS", "recovery merge")
+
+        self_spec = self.spec
+        adapter = RacingMergeAdapter(heads=[head])
+        recovery = Supervisor(
+            journal,
+            ProcessSupervisor(journal, Path(self.tmp.name) / "merge-race-logs"),
+            self.codex,
+            adapter,
+        )
+        journal.update(
+            self_spec.mission_id,
+            current_head=head,
+            current_state=State.MERGE,
+            merge_claim_head=head,
+            merge_claim_pid=old_pid,
+            merge_claim_start_ticks=old_start,
+        )
+        real_proc_identity = journal._proc_identity
+
+        def owner_identity(pid):
+            if pid == old_pid:
+                return (("PRESENT", old_start) if owner_alive["value"]
+                        else ("ABSENT", None))
+            return real_proc_identity(pid)
+
+        with patch.object(journal, "_proc_identity", side_effect=owner_identity):
+            # While the old owner is alive, recovery must not even query status.
+            self.assertEqual(recovery.step(self_spec.mission_id, self_spec), State.MERGE)
+            self.assertEqual(status_claim_owners, [])
+            self.assertEqual(external_calls, [])
+
+            # Once the old owner is definitely dead, its claim is transferred
+            # before status is queried, and exactly one recovery merge occurs.
+            owner_alive["value"] = False
+            self.assertEqual(recovery.step(self_spec.mission_id, self_spec), State.POST_MERGE)
+
+        recovery_owner = recovery._merge_owner()
+        self.assertEqual(status_claim_owners, [recovery_owner])
+        self.assertEqual(external_calls, ["recovery-owner"])
+
     def test_head_drift_preserves_live_merge_claim_then_revalidates_after_safe_reclaim(self):
         old_head, new_head = "a" * 40, "b" * 40
         self.journal.update(
@@ -1639,8 +1705,8 @@ class HarnessTest(unittest.TestCase):
         )
         self.adapter.heads = [new_head]
         with patch.object(
-                self.journal, "reclaim_merge_claim_if_stale",
-                return_value="RECLAIMED_HEAD_DRIFT"):
+                self.journal, "confirm_merge_retry_safe",
+                return_value="REWOUND_HEAD_DRIFT"):
             self.assertEqual(
                 self.supervisor.step(self.spec.mission_id, self.spec),
                 State.BLOCKED_EXTERNAL,
@@ -1716,11 +1782,12 @@ class HarnessTest(unittest.TestCase):
             merge_claim_pid=12345,
             merge_claim_start_ticks="owner-start",
         )
+        recovery_pid, recovery_start = self.supervisor._merge_owner()
         with patch.object(
                 self.journal, "_proc_identity", return_value=("UNKNOWN", None)):
             self.assertEqual(
-                self.journal.reclaim_merge_claim_if_stale(
-                    self.spec.mission_id, head,
+                self.journal.claim_merge_recovery(
+                    self.spec.mission_id, head, recovery_pid, recovery_start,
                 ),
                 "UNKNOWN",
             )

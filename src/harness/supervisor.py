@@ -344,6 +344,21 @@ class Supervisor:
                 return State(self.journal.mission(mission_id)["current_state"])
             if row["merge_claim_head"] is not None:
                 claim_head = row["merge_claim_head"]
+                owner_pid, owner_start_ticks = self._merge_owner()
+                recovery = self.journal.claim_merge_recovery(
+                    mission_id, claim_head, owner_pid, owner_start_ticks,
+                )
+                if recovery == "ACTIVE":
+                    # Status observed while the original owner is still alive
+                    # can become stale before reclaim and authorize a duplicate
+                    # merge. Never query status until the dead claim is frozen
+                    # under this recovery controller's durable identity.
+                    return State.MERGE
+                if recovery == "UNKNOWN":
+                    advance(State.BLOCKED_EXTERNAL, "merge claim owner identity is unavailable")
+                    return State.BLOCKED_EXTERNAL
+                if recovery != "RECOVERY_CLAIMED":
+                    return State(self.journal.mission(mission_id)["current_state"])
                 status = self.adapter.merge_status(row["worktree"], claim_head)
                 if status.status == "PASS":
                     if claim_head != row["current_head"]:
@@ -357,18 +372,16 @@ class Supervisor:
                 if status.status != "NOT_STARTED":
                     advance(State.BLOCKED_EXTERNAL, status.evidence)
                     return State.BLOCKED_EXTERNAL
-                reclaim = self.journal.reclaim_merge_claim_if_stale(mission_id, claim_head)
-                if reclaim == "ACTIVE":
-                    # A peer may be between its claim commit and its external
-                    # merge call. Never erase or steal that live claim.
-                    return State.MERGE
-                if reclaim == "UNKNOWN":
-                    advance(State.BLOCKED_EXTERNAL, "merge claim owner identity is unavailable")
+                retry = self.journal.confirm_merge_retry_safe(
+                    mission_id, claim_head, owner_pid, owner_start_ticks,
+                )
+                if retry == "UNKNOWN":
+                    advance(State.BLOCKED_EXTERNAL, "merge recovery identity is unavailable")
                     return State.BLOCKED_EXTERNAL
-                if reclaim == "RECLAIMED_HEAD_DRIFT":
-                    # The old owner is gone and canonical status proved the
-                    # stale merge never started. The journal must have atomically
-                    # rewound to TEST before any new merge claim is possible.
+                if retry == "REWOUND_HEAD_DRIFT":
+                    # Post-owner-death canonical status proved the stale merge
+                    # never started. The recovery lease must atomically rewind
+                    # to TEST before any new merge claim is possible.
                     reclaimed = self.journal.mission(mission_id)
                     if (State(reclaimed["current_state"]) != State.TEST or
                             reclaimed["merge_claim_head"] is not None):
@@ -378,15 +391,12 @@ class Supervisor:
                         )
                         return State.BLOCKED_EXTERNAL
                     return State(reclaimed["current_state"])
-                if reclaim != "RECLAIMED":
+                if retry != "RETRY_SAFE":
                     return State(self.journal.mission(mission_id)["current_state"])
-                row = self.journal.mission(mission_id)
-                # Canonical adapter proved the previous claim never started; reclaim
-                # this exact HEAD in the same supervisor turn.
-                owner_pid, owner_start_ticks = self._merge_owner()
-                if not self.journal.claim_merge(mission_id, row["current_head"], owner_pid, owner_start_ticks):
-                    return State.MERGE
-                return execute_claimed_merge(row["worktree"], row["current_head"])
+                # The post-death NOT_STARTED observation is now bound to the
+                # one live recovery lease, so no other controller can race a
+                # second external invocation for this exact claim.
+                return execute_claimed_merge(row["worktree"], claim_head)
             decision = decide("merge", spec.merge_policy)
             if decision == Decision.OWNER_APPROVAL_REQUIRED:
                 if not self.journal.approved(mission_id, "merge", row["current_head"]):

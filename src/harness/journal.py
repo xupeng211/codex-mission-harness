@@ -687,14 +687,17 @@ class Journal:
             self.db.rollback()
             raise
 
-    def reclaim_merge_claim_if_stale(self, mission_id: str, claim_head: str) -> str:
-        """Reclaim only a claim whose recorded owner is definitely gone.
+    def claim_merge_recovery(self, mission_id: str, claim_head: str,
+                             recovery_pid: int, recovery_start_ticks: str) -> str:
+        """Freeze a dead owner's claim under one live recovery controller.
 
-        A live owner remains authoritative even when canonical merge status is
-        ``NOT_STARTED``; another controller must never erase that claim between
-        its status check and its external merge call. Unknown owner identity is
-        fail-closed for pre-migration or malformed claims.
+        This writer-locked hand-off must happen before querying external merge
+        status.  Once the old PID/start-time identity is definitely gone, it can
+        no longer issue a merge after a recovery controller observes
+        ``NOT_STARTED``.  Unknown owner identity remains fail-closed.
         """
+        if not isinstance(recovery_pid, int) or recovery_pid <= 0 or not recovery_start_ticks:
+            raise RuntimeError("cannot recover merge without a controller identity")
         try:
             self.db.execute("BEGIN IMMEDIATE")
             row = self.db.execute(
@@ -718,31 +721,91 @@ class Journal:
                 self.db.commit()
                 return "ACTIVE"
             current_head = row["current_head"]
-            drifted = current_head != claim_head
-            target = State.TEST if drifted else State.MERGE
             changed = self.db.execute(
-                "UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,"
-                "approval_state='NONE',merge_claim_head=NULL,merge_claim_pid=NULL,"
-                "merge_claim_start_ticks=NULL,updated_at=? "
+                "UPDATE missions SET merge_claim_pid=?,merge_claim_start_ticks=?,updated_at=? "
                 "WHERE mission_id=? AND current_state=? AND current_head IS ? AND merge_claim_head=? "
                 "AND merge_claim_pid=? AND merge_claim_start_ticks=?",
-                (target, now(), mission_id, State.MERGE, current_head, claim_head, pid, start_ticks),
+                (recovery_pid, recovery_start_ticks, now(), mission_id, State.MERGE,
+                 current_head, claim_head, pid, start_ticks),
             ).rowcount
             if changed != 1:
                 self.db.commit()
                 return "NO_CLAIM"
-            self.event(mission_id, "merge_claim_reclaimed", {
+            self.event(mission_id, "merge_recovery_claimed", {
                 "claim_head": claim_head, "current_head": current_head,
-                "owner_pid": pid, "owner_start_ticks": start_ticks,
-                "head_drifted": drifted,
+                "previous_owner_pid": pid, "previous_owner_start_ticks": start_ticks,
+                "recovery_pid": recovery_pid,
+                "recovery_start_ticks": recovery_start_ticks,
             })
-            if drifted:
+            self.db.commit()
+            return "RECOVERY_CLAIMED"
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def confirm_merge_retry_safe(self, mission_id: str, claim_head: str,
+                                 recovery_pid: int, recovery_start_ticks: str) -> str:
+        """Bind a post-owner-death ``NOT_STARTED`` result to the recovery lease.
+
+        The caller may retry only when this exact recovery identity still owns
+        the claim and the canonical source HEAD has not drifted.  Drift clears
+        the claim and atomically rewinds to TEST instead of merging either HEAD.
+        """
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT current_state,current_head,merge_claim_head,merge_claim_pid,"
+                "merge_claim_start_ticks FROM missions WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(mission_id)
+            if (State(row["current_state"]) != State.MERGE or
+                    row["merge_claim_head"] != claim_head or
+                    row["merge_claim_pid"] != recovery_pid or
+                    row["merge_claim_start_ticks"] != recovery_start_ticks):
+                self.db.commit()
+                return "NO_CLAIM"
+            owner_status, observed_ticks = self._proc_identity(recovery_pid)
+            if owner_status == "UNKNOWN":
+                self.db.commit()
+                return "UNKNOWN"
+            if owner_status != "PRESENT" or observed_ticks != recovery_start_ticks:
+                self.db.commit()
+                return "NO_CLAIM"
+            current_head = row["current_head"]
+            if current_head != claim_head:
+                changed = self.db.execute(
+                    "UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,"
+                    "ci_state=NULL,approval_state='NONE',merge_claim_head=NULL,"
+                    "merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? "
+                    "WHERE mission_id=? AND current_state=? AND current_head IS ? "
+                    "AND merge_claim_head=? AND merge_claim_pid=? "
+                    "AND merge_claim_start_ticks=?",
+                    (State.TEST, now(), mission_id, State.MERGE, current_head,
+                     claim_head, recovery_pid, recovery_start_ticks),
+                ).rowcount
+                if changed != 1:
+                    self.db.commit()
+                    return "NO_CLAIM"
+                self.event(mission_id, "merge_claim_released_after_head_drift", {
+                    "claim_head": claim_head, "current_head": current_head,
+                    "recovery_pid": recovery_pid,
+                    "recovery_start_ticks": recovery_start_ticks,
+                })
                 self.event(mission_id, "state_reconciled_to_test", {
                     "from": State.MERGE,
-                    "reason": "stale merge claim owner exited after canonical HEAD changed",
+                    "reason": "canonical merge was not started and source HEAD changed",
                 })
+                self.db.commit()
+                return "REWOUND_HEAD_DRIFT"
+            self.event(mission_id, "merge_retry_authorized", {
+                "claim_head": claim_head, "recovery_pid": recovery_pid,
+                "recovery_start_ticks": recovery_start_ticks,
+                "status": "NOT_STARTED",
+            })
             self.db.commit()
-            return "RECLAIMED_HEAD_DRIFT" if drifted else "RECLAIMED"
+            return "RETRY_SAFE"
         except Exception:
             self.db.rollback()
             raise

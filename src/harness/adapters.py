@@ -45,7 +45,11 @@ class FootballPredictionAdapter:
 
     def post_merge(self, gate: str, head: str) -> GateResult:
         return GateResult("BLOCKED_EXTERNAL", f"canonical post-merge gate {gate} required for {head}")
+
     def merge_status(self, worktree: str, head: str) -> GateResult:
+        # A real adapter may return NOT_STARTED only from canonical status that
+        # proves retry is safe after the recorded claim owner has exited. An
+        # eventually consistent absence is BLOCKED_EXTERNAL, not NOT_STARTED.
         return GateResult("BLOCKED_EXTERNAL", f"canonical merge status required for exact head {head}")
 
 
