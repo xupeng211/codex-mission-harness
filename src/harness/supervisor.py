@@ -487,6 +487,9 @@ class Supervisor:
                 if production.status != "PASS":
                     advance(State.BLOCKED_EXTERNAL, production.evidence)
                     return State.BLOCKED_EXTERNAL
+                facts = production.data or {}
+                if facts.get("main_sha") and facts.get("tree_sha"):
+                    self.journal.update(mission_id, main_sha=facts["main_sha"], tree_sha=facts["tree_sha"], pending_gate=None, ci_state=None)
             for gate in spec.post_merge_gates:
                 result = self.adapter.post_merge(gate, row["current_head"])
                 if result.status != "PASS":

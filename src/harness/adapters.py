@@ -150,7 +150,18 @@ class FootballPredictionAdapter:
         except json.JSONDecodeError: return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "Production Gate check returned no JSON")
         if str(data.get("ci_head_sha", "")).lower() != merge_sha.lower():
             return GateResult("BLOCKED_EXTERNAL", "Production Gate is not bound to exact merge SHA")
-        if data.get("verdict") == "PASS": return GateResult("PASS", "canonical Production Gate passed", data=data)
+        if data.get("verdict") == "PASS":
+            try:
+                self._run(["git", "fetch", "origin", "main"], cwd=worktree)
+                main_sha = self._run(["git", "rev-parse", "origin/main"], cwd=worktree).lower()
+                tree_sha = self._run(["git", "rev-parse", "origin/main^{tree}"], cwd=worktree).lower()
+                reachable = self._call(["git", "merge-base", "--is-ancestor", merge_sha, "origin/main"], cwd=worktree)
+            except (subprocess.SubprocessError, OSError) as exc:
+                return GateResult("BLOCKED_EXTERNAL", f"cannot record post-merge main truth: {exc}")
+            if reachable.returncode != 0:
+                return GateResult("BLOCKED_EXTERNAL", "merged SHA is not reachable from origin/main")
+            data.update({"main_sha": main_sha, "tree_sha": tree_sha})
+            return GateResult("PASS", "canonical Production Gate passed", data=data)
         if str(data.get("ci_status")) in {"queued", "in_progress", "requested", ""}: return GateResult("PENDING", json.dumps(data), data=data)
         return GateResult("FAIL", json.dumps(data), data=data)
 
