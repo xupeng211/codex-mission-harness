@@ -74,7 +74,7 @@ def run(args):
     verdict="FAIL" if any(f.get("severity") in {"P0","P1","P2"} for f in results) else "PASS"
     receipt={"version":VERSION,"repository":git(root,"config","--get","remote.origin.url").decode().strip(),"mission_id":args.mission_id,"base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"manifest_sha256":manifest_hash,"chunks":plan,"provider":"deepseek","model":MODEL,"command_sha256":digest(canon(command)),"started_at":int(time.time()),"completed_at":int(time.time()),"review_result":verdict,"findings":results}
     receipt["integrity_sha256"]=digest(canon(receipt)); path=evidence/f"deepseek-receipt-{head[:12]}-{uuid.uuid4().hex}.json"; path.write_bytes(canon(receipt)); os.chmod(path,0o600)
-    print(json.dumps({"status":verdict,"receipt":str(path),"head_sha":head}))
+    print(json.dumps({"status":verdict,"receipt":str(path),"review_receipt":str(path),"head_sha":head}))
 def main():
     p=argparse.ArgumentParser(); sub=p.add_subparsers(dest="cmd",required=True)
     r=sub.add_parser("run"); r.add_argument("--repo",default="."); r.add_argument("--mission-id",default="codex-mission-harness"); r.add_argument("--base",required=True); r.add_argument("--head",required=True); r.add_argument("--evidence",required=True); r.add_argument("--token-file",required=True); r.add_argument("--timeout",type=int,default=900)

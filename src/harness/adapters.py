@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,6 +76,12 @@ class FootballPredictionAdapter:
                 evidence = json.loads(Path(receipt).read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 return GateResult("BLOCKED_EXTERNAL", "DeepSeek receipt is unreadable", receipt)
+            if evidence.get("version") == "cmh-deepseek-review/v1":
+                observed = evidence.pop("integrity_sha256", None)
+                expected = hashlib.sha256(json.dumps(evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+                evidence["integrity_sha256"] = observed
+                if observed != expected:
+                    return GateResult("BLOCKED_EXTERNAL", "DeepSeek receipt integrity mismatch", receipt)
             required = {"base_sha", "head_sha", "mission_id", "diff_sha256", "review_result", "findings", "integrity"}
             if not required <= set(evidence) or evidence.get("base_sha") != base or evidence.get("head_sha") != head or evidence.get("mission_id") != mission_id:
                 return GateResult("BLOCKED_EXTERNAL", "DeepSeek receipt binding is incomplete or stale", receipt)
@@ -97,7 +104,7 @@ class FootballPredictionAdapter:
     def discover_pr(self, worktree: str, head: str) -> GateResult:
         try:
             repo = json.loads(self._run(["gh", "repo", "view", "--json", "nameWithOwner"], cwd=worktree))["nameWithOwner"]
-            branch = self._run(["git", "branch", "--show-current"], cwd=worktree)
+            branch = self._run(["git", "branch", "--show-current"], cwd=worktree).strip()
             pulls = json.loads(self._run(["gh", "api", f"repos/{repo}/pulls?state=open&head={repo.split('/')[0]}:{branch}"], cwd=worktree))
         except (KeyError, json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
             return GateResult("BLOCKED_EXTERNAL", f"GitHub PR discovery unavailable: {exc}")
