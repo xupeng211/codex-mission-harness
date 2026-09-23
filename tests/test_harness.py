@@ -211,7 +211,7 @@ class HarnessTest(unittest.TestCase):
                 Path(worktree, "uncheckpointed.txt").write_text("late model edit\n")
                 return head
 
-        spec = replace(self.spec, adapter="footballprediction")
+        spec = replace(self.spec, adapter="footballprediction", mission_scope_file="scope.json")
         journal = Journal(Path(self.tmp.name) / "completed-dirty.sqlite")
         journal.create(spec, worktree=str(repo), base_sha="b" * 40,
                        branch="harness/completed-dirty")
@@ -233,7 +233,7 @@ class HarnessTest(unittest.TestCase):
 
     def test_completed_production_turn_blocks_when_checkpoint_inspection_fails(self):
         """An unavailable Git checkpoint inspection is not treated as clean."""
-        spec = replace(self.spec, adapter="footballprediction")
+        spec = replace(self.spec, adapter="footballprediction", mission_scope_file="scope.json")
         self.journal.db.execute(
             "UPDATE missions SET spec_json=?,current_head=?,current_state=? WHERE mission_id=?",
             (json.dumps(spec.__dict__), "a" * 40, State.IMPLEMENT, spec.mission_id),
@@ -826,7 +826,7 @@ class HarnessTest(unittest.TestCase):
                 Path(cwd, "uncheckpointed.txt").write_text("model edit\n")
                 return super().turn(thread_id, prompt, cwd)
 
-        spec = replace(self.spec, adapter="footballprediction")
+        spec = replace(self.spec, adapter="footballprediction", mission_scope_file="scope.json")
         journal = Journal(Path(self.tmp.name) / "dirty.sqlite")
         supervisor = Supervisor(journal, ProcessSupervisor(journal, Path(self.tmp.name) / "dirty-logs"),
                                 DirtyCodex(), FootballPredictionAdapter())
@@ -1483,6 +1483,7 @@ class HarnessTest(unittest.TestCase):
             "mission_id": "constructor-bound",
             "repository": "/source/repository",
             "objective": "safe fixture",
+            "mission_scope_file": "scope.json",
         }))
         tree = Worktree(
             "/source/repository", "b" * 40, "harness/constructor-bound",
@@ -1518,6 +1519,18 @@ class HarnessTest(unittest.TestCase):
         supervisor = build(Path(self.tmp.name), "simulation")
         self.assertIsInstance(supervisor.codex, FixtureCodex)
         self.assertNotIsInstance(supervisor.codex, AppServerCodex)
+
+    def test_football_mission_requires_contained_relative_scope_contract(self):
+        base = {"schema_version": 1, "mission_id": "x", "repository": "/r",
+                "objective": "x", "adapter": "footballprediction"}
+        for scope in (None, "", "/tmp/scope.json", "../scope.json", "a/../../scope.json", "a\\scope.json"):
+            payload = dict(base)
+            if scope is not None:
+                payload["mission_scope_file"] = scope
+            with self.subTest(scope=scope), self.assertRaisesRegex(ValueError, "safe relative path"):
+                MissionSpec.from_mapping(payload)
+        valid = MissionSpec.from_mapping({**base, "mission_scope_file": "docs/agentic/mission.json"})
+        self.assertEqual(valid.mission_scope_file, "docs/agentic/mission.json")
 
     def test_forbidden_merge_is_denied_before_claim(self):
         spec = MissionSpec("deny-merge", "/safe/repo", "fixture", adapter="simulation", merge_policy="auto", forbidden_actions=("merge",))
@@ -1574,6 +1587,34 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_claim_head"], head)
         self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
         self.assertEqual(adapter.merged_heads, {head})
+
+    def test_merge_retry_failure_blocks_instead_of_rearming_unknown_outcome(self):
+        class AlwaysUnavailable(SimulatedAdapter):
+            def merge(self, worktree, head):
+                raise RuntimeError("transport unavailable")
+
+        adapter = AlwaysUnavailable()
+        supervisor = Supervisor(
+            self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "bounded-merge-retry"),
+            self.codex, adapter,
+        )
+        head = "a" * 40
+        self.journal.update(self.spec.mission_id, current_head=head, current_state=State.MERGE,
+                            merge_claim_head=None, merge_claim_pid=None, merge_claim_start_ticks=None)
+        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.MERGE)
+        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
+
+    def test_legacy_two_argument_ci_adapter_is_dispatched_without_crash(self):
+        class TwoArgumentCI(SimulatedAdapter):
+            def ci(self, worktree, head):
+                return GateResult("PASS", "legacy fixture")
+
+        supervisor = Supervisor(
+            self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "two-arg-ci"),
+            self.codex, TwoArgumentCI(),
+        )
+        self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.CI)
+        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.MERGE)
 
     def test_unknown_merge_reconciliation_marker_has_one_durable_consumer(self):
         head = "a" * 40

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import PurePosixPath
 from typing import Any, Mapping
 
 
@@ -75,11 +76,17 @@ class MissionSpec:
                 if not isinstance(value, (list, tuple)) or not all(isinstance(item, str) for item in value):
                     raise ValueError(f"{field} must be a string list")
                 data[field] = tuple(value)
-        if data.get("mission_scope_file") is not None and not isinstance(data["mission_scope_file"], str):
-            raise ValueError("mission_scope_file must be a string when provided")
         adapter = data.get("adapter", "footballprediction")
         if not isinstance(adapter, str) or adapter not in {"footballprediction", "simulation"}:
             raise ValueError("adapter must be exactly footballprediction or simulation")
+        scope = data.get("mission_scope_file")
+        if scope is not None and not isinstance(scope, str):
+            raise ValueError("mission_scope_file must be a string when provided")
+        if adapter == "footballprediction":
+            path = PurePosixPath(scope) if isinstance(scope, str) and scope else None
+            if (path is None or path.is_absolute() or "\\" in scope
+                    or any(part in {"", ".", ".."} for part in path.parts)):
+                raise ValueError("footballprediction mission_scope_file must be a safe relative path")
         if data.get("merge_policy", "owner_approval") not in {"owner_approval", "auto"}:
             raise ValueError("merge_policy must be exactly owner_approval or auto")
         for field in ("mission_id", "repository", "objective"):

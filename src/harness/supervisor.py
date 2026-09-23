@@ -109,11 +109,22 @@ class Supervisor:
                 reviewer = str(job["name"]).split(":", 1)[1]
                 spec = self.journal.spec(mission_id)
                 scope = spec.mission_scope_file
-                if result.state in {"EXITED", "LOST"} and scope:
+                if result.state in {"EXITED", "LOST"}:
+                    root = Path(snapshot["worktree"]).resolve()
                     try:
+                        if not scope:
+                            raise ValueError("FootballPrediction review requires mission_scope_file")
+                        scope_path = (root / scope).resolve()
+                        relative_scope = scope_path.relative_to(root)
+                        tracked = subprocess.run(
+                            ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", str(relative_scope)],
+                            capture_output=True, text=True, check=False,
+                        )
+                        if not scope_path.is_file() or tracked.returncode != 0:
+                            raise ValueError("mission scope contract is not a tracked file")
                         reviewed = self.adapter.review_result(
                             reviewer, worktree=snapshot["worktree"], base=snapshot["base_sha"], head=current,
-                            mission_id=mission_id, scope_file=str(Path(snapshot["worktree"], scope)),
+                            mission_id=mission_id, scope_file=str(scope_path),
                             stdout_path=job["stdout_path"],
                         )
                     except Exception as exc:
@@ -281,7 +292,7 @@ class Supervisor:
                         f"merge returned unsupported status: {result.status}")
             return State(self.journal.mission(mission_id)["current_state"])
 
-        def execute_claimed_merge(worktree: str, head: str) -> State:
+        def execute_claimed_merge(worktree: str, head: str, *, retry: bool = False) -> State:
             """Execute once after a durable claim; unknown outcomes remain reconcilable."""
             try:
                 identity = self.journal.mission(mission_id)
@@ -289,13 +300,18 @@ class Supervisor:
                 claimed_repo = identity["merge_claim_pr_repo"]
                 parameters = inspect.signature(self.adapter.merge).parameters
                 result = (self.adapter.merge(worktree, head, claimed_pr, claimed_repo)
-                          if len(parameters) >= 4 else self.adapter.merge(worktree, head, claimed_pr))
+                          if len(parameters) >= 4 else self.adapter.merge(worktree, head, claimed_pr)
+                          if len(parameters) >= 3 else self.adapter.merge(worktree, head))
             except Exception as exc:
+                if retry:
+                    return finish_merge(GateResult("BLOCKED_EXTERNAL", f"merge retry failed: {exc}"))
                 self.journal.event(mission_id, "merge_outcome_unknown", {"head": head, "error": str(exc)})
                 self.journal.update(mission_id, pending_gate="merge-outcome-unknown")
                 self.journal.db.commit()
                 return State.MERGE
             if result.status == "BLOCKED_EXTERNAL":
+                if retry:
+                    return finish_merge(result)
                 self.journal.event(mission_id, "merge_outcome_unknown", {"head": head, "error": result.evidence})
                 self.journal.update(mission_id, pending_gate="merge-outcome-unknown")
                 self.journal.db.commit()
@@ -393,7 +409,8 @@ class Supervisor:
         elif state == State.CI:
             parameters = inspect.signature(self.adapter.ci).parameters
             result = (self.adapter.ci(row["worktree"], row["current_head"], row["pr_number"], row["pr_repo"])
-                      if len(parameters) >= 4 else self.adapter.ci(row["worktree"], row["current_head"], row["pr_number"]))
+                      if len(parameters) >= 4 else self.adapter.ci(row["worktree"], row["current_head"], row["pr_number"])
+                      if len(parameters) >= 3 else self.adapter.ci(row["worktree"], row["current_head"]))
             facts = result.data or {}
             if facts.get("pr_number") is not None:
                 if not self.journal.bind_pr_identity(mission_id, row["current_head"], int(facts["pr_number"]),
@@ -494,10 +511,11 @@ class Supervisor:
                 # one live recovery lease, so no other controller can race a
                 # second external invocation for this exact claim.
                 self.journal.update(mission_id, pending_gate=None)
-                return execute_claimed_merge(row["worktree"], claim_head)
+                return execute_claimed_merge(row["worktree"], claim_head, retry=True)
             parameters = inspect.signature(self.adapter.ci).parameters
             technical = (self.adapter.ci(row["worktree"], row["current_head"], row["pr_number"], row["pr_repo"])
-                         if len(parameters) >= 4 else self.adapter.ci(row["worktree"], row["current_head"], row["pr_number"]))
+                         if len(parameters) >= 4 else self.adapter.ci(row["worktree"], row["current_head"], row["pr_number"])
+                         if len(parameters) >= 3 else self.adapter.ci(row["worktree"], row["current_head"]))
             if technical.status != "PASS":
                 advance(State.BLOCKED_EXTERNAL, technical.evidence or "pre-merge canonical CI recheck failed")
                 return State.BLOCKED_EXTERNAL

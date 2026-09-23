@@ -258,6 +258,8 @@ class FootballPredictionAdapter:
                             env={"GH_REPO": pr_repo})
         try: data = json.loads(result.stdout)
         except json.JSONDecodeError: return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "Production Gate check returned no JSON")
+        if result.returncode != 0:
+            return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "Production Gate command failed", data=data)
         if str(data.get("ci_head_sha", "")).lower() != merge_sha.lower():
             return GateResult("BLOCKED_EXTERNAL", "Production Gate is not bound to exact merge SHA")
         if data.get("verdict") == "PASS":
