@@ -36,7 +36,10 @@ class FootballPredictionAdapter:
         programs = {"codex": "scripts/devops/codex_independent_review.py",
                     "deepseek": "scripts/devops/claude_deepseek_independent_review.py"}
         if reviewer not in programs: raise ValueError(f"unsupported independent reviewer: {reviewer}")
-        return ["python3", programs[reviewer], "--repo-root", worktree, "--base-sha", base,
+        command = ["python3", programs[reviewer]]
+        if reviewer == "codex":
+            command.append("run")
+        return command + ["--repo-root", worktree, "--base-sha", base,
                 "--head-sha", head, "--mission-id", mission_id, "--mission-scope-file", scope_file,
                 "--evidence-dir", evidence_dir]
 
