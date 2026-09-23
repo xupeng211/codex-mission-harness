@@ -1139,44 +1139,97 @@ class HarnessTest(unittest.TestCase):
         process._children[retried].wait()
         process.poll(self.spec.mission_id)
 
-    def test_release_pipe_failure_keeps_child_registered_and_reapable(self):
+    def test_release_pipe_failure_reaps_child_and_retires_running_lease(self):
         class FailingStdin:
             def write(self, payload):
-                return len(payload)
+                raise BrokenPipeError("bootstrap exited before release")
 
             def close(self):
-                raise BrokenPipeError("bootstrap exited")
+                pass
 
-        class ExitedChild:
+        class LiveChild:
             pid = 12345
 
             def __init__(self):
                 self.stdin = FailingStdin()
+                self.terminated = False
+                self.waited = False
 
             def poll(self):
-                return 17
+                return None if not self.terminated else -15
 
-        child = ExitedChild()
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout):
+                self.waited = True
+                return -15
+
+        child = LiveChild()
         process = self.supervisor.process
         with patch("harness.process.subprocess.Popen", return_value=child), \
                 patch("harness.process.os.getpgid", return_value=12345), \
                 patch("harness.process.proc_start_ticks", return_value="child-start"):
-            job_id = process.start(
-                self.spec.mission_id, "release-fails", ["/bin/false"],
-                str(self.worktree), {}, "a" * 40,
-            )
-        self.assertIs(process._children[job_id], child)
-        result = process.poll(self.spec.mission_id)
-        self.assertIn((job_id, "EXITED", 17), [
-            (item.job_id, item.state, item.exit_code) for item in result
-        ])
-        self.assertNotIn(job_id, process._children)
+            with self.assertRaisesRegex(BrokenPipeError, "before release"):
+                process.start(
+                    self.spec.mission_id, "release-fails", ["/bin/false"],
+                    str(self.worktree), {}, "a" * 40,
+                )
+        row = self.journal.db.execute(
+            "SELECT job_id,state,ended_at FROM jobs WHERE mission_id=? AND name=?",
+            (self.spec.mission_id, "release-fails"),
+        ).fetchone()
+        self.assertTrue(child.terminated)
+        self.assertTrue(child.waited)
+        self.assertNotIn(row["job_id"], process._children)
+        self.assertEqual(row["state"], "LOST")
+        self.assertIsNotNone(row["ended_at"])
         self.assertEqual(
             self.journal.db.execute(
-                "SELECT state FROM jobs WHERE job_id=?", (job_id,),
+                "SELECT count(*) FROM jobs WHERE mission_id=? AND name=? "
+                "AND state IN ('STARTING','RUNNING')",
+                (self.spec.mission_id, "release-fails"),
             ).fetchone()[0],
-            "EXITED",
+            0,
         )
+
+    def test_terminal_poll_cas_cannot_overwrite_a_peer_terminal_result(self):
+        job_id = "concurrent-terminal-poll"
+        database = Path(self.tmp.name) / "harness.sqlite"
+        self.journal.db.execute(
+            "INSERT INTO jobs(job_id,mission_id,name,argv_json,launch_head,pid,pgid,"
+            "start_ticks,state,stdout_path,stderr_path,started_at,launcher_pid,"
+            "launcher_start_ticks,lease_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (job_id, self.spec.mission_id, "verify-pr", "[]", "a" * 40,
+             34567, 34567, "child-start", "RUNNING", "", "", "now",
+             45678, "launcher-start", "lease-a"),
+        )
+        self.journal.db.commit()
+        peer = Journal(database)
+
+        def peer_publishes_exit(pid):
+            peer.db.execute(
+                "UPDATE jobs SET state='EXITED',exit_code=0,ended_at='peer-ended' "
+                "WHERE job_id=? AND state='RUNNING' AND lease_token=?",
+                (job_id, "lease-a"),
+            )
+            peer.db.commit()
+            return "ABSENT", None
+
+        try:
+            with patch("harness.process.proc_identity", side_effect=peer_publishes_exit):
+                self.assertEqual(self.supervisor.process.poll(self.spec.mission_id), [])
+        finally:
+            peer.db.close()
+        row = self.journal.db.execute(
+            "SELECT state,exit_code,ended_at FROM jobs WHERE job_id=?", (job_id,),
+        ).fetchone()
+        self.assertEqual(tuple(row), ("EXITED", 0, "peer-ended"))
+        self.assertIsNone(self.journal.db.execute(
+            "SELECT 1 FROM events WHERE mission_id=? AND kind='process_lost' "
+            "AND json_extract(payload_json, '$.job_id')=?",
+            (self.spec.mission_id, job_id),
+        ).fetchone())
 
     def test_prepublication_identity_failure_retires_starting_reservation(self):
         class UnreleasedChild:

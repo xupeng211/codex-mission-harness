@@ -169,12 +169,45 @@ class ProcessSupervisor:
                 proc.stdin.close()
             except (OSError, ValueError):
                 pass
-            self.journal.event(mission_id, "process_release_failed", {
-                "job_id": job_id, "name": name, "pid": proc.pid,
-                "error": str(exc),
-            })
-            self.journal.db.commit()
-            return job_id
+            # The release outcome is unknown: a short write cannot execute the
+            # gate, while a close error may have delivered EOF and started it.
+            # Stop and reap only our registered child, then retire the exact
+            # RUNNING lease so neither this controller nor a restart can wait
+            # forever on a bootstrap that will receive no further input.
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            except OSError:
+                pass
+            self._children.pop(job_id, None)
+            try:
+                self.journal.db.execute("BEGIN IMMEDIATE")
+                changed = self.journal.db.execute(
+                    "UPDATE jobs SET state='LOST',ended_at=? WHERE job_id=? "
+                    "AND state='RUNNING' AND lease_token=? AND pid=? AND start_ticks=? "
+                    "AND launcher_pid=? AND launcher_start_ticks IS ?",
+                    (now(), job_id, lease, proc.pid, child_start_ticks,
+                     self.launcher_pid, self.launcher_start_ticks),
+                ).rowcount
+                if changed:
+                    self.journal.event(mission_id, "process_release_failed", {
+                        "job_id": job_id, "name": name, "pid": proc.pid,
+                        "error": str(exc), "state": "LOST",
+                    })
+                self.journal.db.commit()
+            except Exception:
+                self.journal.db.rollback()
+                raise
+            raise
         self.journal.event(mission_id, "process_started", {"job_id": job_id, "name": name, "pid": proc.pid, "argv": argv})
         self.journal.db.commit()
         return job_id
@@ -217,10 +250,20 @@ class ProcessSupervisor:
                     continue
                 self._children.pop(row["job_id"], None)
                 state = "EXITED"
-                self.journal.db.execute("UPDATE jobs SET state=?,exit_code=?,ended_at=? WHERE job_id=?",
-                                        (state, code, now(), row["job_id"]))
-                self.journal.event(mission_id, "process_exited", {"job_id": row["job_id"], "exit_code": code})
-                results.append(JobResult(row["job_id"], state, code, row["launch_head"]))
+                changed = self.journal.db.execute(
+                    "UPDATE jobs SET state=?,exit_code=?,ended_at=? WHERE job_id=? "
+                    "AND state='RUNNING' AND lease_token IS ? AND pid IS ? "
+                    "AND start_ticks IS ? AND launcher_pid IS ? "
+                    "AND launcher_start_ticks IS ?",
+                    (state, code, now(), row["job_id"], row["lease_token"],
+                     row["pid"], row["start_ticks"], row["launcher_pid"],
+                     row["launcher_start_ticks"]),
+                ).rowcount
+                if changed:
+                    self.journal.event(mission_id, "process_exited", {
+                        "job_id": row["job_id"], "exit_code": code,
+                    })
+                    results.append(JobResult(row["job_id"], state, code, row["launch_head"]))
                 continue
             process_status, current = proc_identity(pid) if pid else ("UNKNOWN", None)
             if process_status == "UNKNOWN":
@@ -238,10 +281,20 @@ class ProcessSupervisor:
             except ChildProcessError:
                 pass
             state = "EXITED" if code is not None else "LOST"
-            self.journal.db.execute("UPDATE jobs SET state=?,exit_code=?,ended_at=? WHERE job_id=?",
-                                    (state, code, now(), row["job_id"]))
-            self.journal.event(mission_id, "process_" + state.lower(), {"job_id": row["job_id"], "exit_code": code})
-            results.append(JobResult(row["job_id"], state, code, row["launch_head"]))
+            changed = self.journal.db.execute(
+                "UPDATE jobs SET state=?,exit_code=?,ended_at=? WHERE job_id=? "
+                "AND state='RUNNING' AND lease_token IS ? AND pid IS ? "
+                "AND start_ticks IS ? AND launcher_pid IS ? "
+                "AND launcher_start_ticks IS ?",
+                (state, code, now(), row["job_id"], row["lease_token"],
+                 row["pid"], row["start_ticks"], row["launcher_pid"],
+                 row["launcher_start_ticks"]),
+            ).rowcount
+            if changed:
+                self.journal.event(mission_id, "process_" + state.lower(), {
+                    "job_id": row["job_id"], "exit_code": code,
+                })
+                results.append(JobResult(row["job_id"], state, code, row["launch_head"]))
         self.journal.db.commit()
         return results
 
