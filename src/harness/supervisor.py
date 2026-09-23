@@ -254,7 +254,11 @@ class Supervisor:
             """Classify merge outcomes without treating provider failure as policy denial."""
             if result.status == "PASS":
                 data = result.data or {}
-                if data.get("pr") and data.get("merge_sha"):
+                if not data.get("pr") or not data.get("merge_sha"):
+                    if not isinstance(self.adapter, SimulatedAdapter):
+                        advance(State.BLOCKED_EXTERNAL, "merge PASS omitted PR or merge SHA")
+                        return State.BLOCKED_EXTERNAL
+                else:
                     self.journal.update(mission_id, pr_number=int(data["pr"]), merge_sha=str(data["merge_sha"]))
                 advance(State.POST_MERGE, result.evidence)
             elif result.status == "BLOCKED_POLICY":
@@ -475,6 +479,9 @@ class Supervisor:
             else:
                 return state
         elif state == State.POST_MERGE:
+            if not isinstance(self.adapter, SimulatedAdapter) and (not row["merge_sha"] or not row["pr_number"]):
+                advance(State.BLOCKED_EXTERNAL, "post-merge requires durable PR and merge SHA")
+                return State.BLOCKED_EXTERNAL
             if row["merge_sha"] and row["pr_number"]:
                 production = self.adapter.post_merge(
                     row["worktree"], row["merge_sha"], row["pr_number"], row["branch"],

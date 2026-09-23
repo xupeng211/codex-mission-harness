@@ -9,7 +9,7 @@ review = importlib.util.module_from_spec(spec); spec.loader.exec_module(review)
 BASE, HEAD = "a" * 40, "b" * 40
 
 def receipt(**overrides):
-    value = {"version": review.VERSION, "repository": "fixture", "base_sha": BASE, "head_sha": HEAD,
+    value = {"version": review.VERSION, "repository": "fixture", "mission_id": "fixture", "base_sha": BASE, "head_sha": HEAD,
              "diff_sha256": "d" * 64, "manifest_sha256": "e" * 64,
              "chunks": [{"index": 0, "result": {"review_result": "PASS", "findings": []}}],
              "provider": "deepseek", "model": review.MODEL, "command_sha256": "c" * 64,

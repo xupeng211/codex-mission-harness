@@ -33,7 +33,7 @@ def chunks(diff):
         source=diff[start:end]; out.append({"index":len(out),"start":start,"end":end,"sha256":digest(source)}) ; start=end
     return out
 def validate(receipt, base, head):
-    required={"version","repository","base_sha","head_sha","diff_sha256","manifest_sha256","chunks","provider","model","command_sha256","review_result","findings","integrity_sha256"}
+    required={"version","repository","mission_id","base_sha","head_sha","diff_sha256","manifest_sha256","chunks","provider","model","command_sha256","review_result","findings","integrity_sha256"}
     if not required <= set(receipt): raise ValueError("incomplete receipt")
     if receipt["version"] != VERSION or receipt["base_sha"] != base or receipt["head_sha"] != head: raise ValueError("receipt exact-head binding mismatch")
     copy=dict(receipt); observed=copy.pop("integrity_sha256")
@@ -54,7 +54,7 @@ def run(args):
     root=Path(args.repo).resolve(); base=full_sha(args.base); head=full_sha(args.head)
     if git(root,"rev-parse","HEAD").decode().strip().lower()!=head: raise ValueError("worktree HEAD differs from requested HEAD")
     diff=git(root,"diff","--no-ext-diff","--binary",f"{base}..{head}"); plan=chunks(diff); diff_hash=digest(diff)
-    manifest={"version":"cmh-deepseek-chunks/v1","base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"chunks":plan}; manifest_hash=digest(canon(manifest))
+    manifest={"version":"cmh-deepseek-chunks/v1","base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"chunks":[dict(chunk) for chunk in plan]}; manifest_hash=digest(canon(manifest))
     evidence=Path(args.evidence).resolve(); evidence.mkdir(parents=True,exist_ok=True); os.chmod(evidence,0o700)
     token=Path(args.token_file).read_text().strip()
     if not token: raise ValueError("empty DeepSeek token file")
@@ -72,12 +72,12 @@ def run(args):
     finally:
         Path(settings.name).unlink(missing_ok=True)
     verdict="FAIL" if any(f.get("severity") in {"P0","P1","P2"} for f in results) else "PASS"
-    receipt={"version":VERSION,"repository":git(root,"config","--get","remote.origin.url").decode().strip(),"base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"manifest_sha256":manifest_hash,"chunks":plan,"provider":"deepseek","model":MODEL,"command_sha256":digest(canon(command)),"started_at":int(time.time()),"completed_at":int(time.time()),"review_result":verdict,"findings":results}
+    receipt={"version":VERSION,"repository":git(root,"config","--get","remote.origin.url").decode().strip(),"mission_id":args.mission_id,"base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"manifest_sha256":manifest_hash,"chunks":plan,"provider":"deepseek","model":MODEL,"command_sha256":digest(canon(command)),"started_at":int(time.time()),"completed_at":int(time.time()),"review_result":verdict,"findings":results}
     receipt["integrity_sha256"]=digest(canon(receipt)); path=evidence/f"deepseek-receipt-{head[:12]}-{uuid.uuid4().hex}.json"; path.write_bytes(canon(receipt)); os.chmod(path,0o600)
     print(json.dumps({"status":verdict,"receipt":str(path),"head_sha":head}))
 def main():
     p=argparse.ArgumentParser(); sub=p.add_subparsers(dest="cmd",required=True)
-    r=sub.add_parser("run"); r.add_argument("--repo",default="."); r.add_argument("--base",required=True); r.add_argument("--head",required=True); r.add_argument("--evidence",required=True); r.add_argument("--token-file",required=True); r.add_argument("--timeout",type=int,default=900)
+    r=sub.add_parser("run"); r.add_argument("--repo",default="."); r.add_argument("--mission-id",default="codex-mission-harness"); r.add_argument("--base",required=True); r.add_argument("--head",required=True); r.add_argument("--evidence",required=True); r.add_argument("--token-file",required=True); r.add_argument("--timeout",type=int,default=900)
     c=sub.add_parser("validate"); c.add_argument("--receipt",required=True); c.add_argument("--base",required=True); c.add_argument("--head",required=True)
     a=p.parse_args()
     try:
