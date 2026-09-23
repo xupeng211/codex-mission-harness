@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "mission_id": "safe-demo",
+  "repository": "/path/to/disposable/repository",
+  "objective": "Run only harmless fixture gates; no network, provider, production or quota actions.",
+  "adapter": "simulation",
+  "required_gates": ["verify-pr"],
+  "reviews": ["codex", "deepseek"],
+  "merge_policy": "owner_approval",
+  "forbidden_actions": ["live_provider_request", "quota_consumption", "production_mutation"]
+}
