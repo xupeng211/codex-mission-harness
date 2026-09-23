@@ -1952,6 +1952,27 @@ class HarnessTest(unittest.TestCase):
         ])
         self.assertEqual(argv[argv.index("--repo-root") + 1], "/candidate")
 
+    def test_codex_receipt_classifier_imports_policy_from_trusted_base(self):
+        adapter = FootballPredictionAdapter()
+        trusted = Path(self.tmp.name) / "trusted-base"
+        receipt = Path(self.tmp.name) / "receipt.json"
+        receipt.write_text("{}")
+        stdout = Path(self.tmp.name) / "review.stdout"
+        stdout.write_text(json.dumps({"review_receipt": str(receipt), "status": "PASS"}))
+        classified = subprocess.CompletedProcess(
+            [], 0, json.dumps({"classification": {"classification": "VALID_CURRENT"}}), "",
+        )
+        with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
+                patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
+                patch.object(adapter, "_call", return_value=classified) as call:
+            result = adapter.review_result(
+                "codex", worktree="/candidate", base="a" * 40, head="b" * 40,
+                mission_id="mission", scope_file="/candidate/scope.json",
+                stdout_path=str(stdout),
+            )
+        self.assertEqual(result.status, "PASS")
+        self.assertEqual(call.call_args.kwargs["cwd"], str(trusted))
+
     def test_trusted_base_checkout_rejects_wrong_or_dirty_checkout(self):
         adapter = FootballPredictionAdapter()
         evidence = Path(self.tmp.name) / "evidence" / "mission" / "codex" / ("b" * 40)

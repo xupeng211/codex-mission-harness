@@ -150,7 +150,9 @@ class FootballPredictionAdapter:
                 return GateResult("FAIL", "canonical DeepSeek receipt reports findings", receipt, evidence)
             return GateResult("PASS", "canonical DeepSeek aggregate receipt validated", receipt, evidence)
         else: return GateResult("BLOCKED_EXTERNAL", f"unknown reviewer {reviewer}")
-        result = self._call(argv, cwd=worktree)
+        # The classifier is policy code from the trusted base checkout.  Its
+        # imports must resolve there, never from the candidate HEAD worktree.
+        result = self._call(argv, cwd=str(trusted))
         if result.returncode != 0:
             return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or result.stdout.strip(), receipt)
         classification = self._json_last_text(result.stdout)
