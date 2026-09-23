@@ -103,6 +103,29 @@ class Supervisor:
                     "exit_code": result.exit_code,
                 })
                 continue
+            job = self.journal.db.execute("SELECT name,stdout_path FROM jobs WHERE job_id=?", (result.job_id,)).fetchone()
+            if job and str(job["name"]).startswith("review:"):
+                reviewer = str(job["name"]).split(":", 1)[1]
+                spec = self.journal.spec(mission_id)
+                scope = spec.mission_scope_file
+                if result.state == "EXITED" and scope:
+                    reviewed = self.adapter.review_result(
+                        reviewer, worktree=snapshot["worktree"], base=snapshot["base_sha"], head=current,
+                        mission_id=mission_id, scope_file=str(Path(snapshot["worktree"], scope)),
+                        stdout_path=job["stdout_path"],
+                    )
+                    self.journal.record_receipt(mission_id, reviewer, current, reviewed.status, reviewed.artifact)
+                    self.journal.update(mission_id, pending_gate=None)
+                    if reviewed.status == "FAIL":
+                        reconcile_transition(State.IMPLEMENT, f"canonical {reviewer} review findings", snapshot)
+                    elif reviewed.status != "PASS":
+                        reconcile_transition(State.BLOCKED_EXTERNAL, reviewed.evidence, snapshot)
+                    continue
+                if result.state == "LOST":
+                    # A durable external receipt may still appear later, but a
+                    # missing owned writer is never replayed automatically.
+                    reconcile_transition(State.BLOCKED_EXTERNAL, "independent review writer outcome is unknown", snapshot)
+                    continue
             if result.state == "EXITED" and result.exit_code == 0:
                 pending = snapshot["pending_gate"]
                 if pending:
@@ -234,6 +257,9 @@ class Supervisor:
         def finish_merge(result: GateResult) -> State:
             """Classify merge outcomes without treating provider failure as policy denial."""
             if result.status == "PASS":
+                data = result.data or {}
+                if data.get("pr") and data.get("merge_sha"):
+                    self.journal.update(mission_id, pr_number=int(data["pr"]), merge_sha=str(data["merge_sha"]))
                 advance(State.POST_MERGE, result.evidence)
             elif result.status == "BLOCKED_POLICY":
                 advance(State.BLOCKED_POLICY, result.evidence)
@@ -293,6 +319,24 @@ class Supervisor:
                     if not permitted(f"review:{reviewer}", spec.forbidden_actions):
                         advance(State.BLOCKED_POLICY, f"mission forbids review:{reviewer}")
                         return State.BLOCKED_POLICY
+                    if not isinstance(self.adapter, SimulatedAdapter):
+                        if not spec.mission_scope_file:
+                            advance(State.BLOCKED_EXTERNAL, "FootballPrediction review requires mission_scope_file")
+                            return State.BLOCKED_EXTERNAL
+                        scope = Path(row["worktree"], spec.mission_scope_file)
+                        if not scope.is_file():
+                            advance(State.BLOCKED_EXTERNAL, f"mission scope contract is unavailable: {scope}")
+                            return State.BLOCKED_EXTERNAL
+                        evidence = Path(row["worktree"]).parent / ".cmh-review-evidence" / mission_id / reviewer / head
+                        evidence.mkdir(parents=True, exist_ok=True)
+                        self.journal.update(mission_id, pending_gate=f"review:{reviewer}")
+                        self.process.start(
+                            mission_id, f"review:{reviewer}",
+                            self.adapter.review_argv(reviewer, worktree=row["worktree"], base=row["base_sha"], head=head,
+                                                     mission_id=mission_id, scope_file=str(scope), evidence_dir=str(evidence)),
+                            row["worktree"], docker_env(mission_id), head,
+                        )
+                        return state
                     result: GateResult = self.adapter.review(reviewer, head)
                     self.journal.record_receipt(mission_id, reviewer, head, result.status)
                     if result.status == "BLOCKED_EXTERNAL":
@@ -346,6 +390,13 @@ class Supervisor:
             if self.adapter.exact_head(row["worktree"]) != row["current_head"]:
                 self.reconcile(mission_id)
                 return State(self.journal.mission(mission_id)["current_state"])
+            if row["pr_number"] is None:
+                pr = self.adapter.discover_pr(row["worktree"], row["current_head"])
+                if pr.status != "PASS":
+                    advance(State.BLOCKED_EXTERNAL, pr.evidence)
+                    return State.BLOCKED_EXTERNAL
+                self.journal.update(mission_id, pr_number=int(pr.data["number"]))
+                row = self.journal.mission(mission_id)
             if row["merge_claim_head"] is not None:
                 claim_head = row["merge_claim_head"]
                 owner_pid, owner_start_ticks = self._merge_owner()
@@ -363,7 +414,12 @@ class Supervisor:
                     return State.BLOCKED_EXTERNAL
                 if recovery != "RECOVERY_CLAIMED":
                     return State(self.journal.mission(mission_id)["current_state"])
-                status = self.adapter.merge_status(row["worktree"], claim_head)
+                try:
+                    status = self.adapter.merge_status(row["worktree"], claim_head, row["pr_number"])
+                except TypeError:
+                    # Compatibility for v0.1 test/dummy adapters; the real
+                    # adapter receives the durable PR identity above.
+                    status = self.adapter.merge_status(row["worktree"], claim_head)
                 if status.status == "PASS":
                     if claim_head != row["current_head"]:
                         advance(
@@ -426,6 +482,16 @@ class Supervisor:
             else:
                 return state
         elif state == State.POST_MERGE:
+            if row["merge_sha"] and row["pr_number"]:
+                production = self.adapter.post_merge(
+                    row["worktree"], row["merge_sha"], row["pr_number"], row["branch"],
+                )
+                if production.status == "PENDING":
+                    self.journal.update(mission_id, pending_gate="production-gate", ci_state="PENDING")
+                    return state
+                if production.status != "PASS":
+                    advance(State.BLOCKED_EXTERNAL, production.evidence)
+                    return State.BLOCKED_EXTERNAL
             for gate in spec.post_merge_gates:
                 result = self.adapter.post_merge(gate, row["current_head"])
                 if result.status != "PASS":

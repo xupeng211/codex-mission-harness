@@ -54,6 +54,10 @@ class MissionSpec:
     merge_policy: str = "owner_approval"
     post_merge_gates: tuple[str, ...] = ()
     forbidden_actions: tuple[str, ...] = ()
+    # FootballPrediction's canonical independent-review runners require a
+    # tracked mission-scope contract. It is deliberately explicit, never an
+    # inferred broad allow-list.
+    mission_scope_file: str | None = None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "MissionSpec":
@@ -71,6 +75,8 @@ class MissionSpec:
                 if not isinstance(value, (list, tuple)) or not all(isinstance(item, str) for item in value):
                     raise ValueError(f"{field} must be a string list")
                 data[field] = tuple(value)
+        if data.get("mission_scope_file") is not None and not isinstance(data["mission_scope_file"], str):
+            raise ValueError("mission_scope_file must be a string when provided")
         adapter = data.get("adapter", "footballprediction")
         if not isinstance(adapter, str) or adapter not in {"footballprediction", "simulation"}:
             raise ValueError("adapter must be exactly footballprediction or simulation")

@@ -38,6 +38,7 @@ class Journal:
               merge_claim_head TEXT,
               merge_claim_pid INTEGER,
               merge_claim_start_ticks TEXT,
+              pr_number INTEGER, merge_sha TEXT, main_sha TEXT, tree_sha TEXT,
               created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS events (
               seq INTEGER PRIMARY KEY AUTOINCREMENT, mission_id TEXT NOT NULL, kind TEXT NOT NULL,
@@ -81,6 +82,11 @@ class Journal:
         if "merge_claim_head" not in mission_columns:
             self.db.execute("ALTER TABLE missions ADD COLUMN merge_claim_head TEXT")
         for name, definition in (("merge_claim_pid", "INTEGER"), ("merge_claim_start_ticks", "TEXT")):
+            if name not in mission_columns:
+                self.db.execute(f"ALTER TABLE missions ADD COLUMN {name} {definition}")
+        mission_columns = {row[1] for row in self.db.execute("PRAGMA table_info(missions)")}
+        for name, definition in (("pr_number", "INTEGER"), ("merge_sha", "TEXT"),
+                                 ("main_sha", "TEXT"), ("tree_sha", "TEXT")):
             if name not in mission_columns:
                 self.db.execute(f"ALTER TABLE missions ADD COLUMN {name} {definition}")
         self.db.commit()

@@ -34,6 +34,23 @@ Each writable mission worktree is created from `origin/main`, records base SHA/b
 
 The adapter calls only its canonical commands (`make verify-targeted`, `make verify-pr`, `make verify-strict`, `make agent-preflight`) and asks the project workflow for independent reviews. It does not contain quota, candidate, authorization, provider or live-request logic. In particular, this project does not invoke FootballPrediction Stage D or provider traffic.
 
+## Using Harness with FootballPrediction
+
+Copy `missions/examples/footballprediction-development.json`, give it a new
+mission ID, point `repository` at your FootballPrediction checkout, and set
+`mission_scope_file` to its tracked mission contract. Keep the safety deny-list
+unless an owner explicitly changes the authorization boundary.
+
+Run `harness run missions/your-mission.json`; use `harness status
+your-mission-id` to see progress. If you close the terminal, run `harness
+resume missions/your-mission.json`: the journal reconciles owned work instead
+of restarting it blindly.
+
+At a technically ready merge, Harness shows `STATE=WAITING_APPROVAL` and the
+exact HEAD. Run `harness approve your-mission-id --action merge --reason
+"approved"`, then resume. Denied provider traffic, quota consumption, live
+authorization, prepared-candidate consumption, and merge are never performed.
+
 ## Approval and review rules
 
 Source fixes, local gates and in-scope review/CI repairs auto-continue. Live providers, quota/spending, protected production changes, credentials, unknown-resource deletion and owner-controlled merge require persistent approval decisions. Review receipts are exact-HEAD-bound; reconciliation invalidates both Codex and DeepSeek receipts whenever HEAD changes, forcing fresh validation/review.
