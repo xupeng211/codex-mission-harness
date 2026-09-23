@@ -1910,6 +1910,16 @@ class HarnessTest(unittest.TestCase):
         with patch.object(adapter, "_call", return_value=completed):
             result = adapter.review_preflight("/fixture", "a" * 40, "b" * 40)
         self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+        self.assertIn("path is missing", result.evidence)
+
+    def test_football_review_contract_change_requires_separate_migration(self):
+        adapter = FootballPredictionAdapter()
+        present = subprocess.CompletedProcess([], 0, "", "")
+        changed = subprocess.CompletedProcess([], 1, "", "")
+        with patch.object(adapter, "_call", side_effect=[
+                *([present] * (2 * len(adapter.REVIEW_CONTRACT_PATHS))), changed]):
+            result = adapter.review_preflight("/fixture", "a" * 40, "b" * 40)
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
         self.assertIn("policy migration", result.evidence)
 
     def test_open_exact_head_pr_proves_merge_not_started(self):

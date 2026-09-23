@@ -28,7 +28,9 @@ class FootballPredictionAdapter:
         "scripts/devops/codex_review_receipt.py", "scripts/devops/claude_deepseek_independent_review.py",
         "scripts/devops/deepseek_chunk_receipt_validation.py", "scripts/devops/deepseek_receipt_evidence.py",
         "scripts/devops/independent_review_protocol.py", "scripts/devops/independent_review_receipt.py",
-        "scripts/devops/review_policy.py", "docs/agentic/independent_review_backends.json",
+        "scripts/devops/review_policy.py", "scripts/devops/agent_workflow.py",
+        "scripts/devops/pr_post_merge_check.py", "scripts/devops/exact_head.py",
+        "docs/agentic/independent_review_backends.json",
         "schemas/agentic/codex_review_result.schema.json", "schemas/agentic/codex_review_receipt.schema.json",
         "schemas/agentic/independent_review_result.schema.json", "schemas/agentic/independent_review_receipt.schema.json",
     )
@@ -45,6 +47,11 @@ class FootballPredictionAdapter:
 
     def review_preflight(self, worktree: str, base: str, head: str) -> GateResult:
         """Anchor executable review policy to the trusted base, not reviewed code."""
+        for revision in (base, head):
+            for path in self.REVIEW_CONTRACT_PATHS:
+                present = self._call(["git", "cat-file", "-e", f"{revision}:{path}"], cwd=worktree)
+                if present.returncode != 0:
+                    return GateResult("BLOCKED_EXTERNAL", f"canonical review contract path is missing at {revision}: {path}")
         result = self._call(["git", "diff", "--quiet", f"{base}..{head}", "--", *self.REVIEW_CONTRACT_PATHS], cwd=worktree)
         if result.returncode == 0:
             return GateResult("PASS", "canonical review contract unchanged from trusted base")
