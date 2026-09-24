@@ -141,6 +141,18 @@ class Supervisor:
                 reviewer = str(job["name"]).split(":", 1)[1]
                 spec = self.journal.spec(mission_id)
                 scope = spec.mission_scope_file
+                if result.state == "LOST":
+                    # The process identity is conclusively dead (PID plus
+                    # start-time no longer matches), so an incomplete review
+                    # may be safely retried.  Keep the terminal job as a
+                    # consumed journal fact; the next REVIEW step launches one
+                    # fresh exact-head run and cannot race the old writer.
+                    self.journal.complete_review_job(
+                        mission_id, result.job_id, reviewer, current, "RETRY", None,
+                        "canonical review writer exited without a durable receipt",
+                        retry=True,
+                    )
+                    continue
                 if result.state in {"EXITED", "LOST"}:
                     root = Path(snapshot["worktree"]).resolve()
                     try:
@@ -161,23 +173,22 @@ class Supervisor:
                         )
                     except Exception as exc:
                         reviewed = GateResult("BLOCKED_EXTERNAL", f"canonical review receipt validation failed: {exc}")
-                    self.journal.record_receipt(mission_id, reviewer, current, reviewed.status, reviewed.artifact)
-                    self.journal.update(mission_id, pending_gate=None)
+                    details = reviewed.data if isinstance(reviewed.data, dict) else {}
+                    reason = reviewed.evidence
                     if reviewed.status == "FAIL":
-                        details = reviewed.data if isinstance(reviewed.data, dict) else {}
-                        repair = {
-                            "reviewer": reviewer,
-                            "head": current,
+                        reason = "canonical review findings: " + json.dumps({
+                            "reviewer": reviewer, "head": current,
                             "findings": details.get("findings", []),
                             "evidence": reviewed.evidence,
-                        }
-                        reconcile_transition(
-                            State.IMPLEMENT,
-                            "canonical review findings: " + json.dumps(repair, sort_keys=True),
-                            snapshot,
-                        )
-                    elif reviewed.status != "PASS":
-                        reconcile_transition(State.BLOCKED_EXTERNAL, reviewed.evidence, snapshot)
+                        }, sort_keys=True)
+                    consumed = self.journal.complete_review_job(
+                        mission_id, result.job_id, reviewer, current, reviewed.status,
+                        reviewed.artifact, reason,
+                    )
+                    if consumed and reviewed.status == "FAIL":
+                        # The atomic journal method already moved the mission
+                        # to IMPLEMENT; no second transition can race it.
+                        pass
                     continue
             if result.state == "EXITED" and result.exit_code == 0:
                 pending = snapshot["pending_gate"]
@@ -678,6 +689,27 @@ class Supervisor:
             if technical.status != "PASS":
                 advance(State.BLOCKED_EXTERNAL, technical.evidence or "pre-merge canonical CI recheck failed")
                 return State.BLOCKED_EXTERNAL
+
+            # Owner approval is a boundary, not a reporting detail.  Do not
+            # invoke any target-controlled merge-readiness/preflight command
+            # until the durable approval for this exact PR identity and HEAD
+            # exists.  A waiting mission is resumed here after approval and
+            # only then evaluates the canonical target gate.
+            decision = decide("merge", spec.merge_policy)
+            if decision == Decision.OWNER_APPROVAL_REQUIRED:
+                if not self.journal.approved(mission_id, "merge", row["current_head"]):
+                    if row["merge_claim_head"] is not None:
+                        advance(State.BLOCKED_EXTERNAL,
+                                "recovered unstarted merge claim has no current owner approval")
+                        return State.BLOCKED_EXTERNAL
+                    self.journal.update(mission_id, approval_state="PENDING", pending_gate="owner-merge")
+                    advance(State.WAITING_APPROVAL, "owner merge approval required")
+                    return State.WAITING_APPROVAL
+                self.journal.update(mission_id, approval_state="APPROVED", pending_gate=None)
+            elif decision != Decision.AUTO_CONTINUE:
+                advance(State.BLOCKED_POLICY, "unknown merge policy decision; fail closed")
+                return State.BLOCKED_POLICY
+
             if not isinstance(self.adapter, SimulatedAdapter):
                 merge_ready = getattr(self.adapter, "merge_ready", None)
                 if not callable(merge_ready) or not spec.mission_scope_file:
@@ -697,31 +729,11 @@ class Supervisor:
                 if readiness.status != "PASS":
                     advance(State.BLOCKED_EXTERNAL, readiness.evidence or "canonical merge-readiness rejected merge")
                     return State.BLOCKED_EXTERNAL
-            decision = decide("merge", spec.merge_policy)
-            if decision == Decision.OWNER_APPROVAL_REQUIRED:
-                if not self.journal.approved(mission_id, "merge", row["current_head"]):
-                    if row["merge_claim_head"] is not None:
-                        advance(State.BLOCKED_EXTERNAL,
-                                "recovered unstarted merge claim has no current owner approval")
-                        return State.BLOCKED_EXTERNAL
-                    self.journal.update(mission_id, approval_state="PENDING", pending_gate="owner-merge")
-                    advance(State.WAITING_APPROVAL, "owner merge approval required")
-                    return State.WAITING_APPROVAL
-                self.journal.update(mission_id, approval_state="APPROVED", pending_gate=None)
-                if row["merge_claim_head"] is None:
-                    owner_pid, owner_start_ticks = self._merge_owner()
-                    if not self.journal.claim_merge(mission_id, row["current_head"], owner_pid, owner_start_ticks):
-                        return State.MERGE
-                execute_claimed_merge(row["worktree"], row["current_head"])
-            else:
-                if decision != Decision.AUTO_CONTINUE:
-                    advance(State.BLOCKED_POLICY, "unknown merge policy decision; fail closed")
-                    return State.BLOCKED_POLICY
-                if row["merge_claim_head"] is None:
-                    owner_pid, owner_start_ticks = self._merge_owner()
-                    if not self.journal.claim_merge(mission_id, row["current_head"], owner_pid, owner_start_ticks):
-                        return State.MERGE
-                execute_claimed_merge(row["worktree"], row["current_head"])
+            if row["merge_claim_head"] is None:
+                owner_pid, owner_start_ticks = self._merge_owner()
+                if not self.journal.claim_merge(mission_id, row["current_head"], owner_pid, owner_start_ticks):
+                    return State.MERGE
+            execute_claimed_merge(row["worktree"], row["current_head"])
         elif state == State.WAITING_APPROVAL:
             if self.journal.approved(mission_id, "merge", row["current_head"]):
                 advance(State.MERGE, "persisted owner merge approval")

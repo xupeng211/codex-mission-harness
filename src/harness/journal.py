@@ -333,6 +333,102 @@ class Journal:
         self.event(mission_id, "review_result", {"reviewer": reviewer, "head": head, "result": result})
         self.db.commit()
 
+    def complete_review_job(self, mission_id: str, job_id: str, reviewer: str,
+                            head: str, result: str, artifact: str | None,
+                            evidence: str, *, retry: bool = False) -> bool:
+        """Consume one exited review job and publish its result atomically.
+
+        Process polling and review receipt publication used to be separate
+        commits.  A second controller could observe the exited job in that
+        window and launch a duplicate reviewer.  This CAS consumes the exact
+        terminal job together with the receipt, pending-gate cleanup and state
+        decision.  A crashed consumer leaves the job terminal and therefore
+        safely replayable; the first successful CAS wins.
+        """
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            mission = self.db.execute(
+                "SELECT current_state,current_head,pending_gate FROM missions WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()
+            job = self.db.execute(
+                "SELECT name,launch_head,state FROM jobs WHERE job_id=? AND mission_id=?",
+                (job_id, mission_id),
+            ).fetchone()
+            if (mission is None or job is None
+                    or State(mission["current_state"]) != State.REVIEW
+                    or mission["current_head"] != head
+                    or mission["pending_gate"] != f"review:{reviewer}"
+                    or job["name"] != f"review:{reviewer}"
+                    or job["launch_head"] != head
+                    or job["state"] not in {"EXITED", "LOST"}):
+                self.db.commit()
+                return False
+
+            if retry:
+                changed = self.db.execute(
+                    "UPDATE jobs SET state='CONSUMED',ended_at=COALESCE(ended_at,?) "
+                    "WHERE job_id=? AND mission_id=? AND state IN ('EXITED','LOST')",
+                    (now(), job_id, mission_id),
+                ).rowcount
+                if changed != 1:
+                    self.db.commit()
+                    return False
+                self.db.execute(
+                    "UPDATE missions SET pending_gate=NULL,updated_at=? WHERE mission_id=? "
+                    "AND current_state=? AND current_head=? AND pending_gate=?",
+                    (now(), mission_id, State.REVIEW, head, f"review:{reviewer}"),
+                )
+                self.event(mission_id, "review_retry_required", {
+                    "job_id": job_id, "reviewer": reviewer, "head": head,
+                    "evidence": evidence,
+                })
+                self.db.commit()
+                return True
+
+            changed = self.db.execute(
+                "UPDATE jobs SET state='CONSUMED',ended_at=COALESCE(ended_at,?) "
+                "WHERE job_id=? AND mission_id=? AND state IN ('EXITED','LOST')",
+                (now(), job_id, mission_id),
+            ).rowcount
+            if changed != 1:
+                self.db.commit()
+                return False
+            self.db.execute(
+                "INSERT INTO receipts(mission_id,reviewer,head_sha,result,artifact_path,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (mission_id, reviewer, head, result, artifact, now()),
+            )
+            target = None
+            if result == "FAIL":
+                target = State.IMPLEMENT
+            elif result == "BLOCKED_EXTERNAL":
+                target = State.BLOCKED_EXTERNAL
+            elif result != "PASS":
+                target = State.BLOCKED_EXTERNAL
+            self.db.execute(
+                "UPDATE missions SET pending_gate=NULL,current_state=COALESCE(?,current_state),"
+                "terminal_state=CASE WHEN ? IS NULL THEN terminal_state WHEN ? IN (?,?) THEN ? ELSE NULL END,"
+                "updated_at=? WHERE mission_id=? AND current_state=? AND current_head=? "
+                "AND pending_gate=?",
+                (target, target, target, State.BLOCKED_EXTERNAL, State.FAILED_FATAL,
+                 target, now(), mission_id, State.REVIEW, head, f"review:{reviewer}"),
+            )
+            self.event(mission_id, "review_result", {
+                "reviewer": reviewer, "head": head, "result": result,
+                "job_id": job_id, "artifact": artifact, "evidence": evidence,
+            })
+            if target is not None:
+                self.event(mission_id, "state_transition", {
+                    "from": State.REVIEW, "to": target, "head": head,
+                    "reason": evidence,
+                })
+            self.db.commit()
+            return True
+        except Exception:
+            self.db.rollback()
+            raise
+
     def invalidate_reviews(self, mission_id: str, current_head: str) -> int:
         try:
             result = self.db.execute(

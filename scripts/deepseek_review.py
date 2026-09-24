@@ -7,10 +7,10 @@ commit-last: an incomplete run has no receipt and is never an approval.
 """
 from __future__ import annotations
 
-import argparse, base64, hashlib, json, os, shutil, subprocess, sys, tempfile, time, uuid
+import argparse, base64, hashlib, hmac, json, os, shutil, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 
-VERSION = "cmh-deepseek-review/v1"
+VERSION = "cmh-deepseek-review/v2"
 MODEL = "deepseek-flash"
 ENDPOINT = "https://api.deepseek.com/anthropic"
 CHUNK_BYTES = 32000
@@ -19,6 +19,12 @@ SCHEMA = {"type":"object","additionalProperties":False,"required":["review_resul
 
 def canon(value): return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 def digest(value): return hashlib.sha256(value).hexdigest()
+def auth_digest(value, secret):
+    if not isinstance(secret, str) or not secret:
+        raise ValueError("review authentication key is required")
+    unsigned = dict(value)
+    unsigned.pop("auth_hmac_sha256", None)
+    return hmac.new(secret.encode("utf-8"), canon(unsigned), hashlib.sha256).hexdigest()
 def sha(path): return digest(Path(path).read_bytes())
 def finding(value):
     return (isinstance(value,dict) and set(value)=={"severity","title","evidence"}
@@ -46,21 +52,25 @@ def chunks(diff):
         if cut > start: end=cut+1
         source=diff[start:end]; out.append({"index":len(out),"start":start,"end":end,"sha256":digest(source)}) ; start=end
     return out
-def validate(receipt, base, head, root=None, receipt_path=None, mission_id=None, repository=None):
-    required={"version","repository","mission_id","base_sha","head_sha","diff_sha256","manifest_sha256","chunks","provider","model","command_sha256","review_result","findings","integrity_sha256"}
+def validate(receipt, base, head, root=None, receipt_path=None, mission_id=None, repository=None, secret=None):
+    required={"version","repository","mission_id","base_sha","head_sha","diff_sha256","manifest_sha256","chunks","chunk_findings","aggregate_result","aggregate_output_sha256","provider","model","command_sha256","review_result","findings","integrity_sha256","auth_hmac_sha256"}
     optional={"started_at","completed_at"}
     if not isinstance(receipt,dict) or not required <= set(receipt) or set(receipt)-required-optional: raise ValueError("incomplete or unknown receipt fields")
     if receipt["version"] != VERSION or receipt["base_sha"] != base or receipt["head_sha"] != head: raise ValueError("receipt exact-head binding mismatch")
     if not isinstance(receipt["repository"],str) or not receipt["repository"] or not isinstance(receipt["mission_id"],str) or not receipt["mission_id"]: raise ValueError("invalid receipt identity")
     if mission_id is not None and receipt["mission_id"] != mission_id: raise ValueError("receipt mission binding mismatch")
     if repository is not None and receipt["repository"] != repository: raise ValueError("receipt repository binding mismatch")
-    copy=dict(receipt); observed=copy.pop("integrity_sha256")
+    copy=dict(receipt); observed=copy.pop("integrity_sha256"); copy.pop("auth_hmac_sha256", None)
     if digest(canon(copy)) != observed: raise ValueError("receipt integrity mismatch")
+    if not isinstance(receipt["auth_hmac_sha256"],str) or len(receipt["auth_hmac_sha256"]) != 64:
+        raise ValueError("review authentication evidence is incomplete")
+    if not hmac.compare_digest(receipt["auth_hmac_sha256"], auth_digest(receipt, secret)):
+        raise ValueError("review authentication evidence mismatch")
     if (receipt["provider"] != "deepseek" or receipt["model"] != MODEL
             or not isinstance(receipt["command_sha256"],str) or len(receipt["command_sha256"])!=64): raise ValueError("reviewer provenance mismatch")
     chunks_=receipt["chunks"]
     if not isinstance(chunks_,list) or not chunks_ or [c.get("index") for c in chunks_ if isinstance(c,dict)] != list(range(len(chunks_))): raise ValueError("missing or duplicate chunks")
-    position=0; aggregate=[]; descriptors=[]
+    position=0; chunk_findings=[]; descriptors=[]
     for chunk in chunks_:
         start,end=chunk.get("start"),chunk.get("end"); result=chunk.get("result")
         if not isinstance(start,int) or not isinstance(end,int) or start!=position or end<=start: raise ValueError("invalid chunk coverage")
@@ -68,13 +78,25 @@ def validate(receipt, base, head, root=None, receipt_path=None, mission_id=None,
         if not isinstance(chunk.get("output_sha256"),str) or len(chunk["output_sha256"])!=64: raise ValueError("invalid chunk output identity")
         reviewer_result(json.dumps(result))
         descriptors.append({"index":chunk["index"],"start":start,"end":end,"sha256":chunk["sha256"]})
-        aggregate.extend(result["findings"]); position=end
-    if aggregate != receipt["findings"]: raise ValueError("aggregate findings mismatch")
+        chunk_findings.extend(result["findings"]); position=end
+    if chunk_findings != receipt["chunk_findings"]: raise ValueError("chunk findings mismatch")
+    aggregate_result = reviewer_result(json.dumps(receipt["aggregate_result"]))
+    if not isinstance(receipt["aggregate_output_sha256"], str) or len(receipt["aggregate_output_sha256"]) != 64:
+        raise ValueError("aggregate output identity is incomplete")
+    if receipt["review_result"] != aggregate_result["review_result"]:
+        raise ValueError("aggregate verdict mismatch")
+    # A synthesis pass may add context, but it may never erase a blocking
+    # finding discovered in an exact chunk.
+    if any(item not in aggregate_result["findings"] for item in chunk_findings
+           if item.get("severity") in {"P0", "P1", "P2"}):
+        raise ValueError("aggregate synthesis dropped a blocking chunk finding")
+    if aggregate_result["findings"] != receipt["findings"]:
+        raise ValueError("aggregate findings mismatch")
     if root is not None:
         diff=git(Path(root).resolve(),"diff","--no-ext-diff","--binary",f"{base}..{head}")
         if position!=len(diff) or digest(diff)!=receipt["diff_sha256"]: raise ValueError("receipt diff coverage mismatch")
         if descriptors!=chunks(diff): raise ValueError("chunk manifest does not match exact diff")
-        manifest={"version":"cmh-deepseek-chunks/v1","base_sha":base,"head_sha":head,"diff_sha256":digest(diff),"chunks":descriptors}
+        manifest={"version":"cmh-deepseek-chunks/v2","base_sha":base,"head_sha":head,"diff_sha256":digest(diff),"chunks":descriptors}
         if digest(canon(manifest))!=receipt["manifest_sha256"]: raise ValueError("chunk manifest hash mismatch")
         if receipt_path is not None:
             evidence=Path(receipt_path).resolve().parent
@@ -82,9 +104,14 @@ def validate(receipt, base, head, root=None, receipt_path=None, mission_id=None,
                 artifact=evidence/f"chunk-{chunk['index']:03d}.json"
                 if not artifact.is_file() or sha(artifact)!=chunk["output_sha256"]: raise ValueError("chunk artifact mismatch")
                 if reviewer_result(artifact.read_text())!=chunk["result"]: raise ValueError("chunk result does not match durable artifact")
+            aggregate_artifact=evidence/"aggregate.json"
+            if not aggregate_artifact.is_file() or sha(aggregate_artifact) != receipt["aggregate_output_sha256"]:
+                raise ValueError("aggregate artifact mismatch")
+            if reviewer_result(aggregate_artifact.read_text()) != aggregate_result:
+                raise ValueError("aggregate result does not match durable artifact")
     if receipt["review_result"] not in {"PASS", "FAIL"}:
         raise ValueError("invalid aggregate verdict")
-    blocking=any(f.get("severity") in {"P0","P1","P2"} for f in aggregate)
+    blocking=any(f.get("severity") in {"P0","P1","P2"} for f in receipt["findings"])
     if (receipt["review_result"] == "PASS") != (not blocking): raise ValueError("aggregate verdict mismatch")
     return receipt
 def prompt(base, head, diff_hash, manifest_hash, chunk, source):
@@ -94,6 +121,22 @@ def prompt(base, head, diff_hash, manifest_hash, chunk, source):
             "PASS only when P0/P1/P2 are absent.\n"
             f"Base={base}\nHead={head}\nDiffSHA256={diff_hash}\nManifestSHA256={manifest_hash}\n"
             f"Chunk={chunk['index']} range={chunk['start']}:{chunk['end']} SHA256={chunk['sha256']}\n"+rendered)
+
+def aggregate_prompt(base, head, diff_hash, manifest_hash, plan, source, chunk_findings):
+    """Ask the independent reviewer to inspect the complete diff once.
+
+    Chunk reviews provide durable localized evidence.  This final pass prevents
+    a cross-chunk defect from disappearing merely because each slice looked
+    locally plausible; it receives the same exact bytes and hashes.
+    """
+    try: rendered = "UTF-8 COMPLETE DIFF:\n" + source.decode("utf-8")
+    except UnicodeDecodeError: rendered = "BASE64-ENCODED EXACT COMPLETE DIFF BYTES:\n" + base64.b64encode(source).decode("ascii")
+    return ("You are the final independent reviewer for the complete exact diff. Do not use tools or filesystem. "
+            "Return only JSON matching the schema. PASS only when P0/P1/P2 are absent. "
+            "Review cross-file and cross-chunk interactions, state transitions, and security boundaries. "
+            "Do not discard a blocking finding from a chunk review; confirm or expand it.\n"
+            f"Base={base}\nHead={head}\nDiffSHA256={diff_hash}\nManifestSHA256={manifest_hash}\n"
+            f"ChunkCount={len(plan)}\nChunkFindings={json.dumps(chunk_findings, sort_keys=True)}\n" + rendered)
 
 def invoke_reviewer(command, prompt_text, env, timeout):
     return subprocess.run(command+[prompt_text],env=env,capture_output=True,text=True,timeout=timeout)
@@ -138,7 +181,7 @@ def run(args):
     if git(root,"rev-parse","HEAD").decode().strip().lower()!=head: raise ValueError("worktree HEAD differs from requested HEAD")
     diff=git(root,"diff","--no-ext-diff","--binary",f"{base}..{head}"); plan=chunks(diff); diff_hash=digest(diff)
     claude_executable,safe_path=resolve_claude_launcher(root,os.environ.get("PATH",""))
-    manifest={"version":"cmh-deepseek-chunks/v1","base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"chunks":[dict(chunk) for chunk in plan]}; manifest_hash=digest(canon(manifest))
+    manifest={"version":"cmh-deepseek-chunks/v2","base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"chunks":[dict(chunk) for chunk in plan]}; manifest_hash=digest(canon(manifest))
     evidence_root=Path(args.evidence).resolve(); evidence_root.mkdir(parents=True,exist_ok=True); os.chmod(evidence_root,0o700)
     run_id=uuid.uuid4().hex; evidence=evidence_root/run_id; evidence.mkdir(mode=0o700)
     token=Path(args.token_file).read_text().strip()
@@ -154,22 +197,40 @@ def run(args):
             raw=completed.stdout.encode(); (evidence/f"chunk-{chunk['index']:03d}.json").write_bytes(raw)
             result=reviewer_result(completed.stdout)
             chunk["result"]=result; chunk["output_sha256"]=digest(raw); results.extend(result.get("findings",[]))
+        aggregate_call=invoke_reviewer(
+            command, aggregate_prompt(base, head, diff_hash, manifest_hash, plan, diff, results),
+            env, args.timeout,
+        )
+        if aggregate_call.returncode:
+            raise RuntimeError(f"DeepSeek aggregate reviewer infrastructure failure: exit={aggregate_call.returncode}")
+        aggregate_raw=aggregate_call.stdout.encode()
+        (evidence/"aggregate.json").write_bytes(aggregate_raw)
+        aggregate_result=reviewer_result(aggregate_call.stdout)
+        if (aggregate_result["review_result"] == "PASS"
+                and any(item.get("severity") in {"P0", "P1", "P2"} for item in results)):
+            raise ValueError("aggregate reviewer erased a blocking chunk finding")
+        if any(item not in aggregate_result["findings"] for item in results
+               if item.get("severity") in {"P0", "P1", "P2"}):
+            raise ValueError("aggregate reviewer dropped a blocking chunk finding")
     finally:
         Path(settings.name).unlink(missing_ok=True)
-    verdict="FAIL" if any(f.get("severity") in {"P0","P1","P2"} for f in results) else "PASS"
-    receipt={"version":VERSION,"repository":git(root,"config","--get","remote.origin.url").decode().strip(),"mission_id":args.mission_id,"base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"manifest_sha256":manifest_hash,"chunks":plan,"provider":"deepseek","model":MODEL,"command_sha256":digest(canon(command)),"started_at":int(time.time()),"completed_at":int(time.time()),"review_result":verdict,"findings":results}
-    receipt["integrity_sha256"]=digest(canon(receipt)); path=evidence/f"deepseek-receipt-{head[:12]}-{uuid.uuid4().hex}.json"; path.write_bytes(canon(receipt)); os.chmod(path,0o600)
+    verdict=aggregate_result["review_result"]
+    aggregate_findings=aggregate_result["findings"]
+    receipt={"version":VERSION,"repository":git(root,"config","--get","remote.origin.url").decode().strip(),"mission_id":args.mission_id,"base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"manifest_sha256":manifest_hash,"chunks":plan,"chunk_findings":results,"aggregate_result":aggregate_result,"aggregate_output_sha256":digest(aggregate_raw),"provider":"deepseek","model":MODEL,"command_sha256":digest(canon(command)),"started_at":int(time.time()),"completed_at":int(time.time()),"review_result":verdict,"findings":aggregate_findings}
+    receipt["integrity_sha256"]=digest(canon(receipt)); receipt["auth_hmac_sha256"]=auth_digest(receipt, token)
+    path=evidence/f"deepseek-receipt-{head[:12]}-{uuid.uuid4().hex}.json"; path.write_bytes(canon(receipt)); os.chmod(path,0o600)
     print(json.dumps({"status":verdict,"receipt":str(path),"review_receipt":str(path),"head_sha":head}))
 def main():
     p=argparse.ArgumentParser(); sub=p.add_subparsers(dest="cmd",required=True)
     r=sub.add_parser("run"); r.add_argument("--repo",default="."); r.add_argument("--mission-id",default="codex-mission-harness"); r.add_argument("--base",required=True); r.add_argument("--head",required=True); r.add_argument("--evidence",required=True); r.add_argument("--token-file",required=True); r.add_argument("--timeout",type=int,default=900)
-    c=sub.add_parser("validate"); c.add_argument("--receipt",required=True); c.add_argument("--base",required=True); c.add_argument("--head",required=True); c.add_argument("--repo",default="."); c.add_argument("--mission-id",default="codex-mission-harness")
+    c=sub.add_parser("validate"); c.add_argument("--receipt",required=True); c.add_argument("--base",required=True); c.add_argument("--head",required=True); c.add_argument("--repo",default="."); c.add_argument("--mission-id",default="codex-mission-harness"); c.add_argument("--token-file",required=True)
     a=p.parse_args()
     try:
         if a.cmd=="run": run(a)
         else:
             repository=git(Path(a.repo).resolve(),"config","--get","remote.origin.url").decode().strip()
-            print(json.dumps({"status":validate(json.loads(Path(a.receipt).read_text()),full_sha(a.base),full_sha(a.head),a.repo,a.receipt,a.mission_id,repository)["review_result"]}))
+            token=Path(a.token_file).read_text().strip()
+            print(json.dumps({"status":validate(json.loads(Path(a.receipt).read_text()),full_sha(a.base),full_sha(a.head),a.repo,a.receipt,a.mission_id,repository,token)["review_result"]}))
     except Exception as exc: print(json.dumps({"status":"BLOCKED_EXTERNAL","error":str(exc)})); return 1
     return 0
 if __name__=="__main__": raise SystemExit(main())

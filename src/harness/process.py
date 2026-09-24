@@ -213,9 +213,21 @@ class ProcessSupervisor:
         return job_id
 
     def poll(self, mission_id: str) -> list[JobResult]:
-        rows = self.journal.db.execute("SELECT * FROM jobs WHERE mission_id=? AND state IN ('STARTING','RUNNING')", (mission_id,)).fetchall()
+        rows = self.journal.db.execute(
+            "SELECT * FROM jobs WHERE mission_id=? AND "
+            "(state IN ('STARTING','RUNNING') OR "
+            "(state IN ('EXITED','LOST') AND name LIKE 'review:%'))",
+            (mission_id,),
+        ).fetchall()
         results = []
         for row in rows:
+            # Terminal review jobs remain visible until the supervisor consumes
+            # their receipt/result atomically.  This closes the crash window
+            # between child reaping and review state publication without
+            # treating an already-consumed job as active work.
+            if row["state"] in {"EXITED", "LOST"}:
+                results.append(JobResult(row["job_id"], row["state"], row["exit_code"], row["launch_head"]))
+                continue
             if row["state"] == "STARTING":
                 # Only the recorded launcher may publish a PID. A dead launcher means the
                 # bootstrap was never released, so retrying is safe and deterministic.

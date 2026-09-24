@@ -15,16 +15,26 @@ spec = importlib.util.spec_from_file_location("deepseek_review", ROOT / "scripts
 review = importlib.util.module_from_spec(spec); spec.loader.exec_module(review)
 
 BASE, HEAD = "a" * 40, "b" * 40
+TEST_SECRET = "unit-test-review-secret"
+
+_validate = review.validate
+def _validated(*args, **kwargs):
+    kwargs.setdefault("secret", TEST_SECRET)
+    return _validate(*args, **kwargs)
+review.validate = _validated
 
 def receipt(**overrides):
     source = b"fixture diff\n"
+    aggregate = {"review_result": "PASS", "findings": []}
     value = {"version": review.VERSION, "repository": "fixture", "mission_id": "fixture", "base_sha": BASE, "head_sha": HEAD,
              "diff_sha256": "d" * 64, "manifest_sha256": "e" * 64,
              "chunks": [{"index": 0, "start": 0, "end": len(source), "sha256": review.digest(source),
                          "output_sha256": "f" * 64, "result": {"review_result": "PASS", "findings": []}}],
+             "chunk_findings": [], "aggregate_result": aggregate,
+             "aggregate_output_sha256": "g" * 64,
              "provider": "deepseek", "model": review.MODEL, "command_sha256": "c" * 64,
              "review_result": "PASS", "findings": []}
-    value.update(overrides); value["integrity_sha256"] = review.digest(review.canon(value)); return value
+    value.update(overrides); value["integrity_sha256"] = review.digest(review.canon(value)); value["auth_hmac_sha256"] = review.auth_digest(value, TEST_SECRET); return value
 
 class DeepSeekReceiptTest(unittest.TestCase):
     def test_claude_launcher_resolution_excludes_relative_and_reviewed_tree_paths(self):
@@ -84,18 +94,43 @@ class DeepSeekReceiptTest(unittest.TestCase):
         with self.assertRaises(ValueError): review.validate(bad, BASE, HEAD)
         bad = receipt(); bad["integrity_sha256"] = "0" * 64
         with self.assertRaises(ValueError): review.validate(bad, BASE, HEAD)
+
+    def test_review_authentication_is_required_and_secret_bound(self):
+        value = receipt()
+        with self.assertRaisesRegex(ValueError, "authentication"):
+            _validate(value, BASE, HEAD, secret=None)
+        with self.assertRaisesRegex(ValueError, "authentication"):
+            _validate(value, BASE, HEAD, secret="wrong-secret")
+        self.assertEqual(_validate(value, BASE, HEAD, secret=TEST_SECRET)["review_result"], "PASS")
     def test_blocking_finding_requires_fail(self):
         finding = {"severity": "P1", "title": "x", "evidence": "y"}
         with self.assertRaises(ValueError): review.validate(receipt(findings=[finding]), BASE, HEAD)
         chunks = receipt()["chunks"]; chunks[0]["result"] = {"review_result": "FAIL", "findings": [finding]}
-        self.assertEqual(review.validate(receipt(review_result="FAIL", findings=[finding], chunks=chunks), BASE, HEAD)["review_result"], "FAIL")
+        value = receipt(review_result="FAIL", findings=[finding], chunks=chunks,
+                        chunk_findings=[finding],
+                        aggregate_result={"review_result": "FAIL", "findings": [finding]})
+        self.assertEqual(review.validate(value, BASE, HEAD)["review_result"], "FAIL")
     def test_unknown_aggregate_verdict_is_rejected(self):
         with self.assertRaises(ValueError):
             review.validate(receipt(review_result="GARBAGE"), BASE, HEAD)
     def test_p3_is_nonblocking(self):
         finding = {"severity": "P3", "title": "x", "evidence": "y"}
         chunks = receipt()["chunks"]; chunks[0]["result"] = {"review_result": "PASS", "findings": [finding]}
-        self.assertEqual(review.validate(receipt(findings=[finding], chunks=chunks), BASE, HEAD)["review_result"], "PASS")
+        value = receipt(findings=[finding], chunks=chunks, chunk_findings=[finding],
+                        aggregate_result={"review_result": "PASS", "findings": [finding]})
+        self.assertEqual(review.validate(value, BASE, HEAD)["review_result"], "PASS")
+
+    def test_aggregate_synthesis_cannot_drop_blocking_chunk_finding(self):
+        finding = {"severity": "P1", "title": "must survive", "evidence": "chunk"}
+        chunks = receipt()["chunks"]
+        chunks[0]["result"] = {"review_result": "FAIL", "findings": [finding]}
+        value = receipt(
+            chunks=chunks, chunk_findings=[finding],
+            aggregate_result={"review_result": "PASS", "findings": []},
+            findings=[], review_result="PASS",
+        )
+        with self.assertRaisesRegex(ValueError, "blocking chunk"):
+            review.validate(value, BASE, HEAD)
     def test_durable_artifact_result_must_match_receipt_chunk(self):
         with tempfile.TemporaryDirectory() as tmp:
             evidence = Path(tmp)
@@ -108,14 +143,16 @@ class DeepSeekReceiptTest(unittest.TestCase):
             source = b"fixture diff\n"
             value["diff_sha256"] = review.digest(source)
             manifest = {
-                "version": "cmh-deepseek-chunks/v1", "base_sha": BASE,
+                "version": "cmh-deepseek-chunks/v2", "base_sha": BASE,
                 "head_sha": HEAD, "diff_sha256": value["diff_sha256"],
                 "chunks": [{key: value["chunks"][0][key]
                             for key in ("index", "start", "end", "sha256")}],
             }
             value["manifest_sha256"] = review.digest(review.canon(manifest))
-            payload = {key: item for key, item in value.items() if key != "integrity_sha256"}
+            payload = {key: item for key, item in value.items()
+                       if key not in {"integrity_sha256", "auth_hmac_sha256"}}
             value["integrity_sha256"] = review.digest(review.canon(payload))
+            value["auth_hmac_sha256"] = review.auth_digest(value, TEST_SECRET)
             with patch.object(review, "git", return_value=source), \
                     self.assertRaisesRegex(ValueError, "chunk result does not match"):
                 review.validate(value, BASE, HEAD, root=evidence,
@@ -163,7 +200,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
             subprocess.run(["git", "-C", str(repo), "commit", "-qam", "head"], check=True)
             head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
             token_file = root / "review-token"
-            token_file.write_text("unit-test-token")
+            token_file.write_text(TEST_SECRET)
             evidence = root / "evidence"
             args = Namespace(repo=str(repo), base=base, head=head, mission_id="fixture",
                              evidence=str(evidence), token_file=str(token_file), timeout=1)
@@ -189,7 +226,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
                 review.run(args)
                 second_result = json.loads(captured.getvalue())
 
-            self.assertEqual(len(invocations), 2)
+            self.assertEqual(len(invocations), 4)
             for command, env in invocations:
                 self.assertEqual(command[0], "/trusted/bin/claude")
                 self.assertEqual(env["PATH"], "/trusted/bin:/usr/bin")

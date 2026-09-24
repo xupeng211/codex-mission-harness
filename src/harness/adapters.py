@@ -356,10 +356,18 @@ class FootballPredictionAdapter:
         body_path.write_text(body, encoding="utf-8")
         body_path.chmod(0o600)
         scope = Path(scope_file).resolve()
+        # The candidate Makefile is not an authority boundary.  This preflight
+        # is deliberately run with a scrubbed environment: even though the
+        # project contract describes it as read-only, a changed target must not
+        # inherit the controller's credentials before the owner has approved a
+        # merge.  The trusted-base merge-readiness command below remains the
+        # canonical policy authority.
         local = self._call(
             ["make", "agent-preflight"], cwd=worktree,
             env={"PR_BODY": str(body_path), "MISSION_SCOPE_FILE": str(scope),
-                 "BASE_REF": base, "HEAD_REF": head, "JSON": "1", "GH_HOST": "github.com"},
+                 "BASE_REF": base, "HEAD_REF": head, "JSON": "1", "GH_HOST": "github.com",
+                 "HOME": "/nonexistent", "PATH": os.defpath, "LANG": "C.UTF-8"},
+            inherit_environment=False,
         )
         if local.returncode != 0:
             return GateResult("BLOCKED_EXTERNAL", local.stderr.strip() or "canonical agent-preflight failed")
@@ -475,9 +483,13 @@ class FootballPredictionAdapter:
         if data.get("verdict") == "PASS":
             try:
                 self._run(["git", "fetch", "origin", "main"], cwd=worktree)
+                # Capture the remote-tracking ref once, then derive every
+                # related fact from that immutable full SHA.  A concurrent
+                # fetch may advance origin/main between commands, but it can
+                # no longer produce a mixed commit/tree observation.
                 main_sha = self._run(["git", "rev-parse", "origin/main"], cwd=worktree).strip().lower()
-                tree_sha = self._run(["git", "rev-parse", "origin/main^{tree}"], cwd=worktree).strip().lower()
-                reachable = self._call(["git", "merge-base", "--is-ancestor", merge_sha, "origin/main"], cwd=worktree)
+                tree_sha = self._run(["git", "rev-parse", f"{main_sha}^{{tree}}"], cwd=worktree).strip().lower()
+                reachable = self._call(["git", "merge-base", "--is-ancestor", merge_sha, main_sha], cwd=worktree)
             except (subprocess.SubprocessError, OSError) as exc:
                 return GateResult("BLOCKED_EXTERNAL", f"cannot record post-merge main truth: {exc}")
             if reachable.returncode != 0:
@@ -489,8 +501,8 @@ class FootballPredictionAdapter:
         return GateResult("BLOCKED_EXTERNAL", "Production Gate returned an invalid verdict", data=data)
 
     @staticmethod
-    def _call(argv, cwd=None, env=None):
-        child_env = os.environ.copy()
+    def _call(argv, cwd=None, env=None, inherit_environment=True):
+        child_env = os.environ.copy() if inherit_environment else {}
         if env: child_env.update(env)
         try:
             child_env["GH_HOST"] = "github.com"

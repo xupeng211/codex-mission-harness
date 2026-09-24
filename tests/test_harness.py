@@ -113,13 +113,25 @@ class HarnessTest(unittest.TestCase):
              str(stdout_path), "", "2026-01-01T00:00:00+00:00"),
         )
         self.journal.db.commit()
-        with patch.object(self.supervisor.process, "poll", return_value=[JobResult("review-job", "EXITED", 0, head)]), \
+        with patch.object(
+                self.supervisor.process,
+                "poll",
+                side_effect=[[JobResult("review-job", "EXITED", 0, head)], []],
+        ), \
                 patch("harness.supervisor.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")), \
                 patch.object(self.supervisor.adapter, "review_result", return_value=GateResult(
                     "FAIL", "canonical receipt reports findings", "/private/review.json",
                     {"findings": findings},
-                )):
+                )) as review_result:
             self.supervisor.reconcile(self.spec.mission_id)
+            # A second controller/reconcile pass consumes no duplicate result
+            # after the atomic review-job publication.
+            self.supervisor.reconcile(self.spec.mission_id)
+        self.assertEqual(review_result.call_count, 1)
+        self.assertEqual(
+            self.journal.db.execute("SELECT state FROM jobs WHERE job_id=?", ("review-job",)).fetchone()[0],
+            "CONSUMED",
+        )
         self.assertEqual(self.journal.status(self.spec.mission_id).state, State.IMPLEMENT)
         resumed = Supervisor(
             self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "resumed-review-logs"),
@@ -2452,6 +2464,21 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(result.data["main_sha"], "d" * 40)
         self.assertEqual(result.data["tree_sha"], "e" * 40)
 
+    def test_post_merge_derives_tree_and_reachability_from_one_captured_main_sha(self):
+        adapter = FootballPredictionAdapter()
+        merge_sha = "a" * 40
+        main_sha = "d" * 40
+        report = {"ci_head_sha": merge_sha, "ci_status": "completed",
+                  "ci_conclusion": "success", "verdict": "PASS", "failures": []}
+        completed = subprocess.CompletedProcess([], 0, json.dumps(report), "")
+        with patch.object(adapter, "_trusted_base_checkout", return_value=Path("/trusted")), \
+                patch.object(adapter, "_call", side_effect=[completed, subprocess.CompletedProcess([], 0, "", "")]), \
+                patch.object(adapter, "_run", side_effect=["", main_sha, "e" * 40]) as run:
+            result = adapter.post_merge("/worktree", merge_sha, 7, "owner/project", "feature", "b" * 40)
+        self.assertEqual(result.status, "PASS")
+        self.assertEqual(run.call_args_list[1].args[0], ["git", "rev-parse", "origin/main"])
+        self.assertEqual(run.call_args_list[2].args[0], ["git", "rev-parse", f"{main_sha}^{{tree}}"])
+
     def test_post_merge_queued_ci_is_pending_even_when_canonical_command_exits_one(self):
         adapter = FootballPredictionAdapter()
         merge_sha = "a" * 40
@@ -2528,6 +2555,46 @@ class HarnessTest(unittest.TestCase):
             )
         self.assertEqual(result.status, "PASS")
         self.assertIn("agent-workflow", " ".join(call.call_args_list[1].args[0]))
+        self.assertFalse(call.call_args_list[0].kwargs["inherit_environment"])
+        self.assertNotIn("ANTHROPIC_API_KEY", call.call_args_list[0].kwargs["env"])
+
+    def test_owner_approval_precedes_target_merge_readiness_command(self):
+        class RecordingAdapter(FootballPredictionAdapter):
+            def __init__(self):
+                self.merge_ready_calls = 0
+                self.merge_calls = 0
+
+            def exact_head(self, worktree):
+                return "a" * 40
+
+            def ci(self, worktree, head, pr_number=None, pr_repo=None, base_sha=None):
+                return GateResult("PASS", "exact CI", data={
+                    "pr_number": pr_number, "pr_repo": pr_repo,
+                })
+
+            def merge_ready(self, **kwargs):
+                self.merge_ready_calls += 1
+                return GateResult("PASS", "ready")
+
+            def merge(self, worktree, head, pr_number=None, pr_repo=None):
+                self.merge_calls += 1
+                return GateResult("PASS", "merged", data={"pr": pr_number,
+                                                            "repo": pr_repo, "merge_sha": "c" * 40})
+
+        adapter = RecordingAdapter()
+        spec = replace(self.spec, adapter="footballprediction",
+                       mission_scope_file="scope.json", merge_policy="owner_approval")
+        self.journal.update(
+            self.spec.mission_id, spec_json=json.dumps(spec.__dict__), current_head="a" * 40,
+            current_state=State.MERGE, pr_number=7, pr_repo="fixture/repo",
+        )
+        supervisor = Supervisor(
+            self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "approval-boundary"),
+            self.codex, adapter,
+        )
+        self.assertEqual(supervisor.step(self.spec.mission_id, spec), State.WAITING_APPROVAL)
+        self.assertEqual(adapter.merge_ready_calls, 0)
+        self.assertEqual(adapter.merge_calls, 0)
 
     def test_ci_malformed_json_evidence_fails_closed(self):
         adapter = FootballPredictionAdapter()
