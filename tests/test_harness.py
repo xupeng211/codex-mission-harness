@@ -106,17 +106,19 @@ class HarnessTest(unittest.TestCase):
             current_state=State.REVIEW, pending_gate="review:codex",
         )
         stdout_path = Path(self.tmp.name) / "review.stdout"
-        stdout_path.write_text("{}"); self.journal.db.execute(
+        receipt_path = Path(self.tmp.name) / "review-receipt.json"
+        receipt_path.write_text('{"review_result":"FAIL"}')
+        stdout_path.write_text(json.dumps({"review_receipt": str(receipt_path)})); self.journal.db.execute(
             "INSERT INTO jobs(job_id,mission_id,name,argv_json,launch_head,state,stdout_path,stderr_path,started_at) "
             "VALUES(?,?,?,?,?,?,?,?,?)",
-            ("review-job", self.spec.mission_id, "review:codex", "[]", head, "EXITED",
+            ("review-job", self.spec.mission_id, "review:codex", "[]", head, "LOST",
              str(stdout_path), "", "2026-01-01T00:00:00+00:00"),
         )
         self.journal.db.commit()
         with patch.object(
                 self.supervisor.process,
                 "poll",
-                side_effect=[[JobResult("review-job", "EXITED", 0, head)], []],
+                side_effect=[[JobResult("review-job", "LOST", None, head)], []],
         ), \
                 patch("harness.supervisor.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")), \
                 patch.object(self.supervisor.adapter, "review_result", return_value=GateResult(
@@ -144,11 +146,60 @@ class HarnessTest(unittest.TestCase):
         self.assertIn("exact source evidence", prompt)
         self.assertEqual(resumed._async_review_repair_context(self.spec.mission_id, "b" * 40), "")
 
+    def test_dead_review_with_invalid_receipt_is_marked_incomplete_then_retried(self):
+        head = "a" * 40
+        spec = replace(self.spec, adapter="footballprediction", mission_scope_file="scope.json")
+        (self.worktree / "scope.json").write_text("{}")
+        self.journal.update(
+            self.spec.mission_id, spec_json=json.dumps(spec.__dict__), current_head=head,
+            current_state=State.REVIEW, pending_gate="review:codex",
+        )
+        stdout_path = Path(self.tmp.name) / "incomplete-review.stdout"
+        invalid_receipt = Path(self.tmp.name) / "invalid-receipt.json"
+        invalid_receipt.write_text("{}")
+        stdout_path.write_text(json.dumps({"review_receipt": str(invalid_receipt)}))
+        self.journal.db.execute(
+            "INSERT INTO jobs(job_id,mission_id,name,argv_json,launch_head,state,stdout_path,stderr_path,started_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            ("incomplete-review-job", self.spec.mission_id, "review:codex", "[]", head, "LOST",
+             str(stdout_path), "", "2026-01-01T00:00:00+00:00"),
+        )
+        self.journal.db.commit()
+        with patch.object(self.supervisor.process, "poll", return_value=[
+                JobResult("incomplete-review-job", "LOST", None, head),
+        ]), patch("harness.supervisor.subprocess.run",
+                  return_value=subprocess.CompletedProcess([], 0, "", "")), \
+                patch.object(self.supervisor.adapter, "review_result", return_value=GateResult(
+                    "BLOCKED_EXTERNAL", "receipt did not validate", str(invalid_receipt),
+                )) as review_result:
+            self.supervisor.reconcile(self.spec.mission_id)
+        review_result.assert_called_once()
+        self.assertEqual(self.journal.mission(self.spec.mission_id)["current_state"], State.REVIEW)
+        self.assertIsNone(self.journal.mission(self.spec.mission_id)["pending_gate"])
+        self.assertEqual(
+            self.journal.db.execute(
+                "SELECT state FROM jobs WHERE job_id='incomplete-review-job'",
+            ).fetchone()[0],
+            "CONSUMED",
+        )
+        self.assertEqual(
+            self.journal.db.execute(
+                "SELECT count(*) FROM receipts WHERE mission_id=? AND head_sha=?",
+                (self.spec.mission_id, head),
+            ).fetchone()[0],
+            0,
+        )
+        retry_event = self.journal.db.execute(
+            "SELECT payload_json FROM events WHERE mission_id=? AND kind='review_retry_required'",
+            (self.spec.mission_id,),
+        ).fetchone()
+        self.assertEqual(json.loads(retry_event[0])["artifact"], str(invalid_receipt))
+
     def test_pre_merge_ci_pending_is_waitable_and_does_not_merge(self):
         head = "a" * 40
         self.journal.update(
             self.spec.mission_id, current_head=head, current_state=State.MERGE,
-            pr_number=7, pr_repo="fixture/repo",
+            pr_number=7, pr_repo="fixture/repo", pr_base_sha="b" * 40,
         )
         with patch.object(self.adapter, "ci", return_value=GateResult("PENDING", "required check queued")):
             state = self.supervisor.run_until_wait(self.spec.mission_id, self.spec)
@@ -164,7 +215,8 @@ class HarnessTest(unittest.TestCase):
         self.journal.update(
             self.spec.mission_id, current_head=head, current_state=State.MERGE,
             pr_number=7, pr_repo="fixture/repo", merge_claim_head=head,
-            merge_claim_pr_number=7, merge_claim_pr_repo="fixture/repo",
+            pr_base_sha="b" * 40, merge_claim_pr_number=7, merge_claim_pr_repo="fixture/repo",
+            merge_claim_pr_base_sha="b" * 40,
             merge_claim_pid=old_pid, merge_claim_start_ticks="dead-owner",
             merge_invocation_started=0,
         )
@@ -238,7 +290,7 @@ class HarnessTest(unittest.TestCase):
         )
         self.journal.update(
             self.spec.mission_id, current_head=head, current_state=State.POST_MERGE,
-            pr_number=7, pr_repo="fixture/repo", merge_sha=merge_sha,
+            pr_number=7, pr_repo="fixture/repo", pr_base_sha="b" * 40, merge_sha=merge_sha,
         )
         with patch("harness.supervisor.time.sleep") as sleep:
             state = supervisor.run_until_terminal(self.spec.mission_id, self.spec, poll_interval=0.01)
@@ -777,7 +829,7 @@ class HarnessTest(unittest.TestCase):
         self.journal.update(self.spec.mission_id, current_head="a" * 40,
                             current_state=State.WAITING_APPROVAL,
                             approval_state="PENDING", pending_gate="owner-merge", pr_number=1,
-                            pr_repo="fixture/repo")
+                            pr_repo="fixture/repo", pr_base_sha="b" * 40)
         self.journal.approve(
             self.spec.mission_id, "merge", "head A only", observed_head="a" * 40,
         )
@@ -810,7 +862,7 @@ class HarnessTest(unittest.TestCase):
         self.journal.update(self.spec.mission_id, current_head="a" * 40,
                             current_state=State.WAITING_APPROVAL,
                             approval_state="PENDING", pending_gate="owner-merge", pr_number=1,
-                            pr_repo="fixture/repo")
+                            pr_repo="fixture/repo", pr_base_sha="b" * 40)
         with self.assertRaisesRegex(ValueError, "unknown or non-sensitive"):
             self.journal.approve(self.spec.mission_id, "typo", observed_head="a" * 40)
         with self.assertRaisesRegex(ValueError, "does not require approval"):
@@ -824,6 +876,14 @@ class HarnessTest(unittest.TestCase):
             self.journal.approve(self.spec.mission_id, "merge", observed_head="b" * 40)
         self.journal.approve(self.spec.mission_id, "merge", observed_head="a" * 40)
         self.assertTrue(self.journal.approved(self.spec.mission_id, "merge", "a" * 40))
+        approval = self.journal.db.execute(
+            "SELECT pr_base_sha FROM approvals WHERE mission_id=? AND action='merge'",
+            (self.spec.mission_id,),
+        ).fetchone()
+        self.assertEqual(approval[0], "b" * 40)
+        self.journal.update(self.spec.mission_id, pr_base_sha="c" * 40)
+        self.assertFalse(self.journal.approved(self.spec.mission_id, "merge", "a" * 40))
+        self.journal.update(self.spec.mission_id, pr_base_sha="b" * 40)
         self.journal.update(self.spec.mission_id, pr_number=2)
         self.assertFalse(self.journal.approved(self.spec.mission_id, "merge", "a" * 40))
         self.journal.update(self.spec.mission_id, pr_number=1, pr_repo="other/repo")
@@ -866,6 +926,7 @@ class HarnessTest(unittest.TestCase):
             pending_gate="owner-merge",
             pr_number=1,
             pr_repo="fixture/repo",
+            pr_base_sha="b" * 40,
         )
         with self.assertRaisesRegex(RuntimeError, "explicitly observed"):
             self.journal.approve(self.spec.mission_id, "merge")
@@ -1860,12 +1921,15 @@ class HarnessTest(unittest.TestCase):
         class KeywordOnlyAdapter(SimulatedAdapter):
             def ci(self, worktree, head, *, pr_number=None, pr_repo=None):
                 seen["ci"] = (pr_number, pr_repo)
-                return GateResult("PASS", "keyword-only CI")
+                return GateResult("PASS", "keyword-only CI", data={
+                    "pr_number": pr_number, "pr_repo": pr_repo, "pr_base_sha": "b" * 40,
+                })
 
             def merge(self, worktree, head, *, pr_number=None, pr_repo=None):
                 seen["merge"] = (pr_number, pr_repo)
                 return GateResult("PASS", "keyword-only merge", data={
-                    "pr": pr_number, "repo": pr_repo, "merge_sha": "c" * 40,
+                    "pr": pr_number, "repo": pr_repo, "pr_base_sha": "b" * 40,
+                    "merge_sha": "c" * 40,
                 })
 
         adapter = KeywordOnlyAdapter()
@@ -1895,7 +1959,8 @@ class HarnessTest(unittest.TestCase):
         self.journal.update(
             self.spec.mission_id, current_head=head, current_state=State.MERGE,
             pr_number=1, pr_repo="fixture/repo", merge_claim_head=head,
-            merge_claim_pr_number=1, merge_claim_pr_repo="fixture/repo",
+            pr_base_sha="b" * 40, merge_claim_pr_number=1, merge_claim_pr_repo="fixture/repo",
+            merge_claim_pr_base_sha="b" * 40,
             merge_claim_pid=owner_pid, merge_claim_start_ticks=owner_ticks,
             merge_invocation_started=1, pending_gate="merge-outcome-unknown",
         )
@@ -1909,8 +1974,10 @@ class HarnessTest(unittest.TestCase):
 
         class RecoveredProductionAdapter(FootballPredictionAdapter):
             def exact_head(self, worktree): return head
-            def merge_status(self, worktree, reviewed_head, pr_number=None, pr_repo=None):
+            def merge_status(self, worktree, reviewed_head, pr_number=None, pr_repo=None,
+                             pr_base_sha=None):
                 return GateResult("PASS", "merged", data={"pr": pr_number, "repo": pr_repo,
+                                                           "pr_base_sha": pr_base_sha,
                                                            "merge_sha": merge_sha})
 
         supervisor = Supervisor(
@@ -1919,8 +1986,9 @@ class HarnessTest(unittest.TestCase):
         )
         self.journal.update(
             self.spec.mission_id, current_head=head, current_state=State.MERGE,
-            pr_number=7, pr_repo="fixture/repo", merge_claim_head=head,
-            merge_claim_pr_number=7, merge_claim_pr_repo="fixture/repo", merge_claim_pid=99999999,
+            pr_number=7, pr_repo="fixture/repo", pr_base_sha="b" * 40,
+            merge_claim_head=head, merge_claim_pr_number=7, merge_claim_pr_repo="fixture/repo",
+            merge_claim_pr_base_sha="b" * 40, merge_claim_pid=99999999,
             merge_claim_start_ticks="dead-owner", merge_invocation_started=1,
         )
         self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
@@ -1929,7 +1997,8 @@ class HarnessTest(unittest.TestCase):
 
     def test_unknown_merge_decision_fails_closed_before_claim(self):
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,
-                            pr_number=1, pr_repo="fixture/repo", merge_claim_head=None,
+                            pr_number=1, pr_repo="fixture/repo", pr_base_sha="b" * 40,
+                            merge_claim_head=None,
                             merge_claim_pid=None, merge_claim_start_ticks=None)
         with patch("harness.supervisor.decide", return_value="UNRECOGNIZED"):
             self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.BLOCKED_POLICY)
@@ -1944,8 +2013,10 @@ class HarnessTest(unittest.TestCase):
         self.supervisor.collect_jobs(self.spec.mission_id)
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,
                             pr_number=1, pr_repo="fixture/repo",
+                            pr_base_sha="b" * 40,
                             merge_claim_head="a" * 40, merge_claim_pid=99999999,
                             merge_claim_pr_number=1, merge_claim_pr_repo="fixture/repo",
+                            merge_claim_pr_base_sha="b" * 40,
                             merge_claim_start_ticks="dead-owner")
         self.adapter.heads = ["a" * 40]
         self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
@@ -2000,13 +2071,15 @@ class HarnessTest(unittest.TestCase):
 
     def test_live_merge_claim_cannot_be_stolen_by_second_controller(self):
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,
-                            pr_number=1, pr_repo="fixture/repo", merge_claim_head=None,
+                            pr_number=1, pr_repo="fixture/repo", pr_base_sha="b" * 40,
+                            merge_claim_head=None,
                             merge_claim_pid=None, merge_claim_start_ticks=None)
         owner_pid, owner_start_ticks = self.supervisor._merge_owner()
         self.assertTrue(self.journal.claim_merge(self.spec.mission_id, "a" * 40, owner_pid, owner_start_ticks))
         claim = self.journal.mission(self.spec.mission_id)
         self.assertEqual((claim["merge_claim_pr_number"], claim["merge_claim_pr_repo"]),
                          (1, "fixture/repo"))
+        self.assertEqual(claim["merge_claim_pr_base_sha"], "b" * 40)
         second = Supervisor(self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "second-logs"),
                             self.codex, self.adapter)
         self.assertEqual(second.step(self.spec.mission_id, self.spec), State.MERGE)
@@ -2023,7 +2096,7 @@ class HarnessTest(unittest.TestCase):
         journal = self.journal
 
         class RacingMergeAdapter(SimulatedAdapter):
-            def merge_status(self, worktree, claimed_head, pr_number=None):
+            def merge_status(self, worktree, claimed_head, pr_number=None, pr_base_sha=None):
                 row = journal.mission(self_spec.mission_id)
                 status_claim_owners.append(
                     (row["merge_claim_pid"], row["merge_claim_start_ticks"]),
@@ -2036,7 +2109,7 @@ class HarnessTest(unittest.TestCase):
                     owner_alive["value"] = False
                 return GateResult("NOT_STARTED", "canonical merge not started")
 
-            def merge(self, worktree, claimed_head, pr_number=None):
+            def merge(self, worktree, claimed_head, pr_number=None, pr_base_sha=None):
                 external_calls.append("recovery-owner")
                 return GateResult("PASS", "recovery merge")
 
@@ -2055,6 +2128,7 @@ class HarnessTest(unittest.TestCase):
             merge_claim_head=head,
             pr_number=1, pr_repo="fixture/repo",
             merge_claim_pr_number=1, merge_claim_pr_repo="fixture/repo",
+            pr_base_sha="b" * 40, merge_claim_pr_base_sha="b" * 40,
             merge_claim_pid=old_pid,
             merge_claim_start_ticks=old_start,
             merge_invocation_started=1,
@@ -2092,6 +2166,7 @@ class HarnessTest(unittest.TestCase):
             current_state=State.MERGE,
             pr_number=1,
             pr_repo="fixture/repo",
+            pr_base_sha="b" * 40,
             merge_claim_head=None,
             merge_claim_pid=None,
             merge_claim_start_ticks=None,
@@ -2167,6 +2242,7 @@ class HarnessTest(unittest.TestCase):
             merge_claim_head=old_head,
             pr_number=1, pr_repo="fixture/repo",
             merge_claim_pr_number=1, merge_claim_pr_repo="fixture/repo",
+            pr_base_sha="b" * 40, merge_claim_pr_base_sha="b" * 40,
             merge_claim_pid=99999999,
             merge_claim_start_ticks="dead-owner",
             merge_invocation_started=1,
@@ -2187,8 +2263,10 @@ class HarnessTest(unittest.TestCase):
     def test_dead_merge_claim_is_reclaimed_only_after_canonical_not_started(self):
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,
                             pr_number=1, pr_repo="fixture/repo",
+                            pr_base_sha="b" * 40,
                             merge_claim_head="a" * 40, merge_claim_pr_number=1,
-                            merge_claim_pr_repo="fixture/repo", merge_claim_pid=99999999,
+                            merge_claim_pr_repo="fixture/repo", merge_claim_pr_base_sha="b" * 40,
+                            merge_claim_pid=99999999,
                             merge_claim_start_ticks="dead-owner")
         self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
         self.assertEqual(self.adapter.merged_heads, {"a" * 40})
@@ -2268,6 +2346,28 @@ class HarnessTest(unittest.TestCase):
             result = adapter.discover_pr("/worktree", "a" * 40)
         self.assertEqual(result.status, "BLOCKED_EXTERNAL")
         self.assertTrue(result.data["retryable"])
+
+    def test_retryable_pr_discovery_remains_pending_and_retries(self):
+        head = "a" * 40
+        self.journal.update(
+            self.spec.mission_id, current_head=head, current_state=State.MERGE,
+        )
+        pending = GateResult("BLOCKED_EXTERNAL", "GitHub temporarily unavailable",
+                             data={"retryable": True})
+        found = GateResult("PASS", "fixture PR", data={
+            "number": 9, "repo": "fixture/repo", "head": head,
+            "base": "main", "state": "OPEN", "base_sha": "b" * 40,
+        })
+        with patch.object(self.adapter, "discover_pr", side_effect=[pending, found]) as discover:
+            self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.MERGE)
+            row = self.journal.mission(self.spec.mission_id)
+            self.assertEqual(row["pending_gate"], "pr-discovery")
+            self.assertIsNone(row["terminal_state"])
+            self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
+        self.assertEqual(discover.call_count, 2)
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertEqual(row["pr_number"], 9)
+        self.assertEqual(row["pr_base_sha"], "b" * 40)
 
     def test_football_review_preflight_requires_both_commits(self):
         adapter = FootballPredictionAdapter()
@@ -2392,7 +2492,7 @@ class HarnessTest(unittest.TestCase):
         pull = {
             "number": 42,
             "head": {"sha": "a" * 40, "ref": branch},
-            "base": {"ref": "main"},
+            "base": {"ref": "main", "sha": "b" * 40},
         }
         with patch.object(adapter, "_run", side_effect=[
                 "https://credential@github.com/owner/project.git", branch, json.dumps([pull])]) as run, \
@@ -2401,7 +2501,7 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(result.status, "PASS")
         self.assertEqual(result.data, {
             "number": 42, "repo": "owner/project", "head": "a" * 40,
-            "base": "main", "state": "OPEN",
+            "base": "main", "state": "OPEN", "base_sha": "b" * 40,
         })
         discovery_argv = run.call_args_list[-1].args[0]
         self.assertEqual(
@@ -2511,16 +2611,19 @@ class HarnessTest(unittest.TestCase):
 
     def test_merge_uses_durable_pr_identity_without_rediscovery(self):
         adapter = FootballPredictionAdapter()
-        not_started = GateResult("NOT_STARTED", "safe")
-        merged = GateResult("PASS", "merged", data={"pr": 17, "merge_sha": "c" * 40})
+        base_sha = "b" * 40
+        not_started = GateResult("NOT_STARTED", "safe", data={"pr_base_sha": base_sha})
+        merged = GateResult("PASS", "merged", data={"pr": 17, "repo": "fixture/repo",
+            "pr_base_sha": base_sha, "merge_sha": "c" * 40})
         completed = subprocess.CompletedProcess([], 0, "", "")
         with patch.object(adapter, "discover_pr") as discover, \
                 patch.object(adapter, "merge_status", side_effect=[not_started, merged]) as status, \
                 patch.object(adapter, "_call", return_value=completed) as call:
-            result = adapter.merge("/candidate", "a" * 40, 17, "fixture/repo")
+            result = adapter.merge("/candidate", "a" * 40, 17, "fixture/repo", base_sha)
         self.assertEqual(result.status, "PASS")
         discover.assert_not_called()
         self.assertEqual(status.call_args_list[0].args, ("/candidate", "a" * 40, 17, "fixture/repo"))
+        self.assertEqual(status.call_args_list[0].kwargs["pr_base_sha"], base_sha)
         self.assertEqual(call.call_args.args[0][:6], ["gh", "pr", "merge", "17", "--repo", "fixture/repo"])
 
     def test_ci_requires_whole_canonical_pr_ready_pass(self):
@@ -2530,9 +2633,10 @@ class HarnessTest(unittest.TestCase):
                                 "message": "status=completed"}]}
         completed = subprocess.CompletedProcess([], 1, json.dumps(report), "policy failed")
         with patch.object(adapter, "discover_pr", return_value=GateResult(
-                "PASS", "PR", data={"number": 7, "repo": "fixture/repo"})), \
+                "PASS", "PR", data={"number": 7, "repo": "fixture/repo", "base_sha": "c" * 40})), \
                 patch.object(adapter, "_pr_state", return_value=GateResult(
-                    "PASS", "PR", data={"head": "a" * 40, "base": "main", "state": "OPEN"})), \
+                    "PASS", "PR", data={"head": "a" * 40, "base": "main", "state": "OPEN",
+                                         "base_sha": "c" * 40})), \
                 patch.object(adapter, "_trusted_base_checkout", return_value=Path("/trusted")), \
                 patch.object(adapter, "_call", return_value=completed):
             result = adapter.ci("/fixture", "a" * 40, base_sha="b" * 40)
@@ -2554,13 +2658,15 @@ class HarnessTest(unittest.TestCase):
         local = subprocess.CompletedProcess([], 0, json.dumps({"verdict": "PASS"}), "")
         ready = subprocess.CompletedProcess([], 0, json.dumps({"merge_ready": "YES"}), "")
         with patch.object(adapter, "_pr_state", return_value=GateResult(
-                "PASS", "PR", data={"body": "body"})), \
+                "PASS", "PR", data={"body": "body", "head": "b" * 40,
+                                     "base": "main", "state": "OPEN", "base_sha": "c" * 40})), \
                 patch.object(adapter, "_trusted_base_checkout", return_value=Path(self.tmp.name) / "trusted"), \
                 patch.object(adapter, "_call", side_effect=[local, ready]) as call:
             result = adapter.merge_ready(
                 worktree=str(self.tmp.name), base="a" * 40, head="b" * 40,
                 mission_id="mission", scope_file=str(scope), pr_number=7,
-                pr_repo="owner/project", receipts={"codex": "/r/c.json"}, ci_status="PASS",
+                pr_repo="owner/project", pr_base_sha="c" * 40,
+                receipts={"codex": "/r/c.json"}, ci_status="PASS",
             )
         self.assertEqual(result.status, "PASS")
         self.assertIn("agent-workflow", " ".join(call.call_args_list[1].args[0]))
@@ -2571,6 +2677,60 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(command[command.index("--protected-invariants") + 1], "PASS")
         self.assertEqual(command[command.index("--forbidden-side-effects") + 1], "NO")
         self.assertEqual(command[command.index("--required-pr-governance") + 1], "PASS")
+
+    def test_merge_ready_rejects_base_sha_change_before_target_commands(self):
+        adapter = FootballPredictionAdapter()
+        with patch.object(adapter, "_pr_state", return_value=GateResult(
+                "PASS", "PR", data={"body": "body", "head": "b" * 40,
+                                     "base": "main", "state": "OPEN", "base_sha": "c" * 40})), \
+                patch.object(adapter, "_call") as call:
+            result = adapter.merge_ready(
+                worktree="/candidate", base="a" * 40, head="b" * 40,
+                mission_id="mission", scope_file="/candidate/scope.json", pr_number=7,
+                pr_repo="owner/project", pr_base_sha="b" * 40,
+                receipts={"codex": "/receipt.json"}, ci_status="PASS",
+            )
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+        self.assertIn("base", result.evidence)
+        call.assert_not_called()
+
+    def test_merge_ready_parses_multiline_json_and_never_executes_candidate_makefile(self):
+        adapter = FootballPredictionAdapter()
+        candidate = Path(self.tmp.name) / "candidate"
+        candidate.mkdir()
+        scope = candidate / "scope.json"
+        scope.write_text("{}")
+        marker = candidate / "makefile-ran"
+        (candidate / "Makefile").write_text(
+            "agent-preflight:\n\t touch " + str(marker) + "\n", encoding="utf-8",
+        )
+        trusted = Path(self.tmp.name) / "trusted-base"
+        local = subprocess.CompletedProcess(
+            [], 0, json.dumps({"verdict": "PASS", "detail": {"ok": True}}, indent=2)
+            + "\nHuman-readable footer\n", "",
+        )
+        ready = subprocess.CompletedProcess(
+            [], 0, json.dumps({"merge_ready": "YES", "reason": "exact gates"}, indent=2)
+            + "\nHuman-readable footer\n", "",
+        )
+        with patch.object(adapter, "_pr_state", return_value=GateResult(
+                "PASS", "PR", data={"body": "body", "head": "b" * 40,
+                                     "base": "main", "state": "OPEN", "base_sha": "c" * 40})), \
+                patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
+                patch.object(adapter, "_call", side_effect=[local, ready]) as call:
+            result = adapter.merge_ready(
+                worktree=str(candidate), base="a" * 40, head="b" * 40,
+                mission_id="mission", scope_file=str(scope), pr_number=7,
+                pr_repo="owner/project", pr_base_sha="c" * 40,
+                receipts={"codex": "/receipt.json"}, ci_status="PASS",
+            )
+        self.assertEqual(result.status, "PASS")
+        self.assertEqual(result.data["reason"], "exact gates")
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual(call.call_args_list[0].args[0][0], sys.executable)
+        self.assertEqual(call.call_args_list[0].kwargs["cwd"], str(trusted))
+        self.assertNotIn("make", call.call_args_list[0].args[0])
+        self.assertFalse(marker.exists())
 
     def test_owner_approval_precedes_target_merge_readiness_command(self):
         class RecordingAdapter(FootballPredictionAdapter):
@@ -2583,24 +2743,24 @@ class HarnessTest(unittest.TestCase):
 
             def ci(self, worktree, head, pr_number=None, pr_repo=None, base_sha=None):
                 return GateResult("PASS", "exact CI", data={
-                    "pr_number": pr_number, "pr_repo": pr_repo,
+                    "pr_number": pr_number, "pr_repo": pr_repo, "pr_base_sha": "b" * 40,
                 })
 
             def merge_ready(self, **kwargs):
                 self.merge_ready_calls += 1
                 return GateResult("PASS", "ready")
 
-            def merge(self, worktree, head, pr_number=None, pr_repo=None):
+            def merge(self, worktree, head, pr_number=None, pr_repo=None, pr_base_sha=None):
                 self.merge_calls += 1
                 return GateResult("PASS", "merged", data={"pr": pr_number,
-                                                            "repo": pr_repo, "merge_sha": "c" * 40})
+                    "repo": pr_repo, "pr_base_sha": pr_base_sha, "merge_sha": "c" * 40})
 
         adapter = RecordingAdapter()
         spec = replace(self.spec, adapter="footballprediction",
                        mission_scope_file="scope.json", merge_policy="owner_approval")
         self.journal.update(
             self.spec.mission_id, spec_json=json.dumps(spec.__dict__), current_head="a" * 40,
-            current_state=State.MERGE, pr_number=7, pr_repo="fixture/repo",
+            current_state=State.MERGE, pr_number=7, pr_repo="fixture/repo", pr_base_sha="b" * 40,
         )
         supervisor = Supervisor(
             self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "approval-boundary"),
@@ -2619,12 +2779,13 @@ class HarnessTest(unittest.TestCase):
         for report in cases:
             with self.subTest(report=report):
                 with patch.object(adapter, "discover_pr", return_value=GateResult(
-                        "PASS", "PR", data={"number": 7, "repo": "fixture/repo"})), \
+                        "PASS", "PR", data={"number": 7, "repo": "fixture/repo", "base_sha": "c" * 40})), \
                         patch.object(adapter, "_pr_state", return_value=GateResult(
-                            "PASS", "PR", data={"head": "a" * 40, "base": "main", "state": "OPEN"})), \
+                            "PASS", "PR", data={"head": "a" * 40, "base": "main", "state": "OPEN",
+                                                 "base_sha": "c" * 40})), \
                         patch.object(adapter, "_call", return_value=subprocess.CompletedProcess(
                             [], 0, json.dumps(report), "")):
-                    result = adapter.ci("/fixture", "a" * 40)
+                    result = adapter.ci("/fixture", "a" * 40, base_sha="b" * 40)
                 self.assertEqual(result.status, "BLOCKED_EXTERNAL")
 
     def test_ci_reuses_durable_pr_and_rejects_identity_change(self):
@@ -2643,48 +2804,116 @@ class HarnessTest(unittest.TestCase):
         state.assert_called_once_with("/fixture", 7, "fixture/repo")
         self.assertEqual(result.status, "BLOCKED_EXTERNAL")
 
+    def test_ci_rejects_pr_base_change_after_review_binding(self):
+        adapter = FootballPredictionAdapter()
+        with patch.object(adapter, "_pr_state", return_value=GateResult(
+                "PASS", "PR", data={"head": "a" * 40, "base": "main", "state": "OPEN",
+                                     "base_sha": "c" * 40})), \
+                patch.object(adapter, "_call") as call:
+            result = adapter.ci(
+                "/fixture", "a" * 40, 7, "fixture/repo",
+                base_sha="d" * 40, pr_base_sha="b" * 40,
+            )
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+        self.assertIn("base SHA changed", result.evidence)
+        call.assert_not_called()
+
     def test_merge_recovery_open_pr_is_ambiguous_not_retry_safe(self):
         adapter = FootballPredictionAdapter()
+        base_sha = "b" * 40
         responses = iter([
             json.dumps({"number": 7, "state": "open", "merged": False, "head": {"sha": "a" * 40},
-                        "base": {"ref": "main"}, "auto_merge": None}),
+                        "base": {"ref": "main", "sha": base_sha}, "auto_merge": None}),
         ])
         with patch.object(adapter, "_run", side_effect=lambda *args, **kwargs: next(responses)):
-            result = adapter.merge_status("/fixture", "a" * 40, 7, "fixture/repo")
+            result = adapter.merge_status("/fixture", "a" * 40, 7, "fixture/repo", base_sha)
         self.assertEqual(result.status, "BLOCKED_EXTERNAL")
         self.assertIn("ambiguous", result.evidence)
 
+    def test_open_pr_with_moved_base_is_not_safe_to_retry_merge(self):
+        adapter = FootballPredictionAdapter()
+        base_sha = "b" * 40
+        responses = iter([
+            json.dumps({"number": 7, "state": "open", "merged": False,
+                        "head": {"sha": "a" * 40},
+                        "base": {"ref": "main", "sha": "c" * 40}, "auto_merge": None}),
+        ])
+        with patch.object(adapter, "_run", side_effect=lambda *args, **kwargs: next(responses)):
+            result = adapter.merge_status(
+                "/fixture", "a" * 40, 7, "fixture/repo", base_sha, allow_open_retry=True,
+            )
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+        self.assertIn("ambiguous", result.evidence)
+
+    def test_merged_pr_recovery_requires_exact_approved_base_parent(self):
+        adapter = FootballPredictionAdapter()
+        merge_sha = "d" * 40
+        pr = {"number": 7, "state": "closed", "merged": True,
+              "head": {"sha": "a" * 40}, "base": {"ref": "main", "sha": "c" * 40},
+              "merge_commit_sha": merge_sha}
+        for first_parent, expected in (("b" * 40, "PASS"), ("e" * 40, "BLOCKED_EXTERNAL")):
+            with self.subTest(first_parent=first_parent), patch.object(
+                    adapter, "_run", side_effect=[json.dumps(pr), json.dumps({
+                        "parents": [{"sha": first_parent}],
+                    })]):
+                result = adapter.merge_status(
+                    "/fixture", "a" * 40, 7, "fixture/repo", "b" * 40,
+                )
+            self.assertEqual(result.status, expected)
+
     def test_merge_queue_or_auto_merge_is_never_retry_safe(self):
         adapter = FootballPredictionAdapter()
+        base_sha = "b" * 40
         for queue_fields in ({"auto_merge": {"enabled_by": {}}},
                              {"auto_merge": None, "merge_queue_entry": {"id": 91}}):
             responses = iter([
                 json.dumps({"number": 7, "state": "open", "merged": False,
-                            "head": {"sha": "a" * 40}, "base": {"ref": "main"},
+                            "head": {"sha": "a" * 40},
+                            "base": {"ref": "main", "sha": base_sha},
                             **queue_fields}),
             ])
             with self.subTest(queue_fields=queue_fields), patch.object(
                     adapter, "_run", side_effect=lambda *args, **kwargs: next(responses)):
                 result = adapter.merge_status(
-                    "/fixture", "a" * 40, 7, "fixture/repo", allow_open_retry=True,
+                    "/fixture", "a" * 40, 7, "fixture/repo", base_sha, allow_open_retry=True,
                 )
                 self.assertEqual(result.status, "BLOCKED_EXTERNAL")
 
     def test_head_change_clears_durable_pr_identity(self):
         self.journal.update(self.spec.mission_id, current_head="a" * 40,
-                            current_state=State.CI, pr_number=7, pr_repo="fixture/repo")
+                            current_state=State.CI, pr_number=7, pr_repo="fixture/repo",
+                            pr_base_sha="b" * 40)
         self.journal.reconcile_head(self.spec.mission_id, "b" * 40)
         row = self.journal.mission(self.spec.mission_id)
         self.assertEqual(row["current_state"], State.TEST)
         self.assertIsNone(row["pr_number"])
         self.assertIsNone(row["pr_repo"])
 
+    def test_merge_completion_cannot_publish_a_different_pr_base_than_its_claim(self):
+        head, base_sha = "a" * 40, "b" * 40
+        self.journal.update(
+            self.spec.mission_id, current_head=head, current_state=State.MERGE,
+            pr_number=7, pr_repo="fixture/repo", pr_base_sha=base_sha,
+            merge_claim_head=head, merge_claim_pr_number=7,
+            merge_claim_pr_repo="fixture/repo", merge_claim_pr_base_sha=base_sha,
+        )
+        with self.assertRaisesRegex(InvalidTransition, "exact claim or PR identity"):
+            self.journal.complete_merge(
+                self.spec.mission_id, head, pr_number=7, pr_repo="fixture/repo",
+                pr_base_sha="c" * 40, merge_sha="d" * 40, reason="mismatched base",
+            )
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertEqual(row["current_state"], State.MERGE)
+        self.assertEqual(row["merge_claim_pr_base_sha"], base_sha)
+
     def test_open_exact_head_pr_proves_merge_not_started(self):
         adapter = FootballPredictionAdapter()
+        base_sha = "b" * 40
         responses = iter([
             json.dumps({"number": 7, "state": "open", "merged": False, "head": {"sha": "a" * 40},
-                        "base": {"ref": "main"}, "auto_merge": None}),
+                        "base": {"ref": "main", "sha": base_sha}, "auto_merge": None}),
         ])
         with patch.object(adapter, "_run", side_effect=lambda *args, **kwargs: next(responses)):
-            result = adapter.merge_status("/fixture", "a" * 40, 7, "fixture/repo", allow_open_retry=True)
+            result = adapter.merge_status("/fixture", "a" * 40, 7, "fixture/repo", base_sha,
+                                          allow_open_retry=True)
         self.assertEqual(result.status, "NOT_STARTED")

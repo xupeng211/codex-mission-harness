@@ -39,14 +39,16 @@ class Supervisor:
     @staticmethod
     def _invoke_pr_adapter(method, worktree: str, head: str,
                            pr_number: int | None, pr_repo: str | None,
-                           base_sha: str | None = None):
+                           base_sha: str | None = None,
+                           pr_base_sha: str | None = None):
         """Support legacy and current signatures without positional-arity guesses."""
         parameters = inspect.signature(method).parameters
         positional = [worktree, head]
         keywords = {}
         accepts_extra_keywords = any(p.kind == inspect.Parameter.VAR_KEYWORD
                                      for p in parameters.values())
-        for name, value in (("pr_number", pr_number), ("pr_repo", pr_repo), ("base_sha", base_sha)):
+        for name, value in (("pr_number", pr_number), ("pr_repo", pr_repo),
+                            ("base_sha", base_sha), ("pr_base_sha", pr_base_sha)):
             parameter = parameters.get(name)
             if parameter is not None and parameter.kind == inspect.Parameter.POSITIONAL_ONLY:
                 positional.append(value)
@@ -141,20 +143,16 @@ class Supervisor:
                 reviewer = str(job["name"]).split(":", 1)[1]
                 spec = self.journal.spec(mission_id)
                 scope = spec.mission_scope_file
-                if result.state == "LOST":
-                    # The process identity is conclusively dead (PID plus
-                    # start-time no longer matches), so an incomplete review
-                    # may be safely retried.  Keep the terminal job as a
-                    # consumed journal fact; the next REVIEW step launches one
-                    # fresh exact-head run and cannot race the old writer.
-                    self.journal.complete_review_job(
-                        mission_id, result.job_id, reviewer, current, "RETRY", None,
-                        "canonical review writer exited without a durable receipt",
-                        retry=True,
-                    )
-                    continue
                 if result.state in {"EXITED", "LOST"}:
                     root = Path(snapshot["worktree"]).resolve()
+                    published_receipt = None
+                    try:
+                        payload = self.adapter._json_last_line(job["stdout_path"])
+                        candidate_receipt = payload.get("review_receipt") if isinstance(payload, dict) else None
+                        if isinstance(candidate_receipt, str) and Path(candidate_receipt).is_file():
+                            published_receipt = candidate_receipt
+                    except (AttributeError, OSError, TypeError):
+                        pass
                     try:
                         if not scope:
                             raise ValueError("FootballPrediction review requires mission_scope_file")
@@ -172,7 +170,26 @@ class Supervisor:
                             stdout_path=job["stdout_path"],
                         )
                     except Exception as exc:
-                        reviewed = GateResult("BLOCKED_EXTERNAL", f"canonical review receipt validation failed: {exc}")
+                        reviewed = GateResult(
+                            "BLOCKED_EXTERNAL", f"canonical review receipt validation failed: {exc}",
+                            published_receipt,
+                        )
+                    if reviewed.status == "BLOCKED_EXTERNAL" and not reviewed.artifact and published_receipt:
+                        reviewed = GateResult(
+                            reviewed.status, reviewed.evidence, published_receipt, reviewed.data,
+                        )
+                    if reviewed.status == "BLOCKED_EXTERNAL":
+                        # The process is conclusively terminal, so an
+                        # incomplete or rejected receipt can be retried safely.
+                        # A valid PASS/FAIL is consumed above; no second review
+                        # may replace that terminal finding after restart.
+                        self.journal.complete_review_job(
+                            mission_id, result.job_id, reviewer, current,
+                            "RETRY", reviewed.artifact, reviewed.evidence or
+                            "canonical review writer exited without a durable receipt",
+                            retry=True,
+                        )
+                        continue
                     details = reviewed.data if isinstance(reviewed.data, dict) else {}
                     reason = reviewed.evidence
                     if reviewed.status == "FAIL":
@@ -325,13 +342,15 @@ class Supervisor:
                 identity = self.journal.mission(mission_id)
                 expected_pr = identity["merge_claim_pr_number"] or identity["pr_number"]
                 expected_repo = identity["merge_claim_pr_repo"] or identity["pr_repo"]
+                expected_pr_base = identity["merge_claim_pr_base_sha"] or identity["pr_base_sha"]
                 if not data.get("pr") or not data.get("merge_sha"):
                     if not isinstance(self.adapter, SimulatedAdapter):
                         advance(State.BLOCKED_EXTERNAL, "merge PASS omitted PR or merge SHA")
                         return State.BLOCKED_EXTERNAL
                 elif (not isinstance(data.get("pr"), int) or isinstance(data.get("pr"), bool)
-                      or data.get("pr") != expected_pr or data.get("repo", expected_repo) != expected_repo):
-                    advance(State.BLOCKED_EXTERNAL, "merge PASS changed the durable PR repository identity")
+                      or data.get("pr") != expected_pr or data.get("repo", expected_repo) != expected_repo
+                      or data.get("pr_base_sha") != expected_pr_base):
+                    advance(State.BLOCKED_EXTERNAL, "merge PASS changed the durable PR/reviewed-base identity")
                     return State.BLOCKED_EXTERNAL
                 merge_sha = data.get("merge_sha")
                 if merge_sha is not None and (not isinstance(merge_sha, str)
@@ -343,7 +362,8 @@ class Supervisor:
                     return State.BLOCKED_EXTERNAL
                 self.journal.complete_merge(
                     mission_id, expected_head, pr_number=expected_pr,
-                    pr_repo=expected_repo, merge_sha=merge_sha,
+                    pr_repo=expected_repo, pr_base_sha=expected_pr_base,
+                    merge_sha=merge_sha,
                     reason=result.evidence,
                 )
             elif result.status == "BLOCKED_POLICY":
@@ -368,6 +388,7 @@ class Supervisor:
                         self.adapter.merge_status, worktree, head,
                         self.journal.mission(mission_id)["merge_claim_pr_number"],
                         self.journal.mission(mission_id)["merge_claim_pr_repo"],
+                        pr_base_sha=self.journal.mission(mission_id)["merge_claim_pr_base_sha"],
                     )
                 except Exception as exc:
                     advance(State.BLOCKED_EXTERNAL,
@@ -389,6 +410,7 @@ class Supervisor:
                     return State(self.journal.mission(mission_id)["current_state"])
                 result = self._invoke_pr_adapter(
                     self.adapter.merge, worktree, head, claimed_pr, claimed_repo,
+                    pr_base_sha=identity["merge_claim_pr_base_sha"],
                 )
             except Exception as exc:
                 self.journal.event(mission_id, "merge_outcome_unknown", {"head": head, "error": str(exc)})
@@ -541,9 +563,12 @@ class Supervisor:
         elif state == State.CI:
             result = self._invoke_pr_adapter(
                 self.adapter.ci, row["worktree"], row["current_head"],
-                row["pr_number"], row["pr_repo"], row["base_sha"],
+                row["pr_number"], row["pr_repo"], row["base_sha"], row["pr_base_sha"],
             )
             facts = result.data if isinstance(result.data, dict) else {}
+            if result.status == "BLOCKED_EXTERNAL" and facts.get("retryable"):
+                self.journal.update(mission_id, pending_gate="github-ci", ci_state="PENDING")
+                return state
             if (not isinstance(result.data, dict)
                     and not isinstance(self.adapter, SimulatedAdapter)
                     and result.status in {"PASS", "PENDING", "FAIL"}):
@@ -555,12 +580,16 @@ class Supervisor:
                 return State.BLOCKED_EXTERNAL
             if "pr_number" in facts or "pr_repo" in facts:
                 pr_number, pr_repo = facts.get("pr_number"), facts.get("pr_repo")
+                pr_base_sha = facts.get("pr_base_sha")
                 if (not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0
                         or not isinstance(pr_repo, str)
-                        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", pr_repo) is None):
+                        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", pr_repo) is None
+                        or not isinstance(pr_base_sha, str)
+                        or re.fullmatch(r"[0-9a-fA-F]{40}", pr_base_sha) is None):
                     advance(State.BLOCKED_EXTERNAL, "canonical CI returned invalid durable PR identity")
                     return State.BLOCKED_EXTERNAL
-                if not self.journal.bind_pr_identity(mission_id, row["current_head"], pr_number, pr_repo):
+                if not self.journal.bind_pr_identity(
+                        mission_id, row["current_head"], pr_number, pr_repo, pr_base_sha):
                     advance(State.BLOCKED_EXTERNAL, "CI PR identity changed or lost its exact source snapshot")
                     return State.BLOCKED_EXTERNAL
             if result.status == "PASS":
@@ -596,6 +625,9 @@ class Supervisor:
             if row["pr_number"] is None:
                 pr = self.adapter.discover_pr(row["worktree"], row["current_head"])
                 if pr.status != "PASS":
+                    if isinstance(pr.data, dict) and pr.data.get("retryable"):
+                        self.journal.update(mission_id, pending_gate="pr-discovery", ci_state="PENDING")
+                        return state
                     advance(State.BLOCKED_EXTERNAL, pr.evidence)
                     return State.BLOCKED_EXTERNAL
                 facts = pr.data if isinstance(pr.data, dict) else {}
@@ -606,7 +638,13 @@ class Supervisor:
                     advance(State.BLOCKED_EXTERNAL,
                             "PR discovery returned an invalid durable PR identity")
                     return State.BLOCKED_EXTERNAL
-                self.journal.update(mission_id, pr_number=pr_number, pr_repo=pr_repo)
+                pr_base_sha = facts.get("base_sha")
+                if (not isinstance(pr_base_sha, str)
+                        or re.fullmatch(r"[0-9a-fA-F]{40}", pr_base_sha) is None
+                        or not self.journal.bind_pr_identity(
+                            mission_id, row["current_head"], pr_number, pr_repo, pr_base_sha)):
+                    advance(State.BLOCKED_EXTERNAL, "PR discovery omitted or changed exact base SHA")
+                    return State.BLOCKED_EXTERNAL
                 row = self.journal.mission(mission_id)
             if row["merge_claim_head"] is not None:
                 claim_head = row["merge_claim_head"]
@@ -642,6 +680,7 @@ class Supervisor:
                             status = self._invoke_pr_adapter(
                                 self.adapter.merge_status, row["worktree"], claim_head,
                                 row["merge_claim_pr_number"], row["merge_claim_pr_repo"],
+                                pr_base_sha=row["merge_claim_pr_base_sha"],
                             )
                         except Exception as exc:
                             advance(State.BLOCKED_EXTERNAL, f"cannot reconcile uncertain merge: {exc}")
@@ -678,7 +717,7 @@ class Supervisor:
                     self.journal.update(mission_id, pending_gate=None)
             technical = self._invoke_pr_adapter(
                 self.adapter.ci, row["worktree"], row["current_head"],
-                row["pr_number"], row["pr_repo"], row["base_sha"],
+                row["pr_number"], row["pr_repo"], row["base_sha"], row["pr_base_sha"],
             )
             if technical.status == "PENDING":
                 self.journal.update(mission_id, pending_gate="pre-merge-ci", ci_state="PENDING")
@@ -722,6 +761,7 @@ class Supervisor:
                         mission_id=mission_id,
                         scope_file=str((Path(row["worktree"]) / spec.mission_scope_file).resolve()),
                         pr_number=row["pr_number"], pr_repo=row["pr_repo"],
+                        pr_base_sha=row["pr_base_sha"],
                         receipts=artifacts, ci_status="PASS",
                     )
                 except Exception as exc:
@@ -839,9 +879,11 @@ class Supervisor:
                           or (state == State.MERGE and row["pending_gate"] == "pre-merge-ci"))
             pending_production = (state == State.POST_MERGE
                                   and row["pending_gate"] == "production-gate")
+            pending_pr_discovery = (state == State.MERGE
+                                    and row["pending_gate"] == "pr-discovery")
             pending_external_gate = (state == State.TEST and row["pending_gate"] in spec.required_gates
                                      and row["ci_state"] == "PENDING")
-            if pending_ci or pending_production or pending_external_gate:
+            if pending_ci or pending_production or pending_external_gate or pending_pr_discovery:
                 time.sleep(poll_interval)
                 continue
             if state in {State.CI, State.MERGE, State.POST_MERGE}:
@@ -851,6 +893,8 @@ class Supervisor:
                 or (State(row["current_state"]) == State.MERGE and row["pending_gate"] == "pre-merge-ci")
                 or (State(row["current_state"]) == State.POST_MERGE
                     and row["pending_gate"] == "production-gate")
+                or (State(row["current_state"]) == State.MERGE
+                    and row["pending_gate"] == "pr-discovery")
                 or (State(row["current_state"]) == State.TEST
                     and row["pending_gate"] in spec.required_gates
                     and row["ci_state"] == "PENDING")):

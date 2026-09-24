@@ -7,6 +7,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -241,9 +242,13 @@ class FootballPredictionAdapter:
         number = matches[0].get("number")
         if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
             return GateResult("BLOCKED_EXTERNAL", "GitHub PR discovery omitted a valid PR number")
+        base_sha = str((matches[0].get("base") or {}).get("sha", "")).lower()
+        if re.fullmatch(r"[0-9a-f]{40}", base_sha) is None:
+            return GateResult("BLOCKED_EXTERNAL", "GitHub PR discovery omitted an exact base SHA")
         return GateResult("PASS", f"PR #{number}", data={
             "number": number, "repo": repo, "head": head.lower(),
             "base": "main", "state": "OPEN",
+            "base_sha": base_sha,
         })
 
     def _repo_from_origin(self, worktree: str) -> str:
@@ -273,7 +278,8 @@ class FootballPredictionAdapter:
         return f"{owner}/{name}"
 
     def ci(self, worktree: str, head: str, pr_number: int | None = None,
-           pr_repo: str | None = None, base_sha: str | None = None) -> GateResult:
+           pr_repo: str | None = None, base_sha: str | None = None,
+           pr_base_sha: str | None = None) -> GateResult:
         # CI evidence is an authority boundary.  Without an immutable base
         # checkout there is no trusted copy of the project's PR-readiness
         # command, so never execute a candidate-controlled Makefile as a
@@ -292,15 +298,21 @@ class FootballPredictionAdapter:
             bound = self._pr_state(worktree, pr_number, pr_repo)
             bound_facts = bound.data or {}
             if (bound.status != "PASS" or bound_facts.get("head") != head.lower()
-                    or bound_facts.get("base") != "main" or bound_facts.get("state") != "OPEN"):
+                    or bound_facts.get("base") != "main" or bound_facts.get("state") != "OPEN"
+                    or re.fullmatch(r"[0-9a-f]{40}", str(bound_facts.get("base_sha", ""))) is None):
                 return GateResult("BLOCKED_EXTERNAL", f"discovered PR #{pr_number} is no longer open at exact HEAD {head}")
         else:
             if not pr_repo: return GateResult("BLOCKED_EXTERNAL", "durable PR identity has no repository")
             bound = self._pr_state(worktree, pr_number, pr_repo)
             if bound.status != "PASS": return bound
             facts = bound.data or {}
-            if facts.get("head") != head.lower() or facts.get("base") != "main" or facts.get("state") != "OPEN":
+            if (facts.get("head") != head.lower() or facts.get("base") != "main"
+                    or facts.get("state") != "OPEN"
+                    or re.fullmatch(r"[0-9a-f]{40}", str(facts.get("base_sha", ""))) is None):
                 return GateResult("BLOCKED_EXTERNAL", f"durable PR #{pr_number} no longer matches open main PR at {head}")
+        observed_base_sha = str((bound.data or {}).get("base_sha", "")).lower()
+        if pr_base_sha is not None and observed_base_sha != pr_base_sha.lower():
+            return GateResult("BLOCKED_EXTERNAL", "durable PR base SHA changed after review/approval")
         try:
             trusted = self._trusted_base_checkout(
                 worktree, base_sha,
@@ -330,8 +342,15 @@ class FootballPredictionAdapter:
                   if str(finding.get("name", "")).startswith("required-check:")]
         if not checks: return GateResult("BLOCKED_EXTERNAL", "canonical pr-ready reported no required checks")
         messages = "\n".join(str(f.get("message", "")) for f in checks)
+        data["pr_base_sha"] = observed_base_sha
         if (result.returncode == 0 and data.get("verdict") == "PASS"
                 and all(f.get("passed") is True for f in checks)):
+            final_pr = self._pr_state(worktree, pr_number, pr_repo)
+            final_facts = final_pr.data if isinstance(final_pr.data, dict) else {}
+            if (final_pr.status != "PASS" or final_facts.get("head") != head.lower()
+                    or final_facts.get("base") != "main" or final_facts.get("state") != "OPEN"
+                    or final_facts.get("base_sha") != observed_base_sha):
+                return GateResult("BLOCKED_EXTERNAL", "PR identity or base changed while exact-head CI was checked")
             return GateResult("PASS", messages, data=data)
         if "status=queued" in messages or "status=in_progress" in messages or "no run for exact HEAD" in messages:
             return GateResult("PENDING", messages, data=data)
@@ -340,7 +359,7 @@ class FootballPredictionAdapter:
         return GateResult("BLOCKED_EXTERNAL", "canonical pr-ready returned contradictory or invalid check evidence", data=data)
 
     def merge_ready(self, *, worktree: str, base: str, head: str, mission_id: str,
-                    scope_file: str, pr_number: int, pr_repo: str,
+                    scope_file: str, pr_number: int, pr_repo: str, pr_base_sha: str,
                     receipts: dict[str, str], ci_status: str) -> GateResult:
         """Delegate the final merge-readiness decision to the target project."""
         codex_receipt = receipts.get("codex")
@@ -350,6 +369,11 @@ class FootballPredictionAdapter:
         pr_state = self._pr_state(worktree, pr_number, pr_repo)
         if pr_state.status != "PASS":
             return pr_state
+        pr_facts = pr_state.data if isinstance(pr_state.data, dict) else {}
+        if (pr_facts.get("head") != head.lower() or pr_facts.get("base") != "main"
+                or pr_facts.get("state") != "OPEN"
+                or pr_facts.get("base_sha") != pr_base_sha.lower()):
+            return GateResult("BLOCKED_EXTERNAL", "PR identity/base no longer matches exact reviewed approval")
         body = (pr_state.data or {}).get("body") if isinstance(pr_state.data, dict) else None
         if not isinstance(body, str):
             return GateResult("BLOCKED_EXTERNAL", "canonical merge-readiness requires the PR body")
@@ -358,16 +382,23 @@ class FootballPredictionAdapter:
         body_path.write_text(body, encoding="utf-8")
         body_path.chmod(0o600)
         scope = Path(scope_file).resolve()
-        # The candidate Makefile is not an authority boundary.  This preflight
-        # is deliberately run with a scrubbed environment: even though the
-        # project contract describes it as read-only, a changed target must not
-        # inherit the controller's credentials before the owner has approved a
-        # merge.  The trusted-base merge-readiness command below remains the
-        # canonical policy authority.
+        trusted = self._trusted_base_checkout(worktree, base, str(evidence))
+        # Execute the canonical implementation from the trusted base; the
+        # candidate worktree is data, never executable authority here.
+        preflight_code = (
+            "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
+            "from scripts.devops import agent_workflow_preflight as p; "
+            "from scripts.ops.helpers import git_change_helpers as h; "
+            "root=Path(sys.argv[2]); p.ROOT=root; h.ROOT_HELPER=root; "
+            "sys.argv=['agent-preflight','--pr-body-file',sys.argv[3],"
+            "'--mission-scope-file',sys.argv[4],'--base-ref',sys.argv[5],"
+            "'--head-ref',sys.argv[6],'--require-review','--json']; "
+            "raise SystemExit(p.main())"
+        )
         local = self._call(
-            ["make", "agent-preflight"], cwd=worktree,
-            env={"PR_BODY": str(body_path), "MISSION_SCOPE_FILE": str(scope),
-                 "BASE_REF": base, "HEAD_REF": head, "JSON": "1", "GH_HOST": "github.com",
+            [sys.executable, "-c", preflight_code, str(trusted), worktree,
+             str(body_path), str(scope), base, head], cwd=str(trusted),
+            env={"GH_HOST": "github.com",
                  "HOME": "/nonexistent", "PATH": os.defpath, "LANG": "C.UTF-8"},
             inherit_environment=False,
         )
@@ -380,7 +411,6 @@ class FootballPredictionAdapter:
         local_path = evidence / "local-preflight.json"
         local_path.write_text(json.dumps(local_json, sort_keys=True), encoding="utf-8")
         local_path.chmod(0o600)
-        trusted = self._trusted_base_checkout(worktree, base, str(evidence))
         code = ("import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
                 "from scripts.devops import agent_workflow as m, agent_workflow_preflight as p, pr_ready_check as r; "
                 "from scripts.ops import ai_workflow_gate as g; from scripts.ops.helpers import git_change_helpers as h; "
@@ -408,7 +438,10 @@ class FootballPredictionAdapter:
                 "--forbidden-side-effects", forbidden_side_effects,
                 "--required-pr-governance", required_pr_governance, "--json"]
         result = self._call(argv, cwd=str(trusted), env={"GH_HOST": "github.com", "GH_REPO": pr_repo})
-        data = self._json_last_text(result.stdout)
+        try:
+            data = self._json_document_prefix(result.stdout)
+        except json.JSONDecodeError:
+            return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "canonical agent-merge-ready returned invalid JSON")
         if result.returncode == 0 and data.get("merge_ready") == "YES":
             return GateResult("PASS", "canonical agent-merge-ready passed", data=data)
         return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "canonical agent-merge-ready rejected merge", data=data)
@@ -424,27 +457,35 @@ class FootballPredictionAdapter:
         number = raw.get("number")
         if (not isinstance(head, dict) or not isinstance(base, dict)
                 or not isinstance(number, int) or isinstance(number, bool)
-                or number != pr_number):
+                or number != pr_number
+                or re.fullmatch(r"[0-9a-fA-F]{40}", str(head.get("sha", ""))) is None
+                or re.fullmatch(r"[0-9a-fA-F]{40}", str(base.get("sha", ""))) is None
+                or not isinstance(base.get("ref"), str)):
             return GateResult("BLOCKED_EXTERNAL", "GitHub PR lookup returned malformed or mismatched identity")
         return GateResult("PASS", f"{pr_repo} PR #{pr_number}", data={"repo": pr_repo, "raw": raw,
             "head": str(head.get("sha", "")).lower(),
             "base": str(base.get("ref", "")),
+            "base_sha": str(base.get("sha", "")).lower(),
             "state": str(raw.get("state", "")).upper(), "body": raw.get("body", "")})
 
     def merge(self, worktree: str, head: str, pr_number: int | None = None,
-              pr_repo: str | None = None) -> GateResult:
-        if pr_number is None or not pr_repo: return GateResult("BLOCKED_EXTERNAL", "merge claim has no durable PR identity")
-        before = self.merge_status(worktree, head, pr_number, pr_repo, allow_open_retry=True)
+              pr_repo: str | None = None, pr_base_sha: str | None = None) -> GateResult:
+        if pr_number is None or not pr_repo or not pr_base_sha:
+            return GateResult("BLOCKED_EXTERNAL", "merge claim has no durable PR/base identity")
+        before = self.merge_status(worktree, head, pr_number, pr_repo,
+                                   pr_base_sha=pr_base_sha, allow_open_retry=True)
         if before.status != "NOT_STARTED": return before
         result = self._call(self._gh("pr", "merge", str(pr_number), "--repo", pr_repo,
                              "--squash", "--match-head-commit", head), cwd=worktree)
         if result.returncode != 0: return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "merge command failed")
-        return self.merge_status(worktree, head, pr_number, pr_repo)
+        return self.merge_status(worktree, head, pr_number, pr_repo,
+                                 pr_base_sha=pr_base_sha)
 
     def merge_status(self, worktree: str, reviewed_head: str, pr_number: int | None = None,
-                     pr_repo: str | None = None, allow_open_retry: bool = False) -> GateResult:
-        if pr_number is None or not pr_repo:
-            return GateResult("BLOCKED_EXTERNAL", "merge claim has no durable PR identity")
+                     pr_repo: str | None = None, pr_base_sha: str | None = None,
+                     allow_open_retry: bool = False) -> GateResult:
+        if pr_number is None or not pr_repo or not pr_base_sha:
+            return GateResult("BLOCKED_EXTERNAL", "merge claim has no durable PR/base identity")
         try:
             data = json.loads(self._run(self._gh("api", f"repos/{pr_repo}/pulls/{pr_number}"), cwd=worktree))
         except (KeyError, json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
@@ -464,13 +505,28 @@ class FootballPredictionAdapter:
             merge_sha = str(data.get("merge_commit_sha") or "").lower()
             if not re.fullmatch(r"[0-9a-f]{40}", merge_sha):
                 return GateResult("BLOCKED_EXTERNAL", "merged PR lacks a full merge SHA")
-            return GateResult("PASS", f"merged {pr_repo} PR #{pr_number}", data={"pr": pr_number, "merge_sha": merge_sha, "repo": pr_repo})
+            try:
+                commit = json.loads(self._run(self._gh("api", f"repos/{pr_repo}/commits/{merge_sha}"), cwd=worktree))
+            except (KeyError, json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
+                return GateResult("BLOCKED_EXTERNAL", f"cannot validate merge base parent: {exc}")
+            parents = commit.get("parents") if isinstance(commit, dict) else None
+            first_parent = (parents[0].get("sha", "").lower()
+                            if isinstance(parents, list) and parents and isinstance(parents[0], dict) else "")
+            if first_parent != pr_base_sha.lower():
+                return GateResult("BLOCKED_EXTERNAL", "merge commit first parent differs from approved PR base SHA")
+            return GateResult("PASS", f"merged {pr_repo} PR #{pr_number}", data={
+                "pr": pr_number, "merge_sha": merge_sha, "repo": pr_repo,
+                "pr_base_sha": pr_base_sha.lower(),
+            })
         queued = data.get("auto_merge") is not None or data.get("merge_queue_entry") is not None
         if (allow_open_retry and data.get("merged") is False and not queued
                 and str(data.get("state", "")).upper() == "OPEN"
                 and str(base.get("ref", "")) == "main"
+                and str(base.get("sha", "")).lower() == pr_base_sha.lower()
                 and str(head.get("sha", "")).lower() == reviewed_head.lower()):
-            return GateResult("NOT_STARTED", f"PR #{pr_number} is still open at the reviewed HEAD; merge retry is safe", data={"pr": pr_number})
+            return GateResult("NOT_STARTED", f"PR #{pr_number} remains open at reviewed HEAD/base; merge retry is safe", data={
+                "pr": pr_number, "repo": pr_repo, "pr_base_sha": pr_base_sha.lower(),
+            })
         return GateResult("BLOCKED_EXTERNAL", f"ambiguous merge state for PR #{pr_number}")
 
     def post_merge(self, worktree: str, merge_sha: str, pr_number: int, pr_repo: str,
@@ -568,28 +624,36 @@ class SimulatedAdapter(FootballPredictionAdapter):
         self.merged_heads: set[str] = set()
     def exact_head(self, worktree): return self.heads[min(self.head_index, len(self.heads)-1)]
     def gate_argv(self, gate): return ["/bin/sh", "-c", "exit 0"]
-    def discover_pr(self, worktree, head): return GateResult("PASS", "fixture PR", data={"number": 1, "repo": "fixture/repo"})
+    def discover_pr(self, worktree, head): return GateResult("PASS", "fixture PR", data={
+        "number": 1, "repo": "fixture/repo", "base_sha": "b" * 40,
+    })
     def review_argv(self, *args, **kwargs): return ["/bin/sh", "-c", "exit 0"]
     def review(self, reviewer, head):
         value=self.reviews[min(self.review_index,len(self.reviews)-1)]; self.review_index+=1; return GateResult(value, f"fixture {reviewer}", "/tmp/fake")
     def review_result(self, reviewer, **kwargs):
         value=self.reviews[min(self.review_index,len(self.reviews)-1)]; self.review_index+=1; return GateResult(value, f"fixture {reviewer}", "/tmp/fake")
-    def ci(self, worktree, head, pr_number=None, pr_repo=None):
-        value=self.ci_results[min(self.ci_index,len(self.ci_results)-1)]; self.ci_index+=1; return GateResult(value, f"fixture CI {head}", data={"pr_number": pr_number or 1, "pr_repo": pr_repo or "fixture/repo"})
+    def ci(self, worktree, head, pr_number=None, pr_repo=None, base_sha=None, pr_base_sha=None):
+        value=self.ci_results[min(self.ci_index,len(self.ci_results)-1)]; self.ci_index+=1
+        return GateResult(value, f"fixture CI {head}", data={
+            "pr_number": pr_number or 1, "pr_repo": pr_repo or "fixture/repo",
+            "pr_base_sha": pr_base_sha or base_sha or ("b" * 40),
+        })
     def merge_ready(self, **kwargs): return GateResult("PASS", "fixture merge readiness")
-    def merge(self, worktree, head, pr_number=None, pr_repo=None):
+    def merge(self, worktree, head, pr_number=None, pr_repo=None, pr_base_sha=None):
         value = self.merge_results[min(self.merge_index, len(self.merge_results)-1)]
         self.merge_index += 1
         if value == "PASS":
             self.merged_heads.add(head)
             return GateResult(value, f"fixture merge {head}", data={
                 "pr": pr_number or 1, "repo": pr_repo or "fixture/repo", "merge_sha": "c" * 40,
+                "pr_base_sha": pr_base_sha,
             })
         return GateResult(value, f"fixture merge {head}")
-    def merge_status(self, worktree, reviewed_head, pr_number=None, pr_repo=None):
+    def merge_status(self, worktree, reviewed_head, pr_number=None, pr_repo=None, pr_base_sha=None):
         if reviewed_head in self.merged_heads:
             return GateResult("PASS", f"fixture merge status {reviewed_head}", data={
                 "pr": pr_number or 1, "repo": pr_repo or "fixture/repo", "merge_sha": "c" * 40,
+                "pr_base_sha": pr_base_sha,
             })
         return GateResult("NOT_STARTED", f"fixture merge status {reviewed_head}")
     def post_merge(self, *args):
