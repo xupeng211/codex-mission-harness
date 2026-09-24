@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import json
+import os
 import queue
 import subprocess
 import sys
@@ -93,6 +94,100 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.REVIEW)
         self.assertEqual(self.journal.mission(self.spec.mission_id)["pending_gate"], "review:codex")
         self.assertEqual(self.codex.turns, [])
+
+    def test_async_review_findings_are_durable_input_to_repair_turn(self):
+        head = "a" * 40
+        findings = [{"severity": "P1", "title": "repair this", "evidence": "exact source evidence"}]
+        spec = replace(self.spec, adapter="footballprediction", mission_scope_file="scope.json")
+        scope_file = self.worktree / "scope.json"
+        scope_file.write_text("{}")
+        self.journal.update(
+            self.spec.mission_id, spec_json=json.dumps(spec.__dict__), current_head=head,
+            current_state=State.REVIEW, pending_gate="review:codex",
+        )
+        stdout_path = Path(self.tmp.name) / "review.stdout"
+        stdout_path.write_text("{}"); self.journal.db.execute(
+            "INSERT INTO jobs(job_id,mission_id,name,argv_json,launch_head,state,stdout_path,stderr_path,started_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            ("review-job", self.spec.mission_id, "review:codex", "[]", head, "EXITED",
+             str(stdout_path), "", "2026-01-01T00:00:00+00:00"),
+        )
+        self.journal.db.commit()
+        with patch.object(self.supervisor.process, "poll", return_value=[JobResult("review-job", "EXITED", 0, head)]), \
+                patch("harness.supervisor.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")), \
+                patch.object(self.supervisor.adapter, "review_result", return_value=GateResult(
+                    "FAIL", "canonical receipt reports findings", "/private/review.json",
+                    {"findings": findings},
+                )):
+            self.supervisor.reconcile(self.spec.mission_id)
+        self.assertEqual(self.journal.status(self.spec.mission_id).state, State.IMPLEMENT)
+        resumed = Supervisor(
+            self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "resumed-review-logs"),
+            self.codex, self.adapter,
+        )
+        self.assertEqual(resumed.step(self.spec.mission_id, spec), State.TEST)
+        prompt = self.codex.turns[-1][1]
+        self.assertIn("P1", prompt)
+        self.assertIn("repair this", prompt)
+        self.assertIn("exact source evidence", prompt)
+        self.assertEqual(resumed._async_review_repair_context(self.spec.mission_id, "b" * 40), "")
+
+    def test_pre_merge_ci_pending_is_waitable_and_does_not_merge(self):
+        head = "a" * 40
+        self.journal.update(
+            self.spec.mission_id, current_head=head, current_state=State.MERGE,
+            pr_number=7, pr_repo="fixture/repo",
+        )
+        with patch.object(self.adapter, "ci", return_value=GateResult("PENDING", "required check queued")):
+            state = self.supervisor.run_until_wait(self.spec.mission_id, self.spec)
+        row = self.journal.mission(self.spec.mission_id)
+        self.assertEqual(state, State.MERGE)
+        self.assertEqual(row["pending_gate"], "pre-merge-ci")
+        self.assertEqual(row["ci_state"], "PENDING")
+        self.assertEqual(self.adapter.merged_heads, set())
+
+    def test_terminal_runner_polls_exact_head_ci_until_it_finishes(self):
+        spec = replace(self.spec, merge_policy="owner_approval")
+        self.journal.update(
+            self.spec.mission_id, spec_json=json.dumps(spec.__dict__),
+            current_head="a" * 40, current_state=State.CI,
+        )
+        with patch.object(self.adapter, "ci", side_effect=[
+                GateResult("PENDING", "check queued"), GateResult("PASS", "checks pass"),
+                GateResult("PASS", "pre-merge recheck pass")]) as check, \
+                patch("harness.supervisor.time.sleep") as sleep:
+            state = self.supervisor.run_until_terminal(self.spec.mission_id, spec, poll_interval=0.01)
+        self.assertEqual(state, State.WAITING_APPROVAL)
+        self.assertEqual(check.call_count, 3)
+        sleep.assert_called_once_with(0.01)
+
+    def test_production_gate_pending_survives_terminal_runner_as_wait_state(self):
+        head, merge_sha = "a" * 40, "c" * 40
+
+        class PendingProductionAdapter:
+            def __init__(self):
+                self.calls = 0
+
+            def exact_head(self, worktree):
+                return head
+
+            def post_merge(self, *args):
+                self.calls += 1
+                return GateResult("PENDING", "Production Gate queued", data={"ci_status": "queued"})
+
+        adapter = PendingProductionAdapter()
+        supervisor = Supervisor(
+            self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "pending-production-logs"),
+            self.codex, adapter,
+        )
+        self.journal.update(
+            self.spec.mission_id, current_head=head, current_state=State.POST_MERGE,
+            pr_number=7, pr_repo="fixture/repo", merge_sha=merge_sha,
+        )
+        state = supervisor.run_until_terminal(self.spec.mission_id, self.spec)
+        self.assertEqual(state, State.POST_MERGE)
+        self.assertEqual(self.journal.mission(self.spec.mission_id)["pending_gate"], "production-gate")
+        self.assertEqual(adapter.calls, 1)
 
     def test_codex_turn_claim_serializes_controllers_and_unknown_outcome_fails_closed(self):
         self.supervisor.step(self.spec.mission_id, self.spec)  # CREATED -> PREPARING
@@ -1520,13 +1615,19 @@ class HarnessTest(unittest.TestCase):
         self.assertIsInstance(supervisor.codex, FixtureCodex)
         self.assertNotIsInstance(supervisor.codex, AppServerCodex)
 
-    def test_football_mission_requires_contained_relative_scope_contract(self):
+    def test_legacy_football_mission_scope_is_readable_but_new_scope_is_contained(self):
         base = {"schema_version": 1, "mission_id": "x", "repository": "/r",
                 "objective": "x", "adapter": "footballprediction"}
-        for scope in (None, "", "/tmp/scope.json", "../scope.json", "a/../../scope.json", "a\\scope.json"):
+        legacy = MissionSpec.from_mapping(base)
+        self.assertIsNone(legacy.mission_scope_file)
+        legacy_payload = {
+            **base, "mission_id": self.spec.mission_id, "repository": self.spec.repository,
+        }
+        self.journal.update(self.spec.mission_id, spec_json=json.dumps(legacy_payload))
+        self.assertIsNone(self.journal.spec(self.spec.mission_id).mission_scope_file)
+        for scope in ("", "/tmp/scope.json", "../scope.json", "a/../../scope.json", "a\\scope.json"):
             payload = dict(base)
-            if scope is not None:
-                payload["mission_scope_file"] = scope
+            payload["mission_scope_file"] = scope
             with self.subTest(scope=scope), self.assertRaisesRegex(ValueError, "safe relative path"):
                 MissionSpec.from_mapping(payload)
         valid = MissionSpec.from_mapping({**base, "mission_scope_file": "docs/agentic/mission.json"})
@@ -2180,6 +2281,82 @@ class HarnessTest(unittest.TestCase):
         with patch.object(adapter, "_run", side_effect=["a" * 40, "dirty\n"]):
             with self.assertRaisesRegex(RuntimeError, "identity is invalid"):
                 adapter._trusted_base_checkout("/candidate", "a" * 40, str(evidence))
+
+    def test_pr_discovery_uses_worktree_origin_not_ambient_gh_repo(self):
+        adapter = FootballPredictionAdapter()
+        branch = "feature/exact-head"
+        pull = {
+            "number": 42,
+            "head": {"sha": "a" * 40, "ref": branch},
+            "base": {"ref": "main"},
+        }
+        with patch.object(adapter, "_run", side_effect=[
+                "https://credential@github.com/owner/project.git", branch, json.dumps([pull])]) as run, \
+                patch.dict(os.environ, {"GH_REPO": "attacker/other-repository"}):
+            result = adapter.discover_pr("/worktree", "a" * 40)
+        self.assertEqual(result.status, "PASS")
+        self.assertEqual(result.data, {"number": 42, "repo": "owner/project"})
+        discovery_argv = run.call_args_list[-1].args[0]
+        self.assertEqual(
+            discovery_argv[2],
+            "repos/owner/project/pulls?state=open&head=owner%3Afeature%2Fexact-head",
+        )
+        self.assertNotIn("credential", result.evidence)
+
+    def test_pr_discovery_rejects_non_github_origin(self):
+        adapter = FootballPredictionAdapter()
+        with patch.object(adapter, "_run", return_value="https://example.invalid/owner/project.git") as run:
+            result = adapter.discover_pr("/worktree", "a" * 40)
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+        self.assertEqual(run.call_count, 1)
+
+    def test_post_merge_parses_canonical_json_before_human_footer(self):
+        adapter = FootballPredictionAdapter()
+        merge_sha = "a" * 40
+        report = {
+            "ci_head_sha": merge_sha, "ci_status": "completed", "ci_conclusion": "success",
+            "verdict": "PASS", "failures": [],
+        }
+        completed = subprocess.CompletedProcess(
+            [], 0, json.dumps(report, indent=2) + "\n\nPost-merge completion evidence passed.\n", "",
+        )
+        with patch.object(adapter, "_trusted_base_checkout", return_value=Path("/trusted")), \
+                patch.object(adapter, "_call", side_effect=[completed, subprocess.CompletedProcess([], 0, "", "")]), \
+                patch.object(adapter, "_run", side_effect=["", "d" * 40, "e" * 40]):
+            result = adapter.post_merge("/worktree", merge_sha, 7, "owner/project", "feature", "b" * 40)
+        self.assertEqual(result.status, "PASS")
+        self.assertEqual(result.data["main_sha"], "d" * 40)
+        self.assertEqual(result.data["tree_sha"], "e" * 40)
+
+    def test_post_merge_queued_ci_is_pending_even_when_canonical_command_exits_one(self):
+        adapter = FootballPredictionAdapter()
+        merge_sha = "a" * 40
+        report = {
+            "ci_head_sha": merge_sha, "ci_status": "queued", "ci_conclusion": "",
+            "verdict": "FAIL", "failures": ["Production Gate CI is queued"],
+        }
+        queued = subprocess.CompletedProcess(
+            [], 1, json.dumps(report, indent=2) + "\n\nPost-merge completion evidence FAILED.\n",
+            "Post-merge completion evidence FAILED.\n",
+        )
+        with patch.object(adapter, "_trusted_base_checkout", return_value=Path("/trusted")), \
+                patch.object(adapter, "_call", return_value=queued), \
+                patch.object(adapter, "_run") as run:
+            result = adapter.post_merge("/worktree", merge_sha, 7, "owner/project", "feature", "b" * 40)
+        self.assertEqual(result.status, "PENDING")
+        run.assert_not_called()
+
+    def test_post_merge_terminal_failure_is_not_mislabeled_as_infrastructure_error(self):
+        adapter = FootballPredictionAdapter()
+        report = {
+            "ci_head_sha": "a" * 40, "ci_status": "completed", "ci_conclusion": "failure",
+            "verdict": "FAIL", "failures": ["Production Gate CI failed"],
+        }
+        failed = subprocess.CompletedProcess([], 1, json.dumps(report) + "\n", "canonical failure")
+        with patch.object(adapter, "_trusted_base_checkout", return_value=Path("/trusted")), \
+                patch.object(adapter, "_call", return_value=failed):
+            result = adapter.post_merge("/worktree", "a" * 40, 7, "owner/project", "feature", "b" * 40)
+        self.assertEqual(result.status, "FAIL")
 
     def test_merge_uses_durable_pr_identity_without_rediscovery(self):
         adapter = FootballPredictionAdapter()

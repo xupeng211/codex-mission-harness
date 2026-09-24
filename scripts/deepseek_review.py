@@ -7,7 +7,7 @@ commit-last: an incomplete run has no receipt and is never an approval.
 """
 from __future__ import annotations
 
-import argparse, base64, hashlib, json, os, subprocess, sys, tempfile, time, uuid
+import argparse, base64, hashlib, json, os, shutil, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 
 VERSION = "cmh-deepseek-review/v1"
@@ -96,19 +96,55 @@ def prompt(base, head, diff_hash, manifest_hash, chunk, source):
 def invoke_reviewer(command, prompt_text, env, timeout):
     return subprocess.run(command+[prompt_text],env=env,capture_output=True,text=True,timeout=timeout)
 
+def resolve_claude_launcher(root, path_value):
+    """Resolve the owner-installed CLI without searching the reviewed tree or CWD."""
+    repository=Path(root).resolve()
+    safe_entries=[]
+    for entry in path_value.split(os.pathsep):
+        if not entry:
+            continue
+        candidate=Path(entry)
+        if not candidate.is_absolute():
+            continue
+        try:
+            directory=candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if (not directory.is_dir() or directory==repository or directory in repository.parents
+                or repository in directory.parents):
+            continue
+        rendered=str(directory)
+        if rendered not in safe_entries:
+            safe_entries.append(rendered)
+    safe_path=os.pathsep.join(safe_entries)
+    if not safe_entries:
+        raise ValueError("trusted absolute Claude Code launcher is unavailable")
+    executable=shutil.which("claude",path=safe_path)
+    if not executable or not Path(executable).is_absolute():
+        raise ValueError("trusted absolute Claude Code launcher is unavailable")
+    try:
+        resolved=Path(executable).resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("trusted absolute Claude Code launcher is unavailable") from exc
+    if (not resolved.is_file() or not os.access(resolved,os.X_OK)
+            or resolved==repository or repository in resolved.parents):
+        raise ValueError("Claude Code launcher is not outside the reviewed repository")
+    return str(resolved),safe_path
+
 def run(args):
     root=Path(args.repo).resolve(); base=full_sha(args.base); head=full_sha(args.head)
     if git(root,"rev-parse","HEAD").decode().strip().lower()!=head: raise ValueError("worktree HEAD differs from requested HEAD")
     diff=git(root,"diff","--no-ext-diff","--binary",f"{base}..{head}"); plan=chunks(diff); diff_hash=digest(diff)
+    claude_executable,safe_path=resolve_claude_launcher(root,os.environ.get("PATH",""))
     manifest={"version":"cmh-deepseek-chunks/v1","base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"chunks":[dict(chunk) for chunk in plan]}; manifest_hash=digest(canon(manifest))
     evidence_root=Path(args.evidence).resolve(); evidence_root.mkdir(parents=True,exist_ok=True); os.chmod(evidence_root,0o700)
     run_id=uuid.uuid4().hex; evidence=evidence_root/run_id; evidence.mkdir(mode=0o700)
     token=Path(args.token_file).read_text().strip()
     if not token: raise ValueError("empty DeepSeek token file")
     settings=tempfile.NamedTemporaryFile(mode="w",delete=False); settings.write('{"permissions":{"allow":[],"deny":["Bash","Edit","Write","Read","Glob","Grep","WebFetch","WebSearch"]}}'); settings.close()
-    results=[]; command=["claude","--bare","--restricted","--print","--model",MODEL,"--settings",settings.name,"--tools","","--disallowed-tools","Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch","--output-format","json","--json-schema",json.dumps(SCHEMA,separators=(",",":"))]
+    results=[]; command=[claude_executable,"--bare","--restricted","--print","--model",MODEL,"--settings",settings.name,"--tools","","--disallowed-tools","Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch","--output-format","json","--json-schema",json.dumps(SCHEMA,separators=(",",":"))]
     try:
-        env={"HOME":"/nonexistent","PATH":os.environ.get("PATH","")+":/usr/bin:/bin","LANG":"C.UTF-8","ANTHROPIC_API_KEY":token,"ANTHROPIC_AUTH_TOKEN":token,"ANTHROPIC_BASE_URL":ENDPOINT,"CLAUDE_CODE_SIMPLE":"1"}
+        env={"HOME":"/nonexistent","PATH":safe_path,"LANG":"C.UTF-8","ANTHROPIC_API_KEY":token,"ANTHROPIC_AUTH_TOKEN":token,"ANTHROPIC_BASE_URL":ENDPOINT,"CLAUDE_CODE_SIMPLE":"1"}
         for chunk in plan:
             source=diff[chunk["start"]:chunk["end"]]
             completed=invoke_reviewer(command,prompt(base,head,diff_hash,manifest_hash,chunk,source),env,args.timeout)

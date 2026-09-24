@@ -55,9 +55,9 @@ class MissionSpec:
     merge_policy: str = "owner_approval"
     post_merge_gates: tuple[str, ...] = ()
     forbidden_actions: tuple[str, ...] = ()
-    # FootballPrediction's canonical independent-review runners require a
-    # tracked mission-scope contract. It is deliberately explicit, never an
-    # inferred broad allow-list.
+    # New FootballPrediction missions provide a tracked scope contract. None
+    # remains readable for legacy v1 journals, but REVIEW fails closed without it.
+    # Scope is explicit, never an inferred broad allow-list.
     mission_scope_file: str | None = None
 
     @classmethod
@@ -82,7 +82,7 @@ class MissionSpec:
         scope = data.get("mission_scope_file")
         if scope is not None and not isinstance(scope, str):
             raise ValueError("mission_scope_file must be a string when provided")
-        if adapter == "footballprediction":
+        if adapter == "footballprediction" and scope is not None:
             path = PurePosixPath(scope) if isinstance(scope, str) and scope else None
             if (path is None or path.is_absolute() or "\\" in scope
                     or any(part in {"", ".", ".."} for part in scope.split("/"))):

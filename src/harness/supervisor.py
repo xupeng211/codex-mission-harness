@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import inspect
+import json
 import subprocess
+import time
 from pathlib import Path
 
 from .adapters import GateResult, SimulatedAdapter
@@ -149,7 +151,18 @@ class Supervisor:
                     self.journal.record_receipt(mission_id, reviewer, current, reviewed.status, reviewed.artifact)
                     self.journal.update(mission_id, pending_gate=None)
                     if reviewed.status == "FAIL":
-                        reconcile_transition(State.IMPLEMENT, f"canonical {reviewer} review findings", snapshot)
+                        details = reviewed.data if isinstance(reviewed.data, dict) else {}
+                        repair = {
+                            "reviewer": reviewer,
+                            "head": current,
+                            "findings": details.get("findings", []),
+                            "evidence": reviewed.evidence,
+                        }
+                        reconcile_transition(
+                            State.IMPLEMENT,
+                            "canonical review findings: " + json.dumps(repair, sort_keys=True),
+                            snapshot,
+                        )
                     elif reviewed.status != "PASS":
                         reconcile_transition(State.BLOCKED_EXTERNAL, reviewed.evidence, snapshot)
                     continue
@@ -376,8 +389,16 @@ class Supervisor:
             if not permitted("source_edit", spec.forbidden_actions):
                 advance(State.BLOCKED_POLICY, "mission forbids source_edit")
                 return State.BLOCKED_POLICY
-            if self._agent_turn(mission_id,
-                                f"Continue mission objective: {spec.objective}. Inspect actual gates; do not declare terminal state from prose.",
+            prompt = f"Continue mission objective: {spec.objective}. Inspect actual gates; do not declare terminal state from prose."
+            repair_context = self._async_review_repair_context(mission_id, expected_head)
+            if repair_context:
+                prompt += (
+                    "\n\nA canonical asynchronous review failed for this exact HEAD. "
+                    "Treat the following JSON as reviewer evidence to verify against source, "
+                    "then repair the confirmed findings and preserve the mission safety policy:\n"
+                    + repair_context
+                )
+            if self._agent_turn(mission_id, prompt,
                                 spec.forbidden_actions):
                 self.journal.transition_after_codex_turn(
                     mission_id, State.TEST, "primary turn completed",
@@ -556,6 +577,9 @@ class Supervisor:
                 self.adapter.ci, row["worktree"], row["current_head"],
                 row["pr_number"], row["pr_repo"],
             )
+            if technical.status == "PENDING":
+                self.journal.update(mission_id, pending_gate="pre-merge-ci", ci_state="PENDING")
+                return state
             if technical.status != "PASS":
                 advance(State.BLOCKED_EXTERNAL, technical.evidence or "pre-merge canonical CI recheck failed")
                 return State.BLOCKED_EXTERNAL
@@ -636,14 +660,16 @@ class Supervisor:
             row = self.journal.mission(mission_id)
             active_turn = row["codex_turn_state"] == "RUNNING"
             pending_review = after == State.REVIEW and str(row["pending_gate"] or "").startswith("review:")
+            pending_production = after == State.POST_MERGE and row["pending_gate"] == "production-gate"
             if after in TERMINAL or after in {State.BLOCKED_EXTERNAL, State.BLOCKED_POLICY} or self.journal.status(mission_id).background_jobs or (
                     before.state == after and after in {State.CI, State.MERGE, State.WAITING_APPROVAL}
-                    ) or pending_review or (before.state == after and after in {State.IMPLEMENT, State.REVIEW, State.CI}
+                    ) or pending_review or pending_production or (before.state == after and after in {State.IMPLEMENT, State.REVIEW, State.CI}
                                             and active_turn):
                 return after
         raise RuntimeError("supervisor progress limit reached")
 
-    def run_until_terminal(self, mission_id: str, spec: MissionSpec, limit: int = 100) -> State:
+    def run_until_terminal(self, mission_id: str, spec: MissionSpec, limit: int = 100,
+                           poll_interval: float = 5.0) -> State:
         """Keep this controller alive long enough to journal owned child exits."""
         for _ in range(limit):
             state = self.run_until_wait(mission_id, spec)
@@ -663,9 +689,44 @@ class Supervisor:
                 return state
             if state == State.REVIEW and str(self.journal.mission(mission_id)["pending_gate"] or "").startswith("review:"):
                 return state
-            if state in {State.CI, State.MERGE}:
+            row = self.journal.mission(mission_id)
+            pending_ci = ((state == State.CI and row["pending_gate"] == "github-ci")
+                          or (state == State.MERGE and row["pending_gate"] == "pre-merge-ci"))
+            if pending_ci:
+                if poll_interval > 0:
+                    time.sleep(poll_interval)
+                continue
+            if state in {State.CI, State.MERGE, State.POST_MERGE}:
                 return state
+        row = self.journal.mission(mission_id)
+        if ((State(row["current_state"]) == State.CI and row["pending_gate"] == "github-ci")
+                or (State(row["current_state"]) == State.MERGE and row["pending_gate"] == "pre-merge-ci")):
+            return State(row["current_state"])
         raise RuntimeError("supervisor terminal progress limit reached")
 
     def collect_jobs(self, mission_id: str) -> None:
         self.reconcile(mission_id)
+
+    def _async_review_repair_context(self, mission_id: str, head: str | None) -> str:
+        row = self.journal.db.execute(
+            "SELECT payload_json FROM events WHERE mission_id=? AND kind='state_transition' "
+            "ORDER BY seq DESC LIMIT 1",
+            (mission_id,),
+        ).fetchone()
+        if row is None:
+            return ""
+        try:
+            payload = json.loads(row["payload_json"])
+            if (payload.get("from") != State.REVIEW or payload.get("to") != State.IMPLEMENT
+                    or payload.get("head") != head):
+                return ""
+            reason = payload.get("reason", "")
+            marker = "canonical review findings: "
+            if not isinstance(reason, str) or not reason.startswith(marker):
+                return ""
+            details = json.loads(reason[len(marker):])
+            if not isinstance(details, dict) or details.get("head") != head:
+                return ""
+            return json.dumps(details, sort_keys=True, indent=2)
+        except (TypeError, json.JSONDecodeError):
+            return ""

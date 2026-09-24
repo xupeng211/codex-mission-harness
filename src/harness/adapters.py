@@ -4,10 +4,12 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlsplit
 
 
 @dataclass(frozen=True)
@@ -168,10 +170,18 @@ class FootballPredictionAdapter:
 
     def discover_pr(self, worktree: str, head: str) -> GateResult:
         try:
-            repo = json.loads(self._run(["gh", "repo", "view", "--json", "nameWithOwner"], cwd=worktree))["nameWithOwner"]
+            repo = self._repo_from_origin(worktree)
             branch = self._run(["git", "branch", "--show-current"], cwd=worktree).strip()
-            pulls = json.loads(self._run(["gh", "api", f"repos/{repo}/pulls?state=open&head={repo.split('/')[0]}:{branch}"], cwd=worktree))
-        except (KeyError, json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
+            if not branch:
+                return GateResult("BLOCKED_EXTERNAL", "GitHub PR discovery requires a named branch")
+            owner = repo.split("/", 1)[0]
+            head_filter = quote(f"{owner}:{branch}", safe="")
+            pulls = json.loads(self._run([
+                "gh", "api", f"repos/{repo}/pulls?state=open&head={head_filter}",
+            ], cwd=worktree))
+            if not isinstance(pulls, list):
+                return GateResult("BLOCKED_EXTERNAL", "GitHub PR discovery returned an invalid response")
+        except (KeyError, ValueError, json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
             return GateResult("BLOCKED_EXTERNAL", f"GitHub PR discovery unavailable: {exc}")
         matches = [p for p in pulls if str((p.get("head") or {}).get("sha", "")).lower() == head.lower()
                    and str((p.get("head") or {}).get("ref", "")) == branch
@@ -179,6 +189,32 @@ class FootballPredictionAdapter:
         if len(matches) != 1:
             return GateResult("BLOCKED_EXTERNAL", f"expected one open PR for branch={branch} head={head}; found {len(matches)}")
         return GateResult("PASS", f"PR #{matches[0]['number']}", data={"number": int(matches[0]["number"]), "repo": repo})
+
+    def _repo_from_origin(self, worktree: str) -> str:
+        """Derive GitHub identity from this checkout's origin, not ambient gh config."""
+        remote = self._run(
+            ["git", "remote", "get-url", "origin"], cwd=worktree,
+        ).strip()
+        if "://" in remote:
+            parsed = urlsplit(remote)
+            host, path = parsed.hostname, parsed.path
+        elif remote.startswith("git@") and ":" in remote:
+            host, path = remote.split("@", 1)[1].split(":", 1)
+        else:
+            raise ValueError("origin is not a supported GitHub remote")
+        if host is None or host.lower() != "github.com":
+            raise ValueError("origin does not identify github.com")
+        parts = path.strip("/").split("/")
+        if len(parts) != 2:
+            raise ValueError("origin does not identify one GitHub repository")
+        owner, name = parts
+        if name.endswith(".git"):
+            name = name[:-4]
+        if (not re.fullmatch(r"[A-Za-z0-9_.-]+", owner)
+                or not re.fullmatch(r"[A-Za-z0-9_.-]+", name)
+                or owner in {".", ".."} or name in {".", ".."}):
+            raise ValueError("origin does not identify one GitHub repository")
+        return f"{owner}/{name}"
 
     def ci(self, worktree: str, head: str, pr_number: int | None = None,
            pr_repo: str | None = None) -> GateResult:
@@ -260,12 +296,18 @@ class FootballPredictionAdapter:
         result = self._call(["python3", str(trusted / "scripts/devops/pr_post_merge_check.py"), "--pr", str(pr_number),
                              "--merge-commit", merge_sha, "--branch", branch, "--json"], cwd=worktree,
                             env={"GH_REPO": pr_repo})
-        try: data = json.loads(result.stdout)
+        try: data = self._json_document_prefix(result.stdout)
         except json.JSONDecodeError: return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "Production Gate check returned no JSON")
-        if result.returncode != 0:
-            return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "Production Gate command failed", data=data)
+        if not isinstance(data, dict):
+            return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "Production Gate check returned no JSON")
         if str(data.get("ci_head_sha", "")).lower() != merge_sha.lower():
             return GateResult("BLOCKED_EXTERNAL", "Production Gate is not bound to exact merge SHA")
+        if str(data.get("ci_status")) in {"queued", "in_progress", "requested"}:
+            return GateResult("PENDING", json.dumps(data), data=data)
+        if result.returncode != 0 and data.get("verdict") == "PASS":
+            return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "Production Gate exit status contradicts PASS", data=data)
+        if result.returncode != 0 and data.get("verdict") != "FAIL":
+            return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "Production Gate command failed", data=data)
         if data.get("verdict") == "PASS":
             try:
                 self._run(["git", "fetch", "origin", "main"], cwd=worktree)
@@ -278,9 +320,9 @@ class FootballPredictionAdapter:
                 return GateResult("BLOCKED_EXTERNAL", "merged SHA is not reachable from origin/main")
             data.update({"main_sha": main_sha, "tree_sha": tree_sha})
             return GateResult("PASS", "canonical Production Gate passed", data=data)
-        if str(data.get("ci_status")) in {"queued", "in_progress", "requested"}: return GateResult("PENDING", json.dumps(data), data=data)
         if not data.get("ci_status"): return GateResult("BLOCKED_EXTERNAL", "Production Gate omitted CI status", data=data)
-        return GateResult("FAIL", json.dumps(data), data=data)
+        if data.get("verdict") == "FAIL": return GateResult("FAIL", json.dumps(data), data=data)
+        return GateResult("BLOCKED_EXTERNAL", "Production Gate returned an invalid verdict", data=data)
 
     @staticmethod
     def _call(argv, cwd=None, env=None):
@@ -309,6 +351,15 @@ class FootballPredictionAdapter:
             if isinstance(value, dict):
                 return value
         return {}
+
+    @staticmethod
+    def _json_document_prefix(text: str) -> dict[str, Any]:
+        """Read the first JSON document while ignoring canonical human footer text."""
+        decoder = json.JSONDecoder()
+        value, _ = decoder.raw_decode(text.lstrip())
+        if not isinstance(value, dict):
+            raise json.JSONDecodeError("expected JSON object", text, 0)
+        return value
 
 
 class SimulatedAdapter(FootballPredictionAdapter):

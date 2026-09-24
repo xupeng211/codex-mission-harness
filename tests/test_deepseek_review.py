@@ -2,6 +2,7 @@ import importlib.util
 import contextlib
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -26,6 +27,38 @@ def receipt(**overrides):
     value.update(overrides); value["integrity_sha256"] = review.digest(review.canon(value)); return value
 
 class DeepSeekReceiptTest(unittest.TestCase):
+    def test_claude_launcher_resolution_excludes_relative_and_reviewed_tree_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            trusted_bin = Path(tmp) / "trusted-bin"
+            root.mkdir(); trusted_bin.mkdir()
+            parent_launcher = Path(tmp) / "claude"
+            parent_launcher.write_text("#!/bin/sh\nexit 98\n")
+            parent_launcher.chmod(0o755)
+            repo_launcher = root / "claude"
+            repo_launcher.write_text("#!/bin/sh\nexit 99\n")
+            repo_launcher.chmod(0o755)
+            trusted_launcher = trusted_bin / "claude"
+            trusted_launcher.write_text("#!/bin/sh\nexit 0\n")
+            trusted_launcher.chmod(0o755)
+            supplied_path = os.pathsep.join(["", str(root), str(Path(tmp)), ".", str(trusted_bin), "/usr/bin"])
+            executable, safe_path = review.resolve_claude_launcher(root, supplied_path)
+            self.assertEqual(executable, str(trusted_launcher.resolve()))
+            self.assertNotIn(str(root), safe_path.split(os.pathsep))
+            self.assertNotIn(str(Path(tmp).resolve()), safe_path.split(os.pathsep))
+            self.assertNotIn(".", safe_path.split(os.pathsep))
+            self.assertFalse(safe_path.startswith(os.pathsep))
+            self.assertFalse(safe_path.endswith(os.pathsep))
+
+    def test_claude_launcher_resolution_fails_when_only_repo_binary_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            launcher = root / "claude"
+            launcher.write_text("#!/bin/sh\nexit 0\n")
+            launcher.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, "trusted absolute Claude Code launcher"):
+                review.resolve_claude_launcher(root, str(root))
     def test_deterministic_chunking_and_full_coverage(self):
         diff = (b"x\n" * 20000)
         first, second = review.chunks(diff), review.chunks(diff)
@@ -133,7 +166,15 @@ class DeepSeekReceiptTest(unittest.TestCase):
                              evidence=str(evidence), token_file=str(token_file), timeout=1)
             raw = json.dumps({"review_result": "PASS", "findings": []})
             completed = subprocess.CompletedProcess(["claude"], 0, raw, "")
-            with patch.object(review, "invoke_reviewer", return_value=completed), \
+            invocations = []
+
+            def capture_invocation(command, prompt_text, env, timeout):
+                invocations.append((command, env))
+                return completed
+
+            with patch.object(review, "resolve_claude_launcher",
+                              return_value=("/trusted/bin/claude", "/trusted/bin:/usr/bin")), \
+                    patch.object(review, "invoke_reviewer", side_effect=capture_invocation), \
                     contextlib.redirect_stdout(io.StringIO()) as captured:
                 review.run(args)
                 first_result = json.loads(captured.getvalue())
@@ -145,6 +186,10 @@ class DeepSeekReceiptTest(unittest.TestCase):
                 review.run(args)
                 second_result = json.loads(captured.getvalue())
 
+            self.assertEqual(len(invocations), 2)
+            for command, env in invocations:
+                self.assertEqual(command[0], "/trusted/bin/claude")
+                self.assertEqual(env["PATH"], "/trusted/bin:/usr/bin")
             second_receipt = Path(second_result["receipt"])
             self.assertNotEqual(first_receipt.parent, second_receipt.parent)
             self.assertTrue(first_receipt.is_file())
