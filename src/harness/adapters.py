@@ -369,14 +369,16 @@ class FootballPredictionAdapter:
                     return GateResult("BLOCKED_EXTERNAL", f"cannot bind reviewed mission scope: {exc}", receipt)
                 scope_hash = hashlib.sha256(scope_bytes).hexdigest()
                 validator = (
-                    "from dataclasses import asdict; import json,sys; from pathlib import Path; "
+                    "from dataclasses import asdict; import json,os,sys; from pathlib import Path; "
+                    "sys.path.insert(0,os.getcwd()); "
                     "from scripts.devops.deepseek_receipt_evidence import _deepseek_receipt_evidence as v; "
                     "print(json.dumps(asdict(v(Path(sys.argv[1]),repo_root=Path(sys.argv[2]),"
                     "expected_base=sys.argv[3],expected_head=sys.argv[4],expected_mission_id=sys.argv[5],expected_scope_hash=sys.argv[6]))))"
                 )
                 checked = self._call(["python3", "-I", "-B", "-c", validator, receipt, worktree, base, head, mission_id, scope_hash], cwd=str(trusted), env={"PYTHONDONTWRITEBYTECODE": "1"})
                 canonical = self._json_last_text(checked.stdout)
-                if checked.returncode != 0 or canonical.get("trusted") is not True:
+                if (checked.returncode != 0 or not isinstance(canonical, dict)
+                        or canonical.get("trusted") is not True):
                     return GateResult("BLOCKED_EXTERNAL", checked.stderr.strip() or "canonical DeepSeek receipt validation failed", receipt)
                 if canonical.get("result") != evidence.get("review_result"):
                     return GateResult("BLOCKED_EXTERNAL", "canonical DeepSeek verdict mismatch", receipt)

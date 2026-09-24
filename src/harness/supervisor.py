@@ -352,7 +352,7 @@ class Supervisor:
                         advance(State.BLOCKED_EXTERNAL, "merge PASS omitted PR or merge SHA")
                         return State.BLOCKED_EXTERNAL
                 elif (not isinstance(data.get("pr"), int) or isinstance(data.get("pr"), bool)
-                      or data.get("pr") != expected_pr or data.get("repo", expected_repo) != expected_repo
+                      or data.get("pr") != expected_pr or data.get("repo") != expected_repo
                       or data.get("pr_base_sha") != expected_pr_base):
                     advance(State.BLOCKED_EXTERNAL, "merge PASS changed the durable PR/reviewed-base identity")
                     return State.BLOCKED_EXTERNAL

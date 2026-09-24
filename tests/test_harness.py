@@ -87,6 +87,17 @@ class HarnessTest(unittest.TestCase):
         stdout.write_text(json.dumps({"review_receipt": str(receipt), "status": "PASS"}))
         return adapter, worktree, evidence, receipt, stdout
 
+    def _deepseek_review_fixture(self):
+        adapter, worktree, evidence_dir, receipt, stdout = self._review_fixture("deepseek")
+        (worktree / "scope.json").write_text("{}")
+        receipt.write_text(json.dumps({
+            "receipt_version": "independent-review-receipt/v1",
+            "base_sha": "a" * 40, "head_sha": "b" * 40, "mission_id": "mission",
+            "diff_sha256": "c" * 64, "review_result": "PASS", "findings": [],
+            "integrity": {"sha256": "d" * 64},
+        }))
+        return adapter, worktree, evidence_dir, receipt, stdout
+
     def _target_git_repo(self):
         adapter = FootballPredictionAdapter()
         repo = Path(self.tmp.name) / "target-policy-repo"
@@ -1973,6 +1984,25 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
         self.assertEqual(seen, {"ci": (1, "fixture/repo"), "merge": (1, "fixture/repo")})
 
+    def test_merge_pass_must_explicitly_bind_durable_repository_identity(self):
+        class MissingRepositoryAdapter(SimulatedAdapter):
+            def ci(self, worktree, head, *, pr_number=None, pr_repo=None):
+                return GateResult("PASS", "keyword-only CI", data={
+                    "pr_number": pr_number, "pr_repo": pr_repo, "pr_base_sha": "b" * 40,
+                })
+
+            def merge(self, worktree, head, *, pr_number=None, pr_repo=None):
+                return GateResult("PASS", "merge omitted repository", data={
+                    "pr": pr_number, "pr_base_sha": "b" * 40, "merge_sha": "c" * 40,
+                })
+
+        supervisor = Supervisor(
+            self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "missing-merge-repository"),
+            self.codex, MissingRepositoryAdapter(),
+        )
+        self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE)
+        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
+
     def test_legacy_two_argument_ci_adapter_is_dispatched_without_crash(self):
         class TwoArgumentCI(SimulatedAdapter):
             def ci(self, worktree, head):
@@ -2510,6 +2540,42 @@ class HarnessTest(unittest.TestCase):
                 patch.object(adapter, "_call", return_value=classified):
             result = adapter.review_result(
                 "codex", worktree=str(worktree), base="a" * 40, head="b" * 40,
+                mission_id="mission", scope_file=str(worktree / "scope.json"),
+                stdout_path=str(stdout), evidence_dir=str(evidence_dir),
+            )
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+
+    def test_deepseek_validator_reimports_policy_from_trusted_cwd_in_isolated_python(self):
+        adapter, worktree, evidence_dir, receipt, stdout = self._deepseek_review_fixture()
+        trusted = Path(self.tmp.name) / "trusted-validator"
+        module = trusted / "scripts" / "devops" / "deepseek_receipt_evidence.py"
+        module.parent.mkdir(parents=True)
+        module.write_text(
+            "from dataclasses import dataclass\n"
+            "@dataclass\n"
+            "class Result:\n    trusted: bool = True\n    result: str = 'PASS'\n"
+            "def _deepseek_receipt_evidence(*args, **kwargs):\n    return Result()\n"
+        )
+        with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
+                patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
+                patch("harness.adapters.subprocess.check_output", return_value=b"{}"):
+            result = adapter.review_result(
+                "deepseek", worktree=str(worktree), base="a" * 40, head="b" * 40,
+                mission_id="mission", scope_file=str(worktree / "scope.json"),
+                stdout_path=str(stdout), evidence_dir=str(evidence_dir),
+            )
+        self.assertEqual(result.status, "PASS")
+
+    def test_deepseek_validator_rejects_non_object_output_without_crashing(self):
+        adapter, worktree, evidence_dir, _, stdout = self._deepseek_review_fixture()
+        trusted = Path(self.tmp.name) / "trusted-validator"
+        checked = subprocess.CompletedProcess([], 0, "[]", "")
+        with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
+                patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
+                patch.object(adapter, "_call", return_value=checked), \
+                patch("harness.adapters.subprocess.check_output", return_value=b"{}"):
+            result = adapter.review_result(
+                "deepseek", worktree=str(worktree), base="a" * 40, head="b" * 40,
                 mission_id="mission", scope_file=str(worktree / "scope.json"),
                 stdout_path=str(stdout), evidence_dir=str(evidence_dir),
             )
