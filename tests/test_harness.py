@@ -2242,6 +2242,21 @@ class HarnessTest(unittest.TestCase):
         result = FootballPredictionAdapter().review("codex", "a" * 40)
         self.assertEqual(result.status, "BLOCKED_EXTERNAL")
 
+    def test_football_adapter_private_evidence_directory_is_owner_only(self):
+        path = Path(self.tmp.name) / "evidence"
+        path.mkdir(mode=0o755)
+        private = FootballPredictionAdapter._private_dir(path)
+        self.assertEqual(private.stat().st_mode & 0o777, 0o700)
+
+    def test_pr_discovery_without_open_pr_is_retryable(self):
+        adapter = FootballPredictionAdapter()
+        with patch.object(adapter, "_run", side_effect=[
+                "https://github.com/owner/project.git", "feature", "[]",
+        ]):
+            result = adapter.discover_pr("/worktree", "a" * 40)
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+        self.assertTrue(result.data["retryable"])
+
     def test_football_review_preflight_requires_both_commits(self):
         adapter = FootballPredictionAdapter()
         missing = subprocess.CompletedProcess([], 1, "", "")
@@ -2495,6 +2510,24 @@ class HarnessTest(unittest.TestCase):
             result = adapter.ci("/fixture", "a" * 40)
         self.assertEqual(result.status, "FAIL")
         self.assertEqual(result.data["pr_number"], 7)
+
+    def test_merge_ready_delegates_to_canonical_target_gate(self):
+        adapter = FootballPredictionAdapter()
+        scope = Path(self.tmp.name) / "scope.json"
+        scope.write_text("{}")
+        local = subprocess.CompletedProcess([], 0, json.dumps({"verdict": "PASS"}), "")
+        ready = subprocess.CompletedProcess([], 0, json.dumps({"merge_ready": "YES"}), "")
+        with patch.object(adapter, "_pr_state", return_value=GateResult(
+                "PASS", "PR", data={"body": "body"})), \
+                patch.object(adapter, "_trusted_base_checkout", return_value=Path(self.tmp.name) / "trusted"), \
+                patch.object(adapter, "_call", side_effect=[local, ready]) as call:
+            result = adapter.merge_ready(
+                worktree=str(self.tmp.name), base="a" * 40, head="b" * 40,
+                mission_id="mission", scope_file=str(scope), pr_number=7,
+                pr_repo="owner/project", receipts={"codex": "/r/c.json"}, ci_status="PASS",
+            )
+        self.assertEqual(result.status, "PASS")
+        self.assertIn("agent-workflow", " ".join(call.call_args_list[1].args[0]))
 
     def test_ci_malformed_json_evidence_fails_closed(self):
         adapter = FootballPredictionAdapter()

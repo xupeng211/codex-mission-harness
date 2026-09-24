@@ -82,6 +82,8 @@ def validate(receipt, base, head, root=None, receipt_path=None, mission_id=None,
                 artifact=evidence/f"chunk-{chunk['index']:03d}.json"
                 if not artifact.is_file() or sha(artifact)!=chunk["output_sha256"]: raise ValueError("chunk artifact mismatch")
                 if reviewer_result(artifact.read_text())!=chunk["result"]: raise ValueError("chunk result does not match durable artifact")
+    if receipt["review_result"] not in {"PASS", "FAIL"}:
+        raise ValueError("invalid aggregate verdict")
     blocking=any(f.get("severity") in {"P0","P1","P2"} for f in aggregate)
     if (receipt["review_result"] == "PASS") != (not blocking): raise ValueError("aggregate verdict mismatch")
     return receipt

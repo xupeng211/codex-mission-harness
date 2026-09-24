@@ -3,7 +3,9 @@ from __future__ import annotations
 import inspect
 import json
 import math
+import os
 import re
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -36,20 +38,29 @@ class Supervisor:
 
     @staticmethod
     def _invoke_pr_adapter(method, worktree: str, head: str,
-                           pr_number: int | None, pr_repo: str | None):
+                           pr_number: int | None, pr_repo: str | None,
+                           base_sha: str | None = None):
         """Support legacy and current signatures without positional-arity guesses."""
         parameters = inspect.signature(method).parameters
         positional = [worktree, head]
         keywords = {}
         accepts_extra_keywords = any(p.kind == inspect.Parameter.VAR_KEYWORD
                                      for p in parameters.values())
-        for name, value in (("pr_number", pr_number), ("pr_repo", pr_repo)):
+        for name, value in (("pr_number", pr_number), ("pr_repo", pr_repo), ("base_sha", base_sha)):
             parameter = parameters.get(name)
             if parameter is not None and parameter.kind == inspect.Parameter.POSITIONAL_ONLY:
                 positional.append(value)
             elif parameter is not None or accepts_extra_keywords:
                 keywords[name] = value
         return method(*positional, **keywords)
+
+    @staticmethod
+    def _invoke_gate_argv(method, gate: str, **context):
+        parameters = inspect.signature(method).parameters
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+            return method(gate, **context)
+        accepted = {name: value for name, value in context.items() if name in parameters}
+        return method(gate, **accepted)
 
     def _codex_checkpoint_ready(self, mission_id: str, worktree: str, *,
                                 expected_state: State, expected_head: str | None) -> bool:
@@ -413,8 +424,45 @@ class Supervisor:
                     advance(State.BLOCKED_POLICY, f"mission forbids gate:{gate}")
                     return State.BLOCKED_POLICY
                 if not self.journal.gate_passed_at_head(mission_id, gate, row["current_head"]):
+                    gate_env = {}
+                    prepare = getattr(self.adapter, "prepare_gate", None)
+                    if callable(prepare) and not isinstance(self.adapter, SimulatedAdapter):
+                        try:
+                            prepared = prepare(
+                                gate, worktree=row["worktree"], base=row["base_sha"],
+                                head=row["current_head"], mission_id=mission_id,
+                                scope_file=str((Path(row["worktree"]) / spec.mission_scope_file).resolve())
+                                if spec.mission_scope_file else "",
+                            )
+                        except Exception as exc:
+                            prepared = GateResult("BLOCKED_EXTERNAL", f"canonical gate input preparation failed: {exc}")
+                        if prepared.status == "PENDING":
+                            self.journal.update(mission_id, pending_gate=gate, ci_state="PENDING")
+                            return state
+                        if prepared.status == "BLOCKED_EXTERNAL":
+                            details = prepared.data if isinstance(prepared.data, dict) else {}
+                            if details.get("retryable"):
+                                self.journal.update(mission_id, pending_gate=gate, ci_state="PENDING")
+                                return state
+                            advance(State.BLOCKED_EXTERNAL, prepared.evidence)
+                            return State.BLOCKED_EXTERNAL
+                        if prepared.status != "PASS":
+                            advance(State.BLOCKED_EXTERNAL, prepared.evidence or "gate input preparation failed")
+                            return State.BLOCKED_EXTERNAL
+                        gate_env = (prepared.data or {}).get("env", {}) if isinstance(prepared.data, dict) else {}
                     self.journal.update(mission_id, pending_gate=gate)
-                    self.process.start(mission_id, gate, self.adapter.gate_argv(gate), row["worktree"], docker_env(mission_id), row["current_head"])
+                    env = docker_env(mission_id)
+                    if isinstance(gate_env, dict):
+                        env.update({str(key): str(value) for key, value in gate_env.items()})
+                    self.process.start(
+                        mission_id, gate,
+                        self._invoke_gate_argv(self.adapter.gate_argv, gate,
+                            worktree=row["worktree"], base=row["base_sha"],
+                            head=row["current_head"], mission_id=mission_id,
+                            scope_file=spec.mission_scope_file or "",
+                        ),
+                        row["worktree"], env, row["current_head"],
+                    )
                     return state
             advance(State.REVIEW, "local canonical gates pass")
         elif state == State.REVIEW:
@@ -440,7 +488,12 @@ class Supervisor:
                             advance(State.BLOCKED_EXTERNAL, preflight.evidence)
                             return State.BLOCKED_EXTERNAL
                         evidence = Path(row["worktree"]).parent / ".cmh-review-evidence" / mission_id / reviewer / head
-                        evidence.mkdir(parents=True, exist_ok=True)
+                        evidence.mkdir(mode=0o700, parents=True, exist_ok=True)
+                        for private_dir in (evidence.parent.parent, evidence.parent, evidence):
+                            private_dir.chmod(0o700)
+                            info = private_dir.stat()
+                            if (hasattr(os, "getuid") and info.st_uid != os.getuid()) or stat.S_IMODE(info.st_mode) & 0o077:
+                                raise RuntimeError(f"review evidence directory is not private: {private_dir}")
                         self.journal.update(mission_id, pending_gate=f"review:{reviewer}")
                         self.process.start(
                             mission_id, f"review:{reviewer}",
@@ -477,7 +530,7 @@ class Supervisor:
         elif state == State.CI:
             result = self._invoke_pr_adapter(
                 self.adapter.ci, row["worktree"], row["current_head"],
-                row["pr_number"], row["pr_repo"],
+                row["pr_number"], row["pr_repo"], row["base_sha"],
             )
             facts = result.data if isinstance(result.data, dict) else {}
             if (not isinstance(result.data, dict)
@@ -514,7 +567,11 @@ class Supervisor:
                         expected_state=state, expected_head=expected_head,
                     )
             elif result.status == "BLOCKED_EXTERNAL":
-                advance(State.BLOCKED_EXTERNAL, result.evidence)
+                details = result.data if isinstance(result.data, dict) else {}
+                if details.get("retryable"):
+                    self.journal.update(mission_id, pending_gate="github-ci", ci_state="PENDING")
+                else:
+                    advance(State.BLOCKED_EXTERNAL, result.evidence)
             else:
                 self.journal.update(mission_id, pending_gate="github-ci", ci_state=result.status)
         elif state == State.MERGE:
@@ -610,14 +667,36 @@ class Supervisor:
                     self.journal.update(mission_id, pending_gate=None)
             technical = self._invoke_pr_adapter(
                 self.adapter.ci, row["worktree"], row["current_head"],
-                row["pr_number"], row["pr_repo"],
+                row["pr_number"], row["pr_repo"], row["base_sha"],
             )
             if technical.status == "PENDING":
+                self.journal.update(mission_id, pending_gate="pre-merge-ci", ci_state="PENDING")
+                return state
+            if technical.status == "BLOCKED_EXTERNAL" and isinstance(technical.data, dict) and technical.data.get("retryable"):
                 self.journal.update(mission_id, pending_gate="pre-merge-ci", ci_state="PENDING")
                 return state
             if technical.status != "PASS":
                 advance(State.BLOCKED_EXTERNAL, technical.evidence or "pre-merge canonical CI recheck failed")
                 return State.BLOCKED_EXTERNAL
+            if not isinstance(self.adapter, SimulatedAdapter):
+                merge_ready = getattr(self.adapter, "merge_ready", None)
+                if not callable(merge_ready) or not spec.mission_scope_file:
+                    advance(State.BLOCKED_EXTERNAL, "target project canonical merge-readiness gate is unavailable")
+                    return State.BLOCKED_EXTERNAL
+                artifacts = self.journal.latest_review_artifacts(mission_id, row["current_head"])
+                try:
+                    readiness = merge_ready(
+                        worktree=row["worktree"], base=row["base_sha"], head=row["current_head"],
+                        mission_id=mission_id,
+                        scope_file=str((Path(row["worktree"]) / spec.mission_scope_file).resolve()),
+                        pr_number=row["pr_number"], pr_repo=row["pr_repo"],
+                        receipts=artifacts, ci_status="PASS",
+                    )
+                except Exception as exc:
+                    readiness = GateResult("BLOCKED_EXTERNAL", f"canonical merge-readiness invocation failed: {exc}")
+                if readiness.status != "PASS":
+                    advance(State.BLOCKED_EXTERNAL, readiness.evidence or "canonical merge-readiness rejected merge")
+                    return State.BLOCKED_EXTERNAL
             decision = decide("merge", spec.merge_policy)
             if decision == Decision.OWNER_APPROVAL_REQUIRED:
                 if not self.journal.approved(mission_id, "merge", row["current_head"]):
@@ -705,9 +784,11 @@ class Supervisor:
             active_turn = row["codex_turn_state"] == "RUNNING"
             pending_review = after == State.REVIEW and str(row["pending_gate"] or "").startswith("review:")
             pending_production = after == State.POST_MERGE and row["pending_gate"] == "production-gate"
+            pending_external_gate = (after == State.TEST and row["pending_gate"] in spec.required_gates
+                                     and row["ci_state"] == "PENDING")
             if after in TERMINAL or after in {State.BLOCKED_EXTERNAL, State.BLOCKED_POLICY} or self.journal.status(mission_id).background_jobs or (
                     before.state == after and after in {State.CI, State.MERGE, State.WAITING_APPROVAL}
-                    ) or pending_review or pending_production or (before.state == after and after in {State.IMPLEMENT, State.REVIEW, State.CI}
+                    ) or pending_review or pending_production or pending_external_gate or (before.state == after and after in {State.IMPLEMENT, State.REVIEW, State.CI}
                                             and active_turn):
                 return after
         raise RuntimeError("supervisor progress limit reached")
@@ -746,7 +827,9 @@ class Supervisor:
                           or (state == State.MERGE and row["pending_gate"] == "pre-merge-ci"))
             pending_production = (state == State.POST_MERGE
                                   and row["pending_gate"] == "production-gate")
-            if pending_ci or pending_production:
+            pending_external_gate = (state == State.TEST and row["pending_gate"] in spec.required_gates
+                                     and row["ci_state"] == "PENDING")
+            if pending_ci or pending_production or pending_external_gate:
                 time.sleep(poll_interval)
                 continue
             if state in {State.CI, State.MERGE, State.POST_MERGE}:
@@ -755,7 +838,10 @@ class Supervisor:
         if ((State(row["current_state"]) == State.CI and row["pending_gate"] == "github-ci")
                 or (State(row["current_state"]) == State.MERGE and row["pending_gate"] == "pre-merge-ci")
                 or (State(row["current_state"]) == State.POST_MERGE
-                    and row["pending_gate"] == "production-gate")):
+                    and row["pending_gate"] == "production-gate")
+                or (State(row["current_state"]) == State.TEST
+                    and row["pending_gate"] in spec.required_gates
+                    and row["ci_state"] == "PENDING")):
             return State(row["current_state"])
         raise RuntimeError("supervisor terminal progress limit reached")
 

@@ -5,6 +5,7 @@ import json
 import hashlib
 import os
 import re
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,9 +45,47 @@ class FootballPredictionAdapter:
             raise RuntimeError("canonical evidence requires a clean committed worktree")
         return self._run(["git", "-C", worktree, "rev-parse", "HEAD"]).strip().lower()
 
-    def gate_argv(self, gate: str) -> list[str]:
+    def gate_argv(self, gate: str, **_context: Any) -> list[str]:
         if gate not in self.GATES: raise ValueError(f"unsupported canonical gate: {gate}")
         return self.GATES[gate]
+
+    @staticmethod
+    def _gh(*args: str) -> list[str]:
+        return ["gh", *args]
+
+    @staticmethod
+    def _private_dir(path: Path) -> Path:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = path.stat()
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise RuntimeError(f"evidence directory is not owned by the current user: {path}")
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            path.chmod(0o700)
+            if stat.S_IMODE(path.stat().st_mode) & 0o077:
+                raise RuntimeError(f"evidence directory is not owner-only: {path}")
+        return path
+
+    def prepare_gate(self, gate: str, *, worktree: str, base: str, head: str,
+                     mission_id: str, scope_file: str) -> GateResult:
+        """Prepare explicit inputs required by FootballPrediction preflight."""
+        if gate != "agent-preflight":
+            return GateResult("PASS")
+        pr = self.discover_pr(worktree, head)
+        if pr.status != "PASS":
+            return pr
+        facts = pr.data if isinstance(pr.data, dict) else {}
+        detail = self._pr_state(worktree, int(facts["number"]), str(facts["repo"]))
+        body = (detail.data or {}).get("body") if isinstance(detail.data, dict) else None
+        if not isinstance(body, str):
+            return GateResult("BLOCKED_EXTERNAL", "PR discovery omitted a usable PR body")
+        evidence = self._private_dir(Path(worktree).parent / ".cmh-gate-evidence" / mission_id / head)
+        body_path = evidence / "pr-body.md"
+        body_path.write_text(body, encoding="utf-8")
+        body_path.chmod(0o600)
+        return GateResult("PASS", "canonical preflight inputs prepared", data={"env": {
+            "PR_BODY": str(body_path), "MISSION_SCOPE_FILE": scope_file,
+            "BASE_REF": base, "HEAD_REF": head, "JSON": "1",
+        }})
 
     def review_preflight(self, worktree: str, base: str, head: str) -> GateResult:
         """Prove both immutable commits exist; policy executes from base checkout."""
@@ -176,13 +215,15 @@ class FootballPredictionAdapter:
                 return GateResult("BLOCKED_EXTERNAL", "GitHub PR discovery requires a named branch")
             owner = repo.split("/", 1)[0]
             head_filter = quote(f"{owner}:{branch}", safe="")
-            pulls = json.loads(self._run([
-                "gh", "api", f"repos/{repo}/pulls?state=open&head={head_filter}",
-            ], cwd=worktree))
+            pulls = json.loads(self._run(self._gh(
+                "api", f"repos/{repo}/pulls?state=open&head={head_filter}",
+            ), cwd=worktree))
             if not isinstance(pulls, list) or not all(isinstance(pull, dict) for pull in pulls):
                 return GateResult("BLOCKED_EXTERNAL", "GitHub PR discovery returned an invalid response")
-        except (KeyError, ValueError, json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
-            return GateResult("BLOCKED_EXTERNAL", f"GitHub PR discovery unavailable: {exc}")
+        except (subprocess.SubprocessError, OSError) as exc:
+            return GateResult("BLOCKED_EXTERNAL", f"GitHub PR discovery unavailable: {exc}", data={"retryable": True})
+        except (KeyError, ValueError, json.JSONDecodeError) as exc:
+            return GateResult("BLOCKED_EXTERNAL", f"GitHub PR discovery returned invalid evidence: {exc}")
         matches = []
         for pull in pulls:
             pull_head, pull_base = pull.get("head"), pull.get("base")
@@ -192,6 +233,9 @@ class FootballPredictionAdapter:
                     and pull_head.get("ref") == branch
                     and pull_base.get("ref") == "main"):
                 matches.append(pull)
+        if len(matches) == 0:
+            return GateResult("BLOCKED_EXTERNAL", f"no open PR for branch={branch} head={head}; publication may still be pending",
+                              data={"retryable": True, "branch": branch, "head": head.lower()})
         if len(matches) != 1:
             return GateResult("BLOCKED_EXTERNAL", f"expected one open PR for branch={branch} head={head}; found {len(matches)}")
         number = matches[0].get("number")
@@ -229,7 +273,7 @@ class FootballPredictionAdapter:
         return f"{owner}/{name}"
 
     def ci(self, worktree: str, head: str, pr_number: int | None = None,
-           pr_repo: str | None = None) -> GateResult:
+           pr_repo: str | None = None, base_sha: str | None = None) -> GateResult:
         if pr_number is None:
             pr = self.discover_pr(worktree, head)
             if pr.status != "PASS": return pr
@@ -251,8 +295,24 @@ class FootballPredictionAdapter:
             facts = bound.data or {}
             if facts.get("head") != head.lower() or facts.get("base") != "main" or facts.get("state") != "OPEN":
                 return GateResult("BLOCKED_EXTERNAL", f"durable PR #{pr_number} no longer matches open main PR at {head}")
-        result = self._call(["make", "pr-ready", f"PR={pr_number}", "JSON=1"], cwd=worktree,
-                            env={"GH_REPO": pr_repo})
+        try:
+            if not base_sha:
+                result = self._call(["make", "pr-ready", f"PR={pr_number}", "JSON=1"], cwd=worktree,
+                                    env={"GH_REPO": pr_repo, "GH_HOST": "github.com"})
+            else:
+                trusted = self._trusted_base_checkout(
+                    worktree, base_sha,
+                    str(Path(worktree).parent / ".cmh-review-evidence" / "pr-ready" / head),
+                )
+                code = ("import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
+                        "from scripts.devops import pr_ready_check as m; m.ROOT=Path(sys.argv[2]); "
+                        "sys.argv=['pr-ready-check','--pr',sys.argv[3],'--json']; raise SystemExit(m.main())")
+                result = self._call(
+                    ["python3", "-c", code, str(trusted), worktree, str(pr_number)],
+                    cwd=str(trusted), env={"GH_REPO": pr_repo, "GH_HOST": "github.com"},
+                )
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            return GateResult("BLOCKED_EXTERNAL", f"trusted PR readiness unavailable: {exc}")
         try: data = self._json_document_prefix(result.stdout)
         except json.JSONDecodeError: return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "canonical pr-ready returned no JSON")
         pr_data = data.get("pr")
@@ -277,9 +337,66 @@ class FootballPredictionAdapter:
             return GateResult("FAIL", messages or "canonical pr-ready reported FAIL", data=data)
         return GateResult("BLOCKED_EXTERNAL", "canonical pr-ready returned contradictory or invalid check evidence", data=data)
 
+    def merge_ready(self, *, worktree: str, base: str, head: str, mission_id: str,
+                    scope_file: str, pr_number: int, pr_repo: str,
+                    receipts: dict[str, str], ci_status: str) -> GateResult:
+        """Delegate the final merge-readiness decision to the target project."""
+        codex_receipt = receipts.get("codex")
+        deepseek_receipt = receipts.get("deepseek")
+        if not codex_receipt and not deepseek_receipt:
+            return GateResult("BLOCKED_EXTERNAL", "canonical merge-readiness requires a durable review receipt")
+        pr_state = self._pr_state(worktree, pr_number, pr_repo)
+        if pr_state.status != "PASS":
+            return pr_state
+        body = (pr_state.data or {}).get("body") if isinstance(pr_state.data, dict) else None
+        if not isinstance(body, str):
+            return GateResult("BLOCKED_EXTERNAL", "canonical merge-readiness requires the PR body")
+        evidence = self._private_dir(Path(worktree).parent / ".cmh-merge-evidence" / mission_id / head)
+        body_path = evidence / "pr-body.md"
+        body_path.write_text(body, encoding="utf-8")
+        body_path.chmod(0o600)
+        scope = Path(scope_file).resolve()
+        local = self._call(
+            ["make", "agent-preflight"], cwd=worktree,
+            env={"PR_BODY": str(body_path), "MISSION_SCOPE_FILE": str(scope),
+                 "BASE_REF": base, "HEAD_REF": head, "JSON": "1", "GH_HOST": "github.com"},
+        )
+        if local.returncode != 0:
+            return GateResult("BLOCKED_EXTERNAL", local.stderr.strip() or "canonical agent-preflight failed")
+        try:
+            local_json = self._json_document_prefix(local.stdout)
+        except json.JSONDecodeError as exc:
+            return GateResult("BLOCKED_EXTERNAL", f"canonical agent-preflight returned invalid JSON: {exc}")
+        local_path = evidence / "local-preflight.json"
+        local_path.write_text(json.dumps(local_json, sort_keys=True), encoding="utf-8")
+        local_path.chmod(0o600)
+        trusted = self._trusted_base_checkout(worktree, base, str(evidence))
+        code = ("import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
+                "from scripts.devops import agent_workflow as m, agent_workflow_preflight as p, pr_ready_check as r; "
+                "from scripts.ops import ai_workflow_gate as g; from scripts.ops.helpers import git_change_helpers as h; "
+                "p.ROOT=r.ROOT=g.ROOT=Path(sys.argv[2]); h.ROOT_HELPER=Path(sys.argv[2]); "
+                "sys.argv=['agent-workflow']+sys.argv[3:]; raise SystemExit(m.main())")
+        argv = ["python3", "-c", code, str(trusted), worktree, "merge-ready",
+                "--repo-root", worktree, "--base-sha", base, "--head-sha", head,
+                "--mission-id", mission_id, "--mission-scope-file", str(scope),
+                "--local-preflight-json", str(local_path)]
+        if codex_receipt:
+            argv += ["--receipt", codex_receipt]
+        if deepseek_receipt:
+            argv += ["--deepseek-receipt", deepseek_receipt]
+        argv += ["--selected-backend", "codex" if codex_receipt else "deepseek",
+                "--pr", str(pr_number), "--remote-ci-status", ci_status,
+                "--protected-invariants", "PASS", "--forbidden-side-effects", "NO",
+                "--required-pr-governance", "PASS", "--json"]
+        result = self._call(argv, cwd=str(trusted), env={"GH_HOST": "github.com", "GH_REPO": pr_repo})
+        data = self._json_last_text(result.stdout)
+        if result.returncode == 0 and data.get("merge_ready") == "YES":
+            return GateResult("PASS", "canonical agent-merge-ready passed", data=data)
+        return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "canonical agent-merge-ready rejected merge", data=data)
+
     def _pr_state(self, worktree: str, pr_number: int, pr_repo: str) -> GateResult:
         try:
-            raw = json.loads(self._run(["gh", "api", f"repos/{pr_repo}/pulls/{pr_number}"], cwd=worktree))
+            raw = json.loads(self._run(self._gh("api", f"repos/{pr_repo}/pulls/{pr_number}"), cwd=worktree))
         except (KeyError, json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
             return GateResult("BLOCKED_EXTERNAL", f"cannot inspect durable PR identity: {exc}")
         if not isinstance(raw, dict):
@@ -293,15 +410,15 @@ class FootballPredictionAdapter:
         return GateResult("PASS", f"{pr_repo} PR #{pr_number}", data={"repo": pr_repo, "raw": raw,
             "head": str(head.get("sha", "")).lower(),
             "base": str(base.get("ref", "")),
-            "state": str(raw.get("state", "")).upper()})
+            "state": str(raw.get("state", "")).upper(), "body": raw.get("body", "")})
 
     def merge(self, worktree: str, head: str, pr_number: int | None = None,
               pr_repo: str | None = None) -> GateResult:
         if pr_number is None or not pr_repo: return GateResult("BLOCKED_EXTERNAL", "merge claim has no durable PR identity")
         before = self.merge_status(worktree, head, pr_number, pr_repo, allow_open_retry=True)
         if before.status != "NOT_STARTED": return before
-        result = self._call(["gh", "pr", "merge", str(pr_number), "--repo", pr_repo,
-                             "--squash", "--match-head-commit", head], cwd=worktree)
+        result = self._call(self._gh("pr", "merge", str(pr_number), "--repo", pr_repo,
+                             "--squash", "--match-head-commit", head), cwd=worktree)
         if result.returncode != 0: return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "merge command failed")
         return self.merge_status(worktree, head, pr_number, pr_repo)
 
@@ -310,7 +427,7 @@ class FootballPredictionAdapter:
         if pr_number is None or not pr_repo:
             return GateResult("BLOCKED_EXTERNAL", "merge claim has no durable PR identity")
         try:
-            data = json.loads(self._run(["gh", "api", f"repos/{pr_repo}/pulls/{pr_number}"], cwd=worktree))
+            data = json.loads(self._run(self._gh("api", f"repos/{pr_repo}/pulls/{pr_number}"), cwd=worktree))
         except (KeyError, json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
             return GateResult("BLOCKED_EXTERNAL", f"cannot reconcile merge state: {exc}")
         if not isinstance(data, dict):
@@ -342,7 +459,7 @@ class FootballPredictionAdapter:
         trusted = self._trusted_base_checkout(worktree, base, str(Path(worktree).parent / ".cmh-review-evidence" / "post-merge" / merge_sha))
         result = self._call(["python3", str(trusted / "scripts/devops/pr_post_merge_check.py"), "--pr", str(pr_number),
                              "--merge-commit", merge_sha, "--branch", branch, "--json"], cwd=worktree,
-                            env={"GH_REPO": pr_repo})
+                            env={"GH_REPO": pr_repo, "GH_HOST": "github.com"})
         try: data = self._json_document_prefix(result.stdout)
         except json.JSONDecodeError: return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "Production Gate check returned no JSON")
         if not isinstance(data, dict):
@@ -375,9 +492,19 @@ class FootballPredictionAdapter:
     def _call(argv, cwd=None, env=None):
         child_env = os.environ.copy()
         if env: child_env.update(env)
-        return subprocess.run(argv, cwd=cwd, env=child_env, text=True, capture_output=True, check=False, timeout=60)
+        try:
+            child_env["GH_HOST"] = "github.com"
+            return subprocess.run(argv, cwd=cwd, env=child_env, text=True, capture_output=True, check=False, timeout=60)
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            return subprocess.CompletedProcess(argv, 124, stdout, f"command timed out after 60 seconds: {argv[0]}")
+        except OSError as exc:
+            return subprocess.CompletedProcess(argv, 127, "", f"cannot execute command: {exc}")
     @staticmethod
-    def _run(argv, cwd=None): return subprocess.check_output(argv, cwd=cwd, text=True, stderr=subprocess.PIPE, timeout=60)
+    def _run(argv, cwd=None):
+        env = os.environ.copy()
+        env["GH_HOST"] = "github.com"
+        return subprocess.check_output(argv, cwd=cwd, env=env, text=True, stderr=subprocess.PIPE, timeout=60)
     @staticmethod
     def _json_last_line(path):
         try:
@@ -426,6 +553,7 @@ class SimulatedAdapter(FootballPredictionAdapter):
         value=self.reviews[min(self.review_index,len(self.reviews)-1)]; self.review_index+=1; return GateResult(value, f"fixture {reviewer}", "/tmp/fake")
     def ci(self, worktree, head, pr_number=None, pr_repo=None):
         value=self.ci_results[min(self.ci_index,len(self.ci_results)-1)]; self.ci_index+=1; return GateResult(value, f"fixture CI {head}", data={"pr_number": pr_number or 1, "pr_repo": pr_repo or "fixture/repo"})
+    def merge_ready(self, **kwargs): return GateResult("PASS", "fixture merge readiness")
     def merge(self, worktree, head, pr_number=None, pr_repo=None):
         value = self.merge_results[min(self.merge_index, len(self.merge_results)-1)]
         self.merge_index += 1

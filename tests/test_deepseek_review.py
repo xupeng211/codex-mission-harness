@@ -89,6 +89,9 @@ class DeepSeekReceiptTest(unittest.TestCase):
         with self.assertRaises(ValueError): review.validate(receipt(findings=[finding]), BASE, HEAD)
         chunks = receipt()["chunks"]; chunks[0]["result"] = {"review_result": "FAIL", "findings": [finding]}
         self.assertEqual(review.validate(receipt(review_result="FAIL", findings=[finding], chunks=chunks), BASE, HEAD)["review_result"], "FAIL")
+    def test_unknown_aggregate_verdict_is_rejected(self):
+        with self.assertRaises(ValueError):
+            review.validate(receipt(review_result="GARBAGE"), BASE, HEAD)
     def test_p3_is_nonblocking(self):
         finding = {"severity": "P3", "title": "x", "evidence": "y"}
         chunks = receipt()["chunks"]; chunks[0]["result"] = {"review_result": "PASS", "findings": [finding]}

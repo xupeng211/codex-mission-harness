@@ -438,6 +438,16 @@ class Journal:
         ).fetchall()
         return {row[0] for row in rows}
 
+    def latest_review_artifacts(self, mission_id: str, head: str) -> dict[str, str]:
+        rows = self.db.execute(
+            "SELECT reviewer,artifact_path FROM receipts WHERE mission_id=? AND head_sha=? "
+            "AND result='PASS' AND invalidated=0 AND artifact_path IS NOT NULL "
+            "AND id=(SELECT MAX(latest.id) FROM receipts AS latest WHERE latest.mission_id=receipts.mission_id "
+            "AND latest.head_sha=receipts.head_sha AND latest.reviewer=receipts.reviewer)",
+            (mission_id, head),
+        ).fetchall()
+        return {str(row["reviewer"]): str(row["artifact_path"]) for row in rows}
+
     def approve(self, mission_id: str, action: str, reason: str = "", observed_head: str | None = None) -> None:
         if observed_head is None:
             raise RuntimeError("approval requires an explicitly observed canonical HEAD")
