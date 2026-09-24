@@ -139,7 +139,13 @@ def aggregate_prompt(base, head, diff_hash, manifest_hash, plan, source, chunk_f
             f"ChunkCount={len(plan)}\nChunkFindings={json.dumps(chunk_findings, sort_keys=True)}\n" + rendered)
 
 def invoke_reviewer(command, prompt_text, env, timeout):
-    return subprocess.run(command+[prompt_text],env=env,capture_output=True,text=True,timeout=timeout)
+    # Keep the exact diff in the reviewer's input, but do not put the complete
+    # synthesis prompt in argv.  Large release diffs can exceed ARG_MAX (the
+    # chunk prompts happen to fit while the full-diff prompt does not).  Claude
+    # Code's print mode explicitly supports text prompts on stdin, which also
+    # avoids exposing source bytes through process listings.
+    return subprocess.run(command, input=prompt_text, env=env, capture_output=True,
+                          text=True, timeout=timeout)
 
 def resolve_claude_launcher(root, path_value):
     """Resolve the owner-installed CLI without searching the reviewed tree or CWD."""
