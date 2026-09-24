@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -297,7 +299,7 @@ class Supervisor:
         def finish_merge(result: GateResult) -> State:
             """Classify merge outcomes without treating provider failure as policy denial."""
             if result.status == "PASS":
-                data = result.data or {}
+                data = result.data if isinstance(result.data, dict) else {}
                 identity = self.journal.mission(mission_id)
                 expected_pr = identity["merge_claim_pr_number"] or identity["pr_number"]
                 expected_repo = identity["merge_claim_pr_repo"] or identity["pr_repo"]
@@ -477,10 +479,24 @@ class Supervisor:
                 self.adapter.ci, row["worktree"], row["current_head"],
                 row["pr_number"], row["pr_repo"],
             )
-            facts = result.data or {}
-            if facts.get("pr_number") is not None:
-                if not self.journal.bind_pr_identity(mission_id, row["current_head"], int(facts["pr_number"]),
-                                                     str(facts.get("pr_repo") or "")):
+            facts = result.data if isinstance(result.data, dict) else {}
+            if (not isinstance(result.data, dict)
+                    and not isinstance(self.adapter, SimulatedAdapter)
+                    and result.status in {"PASS", "PENDING", "FAIL"}):
+                advance(State.BLOCKED_EXTERNAL, "canonical CI returned malformed PR identity evidence")
+                return State.BLOCKED_EXTERNAL
+            if (not isinstance(self.adapter, SimulatedAdapter)
+                    and ("pr_number" not in facts or "pr_repo" not in facts)):
+                advance(State.BLOCKED_EXTERNAL, "canonical CI omitted durable PR identity evidence")
+                return State.BLOCKED_EXTERNAL
+            if "pr_number" in facts or "pr_repo" in facts:
+                pr_number, pr_repo = facts.get("pr_number"), facts.get("pr_repo")
+                if (not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0
+                        or not isinstance(pr_repo, str)
+                        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", pr_repo) is None):
+                    advance(State.BLOCKED_EXTERNAL, "canonical CI returned invalid durable PR identity")
+                    return State.BLOCKED_EXTERNAL
+                if not self.journal.bind_pr_identity(mission_id, row["current_head"], pr_number, pr_repo):
                     advance(State.BLOCKED_EXTERNAL, "CI PR identity changed or lost its exact source snapshot")
                     return State.BLOCKED_EXTERNAL
             if result.status == "PASS":
@@ -514,7 +530,15 @@ class Supervisor:
                 if pr.status != "PASS":
                     advance(State.BLOCKED_EXTERNAL, pr.evidence)
                     return State.BLOCKED_EXTERNAL
-                self.journal.update(mission_id, pr_number=int(pr.data["number"]), pr_repo=str(pr.data["repo"]))
+                facts = pr.data if isinstance(pr.data, dict) else {}
+                pr_number, pr_repo = facts.get("number"), facts.get("repo")
+                if (not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0
+                        or not isinstance(pr_repo, str)
+                        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", pr_repo) is None):
+                    advance(State.BLOCKED_EXTERNAL,
+                            "PR discovery returned an invalid durable PR identity")
+                    return State.BLOCKED_EXTERNAL
+                self.journal.update(mission_id, pr_number=pr_number, pr_repo=pr_repo)
                 row = self.journal.mission(mission_id)
             if row["merge_claim_head"] is not None:
                 claim_head = row["merge_claim_head"]
@@ -522,57 +546,68 @@ class Supervisor:
                 recovery = self.journal.claim_merge_recovery(
                     mission_id, claim_head, owner_pid, owner_start_ticks,
                 )
+                resume_owned_pending_ci = False
                 if recovery == "ACTIVE":
-                    # A live owner remains strictly non-stealable. It may be
-                    # inside the external invocation or its status query.
-                    return State.MERGE
+                    # The same still-running controller may resume its own
+                    # uninvoked claim after pre-merge CI returned PENDING.
+                    # Every other live claim remains strictly non-stealable.
+                    if (row["merge_claim_pid"] == owner_pid
+                            and row["merge_claim_start_ticks"] == owner_start_ticks
+                            and row["merge_invocation_started"] == 0
+                            and row["pending_gate"] == "pre-merge-ci"
+                            and claim_head == row["current_head"]):
+                        resume_owned_pending_ci = True
+                        row = self.journal.mission(mission_id)
+                    else:
+                        return State.MERGE
                 if recovery == "UNKNOWN":
                     advance(State.BLOCKED_EXTERNAL, "merge claim owner identity is unavailable")
                     return State.BLOCKED_EXTERNAL
-                if recovery != "RECOVERY_CLAIMED":
+                if not resume_owned_pending_ci and recovery != "RECOVERY_CLAIMED":
                     return State(self.journal.mission(mission_id)["current_state"])
-                row = self.journal.mission(mission_id)
-                invocation_uncertain = (bool(row["merge_invocation_started"])
-                                        or row["pending_gate"] == "merge-outcome-unknown")
-                if invocation_uncertain:
-                    try:
-                        status = self._invoke_pr_adapter(
-                            self.adapter.merge_status, row["worktree"], claim_head,
-                            row["merge_claim_pr_number"], row["merge_claim_pr_repo"],
-                        )
-                    except Exception as exc:
-                        advance(State.BLOCKED_EXTERNAL, f"cannot reconcile uncertain merge: {exc}")
-                        return State.BLOCKED_EXTERNAL
-                    if status.status == "PASS":
-                        if claim_head != row["current_head"]:
-                            advance(State.BLOCKED_EXTERNAL,
-                                    "merge completed for a stale claimed HEAD after canonical HEAD drift")
+                if not resume_owned_pending_ci:
+                    row = self.journal.mission(mission_id)
+                    invocation_uncertain = (bool(row["merge_invocation_started"])
+                                            or row["pending_gate"] == "merge-outcome-unknown")
+                    if invocation_uncertain:
+                        try:
+                            status = self._invoke_pr_adapter(
+                                self.adapter.merge_status, row["worktree"], claim_head,
+                                row["merge_claim_pr_number"], row["merge_claim_pr_repo"],
+                            )
+                        except Exception as exc:
+                            advance(State.BLOCKED_EXTERNAL, f"cannot reconcile uncertain merge: {exc}")
                             return State.BLOCKED_EXTERNAL
-                        return finish_merge(status)
-                    advance(State.BLOCKED_EXTERNAL, status.evidence or
-                            "merge invocation may have started; outcome remains ambiguous")
-                    return State.BLOCKED_EXTERNAL
-                retry = self.journal.confirm_merge_retry_safe(
-                    mission_id, claim_head, owner_pid, owner_start_ticks,
-                )
-                if retry == "UNKNOWN":
-                    advance(State.BLOCKED_EXTERNAL, "merge recovery identity is unavailable")
-                    return State.BLOCKED_EXTERNAL
-                if retry == "REWOUND_HEAD_DRIFT":
-                    # The durable invocation phase proved the stale merge was
-                    # never invoked. Rewind before any new merge claim.
-                    reclaimed = self.journal.mission(mission_id)
-                    if (State(reclaimed["current_state"]) != State.TEST or
-                            reclaimed["merge_claim_head"] is not None):
-                        advance(
-                            State.BLOCKED_EXTERNAL,
-                            "merge claim drift reclaim did not durably rewind to TEST",
-                        )
+                        if status.status == "PASS":
+                            if claim_head != row["current_head"]:
+                                advance(State.BLOCKED_EXTERNAL,
+                                        "merge completed for a stale claimed HEAD after canonical HEAD drift")
+                                return State.BLOCKED_EXTERNAL
+                            return finish_merge(status)
+                        advance(State.BLOCKED_EXTERNAL, status.evidence or
+                                "merge invocation may have started; outcome remains ambiguous")
                         return State.BLOCKED_EXTERNAL
-                    return State(reclaimed["current_state"])
-                if retry != "RETRY_SAFE":
-                    return State(self.journal.mission(mission_id)["current_state"])
-                self.journal.update(mission_id, pending_gate=None)
+                    retry = self.journal.confirm_merge_retry_safe(
+                        mission_id, claim_head, owner_pid, owner_start_ticks,
+                    )
+                    if retry == "UNKNOWN":
+                        advance(State.BLOCKED_EXTERNAL, "merge recovery identity is unavailable")
+                        return State.BLOCKED_EXTERNAL
+                    if retry == "REWOUND_HEAD_DRIFT":
+                        # The durable invocation phase proved the stale merge was
+                        # never invoked. Rewind before any new merge claim.
+                        reclaimed = self.journal.mission(mission_id)
+                        if (State(reclaimed["current_state"]) != State.TEST or
+                                reclaimed["merge_claim_head"] is not None):
+                            advance(
+                                State.BLOCKED_EXTERNAL,
+                                "merge claim drift reclaim did not durably rewind to TEST",
+                            )
+                            return State.BLOCKED_EXTERNAL
+                        return State(reclaimed["current_state"])
+                    if retry != "RETRY_SAFE":
+                        return State(self.journal.mission(mission_id)["current_state"])
+                    self.journal.update(mission_id, pending_gate=None)
             technical = self._invoke_pr_adapter(
                 self.adapter.ci, row["worktree"], row["current_head"],
                 row["pr_number"], row["pr_repo"],
@@ -627,11 +662,20 @@ class Supervisor:
                 if production.status != "PASS":
                     advance(State.BLOCKED_EXTERNAL, production.evidence)
                     return State.BLOCKED_EXTERNAL
-                facts = production.data or {}
-                if not facts.get("main_sha") or not facts.get("tree_sha"):
-                    advance(State.BLOCKED_EXTERNAL, "Production Gate PASS omitted main/tree truth")
+                facts = production.data if isinstance(production.data, dict) else {}
+                main_sha, tree_sha = facts.get("main_sha"), facts.get("tree_sha")
+                observed_merge_sha = facts.get("ci_head_sha")
+                full_sha = lambda value: (isinstance(value, str)
+                                          and re.fullmatch(r"[0-9a-fA-F]{40}", value) is not None)
+                if (not isinstance(production.data, dict)
+                        or not full_sha(observed_merge_sha)
+                        or observed_merge_sha.lower() != str(row["merge_sha"]).lower()
+                        or not full_sha(main_sha) or not full_sha(tree_sha)):
+                    advance(State.BLOCKED_EXTERNAL,
+                            "Production Gate PASS omitted exact merge-SHA or full main/tree truth")
                     return State.BLOCKED_EXTERNAL
-                self.journal.update(mission_id, main_sha=facts["main_sha"], tree_sha=facts["tree_sha"], pending_gate=None, ci_state=None)
+                self.journal.update(mission_id, main_sha=main_sha.lower(), tree_sha=tree_sha.lower(),
+                                    pending_gate=None, ci_state=None)
             # Legacy simulation gates remain a test seam only. Production is
             # governed by the exact merge-SHA Production Gate above.
             if isinstance(self.adapter, SimulatedAdapter):
@@ -671,6 +715,14 @@ class Supervisor:
     def run_until_terminal(self, mission_id: str, spec: MissionSpec, limit: int = 100,
                            poll_interval: float = 5.0) -> State:
         """Keep this controller alive long enough to journal owned child exits."""
+        try:
+            valid_poll_interval = (not isinstance(poll_interval, bool)
+                                   and isinstance(poll_interval, (int, float))
+                                   and math.isfinite(poll_interval) and poll_interval > 0)
+        except (OverflowError, TypeError):
+            valid_poll_interval = False
+        if not valid_poll_interval:
+            raise ValueError("poll_interval must be a finite positive number")
         for _ in range(limit):
             state = self.run_until_wait(mission_id, spec)
             if state in TERMINAL or state in {State.WAITING_APPROVAL, State.BLOCKED_EXTERNAL, State.BLOCKED_POLICY}:
@@ -692,15 +744,18 @@ class Supervisor:
             row = self.journal.mission(mission_id)
             pending_ci = ((state == State.CI and row["pending_gate"] == "github-ci")
                           or (state == State.MERGE and row["pending_gate"] == "pre-merge-ci"))
-            if pending_ci:
-                if poll_interval > 0:
-                    time.sleep(poll_interval)
+            pending_production = (state == State.POST_MERGE
+                                  and row["pending_gate"] == "production-gate")
+            if pending_ci or pending_production:
+                time.sleep(poll_interval)
                 continue
             if state in {State.CI, State.MERGE, State.POST_MERGE}:
                 return state
         row = self.journal.mission(mission_id)
         if ((State(row["current_state"]) == State.CI and row["pending_gate"] == "github-ci")
-                or (State(row["current_state"]) == State.MERGE and row["pending_gate"] == "pre-merge-ci")):
+                or (State(row["current_state"]) == State.MERGE and row["pending_gate"] == "pre-merge-ci")
+                or (State(row["current_state"]) == State.POST_MERGE
+                    and row["pending_gate"] == "production-gate")):
             return State(row["current_state"])
         raise RuntimeError("supervisor terminal progress limit reached")
 

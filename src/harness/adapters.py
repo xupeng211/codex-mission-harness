@@ -179,16 +179,28 @@ class FootballPredictionAdapter:
             pulls = json.loads(self._run([
                 "gh", "api", f"repos/{repo}/pulls?state=open&head={head_filter}",
             ], cwd=worktree))
-            if not isinstance(pulls, list):
+            if not isinstance(pulls, list) or not all(isinstance(pull, dict) for pull in pulls):
                 return GateResult("BLOCKED_EXTERNAL", "GitHub PR discovery returned an invalid response")
         except (KeyError, ValueError, json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
             return GateResult("BLOCKED_EXTERNAL", f"GitHub PR discovery unavailable: {exc}")
-        matches = [p for p in pulls if str((p.get("head") or {}).get("sha", "")).lower() == head.lower()
-                   and str((p.get("head") or {}).get("ref", "")) == branch
-                   and str((p.get("base") or {}).get("ref", "")) == "main"]
+        matches = []
+        for pull in pulls:
+            pull_head, pull_base = pull.get("head"), pull.get("base")
+            if not isinstance(pull_head, dict) or not isinstance(pull_base, dict):
+                continue
+            if (pull_head.get("sha") == head.lower()
+                    and pull_head.get("ref") == branch
+                    and pull_base.get("ref") == "main"):
+                matches.append(pull)
         if len(matches) != 1:
             return GateResult("BLOCKED_EXTERNAL", f"expected one open PR for branch={branch} head={head}; found {len(matches)}")
-        return GateResult("PASS", f"PR #{matches[0]['number']}", data={"number": int(matches[0]["number"]), "repo": repo})
+        number = matches[0].get("number")
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            return GateResult("BLOCKED_EXTERNAL", "GitHub PR discovery omitted a valid PR number")
+        return GateResult("PASS", f"PR #{number}", data={
+            "number": number, "repo": repo, "head": head.lower(),
+            "base": "main", "state": "OPEN",
+        })
 
     def _repo_from_origin(self, worktree: str) -> str:
         """Derive GitHub identity from this checkout's origin, not ambient gh config."""
@@ -221,8 +233,17 @@ class FootballPredictionAdapter:
         if pr_number is None:
             pr = self.discover_pr(worktree, head)
             if pr.status != "PASS": return pr
-            pr_number = int(pr.data["number"])
-            pr_repo = str(pr.data["repo"])
+            facts = pr.data if isinstance(pr.data, dict) else {}
+            pr_number, pr_repo = facts.get("number"), facts.get("repo")
+            if (not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0
+                    or not isinstance(pr_repo, str) or not re.fullmatch(
+                        r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", pr_repo)):
+                return GateResult("BLOCKED_EXTERNAL", "PR discovery returned an invalid durable identity")
+            bound = self._pr_state(worktree, pr_number, pr_repo)
+            bound_facts = bound.data or {}
+            if (bound.status != "PASS" or bound_facts.get("head") != head.lower()
+                    or bound_facts.get("base") != "main" or bound_facts.get("state") != "OPEN"):
+                return GateResult("BLOCKED_EXTERNAL", f"discovered PR #{pr_number} is no longer open at exact HEAD {head}")
         else:
             if not pr_repo: return GateResult("BLOCKED_EXTERNAL", "durable PR identity has no repository")
             bound = self._pr_state(worktree, pr_number, pr_repo)
@@ -232,28 +253,46 @@ class FootballPredictionAdapter:
                 return GateResult("BLOCKED_EXTERNAL", f"durable PR #{pr_number} no longer matches open main PR at {head}")
         result = self._call(["make", "pr-ready", f"PR={pr_number}", "JSON=1"], cwd=worktree,
                             env={"GH_REPO": pr_repo})
-        try: data = json.loads(result.stdout)
+        try: data = self._json_document_prefix(result.stdout)
         except json.JSONDecodeError: return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "canonical pr-ready returned no JSON")
+        pr_data = data.get("pr")
+        findings = data.get("findings")
+        if (not isinstance(pr_data, dict) or not isinstance(findings, list)
+                or not all(isinstance(finding, dict) for finding in findings)):
+            return GateResult("BLOCKED_EXTERNAL", "canonical pr-ready returned malformed PR/check evidence")
         data["pr_number"] = pr_number
         data["pr_repo"] = pr_repo
-        observed = str((data.get("pr") or {}).get("head_sha", "")).lower()
+        observed = str(pr_data.get("head_sha", "")).lower()
         if observed != head.lower(): return GateResult("BLOCKED_EXTERNAL", f"PR HEAD {observed or 'MISSING'} does not equal {head}")
-        checks = [f for f in data.get("findings", []) if str(f.get("name", "")).startswith("required-check:")]
+        checks = [finding for finding in findings
+                  if str(finding.get("name", "")).startswith("required-check:")]
         if not checks: return GateResult("BLOCKED_EXTERNAL", "canonical pr-ready reported no required checks")
         messages = "\n".join(str(f.get("message", "")) for f in checks)
-        if result.returncode == 0 and data.get("verdict") == "PASS" and all(bool(f.get("passed")) for f in checks): return GateResult("PASS", messages, data=data)
+        if (result.returncode == 0 and data.get("verdict") == "PASS"
+                and all(f.get("passed") is True for f in checks)):
+            return GateResult("PASS", messages, data=data)
         if "status=queued" in messages or "status=in_progress" in messages or "no run for exact HEAD" in messages:
             return GateResult("PENDING", messages, data=data)
-        return GateResult("FAIL", messages, data=data)
+        if data.get("verdict") == "FAIL":
+            return GateResult("FAIL", messages or "canonical pr-ready reported FAIL", data=data)
+        return GateResult("BLOCKED_EXTERNAL", "canonical pr-ready returned contradictory or invalid check evidence", data=data)
 
     def _pr_state(self, worktree: str, pr_number: int, pr_repo: str) -> GateResult:
         try:
             raw = json.loads(self._run(["gh", "api", f"repos/{pr_repo}/pulls/{pr_number}"], cwd=worktree))
         except (KeyError, json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
             return GateResult("BLOCKED_EXTERNAL", f"cannot inspect durable PR identity: {exc}")
+        if not isinstance(raw, dict):
+            return GateResult("BLOCKED_EXTERNAL", "GitHub PR lookup returned a non-object JSON value")
+        head, base = raw.get("head"), raw.get("base")
+        number = raw.get("number")
+        if (not isinstance(head, dict) or not isinstance(base, dict)
+                or not isinstance(number, int) or isinstance(number, bool)
+                or number != pr_number):
+            return GateResult("BLOCKED_EXTERNAL", "GitHub PR lookup returned malformed or mismatched identity")
         return GateResult("PASS", f"{pr_repo} PR #{pr_number}", data={"repo": pr_repo, "raw": raw,
-            "head": str((raw.get("head") or {}).get("sha", "")).lower(),
-            "base": str((raw.get("base") or {}).get("ref", "")),
+            "head": str(head.get("sha", "")).lower(),
+            "base": str(base.get("ref", "")),
             "state": str(raw.get("state", "")).upper()})
 
     def merge(self, worktree: str, head: str, pr_number: int | None = None,
@@ -274,19 +313,27 @@ class FootballPredictionAdapter:
             data = json.loads(self._run(["gh", "api", f"repos/{pr_repo}/pulls/{pr_number}"], cwd=worktree))
         except (KeyError, json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
             return GateResult("BLOCKED_EXTERNAL", f"cannot reconcile merge state: {exc}")
+        if not isinstance(data, dict):
+            return GateResult("BLOCKED_EXTERNAL", "GitHub merge-status lookup returned a non-object JSON value")
+        number, head, base = data.get("number"), data.get("head"), data.get("base")
+        if (not isinstance(number, int) or isinstance(number, bool) or number != pr_number
+                or not isinstance(head, dict) or not isinstance(base, dict)):
+            return GateResult("BLOCKED_EXTERNAL", "GitHub merge-status lookup returned malformed or mismatched PR identity")
         if data.get("merged") is True:
-            merged_head = str((data.get("head") or {}).get("sha", "")).lower()
+            merged_head = str(head.get("sha", "")).lower()
             if merged_head != reviewed_head.lower():
                 return GateResult("BLOCKED_EXTERNAL", f"merged PR head {merged_head or 'MISSING'} differs from reviewed head {reviewed_head}")
-            if str((data.get("base") or {}).get("ref", "")) != "main":
+            if str(base.get("ref", "")) != "main":
                 return GateResult("BLOCKED_EXTERNAL", "merged PR base differs from main")
             merge_sha = str(data.get("merge_commit_sha") or "").lower()
-            if len(merge_sha) != 40: return GateResult("BLOCKED_EXTERNAL", "merged PR lacks a full merge SHA")
+            if not re.fullmatch(r"[0-9a-f]{40}", merge_sha):
+                return GateResult("BLOCKED_EXTERNAL", "merged PR lacks a full merge SHA")
             return GateResult("PASS", f"merged {pr_repo} PR #{pr_number}", data={"pr": pr_number, "merge_sha": merge_sha, "repo": pr_repo})
         queued = data.get("auto_merge") is not None or data.get("merge_queue_entry") is not None
-        if (allow_open_retry and not queued and str(data.get("state", "")).upper() == "OPEN"
-                and str((data.get("base") or {}).get("ref", "")) == "main"
-                and str((data.get("head") or {}).get("sha", "")).lower() == reviewed_head.lower()):
+        if (allow_open_retry and data.get("merged") is False and not queued
+                and str(data.get("state", "")).upper() == "OPEN"
+                and str(base.get("ref", "")) == "main"
+                and str(head.get("sha", "")).lower() == reviewed_head.lower()):
             return GateResult("NOT_STARTED", f"PR #{pr_number} is still open at the reviewed HEAD; merge retry is safe", data={"pr": pr_number})
         return GateResult("BLOCKED_EXTERNAL", f"ambiguous merge state for PR #{pr_number}")
 
@@ -380,9 +427,20 @@ class SimulatedAdapter(FootballPredictionAdapter):
     def ci(self, worktree, head, pr_number=None, pr_repo=None):
         value=self.ci_results[min(self.ci_index,len(self.ci_results)-1)]; self.ci_index+=1; return GateResult(value, f"fixture CI {head}", data={"pr_number": pr_number or 1, "pr_repo": pr_repo or "fixture/repo"})
     def merge(self, worktree, head, pr_number=None, pr_repo=None):
-        self.merged_heads.add(head); value=self.merge_results[min(self.merge_index,len(self.merge_results)-1)]; self.merge_index+=1; return GateResult(value, f"fixture merge {head}", data={"pr":1,"merge_sha":"c"*40})
+        value = self.merge_results[min(self.merge_index, len(self.merge_results)-1)]
+        self.merge_index += 1
+        if value == "PASS":
+            self.merged_heads.add(head)
+            return GateResult(value, f"fixture merge {head}", data={
+                "pr": pr_number or 1, "repo": pr_repo or "fixture/repo", "merge_sha": "c" * 40,
+            })
+        return GateResult(value, f"fixture merge {head}")
     def merge_status(self, worktree, reviewed_head, pr_number=None, pr_repo=None):
-        return GateResult("PASS" if reviewed_head in self.merged_heads else "NOT_STARTED", f"fixture merge status {reviewed_head}", data={"pr":1,"merge_sha":"c"*40})
+        if reviewed_head in self.merged_heads:
+            return GateResult("PASS", f"fixture merge status {reviewed_head}", data={
+                "pr": pr_number or 1, "repo": pr_repo or "fixture/repo", "merge_sha": "c" * 40,
+            })
+        return GateResult("NOT_STARTED", f"fixture merge status {reviewed_head}")
     def post_merge(self, *args):
         value=self.post_results[min(self.post_index,len(self.post_results)-1)]; self.post_index+=1
         return GateResult(value, "fixture post merge", data={"main_sha":"d"*40,"tree_sha":"e"*40})

@@ -146,6 +146,45 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(row["ci_state"], "PENDING")
         self.assertEqual(self.adapter.merged_heads, set())
 
+    def test_recovered_merge_claim_resumes_polling_pre_merge_ci(self):
+        head = "a" * 40
+        old_pid = 99999999
+        self.journal.update(
+            self.spec.mission_id, current_head=head, current_state=State.MERGE,
+            pr_number=7, pr_repo="fixture/repo", merge_claim_head=head,
+            merge_claim_pr_number=7, merge_claim_pr_repo="fixture/repo",
+            merge_claim_pid=old_pid, merge_claim_start_ticks="dead-owner",
+            merge_invocation_started=0,
+        )
+        real_identity = self.journal._proc_identity
+
+        def owner_identity(pid):
+            if pid == old_pid:
+                return "ABSENT", None
+            return real_identity(pid)
+
+        with patch.object(self.adapter, "ci", side_effect=[
+                GateResult("PENDING", "required check queued"),
+                GateResult("PASS", "required check passed"),
+        ]) as ci, patch.object(self.journal, "_proc_identity", side_effect=owner_identity):
+            self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.MERGE)
+            row = self.journal.mission(self.spec.mission_id)
+            self.assertEqual(row["merge_claim_head"], head)
+            self.assertEqual(row["pending_gate"], "pre-merge-ci")
+            # The same live lease polls again instead of treating itself as a
+            # foreign ACTIVE owner and leaving this mission permanently stuck.
+            self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
+        self.assertEqual(ci.call_count, 2)
+        self.assertEqual(self.adapter.merged_heads, {head})
+        self.assertEqual(self.adapter.merge_index, 1)
+
+    def test_terminal_runner_rejects_nonpositive_or_nonfinite_poll_interval(self):
+        for value in (0, -0.1, float("nan"), float("inf"), -float("inf"), True, "1"):
+            with self.subTest(poll_interval=value), self.assertRaises(ValueError):
+                self.supervisor.run_until_terminal(
+                    self.spec.mission_id, self.spec, poll_interval=value,
+                )
+
     def test_terminal_runner_polls_exact_head_ci_until_it_finishes(self):
         spec = replace(self.spec, merge_policy="owner_approval")
         self.journal.update(
@@ -161,7 +200,7 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(check.call_count, 3)
         sleep.assert_called_once_with(0.01)
 
-    def test_production_gate_pending_survives_terminal_runner_as_wait_state(self):
+    def test_terminal_runner_polls_production_gate_until_it_finishes(self):
         head, merge_sha = "a" * 40, "c" * 40
 
         class PendingProductionAdapter:
@@ -173,7 +212,12 @@ class HarnessTest(unittest.TestCase):
 
             def post_merge(self, *args):
                 self.calls += 1
-                return GateResult("PENDING", "Production Gate queued", data={"ci_status": "queued"})
+                if self.calls == 1:
+                    return GateResult("PENDING", "Production Gate queued", data={"ci_status": "queued"})
+                return GateResult("PASS", "Production Gate passed", data={
+                    "ci_head_sha": merge_sha,
+                    "main_sha": "d" * 40, "tree_sha": "e" * 40,
+                })
 
         adapter = PendingProductionAdapter()
         supervisor = Supervisor(
@@ -184,10 +228,35 @@ class HarnessTest(unittest.TestCase):
             self.spec.mission_id, current_head=head, current_state=State.POST_MERGE,
             pr_number=7, pr_repo="fixture/repo", merge_sha=merge_sha,
         )
-        state = supervisor.run_until_terminal(self.spec.mission_id, self.spec)
-        self.assertEqual(state, State.POST_MERGE)
-        self.assertEqual(self.journal.mission(self.spec.mission_id)["pending_gate"], "production-gate")
-        self.assertEqual(adapter.calls, 1)
+        with patch("harness.supervisor.time.sleep") as sleep:
+            state = supervisor.run_until_terminal(self.spec.mission_id, self.spec, poll_interval=0.01)
+        self.assertEqual(state, State.PASS)
+        self.assertIsNone(self.journal.mission(self.spec.mission_id)["pending_gate"])
+        self.assertEqual(adapter.calls, 2)
+        sleep.assert_called_once_with(0.01)
+
+    def test_supervisor_rejects_production_pass_not_bound_to_merge_sha(self):
+        head, merge_sha = "a" * 40, "c" * 40
+
+        class WrongSourceProductionAdapter(FootballPredictionAdapter):
+            def exact_head(self, worktree):
+                return head
+
+            def post_merge(self, *args):
+                return GateResult("PASS", "wrong source", data={
+                    "ci_head_sha": "b" * 40, "main_sha": "d" * 40, "tree_sha": "e" * 40,
+                })
+
+        adapter = WrongSourceProductionAdapter()
+        supervisor = Supervisor(
+            self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "wrong-production-source"),
+            self.codex, adapter,
+        )
+        self.journal.update(
+            self.spec.mission_id, current_head=head, current_state=State.POST_MERGE,
+            pr_number=7, pr_repo="fixture/repo", merge_sha=merge_sha,
+        )
+        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
 
     def test_codex_turn_claim_serializes_controllers_and_unknown_outcome_fails_closed(self):
         self.supervisor.step(self.spec.mission_id, self.spec)  # CREATED -> PREPARING
@@ -2119,6 +2188,14 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(self.supervisor.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
         self.assertEqual(self.adapter.merged_heads, set())
 
+    def test_simulated_merge_failure_does_not_claim_external_merge_completed(self):
+        adapter = SimulatedAdapter(merge=["BLOCKED_EXTERNAL"])
+        result = adapter.merge("/fixture", "a" * 40, 7, "fixture/repo")
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+        self.assertEqual(adapter.merged_heads, set())
+        self.assertEqual(adapter.merge_status("/fixture", "a" * 40, 7, "fixture/repo").status,
+                         "NOT_STARTED")
+
     def test_unverifiable_live_merge_owner_claim_cannot_be_reclaimed(self):
         head = "a" * 40
         self.journal.update(
@@ -2295,7 +2372,10 @@ class HarnessTest(unittest.TestCase):
                 patch.dict(os.environ, {"GH_REPO": "attacker/other-repository"}):
             result = adapter.discover_pr("/worktree", "a" * 40)
         self.assertEqual(result.status, "PASS")
-        self.assertEqual(result.data, {"number": 42, "repo": "owner/project"})
+        self.assertEqual(result.data, {
+            "number": 42, "repo": "owner/project", "head": "a" * 40,
+            "base": "main", "state": "OPEN",
+        })
         discovery_argv = run.call_args_list[-1].args[0]
         self.assertEqual(
             discovery_argv[2],
@@ -2309,6 +2389,35 @@ class HarnessTest(unittest.TestCase):
             result = adapter.discover_pr("/worktree", "a" * 40)
         self.assertEqual(result.status, "BLOCKED_EXTERNAL")
         self.assertEqual(run.call_count, 1)
+
+    def test_pr_discovery_malformed_nested_fields_fail_closed(self):
+        adapter = FootballPredictionAdapter()
+        malformed = [{
+            "number": 42, "head": "not-an-object", "base": {"ref": "main"},
+        }]
+        with patch.object(adapter, "_run", side_effect=[
+                "https://github.com/owner/project.git", "feature", json.dumps(malformed),
+        ]):
+            result = adapter.discover_pr("/worktree", "a" * 40)
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+
+    def test_supervisor_rejects_untrusted_pr_discovery_identity_without_casting(self):
+        class MalformedPRAdapter(SimulatedAdapter):
+            def discover_pr(self, worktree, head):
+                return GateResult("PASS", "untrusted", data={
+                    "number": "7", "repo": "fixture/repo",
+                })
+
+        adapter = MalformedPRAdapter()
+        supervisor = Supervisor(
+            self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "invalid-pr-logs"),
+            self.codex, adapter,
+        )
+        self.journal.update(
+            self.spec.mission_id, current_head="a" * 40, current_state=State.MERGE,
+        )
+        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
+        self.assertIsNone(self.journal.mission(self.spec.mission_id)["pr_number"])
 
     def test_post_merge_parses_canonical_json_before_human_footer(self):
         adapter = FootballPredictionAdapter()
@@ -2379,10 +2488,30 @@ class HarnessTest(unittest.TestCase):
                                 "message": "status=completed"}]}
         completed = subprocess.CompletedProcess([], 1, json.dumps(report), "policy failed")
         with patch.object(adapter, "discover_pr", return_value=GateResult(
-                "PASS", "PR", data={"number": 7, "repo": "fixture/repo"})), patch.object(adapter, "_call", return_value=completed):
+                "PASS", "PR", data={"number": 7, "repo": "fixture/repo"})), \
+                patch.object(adapter, "_pr_state", return_value=GateResult(
+                    "PASS", "PR", data={"head": "a" * 40, "base": "main", "state": "OPEN"})), \
+                patch.object(adapter, "_call", return_value=completed):
             result = adapter.ci("/fixture", "a" * 40)
         self.assertEqual(result.status, "FAIL")
         self.assertEqual(result.data["pr_number"], 7)
+
+    def test_ci_malformed_json_evidence_fails_closed(self):
+        adapter = FootballPredictionAdapter()
+        cases = (
+            {"verdict": "PASS", "pr": [], "findings": []},
+            {"verdict": "PASS", "pr": {"head_sha": "a" * 40}, "findings": [None]},
+        )
+        for report in cases:
+            with self.subTest(report=report):
+                with patch.object(adapter, "discover_pr", return_value=GateResult(
+                        "PASS", "PR", data={"number": 7, "repo": "fixture/repo"})), \
+                        patch.object(adapter, "_pr_state", return_value=GateResult(
+                            "PASS", "PR", data={"head": "a" * 40, "base": "main", "state": "OPEN"})), \
+                        patch.object(adapter, "_call", return_value=subprocess.CompletedProcess(
+                            [], 0, json.dumps(report), "")):
+                    result = adapter.ci("/fixture", "a" * 40)
+                self.assertEqual(result.status, "BLOCKED_EXTERNAL")
 
     def test_ci_reuses_durable_pr_and_rejects_identity_change(self):
         adapter = FootballPredictionAdapter()
@@ -2397,7 +2526,7 @@ class HarnessTest(unittest.TestCase):
     def test_merge_recovery_open_pr_is_ambiguous_not_retry_safe(self):
         adapter = FootballPredictionAdapter()
         responses = iter([
-            json.dumps({"state": "open", "merged": False, "head": {"sha": "a" * 40},
+            json.dumps({"number": 7, "state": "open", "merged": False, "head": {"sha": "a" * 40},
                         "base": {"ref": "main"}, "auto_merge": None}),
         ])
         with patch.object(adapter, "_run", side_effect=lambda *args, **kwargs: next(responses)):
@@ -2407,13 +2536,19 @@ class HarnessTest(unittest.TestCase):
 
     def test_merge_queue_or_auto_merge_is_never_retry_safe(self):
         adapter = FootballPredictionAdapter()
-        responses = iter([
-            json.dumps({"state": "open", "merged": False, "head": {"sha": "a" * 40},
-                        "base": {"ref": "main"}, "auto_merge": {"enabled_by": {}}}),
-        ])
-        with patch.object(adapter, "_run", side_effect=lambda *args, **kwargs: next(responses)):
-            result = adapter.merge_status("/fixture", "a" * 40, 7, "fixture/repo", allow_open_retry=True)
-        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+        for queue_fields in ({"auto_merge": {"enabled_by": {}}},
+                             {"auto_merge": None, "merge_queue_entry": {"id": 91}}):
+            responses = iter([
+                json.dumps({"number": 7, "state": "open", "merged": False,
+                            "head": {"sha": "a" * 40}, "base": {"ref": "main"},
+                            **queue_fields}),
+            ])
+            with self.subTest(queue_fields=queue_fields), patch.object(
+                    adapter, "_run", side_effect=lambda *args, **kwargs: next(responses)):
+                result = adapter.merge_status(
+                    "/fixture", "a" * 40, 7, "fixture/repo", allow_open_retry=True,
+                )
+                self.assertEqual(result.status, "BLOCKED_EXTERNAL")
 
     def test_head_change_clears_durable_pr_identity(self):
         self.journal.update(self.spec.mission_id, current_head="a" * 40,
@@ -2427,7 +2562,7 @@ class HarnessTest(unittest.TestCase):
     def test_open_exact_head_pr_proves_merge_not_started(self):
         adapter = FootballPredictionAdapter()
         responses = iter([
-            json.dumps({"state": "open", "merged": False, "head": {"sha": "a" * 40},
+            json.dumps({"number": 7, "state": "open", "merged": False, "head": {"sha": "a" * 40},
                         "base": {"ref": "main"}, "auto_merge": None}),
         ])
         with patch.object(adapter, "_run", side_effect=lambda *args, **kwargs: next(responses)):
