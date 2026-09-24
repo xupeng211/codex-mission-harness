@@ -274,6 +274,12 @@ class FootballPredictionAdapter:
 
     def ci(self, worktree: str, head: str, pr_number: int | None = None,
            pr_repo: str | None = None, base_sha: str | None = None) -> GateResult:
+        # CI evidence is an authority boundary.  Without an immutable base
+        # checkout there is no trusted copy of the project's PR-readiness
+        # command, so never execute a candidate-controlled Makefile as a
+        # fallback or interpret its stdout as GitHub truth.
+        if not base_sha:
+            return GateResult("BLOCKED_EXTERNAL", "canonical CI requires an exact trusted base SHA")
         if pr_number is None:
             pr = self.discover_pr(worktree, head)
             if pr.status != "PASS": return pr
@@ -296,21 +302,17 @@ class FootballPredictionAdapter:
             if facts.get("head") != head.lower() or facts.get("base") != "main" or facts.get("state") != "OPEN":
                 return GateResult("BLOCKED_EXTERNAL", f"durable PR #{pr_number} no longer matches open main PR at {head}")
         try:
-            if not base_sha:
-                result = self._call(["make", "pr-ready", f"PR={pr_number}", "JSON=1"], cwd=worktree,
-                                    env={"GH_REPO": pr_repo, "GH_HOST": "github.com"})
-            else:
-                trusted = self._trusted_base_checkout(
-                    worktree, base_sha,
-                    str(Path(worktree).parent / ".cmh-review-evidence" / "pr-ready" / head),
-                )
-                code = ("import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
-                        "from scripts.devops import pr_ready_check as m; m.ROOT=Path(sys.argv[2]); "
-                        "sys.argv=['pr-ready-check','--pr',sys.argv[3],'--json']; raise SystemExit(m.main())")
-                result = self._call(
-                    ["python3", "-c", code, str(trusted), worktree, str(pr_number)],
-                    cwd=str(trusted), env={"GH_REPO": pr_repo, "GH_HOST": "github.com"},
-                )
+            trusted = self._trusted_base_checkout(
+                worktree, base_sha,
+                str(Path(worktree).parent / ".cmh-review-evidence" / "pr-ready" / head),
+            )
+            code = ("import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
+                    "from scripts.devops import pr_ready_check as m; m.ROOT=Path(sys.argv[2]); "
+                    "sys.argv=['pr-ready-check','--pr',sys.argv[3],'--json']; raise SystemExit(m.main())")
+            result = self._call(
+                ["python3", "-c", code, str(trusted), worktree, str(pr_number)],
+                cwd=str(trusted), env={"GH_REPO": pr_repo, "GH_HOST": "github.com"},
+            )
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
             return GateResult("BLOCKED_EXTERNAL", f"trusted PR readiness unavailable: {exc}")
         try: data = self._json_document_prefix(result.stdout)
@@ -392,10 +394,19 @@ class FootballPredictionAdapter:
             argv += ["--receipt", codex_receipt]
         if deepseek_receipt:
             argv += ["--deepseek-receipt", deepseek_receipt]
+        local_verdict = str(local_json.get("verdict", "")).strip().upper()
+        # These are declarations required by FootballPrediction's canonical
+        # CLI.  Derive them from already observed, exact-head evidence rather
+        # than asserting PASS/NO unconditionally; the trusted target command
+        # still recomputes the machine checks and rejects contradictory input.
+        protected_invariants = "PASS" if local_verdict == "PASS" else "UNKNOWN"
+        forbidden_side_effects = "NO" if local_verdict == "PASS" else "UNKNOWN"
+        required_pr_governance = "PASS" if ci_status == "PASS" and pr_state.status == "PASS" else "UNKNOWN"
         argv += ["--selected-backend", "codex" if codex_receipt else "deepseek",
                 "--pr", str(pr_number), "--remote-ci-status", ci_status,
-                "--protected-invariants", "PASS", "--forbidden-side-effects", "NO",
-                "--required-pr-governance", "PASS", "--json"]
+                "--protected-invariants", protected_invariants,
+                "--forbidden-side-effects", forbidden_side_effects,
+                "--required-pr-governance", required_pr_governance, "--json"]
         result = self._call(argv, cwd=str(trusted), env={"GH_HOST": "github.com", "GH_REPO": pr_repo})
         data = self._json_last_text(result.stdout)
         if result.returncode == 0 and data.get("merge_ready") == "YES":

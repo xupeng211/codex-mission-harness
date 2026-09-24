@@ -2533,10 +2533,19 @@ class HarnessTest(unittest.TestCase):
                 "PASS", "PR", data={"number": 7, "repo": "fixture/repo"})), \
                 patch.object(adapter, "_pr_state", return_value=GateResult(
                     "PASS", "PR", data={"head": "a" * 40, "base": "main", "state": "OPEN"})), \
+                patch.object(adapter, "_trusted_base_checkout", return_value=Path("/trusted")), \
                 patch.object(adapter, "_call", return_value=completed):
-            result = adapter.ci("/fixture", "a" * 40)
+            result = adapter.ci("/fixture", "a" * 40, base_sha="b" * 40)
         self.assertEqual(result.status, "FAIL")
         self.assertEqual(result.data["pr_number"], 7)
+
+    def test_ci_without_trusted_base_sha_fails_closed_without_running_candidate(self):
+        adapter = FootballPredictionAdapter()
+        with patch.object(adapter, "_call") as call:
+            result = adapter.ci("/fixture", "a" * 40)
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+        self.assertIn("trusted base SHA", result.evidence)
+        call.assert_not_called()
 
     def test_merge_ready_delegates_to_canonical_target_gate(self):
         adapter = FootballPredictionAdapter()
@@ -2557,6 +2566,11 @@ class HarnessTest(unittest.TestCase):
         self.assertIn("agent-workflow", " ".join(call.call_args_list[1].args[0]))
         self.assertFalse(call.call_args_list[0].kwargs["inherit_environment"])
         self.assertNotIn("ANTHROPIC_API_KEY", call.call_args_list[0].kwargs["env"])
+        command = call.call_args_list[1].args[0]
+        self.assertIn("--protected-invariants", command)
+        self.assertEqual(command[command.index("--protected-invariants") + 1], "PASS")
+        self.assertEqual(command[command.index("--forbidden-side-effects") + 1], "NO")
+        self.assertEqual(command[command.index("--required-pr-governance") + 1], "PASS")
 
     def test_owner_approval_precedes_target_merge_readiness_command(self):
         class RecordingAdapter(FootballPredictionAdapter):
@@ -2618,7 +2632,13 @@ class HarnessTest(unittest.TestCase):
         with patch.object(adapter, "discover_pr") as discover, patch.object(
                 adapter, "_pr_state", return_value=GateResult(
                     "PASS", "PR", data={"head": "b" * 40, "base": "main", "state": "OPEN"})) as state:
-            result = adapter.ci("/fixture", "a" * 40, 7, "fixture/repo")
+            result = adapter.ci(
+                "/fixture",
+                "a" * 40,
+                7,
+                "fixture/repo",
+                base_sha="b" * 40,
+            )
         discover.assert_not_called()
         state.assert_called_once_with("/fixture", 7, "fixture/repo")
         self.assertEqual(result.status, "BLOCKED_EXTERNAL")
