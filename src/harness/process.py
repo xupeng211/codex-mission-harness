@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .journal import Journal, now
+from .sandbox import SandboxUnavailable, preflight_project_gate, project_gate_invocation
 
 
 BOOTSTRAP = """import json, os, sys
@@ -62,12 +63,22 @@ class ProcessSupervisor:
         self.launcher_start_ticks = proc_start_ticks(self.launcher_pid)
         log_root.mkdir(parents=True, exist_ok=True)
 
-    def start(self, mission_id: str, name: str, argv: list[str], cwd: str, env: dict[str, str], launch_head: str) -> str:
+    def start(self, mission_id: str, name: str, argv: list[str], cwd: str, env: dict[str, str],
+              launch_head: str, sandbox_profile: str | None = None) -> str:
         if self.launcher_start_ticks is None:
             raise RuntimeError("cannot reserve a gate without launcher process identity")
         job_id = uuid.uuid4().hex
         lease = uuid.uuid4().hex
         out, err = self.log_root / f"{job_id}.out", self.log_root / f"{job_id}.err"
+        child_env = {**os.environ, **env}
+        bootstrap_env = None
+        if sandbox_profile is not None:
+            if sandbox_profile != "project-gate":
+                raise ValueError(f"unsupported process sandbox profile: {sandbox_profile}")
+            invocation = project_gate_invocation(argv, cwd, env, self.log_root, job_id)
+            preflight_project_gate(invocation)
+            argv, cwd, child_env = invocation.argv, invocation.cwd, invocation.env
+            bootstrap_env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
         # Reserve before spawning: concurrent supervisors observe the same durable job, never launch twice.
         try:
             self.journal.db.execute("BEGIN IMMEDIATE")
@@ -90,7 +101,7 @@ class ProcessSupervisor:
                 # The bootstrap cannot run the gate until its PID has been journaled. If
                 # this controller dies before publication its stdin closes and no gate runs.
                 proc = subprocess.Popen([sys.executable, "-c", BOOTSTRAP], stdin=subprocess.PIPE, stdout=stdout, stderr=stderr,
-                                        start_new_session=True)
+                                        start_new_session=True, env=bootstrap_env)
         except Exception as exc:
             try:
                 changed = self.journal.db.execute(
@@ -157,8 +168,7 @@ class ProcessSupervisor:
                 raise
             raise
         assert proc.stdin is not None
-        payload = json.dumps({"argv": argv, "cwd": cwd,
-                              "env": {**os.environ, **env}}).encode()
+        payload = json.dumps({"argv": argv, "cwd": cwd, "env": child_env}).encode()
         try:
             written = proc.stdin.write(payload)
             if written != len(payload):

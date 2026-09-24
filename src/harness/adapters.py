@@ -475,11 +475,46 @@ class FootballPredictionAdapter:
         before = self.merge_status(worktree, head, pr_number, pr_repo,
                                    pr_base_sha=pr_base_sha, allow_open_retry=True)
         if before.status != "NOT_STARTED": return before
+        freshness = self._strict_base_freshness(worktree, pr_repo)
+        if freshness.status != "PASS":
+            return freshness
         result = self._call(self._gh("pr", "merge", str(pr_number), "--repo", pr_repo,
                              "--squash", "--match-head-commit", head), cwd=worktree)
         if result.returncode != 0: return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "merge command failed")
         return self.merge_status(worktree, head, pr_number, pr_repo,
                                  pr_base_sha=pr_base_sha)
+
+    def _strict_base_freshness(self, worktree: str, pr_repo: str) -> GateResult:
+        """Require server enforcement that rejects a PR after its base moves."""
+        result = self._call(self._gh(
+            "api", f"repos/{pr_repo}/branches/main/protection"), cwd=worktree,
+        )
+        if result.returncode != 0:
+            return GateResult(
+                "BLOCKED_POLICY",
+                "cannot prove GitHub enforces strict base freshness; branch protection lookup "
+                f"failed with exit {result.returncode}",
+            )
+        try:
+            protection = json.loads(result.stdout)
+        except (TypeError, json.JSONDecodeError):
+            return GateResult("BLOCKED_POLICY", "GitHub branch protection response is not valid JSON")
+        if not isinstance(protection, dict):
+            return GateResult("BLOCKED_POLICY", "GitHub branch protection response is malformed")
+        statuses = protection.get("required_status_checks")
+        if not isinstance(statuses, dict) or statuses.get("strict") is not True:
+            return GateResult("BLOCKED_POLICY", "GitHub main branch does not require strict up-to-date checks")
+        contexts = statuses.get("contexts", [])
+        checks = statuses.get("checks", [])
+        if (not isinstance(contexts, list) or not isinstance(checks, list)
+                or not any(isinstance(item, str) and item for item in contexts)
+                and not any(isinstance(item, dict) and isinstance(item.get("context"), str)
+                            and item["context"] for item in checks)):
+            return GateResult("BLOCKED_POLICY", "GitHub strict base protection has no required status checks")
+        admins = protection.get("enforce_admins")
+        if not isinstance(admins, dict) or admins.get("enabled") is not True:
+            return GateResult("BLOCKED_POLICY", "GitHub strict base protection does not cover administrators")
+        return GateResult("PASS", "GitHub enforces strict up-to-date checks for main and administrators")
 
     def merge_status(self, worktree: str, reviewed_head: str, pr_number: int | None = None,
                      pr_repo: str | None = None, pr_base_sha: str | None = None,

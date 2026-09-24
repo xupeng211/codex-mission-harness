@@ -2616,15 +2616,64 @@ class HarnessTest(unittest.TestCase):
         merged = GateResult("PASS", "merged", data={"pr": 17, "repo": "fixture/repo",
             "pr_base_sha": base_sha, "merge_sha": "c" * 40})
         completed = subprocess.CompletedProcess([], 0, "", "")
+        protection = subprocess.CompletedProcess([], 0, json.dumps({
+            "required_status_checks": {"strict": True, "contexts": ["verify"]},
+            "enforce_admins": {"enabled": True},
+        }), "")
         with patch.object(adapter, "discover_pr") as discover, \
                 patch.object(adapter, "merge_status", side_effect=[not_started, merged]) as status, \
-                patch.object(adapter, "_call", return_value=completed) as call:
+                patch.object(adapter, "_call", side_effect=[protection, completed]) as call:
             result = adapter.merge("/candidate", "a" * 40, 17, "fixture/repo", base_sha)
         self.assertEqual(result.status, "PASS")
         discover.assert_not_called()
         self.assertEqual(status.call_args_list[0].args, ("/candidate", "a" * 40, 17, "fixture/repo"))
         self.assertEqual(status.call_args_list[0].kwargs["pr_base_sha"], base_sha)
-        self.assertEqual(call.call_args.args[0][:6], ["gh", "pr", "merge", "17", "--repo", "fixture/repo"])
+        self.assertEqual(call.call_args_list[0].args[0], [
+            "gh", "api", "repos/fixture/repo/branches/main/protection",
+        ])
+        self.assertEqual(call.call_args_list[1].args[0][:6], [
+            "gh", "pr", "merge", "17", "--repo", "fixture/repo",
+        ])
+        self.assertIn("--match-head-commit", call.call_args_list[1].args[0])
+
+    def test_merge_fails_closed_without_server_enforced_base_freshness(self):
+        adapter = FootballPredictionAdapter()
+        base_sha = "b" * 40
+        not_started = GateResult("NOT_STARTED", "safe", data={"pr_base_sha": base_sha})
+        unavailable = subprocess.CompletedProcess([], 1, "", "HTTP 403")
+        with patch.object(adapter, "merge_status", return_value=not_started), \
+                patch.object(adapter, "_call", return_value=unavailable) as call:
+            result = adapter.merge("/candidate", "a" * 40, 17, "fixture/repo", base_sha)
+        self.assertEqual(result.status, "BLOCKED_POLICY")
+        self.assertIn("strict base freshness", result.evidence)
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(call.call_args.args[0], [
+            "gh", "api", "repos/fixture/repo/branches/main/protection",
+        ])
+
+    def test_merge_requires_strict_statuses_and_admin_enforcement(self):
+        adapter = FootballPredictionAdapter()
+        cases = (
+            {"required_status_checks": {"strict": False, "contexts": ["verify"]},
+             "enforce_admins": {"enabled": True}},
+            {"required_status_checks": {"strict": True, "contexts": []},
+             "enforce_admins": {"enabled": True}},
+            {"required_status_checks": {"strict": True, "contexts": ["verify"]},
+             "enforce_admins": {"enabled": False}},
+        )
+        for protection_data in cases:
+            with self.subTest(protection_data=protection_data):
+                # Exercise the public merge path so an invalid rule can never
+                # reach the irreversible GitHub merge command.
+                not_started = GateResult("NOT_STARTED", "safe")
+                response = subprocess.CompletedProcess([], 0, json.dumps(protection_data), "")
+                with patch.object(adapter, "merge_status", return_value=not_started), \
+                        patch.object(adapter, "_call", return_value=response) as call:
+                    result = adapter.merge(
+                        "/candidate", "a" * 40, 17, "fixture/repo", "b" * 40,
+                    )
+                self.assertEqual(result.status, "BLOCKED_POLICY")
+                self.assertEqual(call.call_count, 1)
 
     def test_ci_requires_whole_canonical_pr_ready_pass(self):
         adapter = FootballPredictionAdapter()

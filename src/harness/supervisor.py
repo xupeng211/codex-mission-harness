@@ -17,6 +17,7 @@ from .isolation import docker_env
 from .journal import Journal
 from .policy import Decision, decide, permitted
 from .process import ProcessSupervisor
+from .sandbox import SandboxUnavailable
 
 
 class Supervisor:
@@ -487,15 +488,21 @@ class Supervisor:
                     env = docker_env(mission_id)
                     if isinstance(gate_env, dict):
                         env.update({str(key): str(value) for key, value in gate_env.items()})
-                    self.process.start(
-                        mission_id, gate,
-                        self._invoke_gate_argv(self.adapter.gate_argv, gate,
-                            worktree=row["worktree"], base=row["base_sha"],
-                            head=row["current_head"], mission_id=mission_id,
-                            scope_file=spec.mission_scope_file or "",
-                        ),
-                        row["worktree"], env, row["current_head"],
-                    )
+                    try:
+                        self.process.start(
+                            mission_id, gate,
+                            self._invoke_gate_argv(self.adapter.gate_argv, gate,
+                                worktree=row["worktree"], base=row["base_sha"],
+                                head=row["current_head"], mission_id=mission_id,
+                                scope_file=spec.mission_scope_file or "",
+                            ),
+                            row["worktree"], env, row["current_head"],
+                            sandbox_profile=(None if isinstance(self.adapter, SimulatedAdapter)
+                                            else "project-gate"),
+                        )
+                    except SandboxUnavailable as exc:
+                        advance(State.BLOCKED_EXTERNAL, f"candidate gate isolation unavailable: {exc}")
+                        return State.BLOCKED_EXTERNAL
                     return state
             advance(State.REVIEW, "local canonical gates pass")
         elif state == State.REVIEW:
