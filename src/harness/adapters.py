@@ -40,6 +40,36 @@ class FootballPredictionAdapter:
         "schemas/agentic/independent_review_result.schema.json", "schemas/agentic/independent_review_receipt.schema.json",
     )
 
+    @staticmethod
+    def _safe_mission_id(mission_id: str) -> str:
+        if (not isinstance(mission_id, str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", mission_id) is None
+                or mission_id in {".", ".."}):
+            raise ValueError("mission_id is not a safe evidence path component")
+        return mission_id
+
+    @classmethod
+    def review_evidence_dir(cls, worktree: str, mission_id: str, reviewer: str, head: str) -> Path:
+        mission_id = cls._safe_mission_id(mission_id)
+        if reviewer not in {"codex", "deepseek"}:
+            raise ValueError("unsupported independent reviewer")
+        if not isinstance(head, str) or re.fullmatch(r"[0-9a-fA-F]{40}", head) is None:
+            raise ValueError("review HEAD must be a full commit SHA")
+        repo = Path(worktree).resolve(strict=True)
+        return repo.parent / ".cmh-review-evidence" / mission_id / reviewer / head.lower()
+
+    @staticmethod
+    def _validate_review_evidence_dir(evidence_dir: Path) -> Path:
+        evidence_dir = evidence_dir.absolute()
+        for directory in (evidence_dir.parents[2], evidence_dir.parents[1],
+                          evidence_dir.parents[0], evidence_dir):
+            info = directory.lstat()
+            if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                    or (hasattr(os, "getuid") and info.st_uid != os.getuid())
+                    or stat.S_IMODE(info.st_mode) & 0o077):
+                raise RuntimeError(f"review evidence directory is not private: {directory}")
+        return evidence_dir.resolve(strict=True)
+
     def exact_head(self, worktree: str) -> str:
         dirty = self._run(["git", "-C", worktree, "status", "--porcelain=v1", "--untracked-files=all"])
         if dirty:
@@ -79,7 +109,13 @@ class FootballPredictionAdapter:
         body = (detail.data or {}).get("body") if isinstance(detail.data, dict) else None
         if not isinstance(body, str):
             return GateResult("BLOCKED_EXTERNAL", "PR discovery omitted a usable PR body")
-        evidence = self._private_dir(Path(worktree).parent / ".cmh-gate-evidence" / mission_id / head)
+        try:
+            mission_id = self._safe_mission_id(mission_id)
+        except ValueError as exc:
+            return GateResult("BLOCKED_EXTERNAL", str(exc))
+        if not isinstance(head, str) or re.fullmatch(r"[0-9a-fA-F]{40}", head) is None:
+            return GateResult("BLOCKED_EXTERNAL", "preflight HEAD is not a full commit SHA")
+        evidence = self._private_dir(Path(worktree).parent / ".cmh-gate-evidence" / mission_id / head.lower())
         body_path = evidence / "pr-body.md"
         body_path.write_text(body, encoding="utf-8")
         body_path.chmod(0o600)
@@ -96,29 +132,173 @@ class FootballPredictionAdapter:
                 return GateResult("BLOCKED_EXTERNAL", f"canonical review commit is unavailable: {revision}")
         return GateResult("PASS", "canonical policy will execute from trusted base")
 
-    def _trusted_base_checkout(self, worktree: str, base: str, evidence_dir: str) -> Path:
-        root = Path(evidence_dir).resolve().parents[2] / "trusted-base" / base
-        if not root.exists():
-            root.parent.mkdir(parents=True, exist_ok=True)
-            added = self._call(["git", "worktree", "add", "--detach", str(root), base], cwd=worktree)
+    def _trusted_base_checkout(self, worktree: str, base: str) -> Path:
+        """Return only a registered, byte-verified worktree of the exact base."""
+        if not isinstance(base, str) or re.fullmatch(r"[0-9a-fA-F]{40}", base) is None:
+            raise RuntimeError("trusted base checkout requires a full base SHA")
+        base = base.lower()
+        candidate = Path(worktree).resolve(strict=True)
+        root = candidate.parent / ".cmh-trusted-base" / base
+        root_parent = root.parent
+        if root_parent.is_symlink():
+            raise RuntimeError("trusted base checkout parent is a symlink")
+        root_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        parent_info = root_parent.lstat()
+        if (not stat.S_ISDIR(parent_info.st_mode)
+                or (hasattr(os, "getuid") and parent_info.st_uid != os.getuid())):
+            raise RuntimeError("trusted base checkout parent is not owned by the current user")
+        if stat.S_IMODE(parent_info.st_mode) & 0o077:
+            root_parent.chmod(0o700)
+            if stat.S_IMODE(root_parent.stat().st_mode) & 0o077:
+                raise RuntimeError("trusted base checkout parent is not owner-only")
+
+        if not root.exists() and not root.is_symlink():
+            added = self._call([
+                "git", "-c", "core.hooksPath=/dev/null", "-c", "core.attributesFile=/dev/null",
+                "-c", "core.fsmonitor=false", "--no-replace-objects", "worktree", "add",
+                "--detach", str(root), base,
+            ], cwd=str(candidate))
             if added.returncode != 0:
                 raise RuntimeError(added.stderr.strip() or "cannot create trusted base checkout")
-        observed = self._run(["git", "rev-parse", "HEAD"], cwd=str(root)).strip().lower()
-        dirty = self._run(["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=str(root))
-        if observed != base.lower() or dirty:
+        root_info = root.lstat()
+        if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+            raise RuntimeError("trusted base checkout path is not a real directory")
+
+        listing = self._call([
+            "git", "--no-replace-objects", "worktree", "list", "--porcelain",
+        ], cwd=str(candidate))
+        if listing.returncode != 0:
+            raise RuntimeError(listing.stderr.strip() or "cannot verify trusted worktree registration")
+        records: list[dict[str, str | bool]] = []
+        record: dict[str, str | bool] = {}
+        for line in listing.stdout.splitlines() + [""]:
+            if not line:
+                if record:
+                    records.append(record)
+                    record = {}
+            elif line.startswith("worktree "):
+                record["worktree"] = line[len("worktree "):]
+            elif line.startswith("HEAD "):
+                record["head"] = line[len("HEAD "):].lower()
+            elif line == "detached":
+                record["detached"] = True
+        matching = [item for item in records
+                    if isinstance(item.get("worktree"), str)
+                    and Path(str(item["worktree"])).resolve() == root.resolve()]
+        if len(matching) != 1 or matching[0].get("head") != base or not matching[0].get("detached"):
+            raise RuntimeError("trusted base checkout is not the registered detached worktree for this repository")
+
+        candidate_common = Path(self._run([
+            "git", "rev-parse", "--path-format=absolute", "--git-common-dir",
+        ], cwd=str(candidate)).strip()).resolve()
+        trusted_common = Path(self._run([
+            "git", "rev-parse", "--path-format=absolute", "--git-common-dir",
+        ], cwd=str(root)).strip()).resolve()
+        git_file = root / ".git"
+        git_file_info = git_file.lstat()
+        if not stat.S_ISREG(git_file_info.st_mode) or stat.S_ISLNK(git_file_info.st_mode):
+            raise RuntimeError("trusted base checkout has no regular linked-worktree metadata file")
+        git_file_lines = git_file.read_text(encoding="utf-8").splitlines()
+        if len(git_file_lines) != 1 or not git_file_lines[0].startswith("gitdir: "):
+            raise RuntimeError("trusted base checkout worktree link is malformed")
+        admin_dir = Path(git_file_lines[0][len("gitdir: "):])
+        if not admin_dir.is_absolute():
+            admin_dir = root / admin_dir
+        admin_dir = admin_dir.resolve(strict=True)
+        worktrees_dir = (candidate_common / "worktrees").resolve()
+        try:
+            admin_dir.relative_to(worktrees_dir)
+        except ValueError as exc:
+            raise RuntimeError("trusted base checkout is linked to another Git repository") from exc
+        back_link = admin_dir / "gitdir"
+        if (back_link.is_symlink() or not back_link.is_file()
+                or Path(back_link.read_text(encoding="utf-8").strip()).resolve() != git_file.resolve()):
+            raise RuntimeError("trusted base checkout worktree back-link is invalid")
+        if candidate_common != trusted_common:
+            raise RuntimeError("trusted base checkout uses another Git common directory")
+
+        observed = self._run([
+            "git", "--no-replace-objects", "-c", "core.fsmonitor=false", "rev-parse", "HEAD",
+        ], cwd=str(root)).strip().lower()
+        dirty = self._run([
+            "git", "--no-replace-objects", "-c", "core.fsmonitor=false", "status",
+            "--porcelain=v1", "--untracked-files=all",
+        ], cwd=str(root))
+        if observed != base or dirty:
             raise RuntimeError("trusted base checkout identity is invalid")
+        self._verify_trusted_policy_sources(candidate, root, base)
         return root
+
+    def _verify_trusted_policy_sources(self, candidate: Path, trusted: Path, base: str) -> None:
+        result = self._call([
+            "git", "--no-replace-objects", "ls-tree", "-rz", "--full-tree", base,
+            "--", "scripts", *self.REVIEW_CONTRACT_PATHS,
+        ], cwd=str(candidate))
+        if result.returncode != 0:
+            raise RuntimeError("cannot read trusted review policy tree")
+        blobs: dict[str, tuple[str, str]] = {}
+        for item in result.stdout.split("\0"):
+            if not item:
+                continue
+            try:
+                metadata, relative = item.split("\t", 1)
+                mode, kind, oid = metadata.split(" ", 2)
+            except ValueError as exc:
+                raise RuntimeError("trusted review policy tree is malformed") from exc
+            if kind == "blob":
+                blobs[relative] = (mode, oid)
+            elif relative.startswith("scripts/"):
+                raise RuntimeError("trusted review policy tree contains a non-blob script entry")
+        if not set(self.REVIEW_CONTRACT_PATHS) <= set(blobs):
+            raise RuntimeError("trusted base is missing a required review policy source")
+
+        expected_scripts = {path for path in blobs if path.startswith("scripts/")}
+        scripts_root = trusted / "scripts"
+        if not scripts_root.is_dir():
+            raise RuntimeError("trusted base has no scripts directory")
+        observed_scripts: set[str] = set()
+        for directory, names, filenames in os.walk(scripts_root, followlinks=False):
+            for name in names:
+                if (Path(directory) / name).is_symlink():
+                    raise RuntimeError("trusted base scripts contain a symlink directory")
+            for filename in filenames:
+                source = Path(directory) / filename
+                observed_scripts.add(source.relative_to(trusted).as_posix())
+        if observed_scripts != expected_scripts:
+            raise RuntimeError("trusted base scripts differ from the committed policy tree")
+
+        for relative in sorted(expected_scripts | set(self.REVIEW_CONTRACT_PATHS)):
+            mode, oid = blobs[relative]
+            source = trusted / relative
+            info = source.lstat()
+            if mode == "120000" or not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise RuntimeError("trusted base policy source is not a regular committed file")
+            if bool(info.st_mode & 0o111) != (mode == "100755"):
+                raise RuntimeError("trusted base policy source mode differs from the commit")
+            contents = source.read_bytes()
+            git_blob = hashlib.sha1(
+                f"blob {len(contents)}\0".encode("ascii") + contents,
+                usedforsecurity=False,
+            ).hexdigest()
+            if git_blob != oid:
+                raise RuntimeError("trusted base policy source content differs from the commit")
 
     def review_argv(self, reviewer: str, *, worktree: str, base: str, head: str, mission_id: str,
                     scope_file: str, evidence_dir: str) -> list[str]:
-        trusted = self._trusted_base_checkout(worktree, base, evidence_dir)
+        expected_evidence = self.review_evidence_dir(worktree, mission_id, reviewer, head)
+        if Path(evidence_dir).resolve(strict=False) != expected_evidence.resolve(strict=False):
+            raise ValueError("review evidence directory does not match the exact mission/reviewer/HEAD")
+        self._validate_review_evidence_dir(expected_evidence)
+        trusted = self._trusted_base_checkout(worktree, base)
         common = ["--repo-root", worktree, "--base-sha", base, "--head-sha", head,
                   "--mission-id", mission_id, "--mission-scope-file", scope_file,
                   "--evidence-dir", evidence_dir]
         if reviewer == "codex":
-            return ["python3", str(trusted / "scripts/devops/codex_independent_review.py"), "run", *common]
+            return ["/usr/bin/env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-I", "-B",
+                    str(trusted / "scripts/devops/codex_independent_review.py"), "run", *common]
         if reviewer == "deepseek":
-            return ["python3", str(trusted / "scripts/devops/claude_deepseek_independent_review.py"), *common]
+            return ["/usr/bin/env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-I", "-B",
+                    str(trusted / "scripts/devops/claude_deepseek_independent_review.py"), *common]
         raise ValueError(f"unsupported independent reviewer: {reviewer}")
 
     def review(self, reviewer: str, head: str) -> GateResult:
@@ -130,18 +310,30 @@ class FootballPredictionAdapter:
         return GateResult("BLOCKED_EXTERNAL", "review requires mission_scope_file and exact base/worktree context")
 
     def review_result(self, reviewer: str, *, worktree: str, base: str, head: str, mission_id: str,
-                      scope_file: str, stdout_path: str) -> GateResult:
+                      scope_file: str, stdout_path: str, evidence_dir: str) -> GateResult:
         """Accept only a canonical receipt, revalidated against exact inputs."""
         preflight = self.review_preflight(worktree, base, head)
         if preflight.status != "PASS":
             return preflight
         payload = self._json_last_line(stdout_path)
-        receipt = payload.get("review_receipt") if payload else None
-        if not isinstance(receipt, str) or not Path(receipt).is_file():
+        receipt = payload.get("review_receipt") if isinstance(payload, dict) else None
+        try:
+            expected_evidence = self.review_evidence_dir(worktree, mission_id, reviewer, head)
+            if Path(evidence_dir).resolve(strict=True) != expected_evidence.resolve(strict=True):
+                raise RuntimeError("review evidence directory does not match exact inputs")
+            expected_evidence = self._validate_review_evidence_dir(expected_evidence)
+            receipt_path = Path(receipt) if isinstance(receipt, str) else None
+            if (receipt_path is None or not receipt_path.is_absolute()
+                    or receipt_path.parent.resolve(strict=True) != expected_evidence
+                    or receipt_path.is_symlink()
+                    or not stat.S_ISREG(receipt_path.lstat().st_mode)):
+                raise RuntimeError("reviewer receipt is outside the prevalidated evidence directory")
+        except (OSError, RuntimeError, TypeError, ValueError):
             return GateResult("BLOCKED_EXTERNAL", "canonical review did not publish a receipt")
+        receipt = str(receipt_path)
         if reviewer == "codex":
-            trusted = self._trusted_base_checkout(worktree, base, str(Path(receipt).parent))
-            argv = ["python3", str(trusted / "scripts/devops/codex_independent_review.py"), "classify", "--repo-root", worktree,
+            trusted = self._trusted_base_checkout(worktree, base)
+            argv = ["python3", "-I", "-B", str(trusted / "scripts/devops/codex_independent_review.py"), "classify", "--repo-root", worktree,
                     "--receipt", receipt, "--current-head", head, "--base-sha", base, "--mission-id", mission_id,
                     "--mission-scope-file", scope_file, "--json"]
         elif reviewer == "deepseek":
@@ -154,8 +346,10 @@ class FootballPredictionAdapter:
                 evidence = json.loads(Path(receipt).read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 return GateResult("BLOCKED_EXTERNAL", "DeepSeek receipt is unreadable", receipt)
+            if not isinstance(evidence, dict):
+                return GateResult("BLOCKED_EXTERNAL", "DeepSeek receipt is not a JSON object", receipt)
             if evidence.get("receipt_version") == "independent-review-receipt/v1":
-                trusted = self._trusted_base_checkout(worktree, base, str(Path(receipt).parent))
+                trusted = self._trusted_base_checkout(worktree, base)
                 # Re-run the target's canonical evidence consumer. Its code is
                 # accepted only after review_preflight proves it is unchanged
                 # from the trusted base.
@@ -180,25 +374,29 @@ class FootballPredictionAdapter:
                     "print(json.dumps(asdict(v(Path(sys.argv[1]),repo_root=Path(sys.argv[2]),"
                     "expected_base=sys.argv[3],expected_head=sys.argv[4],expected_mission_id=sys.argv[5],expected_scope_hash=sys.argv[6]))))"
                 )
-                checked = self._call(["python3", "-c", validator, receipt, worktree, base, head, mission_id, scope_hash], cwd=str(trusted))
+                checked = self._call(["python3", "-I", "-B", "-c", validator, receipt, worktree, base, head, mission_id, scope_hash], cwd=str(trusted), env={"PYTHONDONTWRITEBYTECODE": "1"})
                 canonical = self._json_last_text(checked.stdout)
                 if checked.returncode != 0 or canonical.get("trusted") is not True:
                     return GateResult("BLOCKED_EXTERNAL", checked.stderr.strip() or "canonical DeepSeek receipt validation failed", receipt)
                 if canonical.get("result") != evidence.get("review_result"):
                     return GateResult("BLOCKED_EXTERNAL", "canonical DeepSeek verdict mismatch", receipt)
-            blocking = any(isinstance(finding, dict) and finding.get("severity") in {"P0", "P1", "P2"}
-                           for finding in evidence.get("findings", []))
+            findings = evidence.get("findings")
+            if not isinstance(findings, list) or not all(isinstance(finding, dict) for finding in findings):
+                return GateResult("BLOCKED_EXTERNAL", "DeepSeek receipt findings are malformed", receipt)
+            blocking = any(finding.get("severity") in {"P0", "P1", "P2"} for finding in findings)
             if evidence.get("review_result") != "PASS" or blocking:
                 return GateResult("FAIL", "canonical DeepSeek receipt reports findings", receipt, evidence)
             return GateResult("PASS", "canonical DeepSeek aggregate receipt validated", receipt, evidence)
         else: return GateResult("BLOCKED_EXTERNAL", f"unknown reviewer {reviewer}")
         # The classifier is policy code from the trusted base checkout.  Its
         # imports must resolve there, never from the candidate HEAD worktree.
-        result = self._call(argv, cwd=str(trusted))
+        result = self._call(argv, cwd=str(trusted), env={"PYTHONDONTWRITEBYTECODE": "1"})
         if result.returncode != 0:
             return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or result.stdout.strip(), receipt)
         classification = self._json_last_text(result.stdout)
-        if classification.get("classification", {}).get("classification") != "VALID_CURRENT":
+        if (not isinstance(classification, dict)
+                or not isinstance(classification.get("classification"), dict)
+                or classification["classification"].get("classification") != "VALID_CURRENT"):
             return GateResult("BLOCKED_EXTERNAL", "canonical Codex receipt is not VALID_CURRENT", receipt, classification)
         validated = classification.get("receipt")
         verdict = validated.get("review_result") if isinstance(validated, dict) else None
@@ -316,14 +514,13 @@ class FootballPredictionAdapter:
         try:
             trusted = self._trusted_base_checkout(
                 worktree, base_sha,
-                str(Path(worktree).parent / ".cmh-review-evidence" / "pr-ready" / head),
             )
             code = ("import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
                     "from scripts.devops import pr_ready_check as m; m.ROOT=Path(sys.argv[2]); "
                     "sys.argv=['pr-ready-check','--pr',sys.argv[3],'--json']; raise SystemExit(m.main())")
             result = self._call(
-                ["python3", "-c", code, str(trusted), worktree, str(pr_number)],
-                cwd=str(trusted), env={"GH_REPO": pr_repo, "GH_HOST": "github.com"},
+                ["python3", "-I", "-B", "-c", code, str(trusted), worktree, str(pr_number)],
+                cwd=str(trusted), env={"GH_REPO": pr_repo, "GH_HOST": "github.com", "PYTHONDONTWRITEBYTECODE": "1"},
             )
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
             return GateResult("BLOCKED_EXTERNAL", f"trusted PR readiness unavailable: {exc}")
@@ -377,12 +574,18 @@ class FootballPredictionAdapter:
         body = (pr_state.data or {}).get("body") if isinstance(pr_state.data, dict) else None
         if not isinstance(body, str):
             return GateResult("BLOCKED_EXTERNAL", "canonical merge-readiness requires the PR body")
-        evidence = self._private_dir(Path(worktree).parent / ".cmh-merge-evidence" / mission_id / head)
+        try:
+            mission_id = self._safe_mission_id(mission_id)
+        except ValueError as exc:
+            return GateResult("BLOCKED_EXTERNAL", str(exc))
+        if not isinstance(head, str) or re.fullmatch(r"[0-9a-fA-F]{40}", head) is None:
+            return GateResult("BLOCKED_EXTERNAL", "merge HEAD is not a full commit SHA")
+        evidence = self._private_dir(Path(worktree).parent / ".cmh-merge-evidence" / mission_id / head.lower())
         body_path = evidence / "pr-body.md"
         body_path.write_text(body, encoding="utf-8")
         body_path.chmod(0o600)
         scope = Path(scope_file).resolve()
-        trusted = self._trusted_base_checkout(worktree, base, str(evidence))
+        trusted = self._trusted_base_checkout(worktree, base)
         # Execute the canonical implementation from the trusted base; the
         # candidate worktree is data, never executable authority here.
         preflight_code = (
@@ -396,9 +599,9 @@ class FootballPredictionAdapter:
             "raise SystemExit(p.main())"
         )
         local = self._call(
-            [sys.executable, "-c", preflight_code, str(trusted), worktree,
+            [sys.executable, "-I", "-B", "-c", preflight_code, str(trusted), worktree,
              str(body_path), str(scope), base, head], cwd=str(trusted),
-            env={"GH_HOST": "github.com",
+            env={"GH_HOST": "github.com", "PYTHONDONTWRITEBYTECODE": "1",
                  "HOME": "/nonexistent", "PATH": os.defpath, "LANG": "C.UTF-8"},
             inherit_environment=False,
         )
@@ -416,7 +619,7 @@ class FootballPredictionAdapter:
                 "from scripts.ops import ai_workflow_gate as g; from scripts.ops.helpers import git_change_helpers as h; "
                 "p.ROOT=r.ROOT=g.ROOT=Path(sys.argv[2]); h.ROOT_HELPER=Path(sys.argv[2]); "
                 "sys.argv=['agent-workflow']+sys.argv[3:]; raise SystemExit(m.main())")
-        argv = ["python3", "-c", code, str(trusted), worktree, "merge-ready",
+        argv = ["python3", "-I", "-B", "-c", code, str(trusted), worktree, "merge-ready",
                 "--repo-root", worktree, "--base-sha", base, "--head-sha", head,
                 "--mission-id", mission_id, "--mission-scope-file", str(scope),
                 "--local-preflight-json", str(local_path)]
@@ -437,7 +640,8 @@ class FootballPredictionAdapter:
                 "--protected-invariants", protected_invariants,
                 "--forbidden-side-effects", forbidden_side_effects,
                 "--required-pr-governance", required_pr_governance, "--json"]
-        result = self._call(argv, cwd=str(trusted), env={"GH_HOST": "github.com", "GH_REPO": pr_repo})
+        result = self._call(argv, cwd=str(trusted), env={"GH_HOST": "github.com", "GH_REPO": pr_repo,
+                                                        "PYTHONDONTWRITEBYTECODE": "1"})
         try:
             data = self._json_document_prefix(result.stdout)
         except json.JSONDecodeError:
@@ -566,10 +770,10 @@ class FootballPredictionAdapter:
 
     def post_merge(self, worktree: str, merge_sha: str, pr_number: int, pr_repo: str,
                    branch: str, base: str) -> GateResult:
-        trusted = self._trusted_base_checkout(worktree, base, str(Path(worktree).parent / ".cmh-review-evidence" / "post-merge" / merge_sha))
-        result = self._call(["python3", str(trusted / "scripts/devops/pr_post_merge_check.py"), "--pr", str(pr_number),
+        trusted = self._trusted_base_checkout(worktree, base)
+        result = self._call(["python3", "-I", "-B", str(trusted / "scripts/devops/pr_post_merge_check.py"), "--pr", str(pr_number),
                              "--merge-commit", merge_sha, "--branch", branch, "--json"], cwd=worktree,
-                            env={"GH_REPO": pr_repo, "GH_HOST": "github.com"})
+                            env={"GH_REPO": pr_repo, "GH_HOST": "github.com", "PYTHONDONTWRITEBYTECODE": "1"})
         try: data = self._json_document_prefix(result.stdout)
         except json.JSONDecodeError: return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "Production Gate check returned no JSON")
         if not isinstance(data, dict):

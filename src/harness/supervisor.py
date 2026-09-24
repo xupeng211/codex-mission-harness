@@ -165,10 +165,13 @@ class Supervisor:
                         )
                         if not scope_path.is_file() or tracked.returncode != 0:
                             raise ValueError("mission scope contract is not a tracked file")
+                        evidence_dir = self.adapter.review_evidence_dir(
+                            snapshot["worktree"], mission_id, reviewer, current,
+                        )
                         reviewed = self.adapter.review_result(
                             reviewer, worktree=snapshot["worktree"], base=snapshot["base_sha"], head=current,
                             mission_id=mission_id, scope_file=str(scope_path),
-                            stdout_path=job["stdout_path"],
+                            stdout_path=job["stdout_path"], evidence_dir=str(evidence_dir),
                         )
                     except Exception as exc:
                         reviewed = GateResult(
@@ -406,6 +409,15 @@ class Supervisor:
                 claimed_pr = identity["merge_claim_pr_number"]
                 claimed_repo = identity["merge_claim_pr_repo"]
                 owner_pid, owner_ticks = self._merge_owner()
+                # Re-check the exact live recovery lease immediately before
+                # the irreversible adapter call. mark_merge_invocation_started
+                # repeats the owner/HEAD check while atomically arming the
+                # one-shot invocation, closing any race after this assertion.
+                retry_safety = self.journal.confirm_merge_retry_safe(
+                    mission_id, head, owner_pid, owner_ticks,
+                )
+                if retry_safety != "RETRY_SAFE":
+                    return State(self.journal.mission(mission_id)["current_state"])
                 if not self.journal.mark_merge_invocation_started(
                         mission_id, head, owner_pid, owner_ticks):
                     return State(self.journal.mission(mission_id)["current_state"])
@@ -527,20 +539,33 @@ class Supervisor:
                         if preflight.status != "PASS":
                             advance(State.BLOCKED_EXTERNAL, preflight.evidence)
                             return State.BLOCKED_EXTERNAL
-                        evidence = Path(row["worktree"]).parent / ".cmh-review-evidence" / mission_id / reviewer / head
-                        evidence.mkdir(mode=0o700, parents=True, exist_ok=True)
-                        for private_dir in (evidence.parent.parent, evidence.parent, evidence):
-                            private_dir.chmod(0o700)
-                            info = private_dir.stat()
-                            if (hasattr(os, "getuid") and info.st_uid != os.getuid()) or stat.S_IMODE(info.st_mode) & 0o077:
-                                raise RuntimeError(f"review evidence directory is not private: {private_dir}")
-                        self.journal.update(mission_id, pending_gate=f"review:{reviewer}")
-                        self.process.start(
-                            mission_id, f"review:{reviewer}",
-                            self.adapter.review_argv(reviewer, worktree=row["worktree"], base=row["base_sha"], head=head,
-                                                     mission_id=mission_id, scope_file=str(scope), evidence_dir=str(evidence)),
-                            row["worktree"], docker_env(mission_id), head,
-                        )
+                        try:
+                            evidence = self.adapter.review_evidence_dir(
+                                row["worktree"], mission_id, reviewer, head,
+                            )
+                            evidence.mkdir(mode=0o700, parents=True, exist_ok=True)
+                            for private_dir in (evidence.parents[2], evidence.parents[1],
+                                                evidence.parents[0], evidence):
+                                if private_dir.is_symlink():
+                                    raise RuntimeError(f"review evidence directory is a symlink: {private_dir}")
+                                private_dir.chmod(0o700)
+                                info = private_dir.lstat()
+                                if ((hasattr(os, "getuid") and info.st_uid != os.getuid())
+                                        or stat.S_IMODE(info.st_mode) & 0o077):
+                                    raise RuntimeError(f"review evidence directory is not private: {private_dir}")
+                            argv = self.adapter.review_argv(
+                                reviewer, worktree=row["worktree"], base=row["base_sha"], head=head,
+                                mission_id=mission_id, scope_file=str(scope), evidence_dir=str(evidence),
+                            )
+                            self.journal.update(mission_id, pending_gate=f"review:{reviewer}")
+                            self.process.start(
+                                mission_id, f"review:{reviewer}", argv,
+                                row["worktree"], docker_env(mission_id), head,
+                            )
+                        except Exception as exc:
+                            advance(State.BLOCKED_EXTERNAL,
+                                    f"canonical reviewer could not start safely: {exc}")
+                            return State.BLOCKED_EXTERNAL
                         return state
                     result: GateResult = self.adapter.review(reviewer, head)
                     self.journal.record_receipt(mission_id, reviewer, head, result.status)

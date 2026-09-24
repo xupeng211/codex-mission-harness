@@ -72,6 +72,38 @@ class HarnessTest(unittest.TestCase):
             self.supervisor.collect_jobs(self.spec.mission_id)
         self.fail("did not finish")
 
+    def _review_fixture(self, reviewer="codex", head="b" * 40):
+        adapter = FootballPredictionAdapter()
+        worktree = Path(self.tmp.name) / "review-target"
+        worktree.mkdir(exist_ok=True)
+        evidence = adapter.review_evidence_dir(worktree, "mission", reviewer, head)
+        for directory in reversed((evidence.parents[2], evidence.parents[1],
+                                   evidence.parents[0], evidence)):
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            directory.chmod(0o700)
+        receipt = evidence / "receipt.json"
+        receipt.write_text("{}")
+        stdout = Path(self.tmp.name) / "review.stdout"
+        stdout.write_text(json.dumps({"review_receipt": str(receipt), "status": "PASS"}))
+        return adapter, worktree, evidence, receipt, stdout
+
+    def _target_git_repo(self):
+        adapter = FootballPredictionAdapter()
+        repo = Path(self.tmp.name) / "target-policy-repo"
+        repo.mkdir(exist_ok=True)
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Harness Test"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "harness-test@example.invalid"], cwd=repo, check=True)
+        for relative in adapter.REVIEW_CONTRACT_PATHS:
+            path = repo / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            content = "all:\n\t@true\n" if relative == "Makefile" else "# fixture\n"
+            path.write_text(content)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "base policy"], cwd=repo, check=True)
+        base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+        return repo, base
+
     def test_background_verify_continues_same_mission_without_duplicate(self):
         self.advance_to_test()
         self.supervisor.run_until_wait(self.spec.mission_id, self.spec)
@@ -2086,6 +2118,24 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_claim_head"], "a" * 40)
         self.assertEqual(self.adapter.merged_heads, set())
 
+    def test_merge_invocation_rechecks_claim_lease_before_adapter_call(self):
+        head = "a" * 40
+        self.adapter.heads = [head]
+        self.journal.update(
+            self.spec.mission_id, current_head=head, current_state=State.MERGE,
+            pr_number=7, pr_repo="fixture/repo", pr_base_sha="b" * 40,
+            merge_claim_head=None, merge_claim_pid=None, merge_claim_start_ticks=None,
+        )
+        with patch.object(self.journal, "confirm_merge_retry_safe", return_value="NO_CLAIM") as confirm, \
+                patch.object(self.adapter, "merge", wraps=self.adapter.merge) as merge:
+            state = self.supervisor.step(self.spec.mission_id, self.spec)
+        self.assertEqual(state, State.MERGE)
+        confirm.assert_called_once_with(
+            self.spec.mission_id, head, self.supervisor.process.launcher_pid,
+            self.supervisor.process.launcher_start_ticks,
+        )
+        merge.assert_not_called()
+
     def test_invoked_merge_status_is_queried_after_dead_owner_and_not_started_blocks(self):
         """An invoked merge with NOT_STARTED remains ambiguous and is never repeated."""
         head = "a" * 40
@@ -2390,26 +2440,24 @@ class HarnessTest(unittest.TestCase):
         self.assertIn("trusted base", result.evidence)
 
     def test_football_review_executes_policy_from_trusted_base_checkout(self):
-        adapter = FootballPredictionAdapter()
+        adapter, worktree, evidence, _, _ = self._review_fixture()
         trusted = Path(self.tmp.name) / "trusted-base"
         with patch.object(adapter, "_trusted_base_checkout", return_value=trusted):
             argv = adapter.review_argv(
-                "codex", worktree="/candidate", base="a" * 40, head="b" * 40,
-                mission_id="mission", scope_file="/candidate/scope.json",
-                evidence_dir="/evidence/mission/codex/head",
+                "codex", worktree=str(worktree), base="a" * 40, head="b" * 40,
+                mission_id="mission", scope_file=str(worktree / "scope.json"),
+                evidence_dir=str(evidence),
             )
-        self.assertEqual(argv[:3], [
-            "python3", str(trusted / "scripts/devops/codex_independent_review.py"), "run",
+        self.assertEqual(argv[:6], [
+            "/usr/bin/env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-I", "-B",
+            str(trusted / "scripts/devops/codex_independent_review.py"),
         ])
-        self.assertEqual(argv[argv.index("--repo-root") + 1], "/candidate")
+        self.assertEqual(argv[argv.index("--repo-root") + 1], str(worktree))
+        self.assertIn("run", argv)
 
     def test_codex_receipt_classifier_imports_policy_from_trusted_base(self):
-        adapter = FootballPredictionAdapter()
+        adapter, worktree, evidence_dir, receipt, stdout = self._review_fixture()
         trusted = Path(self.tmp.name) / "trusted-base"
-        receipt = Path(self.tmp.name) / "receipt.json"
-        receipt.write_text("{}")
-        stdout = Path(self.tmp.name) / "review.stdout"
-        stdout.write_text(json.dumps({"review_receipt": str(receipt), "status": "PASS"}))
         classified = subprocess.CompletedProcess(
             [], 0, json.dumps({"classification": {"classification": "VALID_CURRENT"},
                                "receipt": {"review_result": "PASS", "findings": []}}), "",
@@ -2418,19 +2466,16 @@ class HarnessTest(unittest.TestCase):
                 patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
                 patch.object(adapter, "_call", return_value=classified) as call:
             result = adapter.review_result(
-                "codex", worktree="/candidate", base="a" * 40, head="b" * 40,
-                mission_id="mission", scope_file="/candidate/scope.json",
-                stdout_path=str(stdout),
+                "codex", worktree=str(worktree), base="a" * 40, head="b" * 40,
+                mission_id="mission", scope_file=str(worktree / "scope.json"),
+                stdout_path=str(stdout), evidence_dir=str(evidence_dir),
             )
         self.assertEqual(result.status, "PASS")
         self.assertEqual(call.call_args.kwargs["cwd"], str(trusted))
 
     def test_codex_review_verdict_comes_from_validated_receipt_not_stdout(self):
-        adapter = FootballPredictionAdapter()
+        adapter, worktree, evidence_dir, receipt, stdout = self._review_fixture()
         trusted = Path(self.tmp.name) / "trusted-base"
-        receipt = Path(self.tmp.name) / "receipt.json"
-        receipt.write_text("{}")
-        stdout = Path(self.tmp.name) / "review.stdout"
         cases = (
             ("PASS", "FAIL", "FAIL"),
             ("FAIL", "PASS", "PASS"),
@@ -2448,19 +2493,15 @@ class HarnessTest(unittest.TestCase):
                         patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
                         patch.object(adapter, "_call", return_value=classified):
                     result = adapter.review_result(
-                        "codex", worktree="/candidate", base="a" * 40, head="b" * 40,
-                        mission_id="mission", scope_file="/candidate/scope.json",
-                        stdout_path=str(stdout),
+                        "codex", worktree=str(worktree), base="a" * 40, head="b" * 40,
+                        mission_id="mission", scope_file=str(worktree / "scope.json"),
+                        stdout_path=str(stdout), evidence_dir=str(evidence_dir),
                     )
                 self.assertEqual(result.status, expected)
 
     def test_codex_classifier_without_receipt_verdict_fails_closed(self):
-        adapter = FootballPredictionAdapter()
+        adapter, worktree, evidence_dir, receipt, stdout = self._review_fixture()
         trusted = Path(self.tmp.name) / "trusted-base"
-        receipt = Path(self.tmp.name) / "receipt.json"
-        receipt.write_text("{}")
-        stdout = Path(self.tmp.name) / "review.stdout"
-        stdout.write_text(json.dumps({"review_receipt": str(receipt), "status": "PASS"}))
         classified = subprocess.CompletedProcess(
             [], 0, json.dumps({"classification": {"classification": "VALID_CURRENT"}}), "",
         )
@@ -2468,23 +2509,69 @@ class HarnessTest(unittest.TestCase):
                 patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
                 patch.object(adapter, "_call", return_value=classified):
             result = adapter.review_result(
-                "codex", worktree="/candidate", base="a" * 40, head="b" * 40,
-                mission_id="mission", scope_file="/candidate/scope.json",
-                stdout_path=str(stdout),
+                "codex", worktree=str(worktree), base="a" * 40, head="b" * 40,
+                mission_id="mission", scope_file=str(worktree / "scope.json"),
+                stdout_path=str(stdout), evidence_dir=str(evidence_dir),
             )
         self.assertEqual(result.status, "BLOCKED_EXTERNAL")
 
-    def test_trusted_base_checkout_rejects_wrong_or_dirty_checkout(self):
+    def test_trusted_base_checkout_rejects_preexisting_unregistered_clone(self):
         adapter = FootballPredictionAdapter()
-        evidence = Path(self.tmp.name) / "evidence" / "mission" / "codex" / ("b" * 40)
-        trusted = evidence.resolve().parents[2] / "trusted-base" / ("a" * 40)
-        trusted.mkdir(parents=True)
-        with patch.object(adapter, "_run", side_effect=["c" * 40, ""]):
-            with self.assertRaisesRegex(RuntimeError, "identity is invalid"):
-                adapter._trusted_base_checkout("/candidate", "a" * 40, str(evidence))
-        with patch.object(adapter, "_run", side_effect=["a" * 40, "dirty\n"]):
-            with self.assertRaisesRegex(RuntimeError, "identity is invalid"):
-                adapter._trusted_base_checkout("/candidate", "a" * 40, str(evidence))
+        repo, base = self._target_git_repo()
+        preexisting = repo.parent / ".cmh-trusted-base" / base
+        preexisting.parent.mkdir(mode=0o700, parents=True)
+        subprocess.run(["git", "clone", "-q", str(repo), str(preexisting)], check=True)
+        with self.assertRaisesRegex(RuntimeError, "registered detached worktree"):
+            adapter._trusted_base_checkout(str(repo), base)
+
+    def test_trusted_base_checkout_detects_hidden_policy_file_edit(self):
+        adapter = FootballPredictionAdapter()
+        repo, base = self._target_git_repo()
+        trusted = adapter._trusted_base_checkout(str(repo), base)
+        makefile = trusted / "Makefile"
+        makefile.write_text("all:\n\t@echo untrusted\n")
+        subprocess.run(["git", "update-index", "--assume-unchanged", "Makefile"], cwd=trusted, check=True)
+        self.assertEqual(subprocess.check_output(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=trusted, text=True,
+        ), "")
+        with self.assertRaisesRegex(RuntimeError, "content differs from the commit"):
+            adapter._trusted_base_checkout(str(repo), base)
+
+    def test_untrusted_stdout_cannot_redirect_receipt_validation_code(self):
+        adapter, worktree, evidence_dir, _, stdout = self._review_fixture()
+        external_receipt = Path(self.tmp.name) / "outside-receipt.json"
+        external_receipt.write_text("{}")
+        stdout.write_text(json.dumps({"review_receipt": str(external_receipt), "status": "PASS"}))
+        with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
+                patch.object(adapter, "_trusted_base_checkout") as trusted:
+            result = adapter.review_result(
+                "codex", worktree=str(worktree), base="a" * 40, head="b" * 40,
+                mission_id="mission", scope_file=str(worktree / "scope.json"),
+                stdout_path=str(stdout), evidence_dir=str(evidence_dir),
+            )
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+        trusted.assert_not_called()
+
+    def test_review_evidence_symlink_is_rejected_before_receipt_use(self):
+        adapter, worktree, evidence_dir, _, stdout = self._review_fixture()
+        evidence_root = evidence_dir.parents[2]
+        moved_root = evidence_root.with_name(".cmh-review-evidence-real")
+        evidence_root.rename(moved_root)
+        evidence_root.symlink_to(moved_root, target_is_directory=True)
+        with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
+                patch.object(adapter, "_trusted_base_checkout") as trusted:
+            result = adapter.review_result(
+                "codex", worktree=str(worktree), base="a" * 40, head="b" * 40,
+                mission_id="mission", scope_file=str(worktree / "scope.json"),
+                stdout_path=str(stdout), evidence_dir=str(evidence_dir),
+            )
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+        trusted.assert_not_called()
+
+    def test_evidence_paths_reject_traversing_mission_ids(self):
+        adapter = FootballPredictionAdapter()
+        with self.assertRaisesRegex(ValueError, "safe evidence path"):
+            adapter.review_evidence_dir("/tmp/worktree", "../escape", "codex", "a" * 40)
 
     def test_pr_discovery_uses_worktree_origin_not_ambient_gh_repo(self):
         adapter = FootballPredictionAdapter()
