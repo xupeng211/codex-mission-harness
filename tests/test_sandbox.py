@@ -64,6 +64,12 @@ class ProjectGateSandboxTest(unittest.TestCase):
             text=True,
         ).strip()
         self.assertIn(("--ro-bind", common), tuple(zip(argv, argv[1:])))
+        ro_bind_pairs = [
+            (argv[index + 1], argv[index + 2])
+            for index, item in enumerate(argv[:-2])
+            if item == "--ro-bind"
+        ]
+        self.assertIn((str(self.worktree / ".git"), "/mnt/.git"), ro_bind_pairs)
         self.assertIn("--bind", argv)
         self.assertEqual(invocation.env["COMPOSE_PROJECT_NAME"], "cmh-test")
 
@@ -112,6 +118,8 @@ class ProjectGateSandboxTest(unittest.TestCase):
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is not installed")
     def test_candidate_makefile_cannot_read_host_credentials_or_git_auth_config(self):
         host_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        gitfile = self.worktree / ".git"
+        gitfile_before = gitfile.read_bytes()
         makefile = self.worktree / "Makefile"
         makefile.write_text(
             "gate-check:\n"
@@ -119,6 +127,7 @@ class ProjectGateSandboxTest(unittest.TestCase):
             "\t@test ! -e /run/docker.sock\n"
             "\t@test -z \"$${GH_TOKEN:-}\"\n"
             "\t@! git config --local --get http.extraheader >/dev/null 2>&1\n"
+            "\t@! printf 'gitdir: /tmp/cmh-fake-gitdir\\n' > .git 2>/dev/null\n"
             "\t@touch sandbox-output.txt\n",
             encoding="utf-8",
         )
@@ -132,6 +141,7 @@ class ProjectGateSandboxTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         self.assertTrue((self.worktree / "sandbox-output.txt").is_file())
+        self.assertEqual(gitfile.read_bytes(), gitfile_before)
 
 
 if __name__ == "__main__":

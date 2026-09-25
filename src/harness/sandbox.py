@@ -239,6 +239,10 @@ def project_gate_invocation(
     if linked_worktree:
         command.extend(_ensure_masked_path_args(common, masked_roots))
         command.extend(("--ro-bind", str(common), str(common_target)))
+        # The worktree's .git file is inside the writable /mnt bind. Overlay
+        # the original pointer read-only so candidate gate code cannot persist
+        # a redirected Git directory onto the host worktree.
+        command.extend(("--ro-bind", str(gitfile), "/mnt/.git"))
     else:
         command.extend(("--ro-bind", str(common), str(common_target)))
     # Local Git config can contain HTTP authorization headers or credential
