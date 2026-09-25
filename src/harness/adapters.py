@@ -630,13 +630,13 @@ class FootballPredictionAdapter:
         if deepseek_receipt:
             argv += ["--deepseek-receipt", deepseek_receipt]
         local_verdict = str(local_json.get("verdict", "")).strip().upper()
-        # These are declarations required by FootballPrediction's canonical
-        # CLI.  Derive them from already observed, exact-head evidence rather
-        # than asserting PASS/NO unconditionally; the trusted target command
-        # still recomputes the machine checks and rejects contradictory input.
+        # The trusted target command rechecks local safety and remote PR
+        # governance itself.  Bind the local declarations to the exact-head
+        # preflight result, and leave governance UNKNOWN here: this adapter's
+        # PR identity lookup does not establish the target's governance rules.
         protected_invariants = "PASS" if local_verdict == "PASS" else "UNKNOWN"
         forbidden_side_effects = "NO" if local_verdict == "PASS" else "UNKNOWN"
-        required_pr_governance = "PASS" if ci_status == "PASS" and pr_state.status == "PASS" else "UNKNOWN"
+        required_pr_governance = "UNKNOWN"
         argv += ["--selected-backend", "codex" if codex_receipt else "deepseek",
                 "--pr", str(pr_number), "--remote-ci-status", ci_status,
                 "--protected-invariants", protected_invariants,

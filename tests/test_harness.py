@@ -2878,7 +2878,9 @@ class HarnessTest(unittest.TestCase):
         self.assertIn("--protected-invariants", command)
         self.assertEqual(command[command.index("--protected-invariants") + 1], "PASS")
         self.assertEqual(command[command.index("--forbidden-side-effects") + 1], "NO")
-        self.assertEqual(command[command.index("--required-pr-governance") + 1], "PASS")
+        self.assertEqual(command[command.index("--required-pr-governance") + 1], "UNKNOWN")
+        self.assertEqual(command[command.index("--pr") + 1], "7")
+        self.assertEqual(command[command.index("--remote-ci-status") + 1], "PASS")
 
     def test_merge_ready_rejects_base_sha_change_before_target_commands(self):
         adapter = FootballPredictionAdapter()
