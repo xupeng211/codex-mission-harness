@@ -52,6 +52,11 @@ def disposition_for(item, *, decision="DISPUTED", chunk_index=0, finding_index=0
     }
 
 class DeepSeekReceiptTest(unittest.TestCase):
+    def test_chunk_and_aggregate_schemas_have_separate_disposition_contracts(self):
+        self.assertNotIn("dispositions", review.CHUNK_SCHEMA["properties"])
+        self.assertIn("dispositions", review.AGGREGATE_SCHEMA["properties"])
+        self.assertIn("dispositions", review.AGGREGATE_SCHEMA["required"])
+
     def test_claude_launcher_resolution_excludes_relative_and_reviewed_tree_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "repo"
@@ -344,6 +349,13 @@ class DeepSeekReceiptTest(unittest.TestCase):
             self.assertTrue(first_receipt.is_file())
             self.assertTrue(second_receipt.is_file())
             self.assertIn(head[:12], first_receipt.name)
+            expected_command_hash = review.digest(review.canon({
+                "chunk": invocations[0][0], "aggregate": invocations[1][0],
+            }))
+            self.assertEqual(
+                json.loads(first_receipt.read_text())["command_sha256"],
+                expected_command_hash,
+            )
             second_chunk = second_receipt.parent / "chunk-000.json"
             self.assertNotEqual(first_chunk, second_chunk)
             self.assertEqual(first_receipt.read_bytes(), first_receipt_before)

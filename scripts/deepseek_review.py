@@ -15,37 +15,44 @@ MODEL = "deepseek-flash"
 ENDPOINT = "https://api.deepseek.com/anthropic"
 CHUNK_BYTES = 32000
 
-SCHEMA = {
+_REVIEW_PROPERTIES = {
+    "review_result": {"enum": ["PASS", "FAIL"]},
+    "findings": {"type": "array", "items": {
+        "type": "object", "additionalProperties": False,
+        "required": ["severity", "title", "evidence"],
+        "properties": {
+            "severity": {"enum": ["P0", "P1", "P2", "P3"]},
+            "title": {"type": "string"},
+            "evidence": {"type": "string"},
+        },
+    }},
+}
+_DISPOSITION_SCHEMA = {
+    "type": "array", "items": {
+        "type": "object", "additionalProperties": False,
+        "required": ["chunk_index", "finding_index", "source_severity",
+                     "finding_sha256", "decision", "rationale"],
+        "properties": {
+            "chunk_index": {"type": "integer", "minimum": 0},
+            "finding_index": {"type": "integer", "minimum": 0},
+            "source_severity": {"enum": ["P0", "P1", "P2"]},
+            "finding_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "decision": {"enum": ["UPHELD", "DISPUTED"]},
+            "rationale": {"type": "string", "minLength": 24},
+        },
+    },
+}
+CHUNK_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "required": ["review_result", "findings"],
-    "properties": {
-        "review_result": {"enum": ["PASS", "FAIL"]},
-        "findings": {"type": "array", "items": {
-            "type": "object", "additionalProperties": False,
-            "required": ["severity", "title", "evidence"],
-            "properties": {
-                "severity": {"enum": ["P0", "P1", "P2", "P3"]},
-                "title": {"type": "string"},
-                "evidence": {"type": "string"},
-            },
-        }},
-        # Only the complete-diff aggregate may emit dispositions.  Each one
-        # explicitly accounts for a P0/P1/P2 finding from a durable chunk.
-        "dispositions": {"type": "array", "items": {
-            "type": "object", "additionalProperties": False,
-            "required": ["chunk_index", "finding_index", "source_severity",
-                         "finding_sha256", "decision", "rationale"],
-            "properties": {
-                "chunk_index": {"type": "integer", "minimum": 0},
-                "finding_index": {"type": "integer", "minimum": 0},
-                "source_severity": {"enum": ["P0", "P1", "P2"]},
-                "finding_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-                "decision": {"enum": ["UPHELD", "DISPUTED"]},
-                "rationale": {"type": "string", "minLength": 24},
-            },
-        }},
-    },
+    "properties": _REVIEW_PROPERTIES,
+}
+AGGREGATE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["review_result", "findings", "dispositions"],
+    "properties": {**_REVIEW_PROPERTIES, "dispositions": _DISPOSITION_SCHEMA},
 }
 
 def canon(value): return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
@@ -279,18 +286,21 @@ def run(args):
     token=Path(args.token_file).read_text().strip()
     if not token: raise ValueError("empty DeepSeek token file")
     settings=tempfile.NamedTemporaryFile(mode="w",delete=False); settings.write('{"permissions":{"allow":[],"deny":["Bash","Edit","Write","Read","Glob","Grep","WebFetch","WebSearch"]}}'); settings.close()
-    results=[]; command=[claude_executable,"--bare","--restricted","--print","--model",MODEL,"--settings",settings.name,"--tools","","--disallowed-tools","Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch","--output-format","json","--json-schema",json.dumps(SCHEMA,separators=(",",":"))]
+    results=[]
+    common_command=[claude_executable,"--bare","--restricted","--print","--model",MODEL,"--settings",settings.name,"--tools","","--disallowed-tools","Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch","--output-format","json"]
+    chunk_command=common_command+["--json-schema",json.dumps(CHUNK_SCHEMA,separators=(",",":"))]
+    aggregate_command=common_command+["--json-schema",json.dumps(AGGREGATE_SCHEMA,separators=(",",":"))]
     try:
         env={"HOME":"/nonexistent","PATH":safe_path,"LANG":"C.UTF-8","ANTHROPIC_API_KEY":token,"ANTHROPIC_AUTH_TOKEN":token,"ANTHROPIC_BASE_URL":ENDPOINT,"CLAUDE_CODE_SIMPLE":"1"}
         for chunk in plan:
             source=diff[chunk["start"]:chunk["end"]]
-            completed=invoke_reviewer(command,prompt(base,head,diff_hash,manifest_hash,chunk,source),env,args.timeout)
+            completed=invoke_reviewer(chunk_command,prompt(base,head,diff_hash,manifest_hash,chunk,source),env,args.timeout)
             if completed.returncode: raise RuntimeError(f"DeepSeek reviewer infrastructure failure: exit={completed.returncode}")
             raw=completed.stdout.encode(); (evidence/f"chunk-{chunk['index']:03d}.json").write_bytes(raw)
             result=reviewer_result(completed.stdout, forbid_dispositions=True)
             chunk["result"]=result; chunk["output_sha256"]=digest(raw); results.extend(result.get("findings",[]))
         aggregate_call=invoke_reviewer(
-            command, aggregate_prompt(base, head, diff_hash, manifest_hash, plan, diff, results),
+            aggregate_command, aggregate_prompt(base, head, diff_hash, manifest_hash, plan, diff, results),
             env, args.timeout,
         )
         if aggregate_call.returncode:
@@ -303,7 +313,8 @@ def run(args):
         Path(settings.name).unlink(missing_ok=True)
     verdict=aggregate_result["review_result"]
     aggregate_findings=aggregate_result["findings"]
-    receipt={"version":VERSION,"repository":git(root,"config","--get","remote.origin.url").decode().strip(),"mission_id":args.mission_id,"base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"manifest_sha256":manifest_hash,"chunks":plan,"chunk_findings":results,"aggregate_result":aggregate_result,"aggregate_output_sha256":digest(aggregate_raw),"provider":"deepseek","model":MODEL,"command_sha256":digest(canon(command)),"started_at":int(time.time()),"completed_at":int(time.time()),"review_result":verdict,"findings":aggregate_findings}
+    command_identity={"chunk":chunk_command,"aggregate":aggregate_command}
+    receipt={"version":VERSION,"repository":git(root,"config","--get","remote.origin.url").decode().strip(),"mission_id":args.mission_id,"base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"manifest_sha256":manifest_hash,"chunks":plan,"chunk_findings":results,"aggregate_result":aggregate_result,"aggregate_output_sha256":digest(aggregate_raw),"provider":"deepseek","model":MODEL,"command_sha256":digest(canon(command_identity)),"started_at":int(time.time()),"completed_at":int(time.time()),"review_result":verdict,"findings":aggregate_findings}
     receipt["integrity_sha256"]=digest(canon(receipt)); receipt["auth_hmac_sha256"]=auth_digest(receipt, token)
     path=evidence/f"deepseek-receipt-{head[:12]}-{uuid.uuid4().hex}.json"; path.write_bytes(canon(receipt)); os.chmod(path,0o600)
     print(json.dumps({"status":verdict,"receipt":str(path),"review_receipt":str(path),"head_sha":head}))
