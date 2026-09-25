@@ -176,10 +176,10 @@ class Supervisor:
                             "BLOCKED_EXTERNAL", f"canonical review receipt validation failed: {exc}",
                         )
                     if reviewed.status == "BLOCKED_EXTERNAL":
-                        # The process is conclusively terminal, so an
+                        # The process is conclusively terminal, so one
                         # incomplete or rejected receipt can be retried safely.
-                        # A valid PASS/FAIL is consumed above; no second review
-                        # may replace that terminal finding after restart.
+                        # The journal bounds this per reviewer and exact HEAD;
+                        # repeated failure becomes terminal BLOCKED_EXTERNAL.
                         self.journal.complete_review_job(
                             mission_id, result.job_id, reviewer, current,
                             "RETRY", reviewed.artifact, reviewed.evidence or

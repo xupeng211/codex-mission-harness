@@ -12,6 +12,8 @@ from typing import Any
 from .domain import InvalidTransition, MissionSpec, Observation, State, TERMINAL, ALLOWED
 from .policy import Decision, SENSITIVE, decide
 
+MAX_REVIEW_RETRIES_PER_HEAD = 1
+
 
 def now() -> str:
     return datetime.now(UTC).isoformat()
@@ -392,26 +394,57 @@ class Journal:
                 self.db.commit()
                 return False
 
+            retry_exhausted = False
+            retries_used = 0
             if retry:
-                changed = self.db.execute(
-                    "UPDATE jobs SET state='CONSUMED',ended_at=COALESCE(ended_at,?) "
-                    "WHERE job_id=? AND mission_id=? AND state IN ('EXITED','LOST')",
-                    (now(), job_id, mission_id),
-                ).rowcount
-                if changed != 1:
+                retry_rows = self.db.execute(
+                    "SELECT payload_json FROM events WHERE mission_id=? AND kind='review_retry_required'",
+                    (mission_id,),
+                ).fetchall()
+                retries_used = 0
+                for retry_row in retry_rows:
+                    try:
+                        retry_payload = json.loads(retry_row["payload_json"])
+                    except (TypeError, json.JSONDecodeError):
+                        retries_used = MAX_REVIEW_RETRIES_PER_HEAD
+                        break
+                    if not isinstance(retry_payload, dict):
+                        retries_used = MAX_REVIEW_RETRIES_PER_HEAD
+                        break
+                    if (retry_payload.get("reviewer") == reviewer
+                            and retry_payload.get("head") == head):
+                        retries_used += 1
+                if retries_used >= MAX_REVIEW_RETRIES_PER_HEAD:
+                    retry = False
+                    retry_exhausted = True
+                    result = "BLOCKED_EXTERNAL"
+                    evidence = (
+                        f"{evidence}; automatic review retries exhausted "
+                        f"({MAX_REVIEW_RETRIES_PER_HEAD} retry per reviewer and exact HEAD)"
+                    )
+                else:
+                    retry_number = retries_used + 1
+                    changed = self.db.execute(
+                        "UPDATE jobs SET state='CONSUMED',ended_at=COALESCE(ended_at,?) "
+                        "WHERE job_id=? AND mission_id=? AND state IN ('EXITED','LOST')",
+                        (now(), job_id, mission_id),
+                    ).rowcount
+                    if changed != 1:
+                        self.db.commit()
+                        return False
+                    self.db.execute(
+                        "UPDATE missions SET pending_gate=NULL,updated_at=? WHERE mission_id=? "
+                        "AND current_state=? AND current_head=? AND pending_gate=?",
+                        (now(), mission_id, State.REVIEW, head, f"review:{reviewer}"),
+                    )
+                    self.event(mission_id, "review_retry_required", {
+                        "job_id": job_id, "reviewer": reviewer, "head": head,
+                        "artifact": artifact, "evidence": evidence,
+                        "retry_number": retry_number,
+                        "max_retries": MAX_REVIEW_RETRIES_PER_HEAD,
+                    })
                     self.db.commit()
-                    return False
-                self.db.execute(
-                    "UPDATE missions SET pending_gate=NULL,updated_at=? WHERE mission_id=? "
-                    "AND current_state=? AND current_head=? AND pending_gate=?",
-                    (now(), mission_id, State.REVIEW, head, f"review:{reviewer}"),
-                )
-                self.event(mission_id, "review_retry_required", {
-                    "job_id": job_id, "reviewer": reviewer, "head": head,
-                    "artifact": artifact, "evidence": evidence,
-                })
-                self.db.commit()
-                return True
+                    return True
 
             changed = self.db.execute(
                 "UPDATE jobs SET state='CONSUMED',ended_at=COALESCE(ended_at,?) "
@@ -421,6 +454,11 @@ class Journal:
             if changed != 1:
                 self.db.commit()
                 return False
+            if retry_exhausted:
+                self.event(mission_id, "review_retry_limit_exhausted", {
+                    "job_id": job_id, "reviewer": reviewer, "head": head,
+                    "retries_used": retries_used,
+                })
             self.db.execute(
                 "INSERT INTO receipts(mission_id,reviewer,head_sha,result,artifact_path,created_at) "
                 "VALUES(?,?,?,?,?,?)",

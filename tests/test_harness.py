@@ -275,7 +275,7 @@ class HarnessTest(unittest.TestCase):
         self.assertIn("exact source evidence", prompt)
         self.assertEqual(resumed._async_review_repair_context(self.spec.mission_id, "b" * 40), "")
 
-    def test_dead_review_with_invalid_receipt_is_marked_incomplete_then_retried(self):
+    def test_dead_review_with_invalid_receipt_retries_once_then_blocks(self):
         head = "a" * 40
         spec = replace(self.spec, adapter="footballprediction", mission_scope_file="scope.json")
         (self.worktree / "scope.json").write_text("{}")
@@ -324,7 +324,53 @@ class HarnessTest(unittest.TestCase):
         ).fetchone()
         retry_payload = json.loads(retry_event[0])
         self.assertIsNone(retry_payload["artifact"])
+        self.assertEqual(retry_payload["retry_number"], 1)
+        self.assertEqual(retry_payload["max_retries"], 1)
         self.assertNotIn(str(invalid_receipt), retry_event[0])
+
+        second_stdout = Path(self.tmp.name) / "second-incomplete-review.stdout"
+        second_stdout.write_text(json.dumps({"review_receipt": str(invalid_receipt)}))
+        self.journal.update(self.spec.mission_id, pending_gate="review:codex")
+        self.journal.db.execute(
+            "INSERT INTO jobs(job_id,mission_id,name,argv_json,launch_head,state,stdout_path,stderr_path,started_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            ("second-incomplete-review-job", self.spec.mission_id, "review:codex", "[]", head, "LOST",
+             str(second_stdout), "", "2026-01-01T00:00:02+00:00"),
+        )
+        self.journal.db.commit()
+        with patch.object(self.supervisor.process, "poll", return_value=[
+                JobResult("second-incomplete-review-job", "LOST", None, head),
+        ]), patch("harness.supervisor.subprocess.run",
+                  return_value=subprocess.CompletedProcess([], 0, "", "")), \
+                patch.object(self.supervisor.adapter, "review_result", return_value=GateResult(
+                    "BLOCKED_EXTERNAL", "receipt still did not validate",
+                )) as second_review_result:
+            self.supervisor.reconcile(self.spec.mission_id)
+
+        second_review_result.assert_called_once()
+        mission = self.journal.mission(self.spec.mission_id)
+        self.assertEqual(mission["current_state"], State.BLOCKED_EXTERNAL)
+        self.assertEqual(mission["terminal_state"], State.BLOCKED_EXTERNAL)
+        self.assertIsNone(mission["pending_gate"])
+        self.assertEqual(
+            self.journal.db.execute(
+                "SELECT count(*) FROM events WHERE mission_id=? AND kind='review_retry_required'",
+                (self.spec.mission_id,),
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.journal.db.execute(
+                "SELECT result FROM receipts WHERE mission_id=? AND reviewer='codex' AND head_sha=?",
+                (self.spec.mission_id, head),
+            ).fetchone()[0],
+            "BLOCKED_EXTERNAL",
+        )
+        with patch.object(self.adapter, "exact_head", return_value=head), \
+                patch.object(self.supervisor.process, "poll", return_value=[]), \
+                patch.object(self.supervisor.process, "start") as duplicate_start:
+            self.assertEqual(self.supervisor.step(self.spec.mission_id, spec), State.BLOCKED_EXTERNAL)
+        duplicate_start.assert_not_called()
 
     def test_stale_terminal_review_job_is_consumed_once_after_head_change(self):
         old_head, current_head = "a" * 40, "b" * 40
