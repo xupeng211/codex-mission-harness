@@ -213,7 +213,7 @@ class HarnessTest(unittest.TestCase):
         ]), patch("harness.supervisor.subprocess.run",
                   return_value=subprocess.CompletedProcess([], 0, "", "")), \
                 patch.object(self.supervisor.adapter, "review_result", return_value=GateResult(
-                    "BLOCKED_EXTERNAL", "receipt did not validate", str(invalid_receipt),
+                    "BLOCKED_EXTERNAL", "receipt did not validate",
                 )) as review_result:
             self.supervisor.reconcile(self.spec.mission_id)
         review_result.assert_called_once()
@@ -236,7 +236,9 @@ class HarnessTest(unittest.TestCase):
             "SELECT payload_json FROM events WHERE mission_id=? AND kind='review_retry_required'",
             (self.spec.mission_id,),
         ).fetchone()
-        self.assertEqual(json.loads(retry_event[0])["artifact"], str(invalid_receipt))
+        retry_payload = json.loads(retry_event[0])
+        self.assertIsNone(retry_payload["artifact"])
+        self.assertNotIn(str(invalid_receipt), retry_event[0])
 
     def test_pre_merge_ci_pending_is_waitable_and_does_not_merge(self):
         head = "a" * 40

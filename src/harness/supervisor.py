@@ -146,14 +146,6 @@ class Supervisor:
                 scope = spec.mission_scope_file
                 if result.state in {"EXITED", "LOST"}:
                     root = Path(snapshot["worktree"]).resolve()
-                    published_receipt = None
-                    try:
-                        payload = self.adapter._json_last_line(job["stdout_path"])
-                        candidate_receipt = payload.get("review_receipt") if isinstance(payload, dict) else None
-                        if isinstance(candidate_receipt, str) and Path(candidate_receipt).is_file():
-                            published_receipt = candidate_receipt
-                    except (AttributeError, OSError, TypeError):
-                        pass
                     try:
                         if not scope:
                             raise ValueError("FootballPrediction review requires mission_scope_file")
@@ -176,11 +168,6 @@ class Supervisor:
                     except Exception as exc:
                         reviewed = GateResult(
                             "BLOCKED_EXTERNAL", f"canonical review receipt validation failed: {exc}",
-                            published_receipt,
-                        )
-                    if reviewed.status == "BLOCKED_EXTERNAL" and not reviewed.artifact and published_receipt:
-                        reviewed = GateResult(
-                            reviewed.status, reviewed.evidence, published_receipt, reviewed.data,
                         )
                     if reviewed.status == "BLOCKED_EXTERNAL":
                         # The process is conclusively terminal, so an

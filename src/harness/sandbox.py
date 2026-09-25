@@ -244,7 +244,15 @@ def project_gate_invocation(
         # a redirected Git directory onto the host worktree.
         command.extend(("--ro-bind", str(gitfile), "/mnt/.git"))
     else:
+        command.extend(_ensure_masked_path_args(common, masked_roots))
         command.extend(("--ro-bind", str(common), str(common_target)))
+        # The root bind still exposes a regular checkout's original .git
+        # directory at its host path. Replace its config there too, unless
+        # that path is hidden by the /mnt worktree bind itself.
+        try:
+            common.relative_to(Path("/mnt"))
+        except ValueError:
+            command.extend(("--ro-bind", str(config_path), str(common / "config")))
     # Local Git config can contain HTTP authorization headers or credential
     # helpers. Replace it with a minimal format-only config before the command.
     command.extend(("--ro-bind", str(config_path), str(common_target / "config")))

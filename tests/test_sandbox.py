@@ -73,6 +73,26 @@ class ProjectGateSandboxTest(unittest.TestCase):
         self.assertIn("--bind", argv)
         self.assertEqual(invocation.env["COMPOSE_PROJECT_NAME"], "cmh-test")
 
+    def test_regular_checkout_sanitizes_original_and_sandbox_git_config_paths(self):
+        with patch("harness.sandbox.shutil.which", return_value="/usr/bin/bwrap"):
+            invocation = project_gate_invocation(
+                ["make", "verify-pr"], str(self.repo), {}, self.logs, "regular-checkout",
+            )
+        argv = invocation.argv
+        ro_bind_pairs = [
+            (argv[index + 1], argv[index + 2])
+            for index, item in enumerate(argv[:-2])
+            if item == "--ro-bind"
+        ]
+        common = self.repo / ".git"
+        self.assertIn((str(invocation.config_path), str(common / "config")), ro_bind_pairs)
+        self.assertIn((str(invocation.config_path), "/mnt/.git/config"), ro_bind_pairs)
+        # This fixture lives under /tmp, which the sandbox masks. The helper
+        # recreates only the target parents before mounting the sanitized file.
+        self.assertIn(str(common), argv)
+        self.assertIn("--dir", argv)
+        self.assertNotIn("controller-secret-marker", invocation.config_path.read_text())
+
     def test_scope_and_pr_body_are_mapped_to_only_the_approved_sandbox_mounts(self):
         scope = self.worktree / "tracked.txt"
         evidence = self.worktree.parent / ".cmh-gate-evidence" / "mission" / ("a" * 40)
