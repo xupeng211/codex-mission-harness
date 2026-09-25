@@ -98,6 +98,18 @@ class HarnessTest(unittest.TestCase):
         }))
         return adapter, worktree, evidence_dir, receipt, stdout
 
+    def _prepare_agent_preflight(self, adapter, worktree):
+        with patch.object(adapter, "discover_pr", return_value=GateResult(
+                "PASS", "fixture PR", data={"number": 2, "repo": "owner/repo"},
+        )), patch.object(adapter, "_pr_state", return_value=GateResult(
+                "PASS", "fixture PR body", data={"body": "review context\n"},
+        )):
+            return adapter.prepare_gate(
+                "agent-preflight", worktree=str(worktree), base="c" * 40,
+                head="a" * 40, mission_id="safe-demo",
+                scope_file=str(worktree / "scope.json"),
+            )
+
     def _target_git_repo(self):
         adapter = FootballPredictionAdapter()
         repo = Path(self.tmp.name) / "target-policy-repo"
@@ -2605,6 +2617,62 @@ class HarnessTest(unittest.TestCase):
         path.mkdir(mode=0o755)
         private = FootballPredictionAdapter._private_dir(path)
         self.assertEqual(private.stat().st_mode & 0o777, 0o700)
+
+    def test_preflight_private_evidence_is_owner_only(self):
+        result = self._prepare_agent_preflight(FootballPredictionAdapter(), self.worktree)
+        self.assertEqual(result.status, "PASS")
+        body_path = Path(result.data["env"]["PR_BODY"])
+        self.assertEqual(body_path.read_text(encoding="utf-8"), "review context\n")
+        self.assertEqual(body_path.stat().st_mode & 0o777, 0o600)
+        for directory in (body_path.parent, body_path.parent.parent, body_path.parent.parent.parent):
+            self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+
+    def test_preflight_rejects_symlinked_evidence_root_without_writing_through(self):
+        root = Path(self.tmp.name)
+        victim = root / "victim-evidence"
+        victim.mkdir(mode=0o700)
+        marker = victim / "marker.txt"
+        marker.write_text("untouched\n", encoding="utf-8")
+        evidence_root = self.worktree.parent / ".cmh-gate-evidence"
+        evidence_root.symlink_to(victim, target_is_directory=True)
+
+        result = self._prepare_agent_preflight(FootballPredictionAdapter(), self.worktree)
+
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+        self.assertEqual(marker.read_text(encoding="utf-8"), "untouched\n")
+        self.assertFalse((victim / "safe-demo").exists())
+
+    def test_preflight_rejects_symlinked_head_directory_without_writing_through(self):
+        root = Path(self.tmp.name)
+        evidence_root = self.worktree.parent / ".cmh-gate-evidence"
+        mission_dir = evidence_root / "safe-demo"
+        mission_dir.mkdir(parents=True, mode=0o700)
+        victim = root / "victim-head"
+        victim.mkdir(mode=0o700)
+        marker = victim / "marker.txt"
+        marker.write_text("untouched\n", encoding="utf-8")
+        (mission_dir / ("a" * 40)).symlink_to(victim, target_is_directory=True)
+
+        result = self._prepare_agent_preflight(FootballPredictionAdapter(), self.worktree)
+
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+        self.assertEqual(marker.read_text(encoding="utf-8"), "untouched\n")
+        self.assertFalse((victim / "pr-body.md").exists())
+
+    def test_preflight_rejects_symlinked_body_file_without_truncating_target(self):
+        root = Path(self.tmp.name)
+        body_directory = (
+            self.worktree.parent / ".cmh-gate-evidence" / "safe-demo" / ("a" * 40)
+        )
+        body_directory.mkdir(parents=True, mode=0o700)
+        victim = root / "victim-body.md"
+        victim.write_text("untouched review body\n", encoding="utf-8")
+        (body_directory / "pr-body.md").symlink_to(victim)
+
+        result = self._prepare_agent_preflight(FootballPredictionAdapter(), self.worktree)
+
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+        self.assertEqual(victim.read_text(encoding="utf-8"), "untouched review body\n")
 
     def test_pr_discovery_without_open_pr_is_retryable(self):
         adapter = FootballPredictionAdapter()

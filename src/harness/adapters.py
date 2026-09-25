@@ -185,16 +185,85 @@ class FootballPredictionAdapter:
         return ["gh", *args]
 
     @staticmethod
-    def _private_dir(path: Path) -> Path:
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        info = path.stat()
-        if hasattr(os, "getuid") and info.st_uid != os.getuid():
-            raise RuntimeError(f"evidence directory is not owned by the current user: {path}")
-        if stat.S_IMODE(info.st_mode) & 0o077:
-            path.chmod(0o700)
-            if stat.S_IMODE(path.stat().st_mode) & 0o077:
-                raise RuntimeError(f"evidence directory is not owner-only: {path}")
+    def _private_dir(path: Path, *, private_root: Path | None = None) -> Path:
+        path = Path(os.path.abspath(path))
+        private_root = Path(os.path.abspath(private_root or path))
+        try:
+            descendants = path.relative_to(private_root).parts
+        except ValueError as exc:
+            raise RuntimeError("evidence directory escapes its private root") from exc
+
+        # The parent of the private root must be a stable anchor. Check every
+        # existing ancestor without following symlinks and reject writable
+        # non-sticky ancestors that could replace path entries.
+        anchor = private_root.parent
+        ancestors = [*reversed(anchor.parents), anchor]
+        for directory in ancestors:
+            info = directory.lstat()
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise RuntimeError("evidence path has a non-directory or symbolic-link ancestor")
+            if ((stat.S_IMODE(info.st_mode) & 0o022)
+                    and not (stat.S_IMODE(info.st_mode) & stat.S_ISVTX)):
+                raise RuntimeError("evidence path has an untrusted writable ancestor")
+        anchor_info = anchor.lstat()
+        anchor_mode = stat.S_IMODE(anchor_info.st_mode)
+        sticky_shared_anchor = bool(
+            (anchor_mode & stat.S_ISVTX) and (anchor_mode & 0o022)
+        )
+        if (hasattr(os, "getuid") and anchor_info.st_uid != os.getuid()
+                and not sticky_shared_anchor):
+            raise RuntimeError("evidence parent is not owned by the current user")
+        if (anchor_mode & 0o022) and not (anchor_mode & stat.S_ISVTX):
+            raise RuntimeError("evidence parent is writable by another user")
+
+        directories = [private_root]
+        current = private_root
+        for part in descendants:
+            current = current / part
+            directories.append(current)
+        for directory in directories:
+            try:
+                directory.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            info = directory.lstat()
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise RuntimeError("evidence directory is not a real directory")
+            if hasattr(os, "getuid") and info.st_uid != os.getuid():
+                raise RuntimeError("evidence directory is not owned by the current user")
+            if stat.S_IMODE(info.st_mode) & 0o077:
+                directory.chmod(0o700)
+                info = directory.lstat()
+                if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                        or stat.S_IMODE(info.st_mode) & 0o077):
+                    raise RuntimeError("evidence directory is not owner-only")
         return path
+
+    @staticmethod
+    def _write_private_file(path: Path, content: str) -> None:
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            raise RuntimeError("safe no-follow evidence writes are unavailable")
+        fd: int | None = None
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | nofollow, 0o600)
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode)
+                    or (hasattr(os, "getuid") and info.st_uid != os.getuid())):
+                raise RuntimeError("evidence file is not a regular current-user-owned file")
+            os.fchmod(fd, 0o600)
+            os.ftruncate(fd, 0)
+            stream = os.fdopen(fd, "w", encoding="utf-8")
+            fd = None
+            with stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError as exc:
+            raise RuntimeError("private evidence file could not be safely written") from exc
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     def prepare_gate(self, gate: str, *, worktree: str, base: str, head: str,
                      mission_id: str, scope_file: str) -> GateResult:
@@ -215,10 +284,16 @@ class FootballPredictionAdapter:
             return GateResult("BLOCKED_EXTERNAL", str(exc))
         if not isinstance(head, str) or re.fullmatch(r"[0-9a-fA-F]{40}", head) is None:
             return GateResult("BLOCKED_EXTERNAL", "preflight HEAD is not a full commit SHA")
-        evidence = self._private_dir(Path(worktree).parent / ".cmh-gate-evidence" / mission_id / head.lower())
-        body_path = evidence / "pr-body.md"
-        body_path.write_text(body, encoding="utf-8")
-        body_path.chmod(0o600)
+        worktree_root = Path(worktree).resolve(strict=True)
+        evidence_root = worktree_root.parent / ".cmh-gate-evidence"
+        try:
+            evidence = self._private_dir(
+                evidence_root / mission_id / head.lower(), private_root=evidence_root,
+            )
+            body_path = evidence / "pr-body.md"
+            self._write_private_file(body_path, body)
+        except (OSError, RuntimeError) as exc:
+            return GateResult("BLOCKED_EXTERNAL", f"cannot prepare private preflight evidence: {exc}")
         return GateResult("PASS", "canonical preflight inputs prepared", data={"env": {
             "PR_BODY": str(body_path), "MISSION_SCOPE_FILE": scope_file,
             "BASE_REF": base, "HEAD_REF": head, "JSON": "1",
@@ -687,10 +762,16 @@ class FootballPredictionAdapter:
             return GateResult("BLOCKED_EXTERNAL", str(exc))
         if not isinstance(head, str) or re.fullmatch(r"[0-9a-fA-F]{40}", head) is None:
             return GateResult("BLOCKED_EXTERNAL", "merge HEAD is not a full commit SHA")
-        evidence = self._private_dir(Path(worktree).parent / ".cmh-merge-evidence" / mission_id / head.lower())
-        body_path = evidence / "pr-body.md"
-        body_path.write_text(body, encoding="utf-8")
-        body_path.chmod(0o600)
+        worktree_root = Path(worktree).resolve(strict=True)
+        evidence_root = worktree_root.parent / ".cmh-merge-evidence"
+        try:
+            evidence = self._private_dir(
+                evidence_root / mission_id / head.lower(), private_root=evidence_root,
+            )
+            body_path = evidence / "pr-body.md"
+            self._write_private_file(body_path, body)
+        except (OSError, RuntimeError) as exc:
+            return GateResult("BLOCKED_EXTERNAL", f"cannot prepare private merge evidence: {exc}")
         scope = Path(scope_file).resolve()
         trusted = self._trusted_base_checkout(worktree, base)
         # Execute the canonical implementation from the trusted base; the
