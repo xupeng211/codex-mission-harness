@@ -266,6 +266,34 @@ class HarnessTest(unittest.TestCase):
             (self.spec.mission_id,),
         ).fetchone()[0], 1)
 
+    def test_terminal_review_job_is_consumed_when_same_head_gate_is_no_longer_pending(self):
+        head = "a" * 40
+        self.journal.update(
+            self.spec.mission_id, current_head=head, current_state=State.TEST,
+            pending_gate=None,
+        )
+        self.journal.db.execute(
+            "INSERT INTO jobs(job_id,mission_id,name,argv_json,launch_head,state,"
+            "stdout_path,stderr_path,started_at,ended_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("superseded-review-job", self.spec.mission_id, "review:codex", "[]", head,
+             "EXITED", "", "", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:01+00:00"),
+        )
+        self.journal.db.commit()
+        with patch.object(self.adapter, "exact_head", return_value=head), \
+                patch.object(self.adapter, "review_result", create=True) as review_result:
+            self.supervisor.reconcile(self.spec.mission_id)
+            self.assertEqual(self.supervisor.process.poll(self.spec.mission_id), [])
+            self.supervisor.reconcile(self.spec.mission_id)
+        review_result.assert_not_called()
+        row = self.journal.db.execute(
+            "SELECT state FROM jobs WHERE job_id='superseded-review-job'",
+        ).fetchone()
+        self.assertEqual(row["state"], "CONSUMED")
+        self.assertEqual(self.journal.db.execute(
+            "SELECT count(*) FROM events WHERE mission_id=? AND kind='review_result_stale'",
+            (self.spec.mission_id,),
+        ).fetchone()[0], 1)
+
     def test_pre_merge_ci_pending_is_waitable_and_does_not_merge(self):
         head = "a" * 40
         self.journal.update(

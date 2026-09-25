@@ -456,13 +456,13 @@ class Journal:
             self.db.rollback()
             raise
 
-    def discard_stale_review_job(self, mission_id: str, job_id: str,
-                                 current_head: str) -> bool:
-        """Retire a terminal review process after its launch HEAD is stale."""
+    def retire_unactionable_review_job(self, mission_id: str, job_id: str,
+                                       current_head: str) -> bool:
+        """Retire a terminal review whose HEAD or pending gate is no longer current."""
         try:
             self.db.execute("BEGIN IMMEDIATE")
             mission = self.db.execute(
-                "SELECT current_head FROM missions WHERE mission_id=?",
+                "SELECT current_state,current_head,pending_gate FROM missions WHERE mission_id=?",
                 (mission_id,),
             ).fetchone()
             job = self.db.execute(
@@ -471,16 +471,31 @@ class Journal:
             ).fetchone()
             if (mission is None or job is None or mission["current_head"] != current_head
                     or not str(job["name"]).startswith("review:")
-                    or job["launch_head"] == current_head
                     or job["state"] not in {"EXITED", "LOST"}):
+                self.db.commit()
+                return False
+            actionable = (
+                State(mission["current_state"]) == State.REVIEW
+                and mission["pending_gate"] == job["name"]
+                and job["launch_head"] == current_head
+            )
+            if actionable:
                 self.db.commit()
                 return False
             changed = self.db.execute(
                 "UPDATE jobs SET state='CONSUMED',ended_at=COALESCE(ended_at,?) "
-                "WHERE job_id=? AND mission_id=? AND state IN ('EXITED','LOST') "
-                "AND launch_head IS NOT ?",
-                (now(), job_id, mission_id, current_head),
+                "WHERE job_id=? AND mission_id=? AND state IN ('EXITED','LOST')",
+                (now(), job_id, mission_id),
             ).rowcount
+            if changed == 1:
+                self.event(mission_id, "review_result_stale", {
+                    "job_id": job_id,
+                    "reviewer": str(job["name"]).split(":", 1)[1],
+                    "launch_head": job["launch_head"],
+                    "current_head": current_head,
+                    "mission_state": mission["current_state"],
+                    "pending_gate": mission["pending_gate"],
+                })
             self.db.commit()
             return changed == 1
         except Exception:
