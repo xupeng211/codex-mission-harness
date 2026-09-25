@@ -43,13 +43,15 @@ def _git_value(worktree: Path, *args: str) -> str:
 
 def _git_config(worktree: Path, key: str, default: str) -> str:
     try:
-        value = subprocess.check_output(
+        completed = subprocess.run(
             ["git", "-C", str(worktree), "config", "--local", "--get", key],
+            stdout=subprocess.PIPE,
             text=True, stderr=subprocess.DEVNULL,
             env={"PATH": SAFE_PATH, "GIT_CONFIG_NOSYSTEM": "1",
                  "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"},
-            timeout=15,
-        ).strip()
+            timeout=15, check=True,
+        )
+        value = completed.stdout.strip()
     except subprocess.CalledProcessError:
         return default
     except (OSError, subprocess.SubprocessError) as exc:

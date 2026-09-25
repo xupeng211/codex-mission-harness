@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from harness.sandbox import SandboxUnavailable, preflight_project_gate, project_gate_invocation
+from harness.sandbox import SandboxUnavailable, _git_config, preflight_project_gate, project_gate_invocation
 
 
 class ProjectGateSandboxTest(unittest.TestCase):
@@ -45,6 +45,10 @@ class ProjectGateSandboxTest(unittest.TestCase):
             return project_gate_invocation(
                 ["make", "verify-pr"], str(cwd or self.worktree), env or {}, self.logs, job_id,
             )
+
+    def test_git_config_returns_default_for_missing_key_and_text_for_present_key(self):
+        self.assertEqual(_git_config(self.worktree, "harness.missing-key", "fallback"), "fallback")
+        self.assertEqual(_git_config(self.worktree, "core.repositoryformatversion", "fallback"), "0")
 
     def test_gate_invocation_clears_environment_masks_credentials_and_network(self):
         invocation = self.build(env={"COMPOSE_PROJECT_NAME": "cmh-test"})
