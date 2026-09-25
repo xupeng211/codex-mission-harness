@@ -124,12 +124,19 @@ class Supervisor:
                 self.journal.reconcile_head(mission_id, current)
                 snapshot = self.journal.mission(mission_id)
             if result.launch_head != current:
+                stale_review_consumed = False
+                if result.state in {"EXITED", "LOST"}:
+                    stale_review_consumed = self.journal.discard_stale_review_job(
+                        mission_id, result.job_id, current,
+                    )
                 if result.state == "EXITED" and result.exit_code != 0:
                     kind = "gate_failure_stale"
                 elif result.state == "EXITED":
                     kind = "gate_stale"
                 else:
                     kind = "process_result_stale"
+                if stale_review_consumed:
+                    kind = "review_result_stale"
                 self.journal.event(mission_id, kind, {
                     "job_id": result.job_id,
                     "gate": snapshot["pending_gate"],

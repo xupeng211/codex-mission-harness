@@ -456,6 +456,37 @@ class Journal:
             self.db.rollback()
             raise
 
+    def discard_stale_review_job(self, mission_id: str, job_id: str,
+                                 current_head: str) -> bool:
+        """Retire a terminal review process after its launch HEAD is stale."""
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            mission = self.db.execute(
+                "SELECT current_head FROM missions WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()
+            job = self.db.execute(
+                "SELECT name,launch_head,state FROM jobs WHERE job_id=? AND mission_id=?",
+                (job_id, mission_id),
+            ).fetchone()
+            if (mission is None or job is None or mission["current_head"] != current_head
+                    or not str(job["name"]).startswith("review:")
+                    or job["launch_head"] == current_head
+                    or job["state"] not in {"EXITED", "LOST"}):
+                self.db.commit()
+                return False
+            changed = self.db.execute(
+                "UPDATE jobs SET state='CONSUMED',ended_at=COALESCE(ended_at,?) "
+                "WHERE job_id=? AND mission_id=? AND state IN ('EXITED','LOST') "
+                "AND launch_head IS NOT ?",
+                (now(), job_id, mission_id, current_head),
+            ).rowcount
+            self.db.commit()
+            return changed == 1
+        except Exception:
+            self.db.rollback()
+            raise
+
     def invalidate_reviews(self, mission_id: str, current_head: str) -> int:
         try:
             result = self.db.execute(
