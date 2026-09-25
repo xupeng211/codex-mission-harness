@@ -7,15 +7,46 @@ commit-last: an incomplete run has no receipt and is never an approval.
 """
 from __future__ import annotations
 
-import argparse, base64, hashlib, hmac, json, os, shutil, subprocess, sys, tempfile, time, uuid
+import argparse, base64, hashlib, hmac, json, os, re, shutil, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 
-VERSION = "cmh-deepseek-review/v2"
+VERSION = "cmh-deepseek-review/v3"
 MODEL = "deepseek-flash"
 ENDPOINT = "https://api.deepseek.com/anthropic"
 CHUNK_BYTES = 32000
 
-SCHEMA = {"type":"object","additionalProperties":False,"required":["review_result","findings"],"properties":{"review_result":{"enum":["PASS","FAIL"]},"findings":{"type":"array","items":{"type":"object","additionalProperties":False,"required":["severity","title","evidence"],"properties":{"severity":{"enum":["P0","P1","P2","P3"]},"title":{"type":"string"},"evidence":{"type":"string"}}}}}}
+SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["review_result", "findings"],
+    "properties": {
+        "review_result": {"enum": ["PASS", "FAIL"]},
+        "findings": {"type": "array", "items": {
+            "type": "object", "additionalProperties": False,
+            "required": ["severity", "title", "evidence"],
+            "properties": {
+                "severity": {"enum": ["P0", "P1", "P2", "P3"]},
+                "title": {"type": "string"},
+                "evidence": {"type": "string"},
+            },
+        }},
+        # Only the complete-diff aggregate may emit dispositions.  Each one
+        # explicitly accounts for a P0/P1/P2 finding from a durable chunk.
+        "dispositions": {"type": "array", "items": {
+            "type": "object", "additionalProperties": False,
+            "required": ["chunk_index", "finding_index", "source_severity",
+                         "finding_sha256", "decision", "rationale"],
+            "properties": {
+                "chunk_index": {"type": "integer", "minimum": 0},
+                "finding_index": {"type": "integer", "minimum": 0},
+                "source_severity": {"enum": ["P0", "P1", "P2"]},
+                "finding_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "decision": {"enum": ["UPHELD", "DISPUTED"]},
+                "rationale": {"type": "string", "minLength": 24},
+            },
+        }},
+    },
+}
 
 def canon(value): return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 def digest(value): return hashlib.sha256(value).hexdigest()
@@ -31,15 +62,69 @@ def finding(value):
             and value.get("severity") in {"P0","P1","P2","P3"}
             and isinstance(value.get("title"),str) and bool(value["title"])
             and isinstance(value.get("evidence"),str) and bool(value["evidence"]))
-def reviewer_result(raw):
-    value=json.loads(raw); result=value.get("structured_output") or value.get("result") or value
-    if (not isinstance(result,dict) or set(result)!={"review_result","findings"}
-            or result.get("review_result") not in {"PASS","FAIL"}
-            or not isinstance(result.get("findings"),list)
-            or not all(finding(item) for item in result["findings"])): raise ValueError("invalid reviewer output")
-    blocking=any(item["severity"] in {"P0","P1","P2"} for item in result["findings"])
-    if (result["review_result"] == "PASS") != (not blocking): raise ValueError("reviewer verdict mismatch")
+def reviewer_result(raw, *, require_dispositions=False, forbid_dispositions=False):
+    value = json.loads(raw)
+    result = value.get("structured_output") or value.get("result") or value
+    required = {"review_result", "findings"}
+    allowed = required | {"dispositions"}
+    if (not isinstance(result, dict) or not required <= set(result)
+            or set(result) - allowed or result.get("review_result") not in {"PASS", "FAIL"}
+            or not isinstance(result.get("findings"), list)
+            or not all(finding(item) for item in result["findings"])):
+        raise ValueError("invalid reviewer output")
+    if forbid_dispositions and "dispositions" in result:
+        raise ValueError("chunk reviewer output cannot contain aggregate dispositions")
+    if require_dispositions and not isinstance(result.get("dispositions"), list):
+        raise ValueError("aggregate reviewer omitted blocker dispositions")
+    if "dispositions" in result:
+        if not isinstance(result["dispositions"], list):
+            raise ValueError("invalid reviewer dispositions")
+        fields = {"chunk_index", "finding_index", "source_severity", "finding_sha256",
+                  "decision", "rationale"}
+        for item in result["dispositions"]:
+            if (not isinstance(item, dict) or set(item) != fields
+                    or type(item.get("chunk_index")) is not int or item["chunk_index"] < 0
+                    or type(item.get("finding_index")) is not int or item["finding_index"] < 0
+                    or item.get("source_severity") not in {"P0", "P1", "P2"}
+                    or not isinstance(item.get("finding_sha256"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", item["finding_sha256"]) is None
+                    or item.get("decision") not in {"UPHELD", "DISPUTED"}
+                    or not isinstance(item.get("rationale"), str)
+                    or len(item["rationale"].strip()) < 24):
+                raise ValueError("invalid reviewer dispositions")
+    blocking = any(item["severity"] in {"P0", "P1", "P2"} for item in result["findings"])
+    if (result["review_result"] == "PASS") != (not blocking):
+        raise ValueError("reviewer verdict mismatch")
     return result
+
+
+def validate_blocker_dispositions(chunks_, aggregate_result):
+    """Require an auditable aggregate decision for every blocking chunk finding."""
+    expected = {}
+    for chunk in chunks_:
+        chunk_index = chunk["index"]
+        for finding_index, item in enumerate(chunk["result"]["findings"]):
+            if item["severity"] in {"P0", "P1", "P2"}:
+                expected[(chunk_index, finding_index)] = item
+
+    observed = {}
+    for item in aggregate_result.get("dispositions", []):
+        identity = (item["chunk_index"], item["finding_index"])
+        source = expected.get(identity)
+        if source is None:
+            raise ValueError("aggregate disposition refers to no blocking chunk finding")
+        if identity in observed:
+            raise ValueError("aggregate duplicated a blocking finding disposition")
+        if (item["source_severity"] != source["severity"]
+                or item["finding_sha256"] != digest(canon(source))):
+            raise ValueError("aggregate disposition does not bind the chunk finding")
+        if item["decision"] == "UPHELD" and source not in aggregate_result["findings"]:
+            raise ValueError("aggregate omitted an upheld blocking chunk finding")
+        if item["decision"] == "DISPUTED" and source in aggregate_result["findings"]:
+            raise ValueError("aggregate both disputed and upheld the same chunk finding")
+        observed[identity] = item
+    if set(observed) != set(expected):
+        raise ValueError("aggregate omitted a blocking chunk finding disposition")
 def git(root, *args): return subprocess.check_output(["git", "-C", str(root), *args])
 def full_sha(value):
     if len(value) != 40 or any(c not in "0123456789abcdef" for c in value.lower()): raise ValueError("full SHA required")
@@ -76,20 +161,21 @@ def validate(receipt, base, head, root=None, receipt_path=None, mission_id=None,
         if not isinstance(start,int) or not isinstance(end,int) or start!=position or end<=start: raise ValueError("invalid chunk coverage")
         if not isinstance(chunk.get("sha256"),str) or len(chunk["sha256"])!=64: raise ValueError("invalid chunk identity")
         if not isinstance(chunk.get("output_sha256"),str) or len(chunk["output_sha256"])!=64: raise ValueError("invalid chunk output identity")
-        reviewer_result(json.dumps(result))
+        reviewer_result(json.dumps(result), forbid_dispositions=True)
         descriptors.append({"index":chunk["index"],"start":start,"end":end,"sha256":chunk["sha256"]})
         chunk_findings.extend(result["findings"]); position=end
     if chunk_findings != receipt["chunk_findings"]: raise ValueError("chunk findings mismatch")
-    aggregate_result = reviewer_result(json.dumps(receipt["aggregate_result"]))
+    aggregate_result = reviewer_result(
+        json.dumps(receipt["aggregate_result"]), require_dispositions=True
+    )
     if not isinstance(receipt["aggregate_output_sha256"], str) or len(receipt["aggregate_output_sha256"]) != 64:
         raise ValueError("aggregate output identity is incomplete")
     if receipt["review_result"] != aggregate_result["review_result"]:
         raise ValueError("aggregate verdict mismatch")
-    # A synthesis pass may add context, but it may never erase a blocking
-    # finding discovered in an exact chunk.
-    if any(item not in aggregate_result["findings"] for item in chunk_findings
-           if item.get("severity") in {"P0", "P1", "P2"}):
-        raise ValueError("aggregate synthesis dropped a blocking chunk finding")
+    # Every blocking chunk finding remains in the receipt and must be explicitly
+    # upheld or disputed by the complete-diff aggregate. The decision is bound
+    # to the exact chunk finding and its rationale is part of the signed receipt.
+    validate_blocker_dispositions(chunks_, aggregate_result)
     if aggregate_result["findings"] != receipt["findings"]:
         raise ValueError("aggregate findings mismatch")
     if root is not None:
@@ -103,11 +189,11 @@ def validate(receipt, base, head, root=None, receipt_path=None, mission_id=None,
             for chunk in chunks_:
                 artifact=evidence/f"chunk-{chunk['index']:03d}.json"
                 if not artifact.is_file() or sha(artifact)!=chunk["output_sha256"]: raise ValueError("chunk artifact mismatch")
-                if reviewer_result(artifact.read_text())!=chunk["result"]: raise ValueError("chunk result does not match durable artifact")
+                if reviewer_result(artifact.read_text(), forbid_dispositions=True)!=chunk["result"]: raise ValueError("chunk result does not match durable artifact")
             aggregate_artifact=evidence/"aggregate.json"
             if not aggregate_artifact.is_file() or sha(aggregate_artifact) != receipt["aggregate_output_sha256"]:
                 raise ValueError("aggregate artifact mismatch")
-            if reviewer_result(aggregate_artifact.read_text()) != aggregate_result:
+            if reviewer_result(aggregate_artifact.read_text(), require_dispositions=True) != aggregate_result:
                 raise ValueError("aggregate result does not match durable artifact")
     if receipt["review_result"] not in {"PASS", "FAIL"}:
         raise ValueError("invalid aggregate verdict")
@@ -134,7 +220,7 @@ def aggregate_prompt(base, head, diff_hash, manifest_hash, plan, source, chunk_f
     return ("You are the final independent reviewer for the complete exact diff. Do not use tools or filesystem. "
             "Return only JSON matching the schema. PASS only when P0/P1/P2 are absent. "
             "Review cross-file and cross-chunk interactions, state transitions, and security boundaries. "
-            "Do not discard a blocking finding from a chunk review; confirm or expand it.\n"
+            "Account for every P0/P1/P2 chunk finding in dispositions using its zero-based chunk_index and finding_index, source_severity, and SHA256 of canonical JSON for the exact finding object. Do not omit or duplicate a disposition. Use UPHELD when the finding is valid and include the exact finding object in findings; use DISPUTED only when the complete diff disproves it, with a specific rationale grounded in the diff. A disputed finding stays in the durable receipt with its rationale. PASS is allowed only when findings contain no P0/P1/P2.\n"
             f"Base={base}\nHead={head}\nDiffSHA256={diff_hash}\nManifestSHA256={manifest_hash}\n"
             f"ChunkCount={len(plan)}\nChunkFindings={json.dumps(chunk_findings, sort_keys=True)}\n" + rendered)
 
@@ -201,7 +287,7 @@ def run(args):
             completed=invoke_reviewer(command,prompt(base,head,diff_hash,manifest_hash,chunk,source),env,args.timeout)
             if completed.returncode: raise RuntimeError(f"DeepSeek reviewer infrastructure failure: exit={completed.returncode}")
             raw=completed.stdout.encode(); (evidence/f"chunk-{chunk['index']:03d}.json").write_bytes(raw)
-            result=reviewer_result(completed.stdout)
+            result=reviewer_result(completed.stdout, forbid_dispositions=True)
             chunk["result"]=result; chunk["output_sha256"]=digest(raw); results.extend(result.get("findings",[]))
         aggregate_call=invoke_reviewer(
             command, aggregate_prompt(base, head, diff_hash, manifest_hash, plan, diff, results),
@@ -211,13 +297,8 @@ def run(args):
             raise RuntimeError(f"DeepSeek aggregate reviewer infrastructure failure: exit={aggregate_call.returncode}")
         aggregate_raw=aggregate_call.stdout.encode()
         (evidence/"aggregate.json").write_bytes(aggregate_raw)
-        aggregate_result=reviewer_result(aggregate_call.stdout)
-        if (aggregate_result["review_result"] == "PASS"
-                and any(item.get("severity") in {"P0", "P1", "P2"} for item in results)):
-            raise ValueError("aggregate reviewer erased a blocking chunk finding")
-        if any(item not in aggregate_result["findings"] for item in results
-               if item.get("severity") in {"P0", "P1", "P2"}):
-            raise ValueError("aggregate reviewer dropped a blocking chunk finding")
+        aggregate_result=reviewer_result(aggregate_call.stdout, require_dispositions=True)
+        validate_blocker_dispositions(plan, aggregate_result)
     finally:
         Path(settings.name).unlink(missing_ok=True)
     verdict=aggregate_result["review_result"]

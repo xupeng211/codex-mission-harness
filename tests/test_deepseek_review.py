@@ -25,7 +25,7 @@ review.validate = _validated
 
 def receipt(**overrides):
     source = b"fixture diff\n"
-    aggregate = {"review_result": "PASS", "findings": []}
+    aggregate = {"review_result": "PASS", "findings": [], "dispositions": []}
     value = {"version": review.VERSION, "repository": "fixture", "mission_id": "fixture", "base_sha": BASE, "head_sha": HEAD,
              "diff_sha256": "d" * 64, "manifest_sha256": "e" * 64,
              "chunks": [{"index": 0, "start": 0, "end": len(source), "sha256": review.digest(source),
@@ -35,6 +35,21 @@ def receipt(**overrides):
              "provider": "deepseek", "model": review.MODEL, "command_sha256": "c" * 64,
              "review_result": "PASS", "findings": []}
     value.update(overrides); value["integrity_sha256"] = review.digest(review.canon(value)); value["auth_hmac_sha256"] = review.auth_digest(value, TEST_SECRET); return value
+
+def disposition_for(item, *, decision="DISPUTED", chunk_index=0, finding_index=0):
+    rationale = (
+        "The complete diff confirms this concern against the exact reviewed code."
+        if decision == "UPHELD" else
+        "The complete diff disproves this localized concern with concrete evidence."
+    )
+    return {
+        "chunk_index": chunk_index,
+        "finding_index": finding_index,
+        "source_severity": item["severity"],
+        "finding_sha256": review.digest(review.canon(item)),
+        "decision": decision,
+        "rationale": rationale,
+    }
 
 class DeepSeekReceiptTest(unittest.TestCase):
     def test_claude_launcher_resolution_excludes_relative_and_reviewed_tree_paths(self):
@@ -108,8 +123,95 @@ class DeepSeekReceiptTest(unittest.TestCase):
         chunks = receipt()["chunks"]; chunks[0]["result"] = {"review_result": "FAIL", "findings": [finding]}
         value = receipt(review_result="FAIL", findings=[finding], chunks=chunks,
                         chunk_findings=[finding],
-                        aggregate_result={"review_result": "FAIL", "findings": [finding]})
+                        aggregate_result={"review_result": "FAIL", "findings": [finding],
+                                          "dispositions": [disposition_for(finding, decision="UPHELD")]})
         self.assertEqual(review.validate(value, BASE, HEAD)["review_result"], "FAIL")
+
+    def test_v2_deepseek_receipt_is_stale_under_disposition_policy(self):
+        with self.assertRaisesRegex(ValueError, "exact-head binding"):
+            review.validate(receipt(version="cmh-deepseek-review/v2"), BASE, HEAD)
+
+    def test_complete_diff_can_dispute_blocker_with_hash_bound_rationale(self):
+        finding = {"severity": "P2", "title": "localized concern", "evidence": "chunk evidence"}
+        chunks = receipt()["chunks"]
+        chunks[0]["result"] = {"review_result": "FAIL", "findings": [finding]}
+        value = receipt(
+            chunks=chunks,
+            chunk_findings=[finding],
+            aggregate_result={
+                "review_result": "PASS", "findings": [],
+                "dispositions": [disposition_for(finding)],
+            },
+            review_result="PASS", findings=[],
+        )
+        self.assertEqual(review.validate(value, BASE, HEAD)["review_result"], "PASS")
+
+    def test_blocking_chunk_finding_cannot_be_silently_dropped(self):
+        finding = {"severity": "P1", "title": "must be accounted for", "evidence": "chunk"}
+        chunks = receipt()["chunks"]
+        chunks[0]["result"] = {"review_result": "FAIL", "findings": [finding]}
+        value = receipt(
+            chunks=chunks, chunk_findings=[finding],
+            aggregate_result={"review_result": "PASS", "findings": [], "dispositions": []},
+            review_result="PASS", findings=[],
+        )
+        with self.assertRaisesRegex(ValueError, "omitted a blocking chunk finding disposition"):
+            review.validate(value, BASE, HEAD)
+
+    def test_disposition_must_bind_exact_blocking_chunk_finding(self):
+        finding = {"severity": "P2", "title": "localized concern", "evidence": "chunk evidence"}
+        chunks = receipt()["chunks"]
+        chunks[0]["result"] = {"review_result": "FAIL", "findings": [finding]}
+        bad_disposition = disposition_for(finding)
+        bad_disposition["finding_sha256"] = "0" * 64
+        value = receipt(
+            chunks=chunks, chunk_findings=[finding],
+            aggregate_result={"review_result": "PASS", "findings": [],
+                              "dispositions": [bad_disposition]},
+            review_result="PASS", findings=[],
+        )
+        with self.assertRaisesRegex(ValueError, "does not bind the chunk finding"):
+            review.validate(value, BASE, HEAD)
+
+    def test_upheld_blocker_must_remain_in_aggregate_findings(self):
+        finding = {"severity": "P1", "title": "upheld concern", "evidence": "chunk"}
+        chunks = receipt()["chunks"]
+        chunks[0]["result"] = {"review_result": "FAIL", "findings": [finding]}
+        value = receipt(
+            chunks=chunks, chunk_findings=[finding],
+            aggregate_result={"review_result": "PASS", "findings": [],
+                              "dispositions": [disposition_for(finding, decision="UPHELD")]},
+            review_result="PASS", findings=[],
+        )
+        with self.assertRaisesRegex(ValueError, "omitted an upheld blocking chunk finding"):
+            review.validate(value, BASE, HEAD)
+
+    def test_disputed_blocker_cannot_also_be_upheld_in_aggregate(self):
+        finding = {"severity": "P2", "title": "disputed concern", "evidence": "chunk"}
+        chunks = receipt()["chunks"]
+        chunks[0]["result"] = {"review_result": "FAIL", "findings": [finding]}
+        value = receipt(
+            chunks=chunks, chunk_findings=[finding],
+            aggregate_result={"review_result": "FAIL", "findings": [finding],
+                              "dispositions": [disposition_for(finding)]},
+            review_result="FAIL", findings=[finding],
+        )
+        with self.assertRaisesRegex(ValueError, "both disputed and upheld"):
+            review.validate(value, BASE, HEAD)
+
+    def test_duplicate_and_orphaned_dispositions_are_rejected(self):
+        finding = {"severity": "P2", "title": "localized concern", "evidence": "chunk"}
+        chunks = [{"index": 0, "result": {"findings": [finding]}}]
+        duplicate = disposition_for(finding)
+        with self.assertRaisesRegex(ValueError, "duplicated a blocking finding"):
+            review.validate_blocker_dispositions(
+                chunks, {"findings": [], "dispositions": [duplicate, duplicate]}
+            )
+        orphan = disposition_for(finding, finding_index=1)
+        with self.assertRaisesRegex(ValueError, "refers to no blocking chunk finding"):
+            review.validate_blocker_dispositions(
+                chunks, {"findings": [], "dispositions": [orphan]}
+            )
     def test_unknown_aggregate_verdict_is_rejected(self):
         with self.assertRaises(ValueError):
             review.validate(receipt(review_result="GARBAGE"), BASE, HEAD)
@@ -117,7 +219,8 @@ class DeepSeekReceiptTest(unittest.TestCase):
         finding = {"severity": "P3", "title": "x", "evidence": "y"}
         chunks = receipt()["chunks"]; chunks[0]["result"] = {"review_result": "PASS", "findings": [finding]}
         value = receipt(findings=[finding], chunks=chunks, chunk_findings=[finding],
-                        aggregate_result={"review_result": "PASS", "findings": [finding]})
+                        aggregate_result={"review_result": "PASS", "findings": [finding],
+                                          "dispositions": []})
         self.assertEqual(review.validate(value, BASE, HEAD)["review_result"], "PASS")
 
     def test_aggregate_synthesis_cannot_drop_blocking_chunk_finding(self):
@@ -129,7 +232,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
             aggregate_result={"review_result": "PASS", "findings": []},
             findings=[], review_result="PASS",
         )
-        with self.assertRaisesRegex(ValueError, "blocking chunk"):
+        with self.assertRaisesRegex(ValueError, "omitted blocker dispositions"):
             review.validate(value, BASE, HEAD)
     def test_durable_artifact_result_must_match_receipt_chunk(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -171,6 +274,10 @@ class DeepSeekReceiptTest(unittest.TestCase):
             review.reviewer_result('{"review_result":"PASS","findings":[{"severity":"CRITICAL","title":"x","evidence":"y"}]}')
         with self.assertRaisesRegex(ValueError, "reviewer verdict mismatch"):
             review.reviewer_result('{"review_result":"PASS","findings":[{"severity":"P1","title":"x","evidence":"y"}]}')
+        with self.assertRaisesRegex(ValueError, "omitted blocker dispositions"):
+            review.reviewer_result('{"review_result":"PASS","findings":[]}', require_dispositions=True)
+        with self.assertRaisesRegex(ValueError, "cannot contain aggregate dispositions"):
+            review.reviewer_result('{"review_result":"PASS","findings":[],"dispositions":[]}', forbid_dispositions=True)
     def test_mission_and_repository_binding_are_required_when_expected(self):
         value = receipt(repository="git@example/repo", mission_id="mission-a")
         self.assertEqual(review.validate(value, BASE, HEAD, mission_id="mission-a",
@@ -204,13 +311,15 @@ class DeepSeekReceiptTest(unittest.TestCase):
             evidence = root / "evidence"
             args = Namespace(repo=str(repo), base=base, head=head, mission_id="fixture",
                              evidence=str(evidence), token_file=str(token_file), timeout=1)
-            raw = json.dumps({"review_result": "PASS", "findings": []})
-            completed = subprocess.CompletedProcess(["claude"], 0, raw, "")
             invocations = []
 
             def capture_invocation(command, prompt_text, env, timeout):
                 invocations.append((command, env))
-                return completed
+                if prompt_text.startswith("You are the final independent reviewer"):
+                    result = {"review_result": "PASS", "findings": [], "dispositions": []}
+                else:
+                    result = {"review_result": "PASS", "findings": []}
+                return subprocess.CompletedProcess(["claude"], 0, json.dumps(result), "")
 
             with patch.object(review, "resolve_claude_launcher",
                               return_value=("/trusted/bin/claude", "/trusted/bin:/usr/bin")), \
@@ -245,3 +354,42 @@ class DeepSeekReceiptTest(unittest.TestCase):
                                     receipt_path, "fixture", "git@github.com:fixture/repo.git")["review_result"],
                     "PASS",
                 )
+
+    def test_run_does_not_publish_receipt_when_aggregate_omits_dispositions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Harness Test"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "harness-test@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(repo), "remote", "add", "origin",
+                            "git@github.com:fixture/repo.git"], check=True)
+            source = repo / "tracked.txt"
+            source.write_text("base\n")
+            subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+            base = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            source.write_text("head\n")
+            subprocess.run(["git", "-C", str(repo), "commit", "-qam", "head"], check=True)
+            head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            token_file = root / "review-token"
+            token_file.write_text(TEST_SECRET)
+            evidence = root / "evidence"
+            args = Namespace(repo=str(repo), base=base, head=head, mission_id="fixture",
+                             evidence=str(evidence), token_file=str(token_file), timeout=1)
+
+            def omit_aggregate_dispositions(command, prompt_text, env, timeout):
+                return subprocess.CompletedProcess(
+                    ["claude"], 0,
+                    json.dumps({"review_result": "PASS", "findings": []}), "",
+                )
+
+            with patch.object(review, "resolve_claude_launcher",
+                              return_value=("/trusted/bin/claude", "/trusted/bin:/usr/bin")), \
+                    patch.object(review, "invoke_reviewer", side_effect=omit_aggregate_dispositions), \
+                    self.assertRaisesRegex(ValueError, "omitted blocker dispositions"):
+                review.run(args)
+
+            self.assertEqual(list(evidence.rglob("deepseek-receipt-*.json")), [])
+            self.assertEqual(len(list(evidence.rglob("aggregate.json"))), 1)
