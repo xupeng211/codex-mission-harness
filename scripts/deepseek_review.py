@@ -132,6 +132,29 @@ def validate_blocker_dispositions(chunks_, aggregate_result):
         observed[identity] = item
     if set(observed) != set(expected):
         raise ValueError("aggregate omitted a blocking chunk finding disposition")
+
+
+def indexed_chunk_findings(chunks_):
+    """Build the aggregate's indexed findings and precomputed blocker hashes."""
+    all_findings = []
+    required_dispositions = []
+    for chunk in chunks_:
+        for finding_index, item in enumerate(chunk["result"]["findings"]):
+            all_findings.append({
+                "chunk_index": chunk["index"],
+                "finding_index": finding_index,
+                "finding": item,
+            })
+            if item["severity"] in {"P0", "P1", "P2"}:
+                required_dispositions.append({
+                    "chunk_index": chunk["index"],
+                    "finding_index": finding_index,
+                    "source_severity": item["severity"],
+                    "finding_sha256": digest(canon(item)),
+                })
+    return all_findings, required_dispositions
+
+
 def git(root, *args): return subprocess.check_output(["git", "-C", str(root), *args])
 def full_sha(value):
     if len(value) != 40 or any(c not in "0123456789abcdef" for c in value.lower()): raise ValueError("full SHA required")
@@ -215,7 +238,8 @@ def prompt(base, head, diff_hash, manifest_hash, chunk, source):
             f"Base={base}\nHead={head}\nDiffSHA256={diff_hash}\nManifestSHA256={manifest_hash}\n"
             f"Chunk={chunk['index']} range={chunk['start']}:{chunk['end']} SHA256={chunk['sha256']}\n"+rendered)
 
-def aggregate_prompt(base, head, diff_hash, manifest_hash, plan, source, chunk_findings):
+def aggregate_prompt(base, head, diff_hash, manifest_hash, plan, source, chunk_findings,
+                     required_dispositions):
     """Ask the independent reviewer to inspect the complete diff once.
 
     Chunk reviews provide durable localized evidence.  This final pass prevents
@@ -227,9 +251,10 @@ def aggregate_prompt(base, head, diff_hash, manifest_hash, plan, source, chunk_f
     return ("You are the final independent reviewer for the complete exact diff. Do not use tools or filesystem. "
             "Return only JSON matching the schema. PASS only when P0/P1/P2 are absent. "
             "Review cross-file and cross-chunk interactions, state transitions, and security boundaries. "
-            "Account for every P0/P1/P2 chunk finding in dispositions using its zero-based chunk_index and finding_index, source_severity, and SHA256 of canonical JSON for the exact finding object. Do not omit or duplicate a disposition. Use UPHELD when the finding is valid and include the exact finding object in findings; use DISPUTED only when the complete diff disproves it, with a specific rationale grounded in the diff. A disputed finding stays in the durable receipt with its rationale. PASS is allowed only when findings contain no P0/P1/P2.\n"
+            "Account for every P0/P1/P2 chunk finding in dispositions. Copy each chunk_index, finding_index, source_severity, and finding_sha256 exactly from RequiredDispositions; do not calculate, modify, omit, or duplicate these values. Use UPHELD when the finding is valid and include the exact finding object in findings; use DISPUTED only when the complete diff disproves it, with a specific rationale grounded in the diff. A disputed finding stays in the durable receipt with its rationale. PASS is allowed only when findings contain no P0/P1/P2.\n"
             f"Base={base}\nHead={head}\nDiffSHA256={diff_hash}\nManifestSHA256={manifest_hash}\n"
-            f"ChunkCount={len(plan)}\nChunkFindings={json.dumps(chunk_findings, sort_keys=True)}\n" + rendered)
+            f"ChunkCount={len(plan)}\nChunkFindings={json.dumps(chunk_findings, sort_keys=True)}\n"
+            f"RequiredDispositions={json.dumps(required_dispositions, sort_keys=True)}\n" + rendered)
 
 def invoke_reviewer(command, prompt_text, env, timeout):
     # Keep the exact diff in the reviewer's input, but do not put the complete
@@ -299,8 +324,11 @@ def run(args):
             raw=completed.stdout.encode(); (evidence/f"chunk-{chunk['index']:03d}.json").write_bytes(raw)
             result=reviewer_result(completed.stdout, forbid_dispositions=True)
             chunk["result"]=result; chunk["output_sha256"]=digest(raw); results.extend(result.get("findings",[]))
+        chunk_findings, required_dispositions = indexed_chunk_findings(plan)
         aggregate_call=invoke_reviewer(
-            aggregate_command, aggregate_prompt(base, head, diff_hash, manifest_hash, plan, diff, results),
+            aggregate_command,
+            aggregate_prompt(base, head, diff_hash, manifest_hash, plan, diff,
+                             chunk_findings, required_dispositions),
             env, args.timeout,
         )
         if aggregate_call.returncode:

@@ -272,6 +272,22 @@ class DeepSeekReceiptTest(unittest.TestCase):
         self.assertIn("BASE64-ENCODED EXACT DIFF BYTES:", rendered)
         self.assertIn("ZGlmZiAtLWdpdCBhL3ggYi94Civ/AAo=", rendered)
         self.assertNotIn("\ufffd", rendered)
+
+    def test_aggregate_prompt_provides_precomputed_blocker_indices_and_hashes(self):
+        blocker = {"severity": "P2", "title": "concern", "evidence": "chunk detail"}
+        chunks = [{"index": 2, "result": {"findings": [blocker]}}]
+        indexed, required = review.indexed_chunk_findings(chunks)
+        source = b"exact diff\n"
+        rendered = review.aggregate_prompt(
+            BASE, HEAD, "d" * 64, "e" * 64, chunks, source, indexed, required,
+        )
+        self.assertEqual(required, [{
+            "chunk_index": 2, "finding_index": 0, "source_severity": "P2",
+            "finding_sha256": review.digest(review.canon(blocker)),
+        }])
+        self.assertIn('"chunk_index": 2', rendered)
+        self.assertIn('"finding_sha256": "' + review.digest(review.canon(blocker)) + '"', rendered)
+        self.assertIn("do not calculate, modify, omit, or duplicate these values", rendered)
     def test_reviewer_result_rejects_invalid_shape(self):
         with self.assertRaisesRegex(ValueError, "invalid reviewer output"):
             review.reviewer_result('{"review_result":"PASS","findings":"not-a-list"}')
