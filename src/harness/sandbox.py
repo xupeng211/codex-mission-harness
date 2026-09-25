@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import pwd
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -124,6 +125,61 @@ def _ensure_masked_path_args(path: Path, masked_roots: tuple[Path, ...]) -> list
     return []
 
 
+def _committed_scope_blob(worktree: Path, scope_path: Path, head: str) -> tuple[Path, bytes]:
+    """Read a tracked scope contract from the exact commit, never the worktree copy."""
+    if re.fullmatch(r"[0-9a-fA-F]{40}", head) is None:
+        raise SandboxUnavailable("mission scope requires a full committed HEAD")
+    if scope_path.is_symlink():
+        raise SandboxUnavailable("mission scope file must not be a symbolic link")
+    try:
+        scope = scope_path.resolve(strict=True)
+        relative = scope.relative_to(worktree).as_posix()
+        observed_head = _git_value(worktree, "rev-parse", "HEAD").lower()
+        if observed_head != head.lower():
+            raise SandboxUnavailable("mission scope HEAD differs from the project gate HEAD")
+        blob = subprocess.check_output(
+            ["git", "--no-replace-objects", "-C", str(worktree), "show", f"{head}:{relative}"],
+            stderr=subprocess.PIPE,
+            timeout=30,
+            env={"PATH": SAFE_PATH, "GIT_CONFIG_NOSYSTEM": "1",
+                 "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except SandboxUnavailable:
+        raise
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise SandboxUnavailable("mission scope is not available from the committed HEAD") from exc
+    if not scope.is_file():
+        raise SandboxUnavailable("mission scope file is not a regular file")
+    return scope, blob
+
+
+def _system_runtime_mounts() -> list[str]:
+    """Expose installed runtime files only; the rest of the host starts hidden."""
+    usr = Path("/usr")
+    if usr.is_symlink() or not usr.is_dir():
+        raise SandboxUnavailable("system runtime directory /usr is unavailable")
+    command = ["--ro-bind", "/usr", "/usr"]
+    for alias in (Path("/bin"), Path("/sbin"), Path("/lib"), Path("/lib64")):
+        if not alias.exists() and not alias.is_symlink():
+            continue
+        if alias.is_symlink():
+            try:
+                target = alias.resolve(strict=True)
+            except OSError as exc:
+                raise SandboxUnavailable(f"system runtime alias is broken: {alias}") from exc
+            try:
+                target.relative_to(usr)
+                relative = target.relative_to(Path("/")).as_posix()
+            except ValueError as exc:
+                raise SandboxUnavailable(f"system runtime alias escapes /usr: {alias}") from exc
+            command.extend(("--symlink", relative, str(alias)))
+        elif alias.is_dir():
+            command.extend(("--ro-bind", str(alias), str(alias)))
+        else:
+            raise SandboxUnavailable(f"system runtime alias is not a directory: {alias}")
+    return command
+
+
 def project_gate_invocation(
     argv: list[str], cwd: str, env: dict[str, str], metadata_dir: Path, job_id: str,
 ) -> SandboxInvocation:
@@ -163,15 +219,29 @@ def project_gate_invocation(
     sandbox_env.update(env)
 
     evidence_dir: Path | None = None
+    committed_scope: tuple[Path, Path] | None = None
     if "MISSION_SCOPE_FILE" in env:
-        scope = Path(env["MISSION_SCOPE_FILE"]).resolve(strict=False)
+        raw_scope = Path(env["MISSION_SCOPE_FILE"])
+        if raw_scope.is_symlink():
+            raise SandboxUnavailable("mission scope file must not be a symbolic link")
+        scope = raw_scope.resolve(strict=False)
         try:
             relative_scope = scope.relative_to(worktree)
         except ValueError as exc:
             raise SandboxUnavailable("mission scope file is outside the candidate worktree") from exc
         if not scope.is_file():
             raise SandboxUnavailable("mission scope file is not a regular file")
+        scope_head = env.get("HEAD_REF") or _git_value(worktree, "rev-parse", "HEAD")
+        scope, scope_blob = _committed_scope_blob(worktree, scope, scope_head)
         sandbox_env["MISSION_SCOPE_FILE"] = str(Path("/mnt") / relative_scope)
+        scope_copy = config_path.parent / f"{job_id}.mission-scope"
+        try:
+            with scope_copy.open("xb") as stream:
+                stream.write(scope_blob)
+            scope_copy.chmod(0o400)
+        except OSError as exc:
+            raise SandboxUnavailable("cannot materialize committed mission scope for the project gate") from exc
+        committed_scope = (scope_copy, Path("/mnt") / relative_scope)
     if "PR_BODY" in env:
         raw_body = Path(env["PR_BODY"])
         if raw_body.is_symlink():
@@ -193,8 +263,8 @@ def project_gate_invocation(
         evidence_dir = body.parent
         sandbox_env["PR_BODY"] = "/tmp/cmh-pr-evidence/pr-body.md"
 
-    root_dirs = (Path("/home"), Path("/root"), Path("/run"), Path("/tmp"),
-                 Path("/var/tmp"), Path("/sys"))
+    root_dirs = (Path("/etc"), Path("/home"), Path("/root"), Path("/run"),
+                 Path("/tmp"), Path("/var"), Path("/sys"), Path("/proc"), Path("/dev"))
     for root in root_dirs:
         if not root.is_dir():
             raise SandboxUnavailable(f"required sandbox mountpoint is unavailable: {root}")
@@ -212,7 +282,7 @@ def project_gate_invocation(
             continue
     if not home_is_masked and home == Path("/"):
         raise SandboxUnavailable("refusing to run a project gate with the controller home at filesystem root")
-    masked_roots = tuple(dict.fromkeys((*root_dirs, home)))
+    masked_roots = tuple(dict.fromkeys((*root_dirs, home, Path("/"))))
 
     # Linked worktrees keep their Git directory in the shared repository. A
     # regular checkout instead gets Git metadata overlaid inside /mnt.
@@ -225,17 +295,30 @@ def project_gate_invocation(
     command = [
         executable,
         "--unshare-all", "--die-with-parent", "--new-session",
-        "--ro-bind", "/", "/",
-        "--tmpfs", "/home", "--tmpfs", "/root", "--tmpfs", "/run",
-        "--tmpfs", "/tmp", "--tmpfs", "/var/tmp", "--tmpfs", "/sys",
+        "--tmpfs", "/",
+        *_system_runtime_mounts(),
+        "--tmpfs", "/etc", "--tmpfs", "/home", "--tmpfs", "/root", "--tmpfs", "/run",
+        "--tmpfs", "/tmp", "--tmpfs", "/var", "--tmpfs", "/sys",
         "--proc", "/proc", "--dev", "/dev",
+        "--dir", "/mnt",
         "--dir", "/tmp/cmh-home",
     ]
+    for source, target in ((Path("/etc/alternatives"), "/etc/alternatives"),
+                           (Path("/etc/ssl/certs"), "/etc/ssl/certs")):
+        if source.is_dir() and not source.is_symlink():
+            parent = Path(target).parent
+            if str(parent) != "/etc":
+                command.extend(("--dir", str(parent)))
+            command.extend(("--dir", target, "--ro-bind", str(source), target))
     if not home_is_masked:
         if not home.is_dir():
             raise SandboxUnavailable("controller home directory cannot be masked")
+        command.extend(_ensure_masked_path_args(home, (*root_dirs, Path("/"))))
         command.extend(("--tmpfs", str(home)))
     command.extend(("--bind", str(worktree), "/mnt"))
+    if committed_scope is not None:
+        scope_source, scope_target = committed_scope
+        command.extend(("--ro-bind", str(scope_source), str(scope_target)))
     if linked_worktree:
         command.extend(_ensure_masked_path_args(common, masked_roots))
         command.extend(("--ro-bind", str(common), str(common_target)))

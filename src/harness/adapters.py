@@ -58,6 +58,106 @@ class FootballPredictionAdapter:
         repo = Path(worktree).resolve(strict=True)
         return repo.parent / ".cmh-review-evidence" / mission_id / reviewer / head.lower()
 
+    def review_context_worktree(self, worktree: str, mission_id: str, head: str) -> Path:
+        """Return a clean detached worktree materialized from the reviewed commit."""
+        mission_id = self._safe_mission_id(mission_id)
+        if not isinstance(head, str) or re.fullmatch(r"[0-9a-fA-F]{40}", head) is None:
+            raise ValueError("review context requires a full HEAD SHA")
+        candidate = Path(worktree).resolve(strict=True)
+        if not candidate.is_dir():
+            raise RuntimeError("review context source is not a repository directory")
+        head = head.lower()
+        context = candidate.parent / f".cmh-review-context-{mission_id}-{head}"
+        if context.is_symlink():
+            raise RuntimeError("review context path is a symbolic link")
+
+        git_env = {
+            "PATH": os.defpath,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+        }
+        if not context.exists():
+            created = self._call(
+                ["git", "-C", str(candidate), "-c", "core.hooksPath=/dev/null",
+                 "-c", "core.attributesFile=/dev/null", "-c", "core.fsmonitor=false",
+                 "--no-replace-objects", "worktree", "add", "--detach", str(context), head],
+                cwd=str(candidate), env=git_env, inherit_environment=False,
+            )
+            if created.returncode != 0 and not context.exists():
+                raise RuntimeError(created.stderr.strip() or "cannot materialize reviewed HEAD worktree")
+        if context.is_symlink() or not context.is_dir():
+            raise RuntimeError("review context path is not a real directory")
+        info = context.lstat()
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise RuntimeError("review context is not owned by the current user")
+        context.chmod(0o700)
+
+        def git_text(root: Path, *args: str) -> str:
+            return subprocess.check_output(
+                ["git", "--no-replace-objects", "-C", str(root), *args],
+                cwd=str(candidate), env=git_env, text=True, stderr=subprocess.PIPE,
+                timeout=60,
+            ).strip()
+
+        if Path(git_text(context, "rev-parse", "--show-toplevel")).resolve() != context.resolve():
+            raise RuntimeError("review context is not a registered repository worktree")
+        if git_text(context, "rev-parse", "HEAD").lower() != head:
+            raise RuntimeError("review context HEAD differs from the requested commit")
+        if git_text(context, "status", "--porcelain=v1", "--untracked-files=all"):
+            raise RuntimeError("review context contains uncommitted files")
+        candidate_common = Path(git_text(candidate, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+        context_common = Path(git_text(context, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+        if candidate_common != context_common:
+            raise RuntimeError("review context belongs to another repository")
+        listing = git_text(candidate, "worktree", "list", "--porcelain")
+        registered = any(
+            block.splitlines()[0] == f"worktree {context}"
+            and f"HEAD {head}" in block.splitlines()
+            and "detached" in block.splitlines()
+            for block in listing.split("\n\n") if block.strip()
+        )
+        if not registered:
+            raise RuntimeError("review context is not registered as the exact detached worktree")
+        return context
+
+    def review_scope_file(self, worktree: str, head: str, relative_scope: str) -> Path:
+        """Validate the review scope against the committed blob in a clean context."""
+        if (not isinstance(relative_scope, str) or not relative_scope or "\\" in relative_scope
+                or Path(relative_scope).is_absolute()
+                or any(part in {"", ".", ".."} for part in relative_scope.split("/"))):
+            raise ValueError("review scope path is not a safe repository-relative path")
+        if not isinstance(head, str) or re.fullmatch(r"[0-9a-fA-F]{40}", head) is None:
+            raise ValueError("review scope requires a full HEAD SHA")
+        root = Path(worktree).resolve(strict=True)
+        scope = root.joinpath(*relative_scope.split("/"))
+        if scope.is_symlink():
+            raise RuntimeError("review scope in committed context is a symbolic link")
+        git_env = {"PATH": os.defpath, "GIT_CONFIG_NOSYSTEM": "1",
+                   "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"}
+        try:
+            observed_head = subprocess.check_output(
+                ["git", "--no-replace-objects", "-C", str(root), "rev-parse", "HEAD"],
+                cwd=str(root), env=git_env, text=True, stderr=subprocess.PIPE, timeout=30,
+            ).strip().lower()
+            if observed_head != head.lower():
+                raise RuntimeError("review context HEAD differs from the requested commit")
+            committed = subprocess.check_output(
+                ["git", "--no-replace-objects", "-C", str(root), "show",
+                 f"{head}:{relative_scope}"],
+                cwd=str(root), env=git_env,
+                stderr=subprocess.PIPE, timeout=30,
+            )
+            observed = scope.read_bytes()
+        except RuntimeError:
+            raise
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError("review scope is unavailable from the committed HEAD") from exc
+        if not scope.is_file() or scope.is_symlink() or observed != committed:
+            raise RuntimeError("review scope differs from the committed HEAD blob")
+        return scope
+
     @staticmethod
     def _validate_review_evidence_dir(evidence_dir: Path) -> Path:
         evidence_dir = evidence_dir.absolute()

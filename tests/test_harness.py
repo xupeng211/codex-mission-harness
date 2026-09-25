@@ -115,6 +115,92 @@ class HarnessTest(unittest.TestCase):
         base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
         return repo, base
 
+    def test_review_context_uses_committed_scope_without_rewriting_candidate_worktree(self):
+        repo = Path(self.tmp.name) / "review-context-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Harness Test"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "harness@example.invalid"], check=True)
+        scope = repo / "docs" / "agentic" / "mission.json"
+        scope.parent.mkdir(parents=True)
+        scope.write_text('{"forbidden_actions":["live"]}\n', encoding="utf-8")
+        (repo / "source.py").write_text("candidate\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "exact review context"], check=True)
+        head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+        committed_scope = scope.read_bytes()
+        scope.write_text('{"forbidden_actions":[]}\n', encoding="utf-8")
+
+        adapter = FootballPredictionAdapter()
+        context = adapter.review_context_worktree(str(repo), "mission", head)
+
+        self.assertEqual(context.parent, repo.parent)
+        self.assertEqual(context.joinpath("docs/agentic/mission.json").read_bytes(), committed_scope)
+        self.assertEqual(scope.read_text(encoding="utf-8"), '{"forbidden_actions":[]}\n')
+        self.assertEqual(adapter.review_scope_file(
+            context, head, "docs/agentic/mission.json",
+        ).read_bytes(), committed_scope)
+        self.assertEqual(subprocess.check_output(
+            ["git", "-C", str(context), "rev-parse", "HEAD"], text=True,
+        ).strip(), head)
+        self.assertTrue(subprocess.check_output(
+            ["git", "-C", str(context), "worktree", "list", "--porcelain"], text=True,
+        ).find(f"worktree {context}\nHEAD {head}\ndetached") >= 0)
+
+    def test_review_scope_rejects_changes_to_committed_review_context(self):
+        repo = Path(self.tmp.name) / "tampered-review-context-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Harness Test"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "harness@example.invalid"], check=True)
+        (repo / "scope.json").write_text("{}\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "scope.json"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "scope"], check=True)
+        head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+        adapter = FootballPredictionAdapter()
+        context = adapter.review_context_worktree(str(repo), "mission", head)
+        (context / "scope.json").write_text("tampered\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "differs from the committed HEAD blob"):
+            adapter.review_scope_file(context, head, "scope.json")
+
+    def test_supervisor_launches_independent_review_from_exact_head_context(self):
+        repo = Path(self.tmp.name) / "review-launch-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Harness Test"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "harness@example.invalid"], check=True)
+        (repo / "scope.json").write_text('{"forbidden_actions":["live"]}\n', encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "scope.json"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+        base = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+        (repo / "source.py").write_text("candidate\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "source.py"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "reviewed head"], check=True)
+        head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+
+        spec = MissionSpec(
+            "review-launch", str(repo), "test exact review context",
+            required_gates=(), reviews=("codex",), mission_scope_file="scope.json",
+        )
+        journal = Journal(Path(self.tmp.name) / "review-launch.sqlite")
+        journal.create(spec, worktree=str(repo), base_sha=base, branch="harness/review-launch")
+        journal.update(spec.mission_id, current_head=head, current_state=State.REVIEW)
+        process = ProcessSupervisor(journal, Path(self.tmp.name) / "review-launch-logs")
+        adapter = FootballPredictionAdapter()
+        supervisor = Supervisor(journal, process, self.codex, adapter)
+
+        with patch.object(adapter, "review_argv", return_value=["canonical-review"]) as review_argv, \
+                patch.object(process, "start", return_value="review-job") as start:
+            self.assertEqual(supervisor.step(spec.mission_id, spec), State.REVIEW)
+
+        context = adapter.review_context_worktree(str(repo), spec.mission_id, head)
+        self.assertEqual(start.call_args.args[2], ["canonical-review"])
+        self.assertEqual(start.call_args.args[3], str(context))
+        self.assertEqual(start.call_args.args[5], head)
+        self.assertEqual(review_argv.call_args.kwargs["worktree"], str(context))
+        self.assertEqual(review_argv.call_args.kwargs["scope_file"], str(context / "scope.json"))
+        self.assertEqual((context / "scope.json").read_text(encoding="utf-8"), '{"forbidden_actions":["live"]}\n')
+
     def test_background_verify_continues_same_mission_without_duplicate(self):
         self.advance_to_test()
         self.supervisor.run_until_wait(self.spec.mission_id, self.spec)

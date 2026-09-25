@@ -150,23 +150,24 @@ class Supervisor:
                 spec = self.journal.spec(mission_id)
                 scope = spec.mission_scope_file
                 if result.state in {"EXITED", "LOST"}:
-                    root = Path(snapshot["worktree"]).resolve()
                     try:
                         if not scope:
                             raise ValueError("FootballPrediction review requires mission_scope_file")
-                        scope_path = (root / scope).resolve()
-                        relative_scope = scope_path.relative_to(root)
-                        tracked = subprocess.run(
-                            ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", str(relative_scope)],
-                            capture_output=True, text=True, check=False,
-                        )
-                        if not scope_path.is_file() or tracked.returncode != 0:
-                            raise ValueError("mission scope contract is not a tracked file")
+                        if isinstance(self.adapter, SimulatedAdapter):
+                            review_root = Path(snapshot["worktree"]).resolve()
+                            scope_path = review_root / scope
+                        else:
+                            context_factory = getattr(self.adapter, "review_context_worktree", None)
+                            scope_validator = getattr(self.adapter, "review_scope_file", None)
+                            if not callable(context_factory) or not callable(scope_validator):
+                                raise ValueError("canonical immutable review context is unavailable")
+                            review_root = context_factory(snapshot["worktree"], mission_id, current)
+                            scope_path = scope_validator(review_root, current, scope)
                         evidence_dir = self.adapter.review_evidence_dir(
                             snapshot["worktree"], mission_id, reviewer, current,
                         )
                         reviewed = self.adapter.review_result(
-                            reviewer, worktree=snapshot["worktree"], base=snapshot["base_sha"], head=current,
+                            reviewer, worktree=str(review_root), base=snapshot["base_sha"], head=current,
                             mission_id=mission_id, scope_file=str(scope_path),
                             stdout_path=job["stdout_path"], evidence_dir=str(evidence_dir),
                         )
@@ -521,13 +522,17 @@ class Supervisor:
                         if not spec.mission_scope_file:
                             advance(State.BLOCKED_EXTERNAL, "FootballPrediction review requires mission_scope_file")
                             return State.BLOCKED_EXTERNAL
-                        root = Path(row["worktree"]).resolve()
-                        scope = (root / spec.mission_scope_file).resolve()
-                        tracked = subprocess.run(["git", "-C", str(root), "ls-files", "--error-unmatch", "--", str(scope.relative_to(root))], capture_output=True, text=True, check=False) if root in scope.parents else None
-                        if not scope.is_file() or tracked is None or tracked.returncode != 0:
-                            advance(State.BLOCKED_EXTERNAL, f"mission scope contract is unavailable: {scope}")
+                        try:
+                            context_factory = getattr(self.adapter, "review_context_worktree", None)
+                            scope_validator = getattr(self.adapter, "review_scope_file", None)
+                            if not callable(context_factory) or not callable(scope_validator):
+                                raise ValueError("canonical immutable review context is unavailable")
+                            review_root = context_factory(row["worktree"], mission_id, head)
+                            scope = scope_validator(review_root, head, spec.mission_scope_file)
+                        except Exception as exc:
+                            advance(State.BLOCKED_EXTERNAL, f"mission scope contract is unavailable at reviewed HEAD: {exc}")
                             return State.BLOCKED_EXTERNAL
-                        preflight = self.adapter.review_preflight(row["worktree"], row["base_sha"], head)
+                        preflight = self.adapter.review_preflight(str(review_root), row["base_sha"], head)
                         if preflight.status != "PASS":
                             advance(State.BLOCKED_EXTERNAL, preflight.evidence)
                             return State.BLOCKED_EXTERNAL
@@ -546,13 +551,13 @@ class Supervisor:
                                         or stat.S_IMODE(info.st_mode) & 0o077):
                                     raise RuntimeError(f"review evidence directory is not private: {private_dir}")
                             argv = self.adapter.review_argv(
-                                reviewer, worktree=row["worktree"], base=row["base_sha"], head=head,
+                                reviewer, worktree=str(review_root), base=row["base_sha"], head=head,
                                 mission_id=mission_id, scope_file=str(scope), evidence_dir=str(evidence),
                             )
                             self.journal.update(mission_id, pending_gate=f"review:{reviewer}")
                             self.process.start(
                                 mission_id, f"review:{reviewer}", argv,
-                                row["worktree"], docker_env(mission_id), head,
+                                str(review_root), docker_env(mission_id), head,
                             )
                         except Exception as exc:
                             advance(State.BLOCKED_EXTERNAL,
@@ -780,10 +785,16 @@ class Supervisor:
                     return State.BLOCKED_EXTERNAL
                 artifacts = self.journal.latest_review_artifacts(mission_id, row["current_head"])
                 try:
+                    context_factory = getattr(self.adapter, "review_context_worktree", None)
+                    scope_validator = getattr(self.adapter, "review_scope_file", None)
+                    if not callable(context_factory) or not callable(scope_validator):
+                        raise ValueError("canonical immutable review context is unavailable")
+                    review_root = context_factory(row["worktree"], mission_id, row["current_head"])
+                    scope_file = scope_validator(review_root, row["current_head"], spec.mission_scope_file)
                     readiness = merge_ready(
-                        worktree=row["worktree"], base=row["base_sha"], head=row["current_head"],
+                        worktree=str(review_root), base=row["base_sha"], head=row["current_head"],
                         mission_id=mission_id,
-                        scope_file=str((Path(row["worktree"]) / spec.mission_scope_file).resolve()),
+                        scope_file=str(scope_file),
                         pr_number=row["pr_number"], pr_repo=row["pr_repo"],
                         pr_base_sha=row["pr_base_sha"],
                         receipts=artifacts, ci_status="PASS",

@@ -56,6 +56,7 @@ class ProjectGateSandboxTest(unittest.TestCase):
         self.assertIn("--unshare-all", argv)
         self.assertIn("--clearenv", argv)
         self.assertIn("--tmpfs", argv)
+        self.assertIn(("--tmpfs", "/"), tuple(zip(argv, argv[1:])))
         self.assertNotIn("GH_TOKEN", invocation.env)
         self.assertNotIn("HTTP_PROXY", invocation.env)
         self.assertNotIn("controller-secret-marker", invocation.config_path.read_text())
@@ -69,6 +70,8 @@ class ProjectGateSandboxTest(unittest.TestCase):
             for index, item in enumerate(argv[:-2])
             if item == "--ro-bind"
         ]
+        self.assertNotIn(("/", "/"), ro_bind_pairs)
+        self.assertIn(("/usr", "/usr"), ro_bind_pairs)
         self.assertIn((str(self.worktree / ".git"), "/mnt/.git"), ro_bind_pairs)
         self.assertIn("--bind", argv)
         self.assertEqual(invocation.env["COMPOSE_PROJECT_NAME"], "cmh-test")
@@ -95,22 +98,34 @@ class ProjectGateSandboxTest(unittest.TestCase):
 
     def test_scope_and_pr_body_are_mapped_to_only_the_approved_sandbox_mounts(self):
         scope = self.worktree / "tracked.txt"
+        scope.write_text("mutated after commit\n", encoding="utf-8")
+        scope_mode = scope.stat().st_mode & 0o777
         evidence = self.worktree.parent / ".cmh-gate-evidence" / "mission" / ("a" * 40)
         evidence.mkdir(parents=True)
         body = evidence / "pr-body.md"
         body.write_text("review context\n", encoding="utf-8")
         body.chmod(0o600)
+        head = subprocess.check_output(["git", "-C", str(self.worktree), "rev-parse", "HEAD"], text=True).strip()
         invocation = self.build(env={
             "MISSION_SCOPE_FILE": str(scope),
             "PR_BODY": str(body),
             "BASE_REF": "b" * 40,
-            "HEAD_REF": "a" * 40,
+            "HEAD_REF": head,
             "JSON": "1",
         })
         self.assertEqual(invocation.env["MISSION_SCOPE_FILE"], "/mnt/tracked.txt")
         self.assertEqual(invocation.env["PR_BODY"], "/tmp/cmh-pr-evidence/pr-body.md")
         self.assertIn(str(evidence), invocation.argv)
         self.assertIn("/tmp/cmh-pr-evidence", invocation.argv)
+        ro_bind_pairs = [
+            (invocation.argv[index + 1], invocation.argv[index + 2])
+            for index, item in enumerate(invocation.argv[:-2])
+            if item == "--ro-bind"
+        ]
+        scope_sources = [source for source, target in ro_bind_pairs if target == "/mnt/tracked.txt"]
+        self.assertEqual(len(scope_sources), 1)
+        self.assertEqual(Path(scope_sources[0]).read_bytes(), b"candidate\n")
+        self.assertEqual(scope.stat().st_mode & 0o777, scope_mode)
 
     def test_gate_rejects_controller_credentials_and_scope_outside_worktree(self):
         with self.assertRaisesRegex(SandboxUnavailable, "environment value outside the allowlist"):
@@ -145,6 +160,12 @@ class ProjectGateSandboxTest(unittest.TestCase):
             "gate-check:\n"
             f"\t@test ! -e {shlex.quote(str(host_home / '.codex'))}\n"
             "\t@test ! -e /run/docker.sock\n"
+            "\t@test ! -e /etc/shadow\n"
+            "\t@test ! -e /var/lib\n"
+            "\t@test ! -e /opt\n"
+            "\t@test -x /usr/bin/python3\n"
+            "\t@test \"$$(cat tracked.txt)\" = candidate\n"
+            "\t@! printf 'scope-tamper\\n' > tracked.txt 2>/dev/null\n"
             "\t@test -z \"$${GH_TOKEN:-}\"\n"
             "\t@! git config --local --get http.extraheader >/dev/null 2>&1\n"
             "\t@! printf 'gitdir: /tmp/cmh-fake-gitdir\\n' > .git 2>/dev/null\n"
@@ -152,7 +173,12 @@ class ProjectGateSandboxTest(unittest.TestCase):
             encoding="utf-8",
         )
         invocation = project_gate_invocation(
-            ["make", "gate-check"], str(self.worktree), {}, self.logs, "hostile-makefile",
+            ["make", "gate-check"], str(self.worktree), {
+                "MISSION_SCOPE_FILE": str(self.worktree / "tracked.txt"),
+                "HEAD_REF": subprocess.check_output(
+                    ["git", "-C", str(self.worktree), "rev-parse", "HEAD"], text=True,
+                ).strip(),
+            }, self.logs, "hostile-makefile",
         )
         host_env = {**os.environ, "GH_TOKEN": "controller-secret-marker"}
         result = subprocess.run(
@@ -161,6 +187,7 @@ class ProjectGateSandboxTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         self.assertTrue((self.worktree / "sandbox-output.txt").is_file())
+        self.assertEqual((self.worktree / "tracked.txt").read_text(encoding="utf-8"), "candidate\n")
         self.assertEqual(gitfile.read_bytes(), gitfile_before)
 
 
