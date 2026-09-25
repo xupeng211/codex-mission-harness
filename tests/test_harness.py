@@ -2843,7 +2843,7 @@ class HarnessTest(unittest.TestCase):
                                          "base_sha": "c" * 40})), \
                 patch.object(adapter, "_trusted_base_checkout", return_value=Path("/trusted")), \
                 patch.object(adapter, "_call", return_value=completed):
-            result = adapter.ci("/fixture", "a" * 40, base_sha="b" * 40)
+            result = adapter.ci("/fixture", "a" * 40, base_sha="c" * 40)
         self.assertEqual(result.status, "FAIL")
         self.assertEqual(result.data["pr_number"], 7)
 
@@ -2853,6 +2853,21 @@ class HarnessTest(unittest.TestCase):
             result = adapter.ci("/fixture", "a" * 40)
         self.assertEqual(result.status, "BLOCKED_EXTERNAL")
         self.assertIn("trusted base SHA", result.evidence)
+        call.assert_not_called()
+
+    def test_ci_rejects_trusted_policy_base_that_differs_from_current_pr_base(self):
+        adapter = FootballPredictionAdapter()
+        with patch.object(adapter, "discover_pr", return_value=GateResult(
+                "PASS", "PR", data={"number": 7, "repo": "owner/project", "base_sha": "c" * 40})), \
+                patch.object(adapter, "_pr_state", return_value=GateResult(
+                    "PASS", "PR", data={"head": "a" * 40, "base": "main", "state": "OPEN",
+                                         "base_sha": "c" * 40})), \
+                patch.object(adapter, "_trusted_base_checkout") as trusted, \
+                patch.object(adapter, "_call") as call:
+            result = adapter.ci("/fixture", "a" * 40, base_sha="b" * 40)
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+        self.assertIn("trusted policy base SHA", result.evidence)
+        trusted.assert_not_called()
         call.assert_not_called()
 
     def test_merge_ready_delegates_to_canonical_target_gate(self):
@@ -2986,12 +3001,12 @@ class HarnessTest(unittest.TestCase):
             with self.subTest(report=report):
                 with patch.object(adapter, "discover_pr", return_value=GateResult(
                         "PASS", "PR", data={"number": 7, "repo": "fixture/repo", "base_sha": "c" * 40})), \
-                        patch.object(adapter, "_pr_state", return_value=GateResult(
-                            "PASS", "PR", data={"head": "a" * 40, "base": "main", "state": "OPEN",
-                                                 "base_sha": "c" * 40})), \
-                        patch.object(adapter, "_call", return_value=subprocess.CompletedProcess(
+                patch.object(adapter, "_pr_state", return_value=GateResult(
+                    "PASS", "PR", data={"head": "a" * 40, "base": "main", "state": "OPEN",
+                                         "base_sha": "c" * 40})), \
+                patch.object(adapter, "_call", return_value=subprocess.CompletedProcess(
                             [], 0, json.dumps(report), "")):
-                    result = adapter.ci("/fixture", "a" * 40, base_sha="b" * 40)
+                    result = adapter.ci("/fixture", "a" * 40, base_sha="c" * 40)
                 self.assertEqual(result.status, "BLOCKED_EXTERNAL")
 
     def test_ci_reuses_durable_pr_and_rejects_identity_change(self):
@@ -3018,7 +3033,7 @@ class HarnessTest(unittest.TestCase):
                 patch.object(adapter, "_call") as call:
             result = adapter.ci(
                 "/fixture", "a" * 40, 7, "fixture/repo",
-                base_sha="d" * 40, pr_base_sha="b" * 40,
+                base_sha="c" * 40, pr_base_sha="b" * 40,
             )
         self.assertEqual(result.status, "BLOCKED_EXTERNAL")
         self.assertIn("base SHA changed", result.evidence)

@@ -511,6 +511,11 @@ class FootballPredictionAdapter:
                     or re.fullmatch(r"[0-9a-f]{40}", str(facts.get("base_sha", ""))) is None):
                 return GateResult("BLOCKED_EXTERNAL", f"durable PR #{pr_number} no longer matches open main PR at {head}")
         observed_base_sha = str((bound.data or {}).get("base_sha", "")).lower()
+        if observed_base_sha != base_sha.lower():
+            return GateResult(
+                "BLOCKED_EXTERNAL",
+                "current PR base SHA differs from the trusted policy base SHA",
+            )
         if pr_base_sha is not None and observed_base_sha != pr_base_sha.lower():
             return GateResult("BLOCKED_EXTERNAL", "durable PR base SHA changed after review/approval")
         try:
