@@ -2827,6 +2827,84 @@ class HarnessTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported independent reviewer"):
             adapter.review_environment("other", worktree=str(worktree))
 
+    def test_authority_call_ignores_ambient_path_and_execution_overrides(self):
+        adapter = FootballPredictionAdapter()
+        attacker_bin = Path(self.tmp.name) / "attacker-bin"
+        attacker_bin.mkdir()
+        fake_gh = attacker_bin / "gh"
+        fake_gh.write_text("#!/bin/sh\nprintf forged\n", encoding="utf-8")
+        fake_gh.chmod(0o755)
+        hostile = {
+            "PATH": str(attacker_bin),
+            "HOME": str(Path.home()),
+            "GH_HOST": "api.attacker.invalid",
+            "GH_REPO": "attacker/forged",
+            "GH_TOKEN": "test-only-token",
+            "GIT_DIR": "/attacker/repo.git",
+            "GIT_WORK_TREE": "/attacker/worktree",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.bare",
+            "GIT_CONFIG_VALUE_0": "true",
+            "PYTHONPATH": "/attacker/python",
+            "PYTHONHOME": "/attacker/python-home",
+            "LD_PRELOAD": "/attacker/lib.so",
+            "OPENAI_API_KEY": "must-not-be-inherited",
+        }
+        completed = subprocess.CompletedProcess([], 0, "trusted response", "")
+        with patch.dict(os.environ, hostile, clear=True), \
+                patch("harness.adapters.subprocess.run", return_value=completed) as run:
+            result = adapter._call(
+                ["gh", "api", "repos/owner/repo"], cwd=self.tmp.name,
+                env={"PATH": str(attacker_bin), "GH_REPO": "owner/repo"},
+            )
+
+        self.assertEqual(result.returncode, 0)
+        argv = run.call_args.args[0]
+        child_env = run.call_args.kwargs["env"]
+        self.assertEqual(argv[0], adapter._trusted_system_executable("gh"))
+        self.assertNotEqual(argv[0], str(fake_gh))
+        self.assertEqual(child_env["PATH"], adapter._trusted_system_path())
+        self.assertEqual(child_env["GH_HOST"], "github.com")
+        self.assertEqual(child_env["GH_REPO"], "owner/repo")
+        # GitHub auth may flow to the verified gh binary; arbitrary execution
+        # controls and unrelated API credentials must not.
+        self.assertEqual(child_env["GH_TOKEN"], "test-only-token")
+        for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
+                     "PYTHONPATH", "PYTHONHOME", "LD_PRELOAD", "OPENAI_API_KEY"):
+            self.assertNotIn(name, child_env)
+        self.assertEqual(child_env["GIT_CONFIG_COUNT"], "0")
+
+    def test_run_uses_trusted_absolute_executable_and_filtered_environment(self):
+        adapter = FootballPredictionAdapter()
+        attacker_bin = Path(self.tmp.name) / "attacker-bin"
+        attacker_bin.mkdir()
+        fake_git = attacker_bin / "git"
+        fake_git.write_text("#!/bin/sh\nprintf forged\n", encoding="utf-8")
+        fake_git.chmod(0o755)
+        hostile = {
+            "PATH": str(attacker_bin),
+            "HOME": str(Path.home()),
+            "GH_TOKEN": "test-only-token",
+            "GIT_DIR": "/attacker/repo.git",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.bare",
+            "PYTHONPATH": "/attacker/python",
+        }
+        with patch.dict(os.environ, hostile, clear=True), \
+                patch("harness.adapters.subprocess.check_output", return_value="main\n") as check_output:
+            result = adapter._run(["git", "branch", "--show-current"], cwd=self.tmp.name)
+
+        self.assertEqual(result, "main\n")
+        argv = check_output.call_args.args[0]
+        child_env = check_output.call_args.kwargs["env"]
+        self.assertEqual(argv[0], adapter._trusted_system_executable("git"))
+        self.assertNotEqual(argv[0], str(fake_git))
+        self.assertEqual(child_env["PATH"], adapter._trusted_system_path())
+        self.assertEqual(child_env["GH_TOKEN"], "test-only-token")
+        for name in ("GIT_DIR", "GIT_CONFIG_KEY_0", "PYTHONPATH"):
+            self.assertNotIn(name, child_env)
+        self.assertEqual(child_env["GIT_CONFIG_COUNT"], "0")
+
     def test_trusted_git_output_ignores_ambient_git_overrides(self):
         adapter = FootballPredictionAdapter()
         hostile = {

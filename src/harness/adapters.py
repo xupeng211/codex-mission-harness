@@ -371,6 +371,215 @@ class FootballPredictionAdapter:
         raise RuntimeError("no trusted absolute Python interpreter is available")
 
     @staticmethod
+    def _trusted_system_path() -> str:
+        """Return only root-owned, non-writable system command directories."""
+        safe: list[str] = []
+        for entry in os.defpath.split(os.pathsep):
+            if not entry or not Path(entry).is_absolute():
+                continue
+            try:
+                directory = Path(entry).resolve(strict=True)
+                info = directory.stat()
+            except OSError:
+                continue
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
+                continue
+            trusted = True
+            for ancestor in directory.parents:
+                try:
+                    ancestor_info = ancestor.stat()
+                except OSError:
+                    trusted = False
+                    break
+                if (not stat.S_ISDIR(ancestor_info.st_mode) or ancestor_info.st_uid != 0
+                        or stat.S_IMODE(ancestor_info.st_mode) & 0o022):
+                    trusted = False
+                    break
+            rendered = str(directory)
+            if trusted and rendered not in safe:
+                safe.append(rendered)
+        if not safe:
+            raise RuntimeError("trusted system command PATH is unavailable")
+        return os.pathsep.join(safe)
+
+    @staticmethod
+    def _validate_executable(path: str, *, owners: set[int] | None = None) -> str:
+        """Resolve one executable and verify its file and ancestor directories."""
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            raise RuntimeError("trusted executable path must be absolute")
+        allowed_owners = owners or ({0, os.getuid()} if hasattr(os, "getuid") else {0})
+        try:
+            resolved = candidate.resolve(strict=True)
+            info = resolved.stat()
+        except OSError as exc:
+            raise RuntimeError("trusted executable is unavailable") from exc
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid not in allowed_owners
+                or stat.S_IMODE(info.st_mode) & 0o022 or not os.access(resolved, os.X_OK)):
+            raise RuntimeError("trusted executable has unsafe ownership or permissions")
+        for directory in (resolved.parent, *resolved.parent.parents):
+            try:
+                directory_info = directory.stat()
+            except OSError as exc:
+                raise RuntimeError("trusted executable has an unavailable parent directory") from exc
+            if (not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_uid not in allowed_owners
+                    or stat.S_IMODE(directory_info.st_mode) & 0o022):
+                raise RuntimeError("trusted executable has an unsafe parent directory")
+        return str(resolved)
+
+    @classmethod
+    def _trusted_system_executable(cls, name: str) -> str:
+        """Resolve a bare command only from the verified system PATH."""
+        if not isinstance(name, str) or not name or Path(name).name != name or name in {".", ".."}:
+            raise RuntimeError("command name is not a safe basename")
+        path = cls._trusted_system_path()
+        candidate = shutil.which(name, path=path)
+        if not candidate:
+            raise RuntimeError(f"trusted system command is unavailable: {name}")
+        return cls._validate_executable(candidate, owners={0})
+
+    @classmethod
+    def _trusted_command_argv(cls, argv):
+        if not isinstance(argv, (list, tuple)) or not argv or not isinstance(argv[0], str):
+            raise RuntimeError("trusted command arguments are malformed")
+        command = argv[0]
+        if Path(command).is_absolute():
+            executable = cls._validate_executable(command)
+        else:
+            if "/" in command or "\\" in command:
+                raise RuntimeError("relative executable paths are forbidden")
+            executable = cls._trusted_system_executable(command)
+        return [executable, *argv[1:]]
+
+    @staticmethod
+    def _trusted_search_path(path: str) -> str:
+        """Validate an explicitly supplied search path used by trusted wrappers."""
+        safe: list[str] = []
+        owners = {0, os.getuid()} if hasattr(os, "getuid") else {0}
+        for entry in path.split(os.pathsep):
+            if not entry or not Path(entry).is_absolute():
+                continue
+            try:
+                directory = Path(entry).resolve(strict=True)
+                info = directory.stat()
+            except OSError:
+                continue
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in owners
+                    or stat.S_IMODE(info.st_mode) & 0o022):
+                continue
+            trusted = True
+            for ancestor in directory.parents:
+                try:
+                    ancestor_info = ancestor.stat()
+                except OSError:
+                    trusted = False
+                    break
+                if (not stat.S_ISDIR(ancestor_info.st_mode) or ancestor_info.st_uid not in owners
+                        or stat.S_IMODE(ancestor_info.st_mode) & 0o022):
+                    trusted = False
+                    break
+            rendered = str(directory)
+            if trusted and rendered not in safe:
+                safe.append(rendered)
+        if not safe:
+            raise RuntimeError("trusted subprocess PATH is unavailable")
+        return os.pathsep.join(safe)
+
+    @classmethod
+    def _trusted_subprocess_environment(cls, *, env=None, inherit_environment=True) -> dict[str, str]:
+        """Pass only deliberate process settings and required GitHub auth/network state."""
+        child_env: dict[str, str] = {}
+        if inherit_environment:
+            try:
+                home = Path(os.environ.get("HOME") or str(Path.home()))
+                home_info = home.lstat()
+                uid = os.getuid() if hasattr(os, "getuid") else home_info.st_uid
+                if (home.is_absolute() and stat.S_ISDIR(home_info.st_mode)
+                        and not stat.S_ISLNK(home_info.st_mode) and home_info.st_uid == uid
+                        and not stat.S_IMODE(home_info.st_mode) & 0o022):
+                    child_env["HOME"] = str(home.resolve(strict=True))
+            except OSError:
+                pass
+            for name in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN",
+                         "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                         "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+                         "SSH_AUTH_SOCK", "SSH_AGENT_PID"):
+                value = os.environ.get(name)
+                if value:
+                    child_env[name] = value
+            for name in ("XDG_CONFIG_HOME", "GH_CONFIG_DIR"):
+                value = os.environ.get(name, "")
+                if not value or not Path(value).is_absolute():
+                    continue
+                try:
+                    directory = Path(value)
+                    info = directory.lstat()
+                    home_path = Path(child_env.get("HOME", "/nonexistent"))
+                    resolved = directory.resolve(strict=True)
+                    uid = os.getuid() if hasattr(os, "getuid") else info.st_uid
+                    if (stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+                            and info.st_uid == uid and not stat.S_IMODE(info.st_mode) & 0o022
+                            and resolved.is_relative_to(home_path)):
+                        child_env[name] = str(resolved)
+                except (OSError, ValueError):
+                    continue
+            ca_names = (
+                "CODEX_CA_CERTIFICATE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO",
+                "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "SSL_CERT_DIR", "SSL_CERT_FILE",
+            )
+            for name in ca_names:
+                value = os.environ.get(name, "")
+                if not value:
+                    continue
+                paths = value.split(os.pathsep) if name == "SSL_CERT_DIR" else [value]
+                safe = True
+                for raw_path in paths:
+                    path = Path(raw_path)
+                    try:
+                        info = path.lstat()
+                    except OSError:
+                        safe = False
+                        break
+                    expected_type = stat.S_ISDIR(info.st_mode) if name == "SSL_CERT_DIR" else stat.S_ISREG(info.st_mode)
+                    if (not path.is_absolute() or stat.S_ISLNK(info.st_mode) or not expected_type
+                            or info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022):
+                        safe = False
+                        break
+                if safe:
+                    child_env[name] = value
+
+        overrides = dict(env or {})
+        requested_path = overrides.pop("PATH", None)
+        child_env.update(overrides)
+        if inherit_environment:
+            # A caller-provided PATH must not undo the safe default.
+            child_env["PATH"] = cls._trusted_system_path()
+        else:
+            child_env["PATH"] = cls._trusted_search_path(requested_path or os.defpath)
+        # Do not let user environment or call-site overrides select Git config
+        # through variables that can redirect repositories or inject config.
+        for name in tuple(child_env):
+            if (name.startswith("GIT_CONFIG_KEY_") or name.startswith("GIT_CONFIG_VALUE_")
+                    or name in {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+                                "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                                "GIT_CONFIG_PARAMETERS", "GIT_SSH", "GIT_SSH_COMMAND",
+                                "GIT_EXEC_PATH", "PYTHONPATH", "PYTHONHOME", "LD_PRELOAD",
+                                "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES"}):
+                child_env.pop(name, None)
+        child_env.update({
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_COUNT": "0",
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GH_HOST": "github.com",
+            "GH_PROMPT_DISABLED": "1",
+        })
+        return child_env
+
+    @staticmethod
     def _trusted_review_path(worktree: str) -> str:
         """Keep only absolute, owner-controlled PATH directories outside the reviewed tree."""
         repository = Path(worktree).resolve(strict=True)
@@ -1149,23 +1358,30 @@ class FootballPredictionAdapter:
         if data.get("verdict") == "FAIL": return GateResult("FAIL", json.dumps(data), data=data)
         return GateResult("BLOCKED_EXTERNAL", "Production Gate returned an invalid verdict", data=data)
 
-    @staticmethod
-    def _call(argv, cwd=None, env=None, inherit_environment=True):
-        child_env = os.environ.copy() if inherit_environment else {}
-        if env: child_env.update(env)
+    @classmethod
+    def _call(cls, argv, cwd=None, env=None, inherit_environment=True):
         try:
-            child_env["GH_HOST"] = "github.com"
-            return subprocess.run(argv, cwd=cwd, env=child_env, text=True, capture_output=True, check=False, timeout=60)
+            trusted_argv = cls._trusted_command_argv(argv)
+            child_env = cls._trusted_subprocess_environment(
+                env=env, inherit_environment=inherit_environment,
+            )
+            return subprocess.run(trusted_argv, cwd=cwd, env=child_env, text=True,
+                                  capture_output=True, check=False, timeout=60)
         except subprocess.TimeoutExpired as exc:
             stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
             return subprocess.CompletedProcess(argv, 124, stdout, f"command timed out after 60 seconds: {argv[0]}")
-        except OSError as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             return subprocess.CompletedProcess(argv, 127, "", f"cannot execute command: {exc}")
-    @staticmethod
-    def _run(argv, cwd=None):
-        env = os.environ.copy()
-        env["GH_HOST"] = "github.com"
-        return subprocess.check_output(argv, cwd=cwd, env=env, text=True, stderr=subprocess.PIPE, timeout=60)
+
+    @classmethod
+    def _run(cls, argv, cwd=None):
+        try:
+            trusted_argv = cls._trusted_command_argv(argv)
+            child_env = cls._trusted_subprocess_environment(inherit_environment=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise subprocess.SubprocessError(f"cannot prepare trusted command: {exc}") from exc
+        return subprocess.check_output(trusted_argv, cwd=cwd, env=child_env, text=True,
+                                       stderr=subprocess.PIPE, timeout=60)
     @staticmethod
     def _json_last_line(path):
         try:
