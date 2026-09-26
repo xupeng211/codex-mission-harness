@@ -73,7 +73,13 @@ class ProjectGateSandboxTest(unittest.TestCase):
         self.assertNotIn(("/", "/"), ro_bind_pairs)
         self.assertIn(("/usr", "/usr"), ro_bind_pairs)
         self.assertIn((str(self.worktree / ".git"), "/mnt/.git"), ro_bind_pairs)
-        self.assertIn("--bind", argv)
+        ro_bind_pairs = [
+            (argv[index + 1], argv[index + 2])
+            for index, item in enumerate(argv[:-2])
+            if item == "--ro-bind"
+        ]
+        self.assertIn((str(self.worktree), "/mnt"), ro_bind_pairs)
+        self.assertNotIn("--bind", argv)
         self.assertEqual(invocation.env["COMPOSE_PROJECT_NAME"], "cmh-test")
 
     def test_regular_checkout_sanitizes_original_and_sandbox_git_config_paths(self):
@@ -169,7 +175,7 @@ class ProjectGateSandboxTest(unittest.TestCase):
             "\t@test -z \"$${GH_TOKEN:-}\"\n"
             "\t@! git config --local --get http.extraheader >/dev/null 2>&1\n"
             "\t@! printf 'gitdir: /tmp/cmh-fake-gitdir\\n' > .git 2>/dev/null\n"
-            "\t@touch sandbox-output.txt\n",
+            "\t@! touch sandbox-output.txt 2>/dev/null\n",
             encoding="utf-8",
         )
         invocation = project_gate_invocation(
@@ -186,7 +192,7 @@ class ProjectGateSandboxTest(unittest.TestCase):
             text=True, capture_output=True, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-        self.assertTrue((self.worktree / "sandbox-output.txt").is_file())
+        self.assertFalse((self.worktree / "sandbox-output.txt").exists())
         self.assertEqual((self.worktree / "tracked.txt").read_text(encoding="utf-8"), "candidate\n")
         self.assertEqual(gitfile.read_bytes(), gitfile_before)
 

@@ -315,23 +315,24 @@ def project_gate_invocation(
             raise SandboxUnavailable("controller home directory cannot be masked")
         command.extend(_ensure_masked_path_args(home, (*root_dirs, Path("/"))))
         command.extend(("--tmpfs", str(home)))
-    command.extend(("--bind", str(worktree), "/mnt"))
+    # Candidate-controlled project gates can execute arbitrary code. Keep the
+    # reviewed source tree read-only so a gate cannot change files that later
+    # gates would mistake for the same committed HEAD.
+    command.extend(("--ro-bind", str(worktree), "/mnt"))
     if committed_scope is not None:
         scope_source, scope_target = committed_scope
         command.extend(("--ro-bind", str(scope_source), str(scope_target)))
     if linked_worktree:
         command.extend(_ensure_masked_path_args(common, masked_roots))
         command.extend(("--ro-bind", str(common), str(common_target)))
-        # The worktree's .git file is inside the writable /mnt bind. Overlay
-        # the original pointer read-only so candidate gate code cannot persist
-        # a redirected Git directory onto the host worktree.
+        # Overlay the pointer explicitly so candidate gate code cannot replace
+        # the worktree's Git directory reference on the host.
         command.extend(("--ro-bind", str(gitfile), "/mnt/.git"))
     else:
         command.extend(_ensure_masked_path_args(common, masked_roots))
         command.extend(("--ro-bind", str(common), str(common_target)))
-        # The root bind still exposes a regular checkout's original .git
-        # directory at its host path. Replace its config there too, unless
-        # that path is hidden by the /mnt worktree bind itself.
+        # Replace the regular checkout's config with the sanitized read-only
+        # version so candidate code cannot read host Git credentials.
         try:
             common.relative_to(Path("/mnt"))
         except ValueError:

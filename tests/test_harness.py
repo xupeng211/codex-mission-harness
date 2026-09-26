@@ -2795,6 +2795,24 @@ class HarnessTest(unittest.TestCase):
             resolved = adapter._trusted_python_interpreter()
         self.assertEqual(resolved, str(system_python.resolve(strict=True)))
 
+    def test_review_scope_git_uses_validated_system_path_without_worktree_entries(self):
+        adapter = FootballPredictionAdapter()
+        root = Path(self.tmp.name) / "scope-root"
+        root.mkdir()
+        (root / "scope.json").write_bytes(b"committed scope")
+        head = "a" * 40
+        with patch.object(adapter, "_trusted_system_path", return_value="/usr/bin:/bin"), \
+                patch("harness.adapters.subprocess.check_output",
+                      side_effect=[head + "\n", b"committed scope"]) as check_output:
+            scope = adapter.review_scope_file(str(root), head, "scope.json")
+        self.assertEqual(scope, root / "scope.json")
+        self.assertEqual(len(check_output.call_args_list), 2)
+        for call in check_output.call_args_list:
+            path = call.kwargs["env"]["PATH"].split(os.pathsep)
+            self.assertEqual(path, ["/usr/bin", "/bin"])
+            self.assertNotIn("", path)
+            self.assertNotIn(str(root), path)
+
     def test_review_environment_filters_ambient_execution_and_git_variables(self):
         adapter = FootballPredictionAdapter()
         worktree = Path(self.tmp.name) / "review-target"

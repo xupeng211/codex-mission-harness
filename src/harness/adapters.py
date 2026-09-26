@@ -73,7 +73,7 @@ class FootballPredictionAdapter:
             raise RuntimeError("review context path is a symbolic link")
 
         git_env = {
-            "PATH": os.defpath,
+            "PATH": self._trusted_system_path(),
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_TERMINAL_PROMPT": "0",
@@ -135,7 +135,7 @@ class FootballPredictionAdapter:
         scope = root.joinpath(*relative_scope.split("/"))
         if scope.is_symlink():
             raise RuntimeError("review scope in committed context is a symbolic link")
-        git_env = {"PATH": os.defpath, "GIT_CONFIG_NOSYSTEM": "1",
+        git_env = {"PATH": self._trusted_system_path(), "GIT_CONFIG_NOSYSTEM": "1",
                    "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"}
         try:
             observed_head = subprocess.check_output(
@@ -309,11 +309,11 @@ class FootballPredictionAdapter:
                 return GateResult("BLOCKED_EXTERNAL", f"canonical review commit is unavailable: {revision}")
         return GateResult("PASS", "canonical policy will execute from trusted base")
 
-    @staticmethod
-    def _trusted_git_environment() -> dict[str, str]:
+    @classmethod
+    def _trusted_git_environment(cls) -> dict[str, str]:
         """Use Git without ambient repository, config, or attribute overrides."""
         return {
-            "PATH": os.defpath,
+            "PATH": cls._trusted_system_path(),
             "HOME": "/nonexistent",
             "LANG": "C.UTF-8",
             "GIT_CONFIG_NOSYSTEM": "1",
@@ -335,11 +335,11 @@ class FootballPredictionAdapter:
             raise RuntimeError(result.stderr.strip() or "trusted Git command failed")
         return result.stdout
 
-    @staticmethod
-    def _trusted_python_interpreter() -> str:
+    @classmethod
+    def _trusted_python_interpreter(cls) -> str:
         """Return an absolute interpreter from the running process or system PATH."""
         candidates = [sys.executable]
-        system_python = shutil.which("python3", path=os.defpath)
+        system_python = shutil.which("python3", path=cls._trusted_system_path())
         if system_python and system_python not in candidates:
             candidates.append(system_python)
         for candidate in candidates:
