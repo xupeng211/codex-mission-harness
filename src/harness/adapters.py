@@ -337,28 +337,38 @@ class FootballPredictionAdapter:
 
     @staticmethod
     def _trusted_python_interpreter() -> str:
-        """Resolve the already-running interpreter and reject writable launch paths."""
-        executable = Path(sys.executable)
-        if not executable.is_absolute():
-            raise RuntimeError("review interpreter path is not absolute")
-        try:
-            resolved = executable.resolve(strict=True)
-            info = resolved.stat()
-        except OSError as exc:
-            raise RuntimeError("review interpreter is unavailable") from exc
-        owners = {0, os.getuid()} if hasattr(os, "getuid") else {info.st_uid}
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid not in owners
-                or stat.S_IMODE(info.st_mode) & 0o022 or not os.access(resolved, os.X_OK)):
-            raise RuntimeError("review interpreter is not trusted")
-        for directory in (resolved.parent, *resolved.parent.parents):
+        """Return an absolute interpreter from the running process or system PATH."""
+        candidates = [sys.executable]
+        system_python = shutil.which("python3", path=os.defpath)
+        if system_python and system_python not in candidates:
+            candidates.append(system_python)
+        for candidate in candidates:
+            executable = Path(candidate)
+            if not executable.is_absolute():
+                continue
             try:
-                directory_info = directory.stat()
-            except OSError as exc:
-                raise RuntimeError("review interpreter directory is unavailable") from exc
-            if (not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_uid not in owners
-                    or stat.S_IMODE(directory_info.st_mode) & 0o022):
-                raise RuntimeError("review interpreter path contains an untrusted directory")
-        return str(resolved)
+                resolved = executable.resolve(strict=True)
+                info = resolved.stat()
+            except OSError:
+                continue
+            owners = {0, os.getuid()} if hasattr(os, "getuid") else {info.st_uid}
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid not in owners
+                    or stat.S_IMODE(info.st_mode) & 0o022 or not os.access(resolved, os.X_OK)):
+                continue
+            trusted_path = True
+            for directory in (resolved.parent, *resolved.parent.parents):
+                try:
+                    directory_info = directory.stat()
+                except OSError:
+                    trusted_path = False
+                    break
+                if (not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_uid not in owners
+                        or stat.S_IMODE(directory_info.st_mode) & 0o022):
+                    trusted_path = False
+                    break
+            if trusted_path:
+                return str(resolved)
+        raise RuntimeError("no trusted absolute Python interpreter is available")
 
     @staticmethod
     def _trusted_review_path(worktree: str) -> str:

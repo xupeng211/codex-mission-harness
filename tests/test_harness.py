@@ -2785,6 +2785,16 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--repo-root") + 1], str(worktree))
         self.assertIn("run", argv)
 
+    def test_trusted_python_interpreter_uses_system_path_when_running_python_is_untrusted(self):
+        adapter = FootballPredictionAdapter()
+        system_python = Path("/usr/bin/python3")
+        if not system_python.exists():
+            self.skipTest("system Python interpreter is unavailable")
+        with patch("harness.adapters.sys.executable", "/tmp/untrusted/python3"), \
+                patch("harness.adapters.shutil.which", return_value=str(system_python)):
+            resolved = adapter._trusted_python_interpreter()
+        self.assertEqual(resolved, str(system_python.resolve(strict=True)))
+
     def test_review_environment_filters_ambient_execution_and_git_variables(self):
         adapter = FootballPredictionAdapter()
         worktree = Path(self.tmp.name) / "review-target"
