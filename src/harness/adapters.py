@@ -1323,8 +1323,13 @@ class FootballPredictionAdapter:
     def post_merge(self, worktree: str, merge_sha: str, pr_number: int, pr_repo: str,
                    branch: str, base: str) -> GateResult:
         trusted = self._trusted_base_checkout(worktree, base)
-        result = self._call(["python3", "-I", "-B", str(trusted / "scripts/devops/pr_post_merge_check.py"), "--pr", str(pr_number),
-                             "--merge-commit", merge_sha, "--branch", branch, "--json"], cwd=worktree,
+        code = ("import sys; from pathlib import Path; "
+                "sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/devops')); "
+                "import pr_post_merge_check as m; "
+                "sys.argv=['pr-post-merge-check']+sys.argv[2:]; raise SystemExit(m.main())")
+        result = self._call([self._trusted_python_interpreter(), "-I", "-B", "-c", code, str(trusted),
+                             "--pr", str(pr_number), "--merge-commit", merge_sha,
+                             "--branch", branch, "--json"], cwd=worktree,
                             env={"GH_REPO": pr_repo, "GH_HOST": "github.com", "PYTHONDONTWRITEBYTECODE": "1"})
         try: data = self._json_document_prefix(result.stdout)
         except json.JSONDecodeError: return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "Production Gate check returned no JSON")

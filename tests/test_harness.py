@@ -3212,6 +3212,29 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(run.call_args_list[1].args[0], ["git", "rev-parse", "origin/main"])
         self.assertEqual(run.call_args_list[2].args[0], ["git", "rev-parse", f"{main_sha}^{{tree}}"])
 
+    def test_post_merge_bootstraps_trusted_project_imports_in_isolated_python(self):
+        adapter = FootballPredictionAdapter()
+        merge_sha = "a" * 40
+        report = {
+            "ci_head_sha": merge_sha, "ci_status": "completed", "ci_conclusion": "success",
+            "verdict": "PASS", "failures": [],
+        }
+        completed = subprocess.CompletedProcess([], 0, json.dumps(report), "")
+        with patch.object(adapter, "_trusted_base_checkout", return_value=Path("/trusted")), \
+                patch.object(adapter, "_trusted_python_interpreter", return_value="/trusted/python"), \
+                patch.object(adapter, "_call", side_effect=[completed, subprocess.CompletedProcess([], 0, "", "")]) as call, \
+                patch.object(adapter, "_run", side_effect=["", "d" * 40, "e" * 40]):
+            result = adapter.post_merge("/worktree", merge_sha, 7, "owner/project", "feature", "b" * 40)
+        self.assertEqual(result.status, "PASS")
+        argv = call.call_args_list[0].args[0]
+        self.assertEqual(argv[:4], ["/trusted/python", "-I", "-B", "-c"])
+        self.assertIn("Path(sys.argv[1]) / 'scripts/devops'", argv[4])
+        self.assertIn("import pr_post_merge_check as m", argv[4])
+        self.assertEqual(argv[5:], [
+            "/trusted", "--pr", "7", "--merge-commit", merge_sha,
+            "--branch", "feature", "--json",
+        ])
+
     def test_post_merge_queued_ci_is_pending_even_when_canonical_command_exits_one(self):
         adapter = FootballPredictionAdapter()
         merge_sha = "a" * 40
