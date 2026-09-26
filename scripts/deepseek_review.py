@@ -7,10 +7,11 @@ commit-last: an incomplete run has no receipt and is never an approval.
 """
 from __future__ import annotations
 
-import argparse, base64, hashlib, hmac, json, os, re, shutil, subprocess, sys, tempfile, time, uuid
+import argparse, base64, hashlib, hmac, json, os, re, shutil, stat, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
-VERSION = "cmh-deepseek-review/v3"
+VERSION = "cmh-deepseek-review/v4"
 MODEL = "deepseek-flash"
 ENDPOINT = "https://api.deepseek.com/anthropic"
 CHUNK_BYTES = 32000
@@ -159,6 +160,66 @@ def git(root, *args): return subprocess.check_output(["git", "-C", str(root), *a
 def full_sha(value):
     if len(value) != 40 or any(c not in "0123456789abcdef" for c in value.lower()): raise ValueError("full SHA required")
     return value.lower()
+
+def repository_identity(remote):
+    """Return a credential-free identity for a Git remote URL."""
+    if not isinstance(remote, str) or not remote.strip():
+        raise ValueError("repository remote is empty")
+    value = remote.strip()
+    parsed = urlsplit(value)
+    if parsed.scheme and parsed.netloc:
+        hostname = parsed.hostname
+        if not hostname:
+            raise ValueError("repository remote has no host")
+        host = hostname.lower()
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        if parsed.port is not None:
+            host += f":{parsed.port}"
+        path = parsed.path.split("?", 1)[0].split("#", 1)[0]
+        return f"{parsed.scheme.lower()}://{host}{path}"
+    # Git's scp-like SSH spelling is [user@]host:path.  Drop the user and
+    # reject an at-sign in the path so malformed credential-like input cannot
+    # be copied into a receipt.
+    match = re.fullmatch(r"(?:(?:[^/@:]+)@)?([^/:]+):([^?#]+)(?:[?#].*)?", value)
+    if match:
+        host, path = match.groups()
+        if "@" in path:
+            raise ValueError("repository remote cannot be sanitized")
+        return f"ssh://{host.lower()}/{path.lstrip('/')}"
+    if "@" in value:
+        raise ValueError("repository remote cannot be sanitized")
+    return value.split("?", 1)[0].split("#", 1)[0]
+
+def trusted_path_owner(info):
+    uid = os.getuid() if hasattr(os, "getuid") else info.st_uid
+    return info.st_uid in {0, uid}
+
+def trusted_path_mode(info):
+    return trusted_path_owner(info) and not (stat.S_IMODE(info.st_mode) & 0o022)
+
+def trusted_directory(path):
+    try:
+        resolved = Path(path).resolve(strict=True)
+        if not resolved.is_dir():
+            return False
+        for directory in (resolved, *resolved.parents):
+            info = directory.stat()
+            if not stat.S_ISDIR(info.st_mode) or not trusted_path_mode(info):
+                return False
+        return True
+    except OSError:
+        return False
+
+def trusted_executable(path):
+    try:
+        resolved = Path(path).resolve(strict=True)
+        info = resolved.stat()
+        return (stat.S_ISREG(info.st_mode) and trusted_path_mode(info)
+                and os.access(resolved, os.X_OK) and trusted_directory(resolved.parent))
+    except OSError:
+        return False
+
 def chunks(diff):
     if not diff: raise ValueError("empty diff is not reviewable")
     out=[]; start=0
@@ -173,8 +234,9 @@ def validate(receipt, base, head, root=None, receipt_path=None, mission_id=None,
     if not isinstance(receipt,dict) or not required <= set(receipt) or set(receipt)-required-optional: raise ValueError("incomplete or unknown receipt fields")
     if receipt["version"] != VERSION or receipt["base_sha"] != base or receipt["head_sha"] != head: raise ValueError("receipt exact-head binding mismatch")
     if not isinstance(receipt["repository"],str) or not receipt["repository"] or not isinstance(receipt["mission_id"],str) or not receipt["mission_id"]: raise ValueError("invalid receipt identity")
+    if repository_identity(receipt["repository"]) != receipt["repository"]: raise ValueError("receipt repository identity is not canonical")
     if mission_id is not None and receipt["mission_id"] != mission_id: raise ValueError("receipt mission binding mismatch")
-    if repository is not None and receipt["repository"] != repository: raise ValueError("receipt repository binding mismatch")
+    if repository is not None and receipt["repository"] != repository_identity(repository): raise ValueError("receipt repository binding mismatch")
     copy=dict(receipt); observed=copy.pop("integrity_sha256"); copy.pop("auth_hmac_sha256", None)
     if digest(canon(copy)) != observed: raise ValueError("receipt integrity mismatch")
     if not isinstance(receipt["auth_hmac_sha256"],str) or len(receipt["auth_hmac_sha256"]) != 64:
@@ -279,7 +341,8 @@ def resolve_claude_launcher(root, path_value):
             directory=candidate.resolve(strict=True)
         except OSError:
             continue
-        if (not directory.is_dir() or directory==repository or directory in repository.parents
+        if (not directory.is_dir() or not trusted_directory(directory)
+                or directory==repository or directory in repository.parents
                 or repository in directory.parents):
             continue
         rendered=str(directory)
@@ -295,14 +358,15 @@ def resolve_claude_launcher(root, path_value):
         resolved=Path(executable).resolve(strict=True)
     except OSError as exc:
         raise ValueError("trusted absolute Claude Code launcher is unavailable") from exc
-    if (not resolved.is_file() or not os.access(resolved,os.X_OK)
+    if (not trusted_executable(resolved)
             or resolved==repository or repository in resolved.parents):
-        raise ValueError("Claude Code launcher is not outside the reviewed repository")
+        raise ValueError("Claude Code launcher is not trusted outside the reviewed repository")
     return str(resolved),safe_path
 
 def run(args):
     root=Path(args.repo).resolve(); base=full_sha(args.base); head=full_sha(args.head)
     if git(root,"rev-parse","HEAD").decode().strip().lower()!=head: raise ValueError("worktree HEAD differs from requested HEAD")
+    repository=repository_identity(git(root,"config","--get","remote.origin.url").decode().strip())
     diff=git(root,"diff","--no-ext-diff","--binary",f"{base}..{head}"); plan=chunks(diff); diff_hash=digest(diff)
     claude_executable,safe_path=resolve_claude_launcher(root,os.environ.get("PATH",""))
     manifest={"version":"cmh-deepseek-chunks/v2","base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"chunks":[dict(chunk) for chunk in plan]}; manifest_hash=digest(canon(manifest))
@@ -342,7 +406,7 @@ def run(args):
     verdict=aggregate_result["review_result"]
     aggregate_findings=aggregate_result["findings"]
     command_identity={"chunk":chunk_command,"aggregate":aggregate_command}
-    receipt={"version":VERSION,"repository":git(root,"config","--get","remote.origin.url").decode().strip(),"mission_id":args.mission_id,"base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"manifest_sha256":manifest_hash,"chunks":plan,"chunk_findings":results,"aggregate_result":aggregate_result,"aggregate_output_sha256":digest(aggregate_raw),"provider":"deepseek","model":MODEL,"command_sha256":digest(canon(command_identity)),"started_at":int(time.time()),"completed_at":int(time.time()),"review_result":verdict,"findings":aggregate_findings}
+    receipt={"version":VERSION,"repository":repository,"mission_id":args.mission_id,"base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"manifest_sha256":manifest_hash,"chunks":plan,"chunk_findings":results,"aggregate_result":aggregate_result,"aggregate_output_sha256":digest(aggregate_raw),"provider":"deepseek","model":MODEL,"command_sha256":digest(canon(command_identity)),"started_at":int(time.time()),"completed_at":int(time.time()),"review_result":verdict,"findings":aggregate_findings}
     receipt["integrity_sha256"]=digest(canon(receipt)); receipt["auth_hmac_sha256"]=auth_digest(receipt, token)
     path=evidence/f"deepseek-receipt-{head[:12]}-{uuid.uuid4().hex}.json"; path.write_bytes(canon(receipt)); os.chmod(path,0o600)
     print(json.dumps({"status":verdict,"receipt":str(path),"review_receipt":str(path),"head_sha":head}))

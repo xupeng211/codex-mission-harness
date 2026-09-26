@@ -3153,6 +3153,38 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(command[command.index("--pr") + 1], "7")
         self.assertEqual(command[command.index("--remote-ci-status") + 1], "PASS")
 
+    def test_merge_ready_rejects_symlink_at_local_preflight_evidence(self):
+        adapter = FootballPredictionAdapter()
+        worktree = Path(self.tmp.name) / "candidate"
+        worktree.mkdir()
+        scope = worktree / "scope.json"
+        scope.write_text("{}")
+        head = "b" * 40
+        evidence = worktree.parent / ".cmh-merge-evidence" / "mission" / head
+        evidence.mkdir(parents=True, mode=0o700)
+        target = Path(self.tmp.name) / "victim.json"
+        target.write_text("preserve this file\n", encoding="utf-8")
+        local_path = evidence / "local-preflight.json"
+        local_path.symlink_to(target)
+        local = subprocess.CompletedProcess([], 0, json.dumps({"verdict": "PASS"}), "")
+        ready = subprocess.CompletedProcess([], 0, json.dumps({"merge_ready": "YES"}), "")
+        with patch.object(adapter, "_pr_state", return_value=GateResult(
+                "PASS", "PR", data={"body": "body", "head": head,
+                                     "base": "main", "state": "OPEN", "base_sha": "c" * 40})), \
+                patch.object(adapter, "_trusted_base_checkout", return_value=Path(self.tmp.name) / "trusted"), \
+                patch.object(adapter, "_call", side_effect=[local, ready]) as call:
+            result = adapter.merge_ready(
+                worktree=str(worktree), base="a" * 40, head=head,
+                mission_id="mission", scope_file=str(scope), pr_number=7,
+                pr_repo="owner/project", pr_base_sha="c" * 40,
+                receipts={"codex": "/receipt.json"}, ci_status="PASS",
+            )
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+        self.assertIn("cannot safely persist local merge evidence", result.evidence)
+        self.assertTrue(local_path.is_symlink())
+        self.assertEqual(target.read_text(encoding="utf-8"), "preserve this file\n")
+        self.assertEqual(call.call_count, 1)
+
     def test_merge_ready_rejects_base_sha_change_before_target_commands(self):
         adapter = FootballPredictionAdapter()
         with patch.object(adapter, "_pr_state", return_value=GateResult(

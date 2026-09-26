@@ -800,8 +800,10 @@ class FootballPredictionAdapter:
         except json.JSONDecodeError as exc:
             return GateResult("BLOCKED_EXTERNAL", f"canonical agent-preflight returned invalid JSON: {exc}")
         local_path = evidence / "local-preflight.json"
-        local_path.write_text(json.dumps(local_json, sort_keys=True), encoding="utf-8")
-        local_path.chmod(0o600)
+        try:
+            self._write_private_file(local_path, json.dumps(local_json, sort_keys=True))
+        except (OSError, RuntimeError) as exc:
+            return GateResult("BLOCKED_EXTERNAL", f"cannot safely persist local merge evidence: {exc}")
         code = ("import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
                 "from scripts.devops import agent_workflow as m, agent_workflow_preflight as p, pr_ready_check as r; "
                 "from scripts.ops import ai_workflow_gate as g; from scripts.ops.helpers import git_change_helpers as h; "

@@ -49,7 +49,8 @@ of restarting it blindly.
 At a technically ready merge, Harness shows `STATE=WAITING_APPROVAL` and the
 exact HEAD. Run `harness approve your-mission-id --action merge --reason
 "approved"`, then resume. Denied provider traffic, quota consumption, live
-authorization, prepared-candidate consumption, and merge are never performed.
+authorization, and prepared-candidate consumption are never performed. Merge
+occurs only after explicit owner approval and the canonical merge gates pass.
 
 ## Approval and review rules
 

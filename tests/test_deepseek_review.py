@@ -58,10 +58,10 @@ class DeepSeekReceiptTest(unittest.TestCase):
         self.assertIn("dispositions", review.AGGREGATE_SCHEMA["required"])
 
     def test_claude_launcher_resolution_excludes_relative_and_reviewed_tree_paths(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as tmp:
             root = Path(tmp) / "repo"
             trusted_bin = Path(tmp) / "trusted-bin"
-            root.mkdir(); trusted_bin.mkdir()
+            root.mkdir(); trusted_bin.mkdir(); trusted_bin.chmod(0o755)
             parent_launcher = Path(tmp) / "claude"
             parent_launcher.write_text("#!/bin/sh\nexit 98\n")
             parent_launcher.chmod(0o755)
@@ -80,8 +80,27 @@ class DeepSeekReceiptTest(unittest.TestCase):
             self.assertFalse(safe_path.startswith(os.pathsep))
             self.assertFalse(safe_path.endswith(os.pathsep))
 
+    def test_claude_launcher_resolution_rejects_writable_path_and_executable(self):
+        with tempfile.TemporaryDirectory(dir=Path.home()) as tmp:
+            root = Path(tmp) / "repo"
+            untrusted_bin = Path(tmp) / "group-writable-bin"
+            root.mkdir(); untrusted_bin.mkdir(); untrusted_bin.chmod(0o770)
+            untrusted_launcher = untrusted_bin / "claude"
+            untrusted_launcher.write_text("#!/bin/sh\nexit 0\n")
+            untrusted_launcher.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, "trusted absolute Claude Code launcher"):
+                review.resolve_claude_launcher(root, str(untrusted_bin))
+
+            trusted_bin = Path(tmp) / "trusted-bin"
+            trusted_bin.mkdir(); trusted_bin.chmod(0o755)
+            writable_launcher = trusted_bin / "claude"
+            writable_launcher.write_text("#!/bin/sh\nexit 0\n")
+            writable_launcher.chmod(0o775)
+            with self.assertRaisesRegex(ValueError, "Claude Code launcher is not trusted"):
+                review.resolve_claude_launcher(root, str(trusted_bin))
+
     def test_claude_launcher_resolution_fails_when_only_repo_binary_exists(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as tmp:
             root = Path(tmp) / "repo"
             root.mkdir()
             launcher = root / "claude"
@@ -135,6 +154,30 @@ class DeepSeekReceiptTest(unittest.TestCase):
     def test_v2_deepseek_receipt_is_stale_under_disposition_policy(self):
         with self.assertRaisesRegex(ValueError, "exact-head binding"):
             review.validate(receipt(version="cmh-deepseek-review/v2"), BASE, HEAD)
+
+    def test_v3_deepseek_receipt_is_stale_under_credential_free_repository_policy(self):
+        with self.assertRaisesRegex(ValueError, "exact-head binding"):
+            review.validate(receipt(version="cmh-deepseek-review/v3"), BASE, HEAD)
+
+    def test_repository_identity_removes_remote_credentials_and_query_data(self):
+        cases = {
+            "https://review-user:secret@github.com/owner/repo.git?access_token=secret#fragment":
+                "https://github.com/owner/repo.git",
+            "ssh://review-user:secret@github.com/owner/repo.git": "ssh://github.com/owner/repo.git",
+            "git@github.com:owner/repo.git": "ssh://github.com/owner/repo.git",
+        }
+        for remote, expected in cases.items():
+            with self.subTest(remote=remote):
+                identity = review.repository_identity(remote)
+                self.assertEqual(identity, expected)
+                self.assertNotIn("secret", identity)
+
+    def test_receipt_rejects_noncanonical_credential_bearing_repository_identity(self):
+        with self.assertRaisesRegex(ValueError, "repository identity is not canonical"):
+            review.validate(
+                receipt(repository="https://review-user:secret@github.com/owner/repo.git"),
+                BASE, HEAD,
+            )
 
     def test_complete_diff_can_dispute_blocker_with_hash_bound_rationale(self):
         finding = {"severity": "P2", "title": "localized concern", "evidence": "chunk evidence"}
@@ -300,15 +343,15 @@ class DeepSeekReceiptTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot contain aggregate dispositions"):
             review.reviewer_result('{"review_result":"PASS","findings":[],"dispositions":[]}', forbid_dispositions=True)
     def test_mission_and_repository_binding_are_required_when_expected(self):
-        value = receipt(repository="git@example/repo", mission_id="mission-a")
+        value = receipt(repository="example/repo", mission_id="mission-a")
         self.assertEqual(review.validate(value, BASE, HEAD, mission_id="mission-a",
-                                         repository="git@example/repo")["review_result"], "PASS")
+                                         repository="example/repo")["review_result"], "PASS")
         with self.assertRaisesRegex(ValueError, "mission binding"):
             review.validate(value, BASE, HEAD, mission_id="mission-b",
-                            repository="git@example/repo")
+                            repository="example/repo")
         with self.assertRaisesRegex(ValueError, "repository binding"):
             review.validate(value, BASE, HEAD, mission_id="mission-a",
-                            repository="git@example/other")
+                            repository="example/other")
     def test_run_scoped_artifact_paths_cannot_overwrite_prior_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -317,8 +360,8 @@ class DeepSeekReceiptTest(unittest.TestCase):
             subprocess.run(["git", "init", "-q", str(repo)], check=True)
             subprocess.run(["git", "-C", str(repo), "config", "user.name", "Harness Test"], check=True)
             subprocess.run(["git", "-C", str(repo), "config", "user.email", "harness-test@example.invalid"], check=True)
-            subprocess.run(["git", "-C", str(repo), "remote", "add", "origin",
-                            "git@github.com:fixture/repo.git"], check=True)
+            remote = "https://review-user:review-password@github.com/fixture/repo.git?access_token=review-token"
+            subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", remote], check=True)
             source = repo / "tracked.txt"
             source.write_text("base\n")
             subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
@@ -365,6 +408,11 @@ class DeepSeekReceiptTest(unittest.TestCase):
             self.assertTrue(first_receipt.is_file())
             self.assertTrue(second_receipt.is_file())
             self.assertIn(head[:12], first_receipt.name)
+            for receipt_path in (first_receipt, second_receipt):
+                receipt_bytes = receipt_path.read_bytes()
+                self.assertEqual(json.loads(receipt_bytes)["repository"], "https://github.com/fixture/repo.git")
+                for credential in (b"review-user", b"review-password", b"review-token"):
+                    self.assertNotIn(credential, receipt_bytes)
             expected_command_hash = review.digest(review.canon({
                 "chunk": invocations[0][0], "aggregate": invocations[1][0],
             }))
@@ -379,7 +427,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
             for receipt_path in (first_receipt, second_receipt):
                 self.assertEqual(
                     review.validate(json.loads(receipt_path.read_text()), base, head, repo,
-                                    receipt_path, "fixture", "git@github.com:fixture/repo.git")["review_result"],
+                                    receipt_path, "fixture", remote)["review_result"],
                     "PASS",
                 )
 
