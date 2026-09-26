@@ -2846,6 +2846,33 @@ class HarnessTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "registered detached worktree"):
             adapter._trusted_base_checkout(str(repo), base)
 
+    def test_trusted_base_checkout_ignores_ambient_git_repository_and_config(self):
+        adapter = FootballPredictionAdapter()
+        repo, base = self._target_git_repo()
+        attacker = Path(self.tmp.name) / "ambient-git-repository"
+        attacker.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(attacker)], check=True)
+        subprocess.run(["git", "-C", str(attacker), "config", "user.name", "Attacker"], check=True)
+        subprocess.run(["git", "-C", str(attacker), "config", "user.email", "attacker@example.invalid"], check=True)
+        (attacker / "untrusted.txt").write_text("ambient repository\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(attacker), "add", "untrusted.txt"], check=True)
+        subprocess.run(["git", "-C", str(attacker), "commit", "-qm", "attacker repository"], check=True)
+        hostile_environment = {
+            "GIT_DIR": str(attacker / ".git"),
+            "GIT_WORK_TREE": str(attacker),
+            "GIT_INDEX_FILE": str(attacker / ".git" / "attacker-index"),
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.bare",
+            "GIT_CONFIG_VALUE_0": "true",
+        }
+        with patch.dict(os.environ, hostile_environment):
+            trusted = adapter._trusted_base_checkout(str(repo), base)
+        self.assertEqual(subprocess.check_output(
+            ["git", "--no-replace-objects", "-C", str(trusted), "rev-parse", "HEAD"],
+            text=True,
+        ).strip(), base)
+        self.assertEqual((trusted / "Makefile").read_text(encoding="utf-8"), "all:\n\t@true\n")
+
     def test_trusted_base_checkout_detects_hidden_policy_file_edit(self):
         adapter = FootballPredictionAdapter()
         repo, base = self._target_git_repo()

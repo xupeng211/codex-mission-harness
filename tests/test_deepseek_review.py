@@ -368,8 +368,25 @@ class DeepSeekReceiptTest(unittest.TestCase):
             subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
             base = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
             source.write_text("head\n")
-            subprocess.run(["git", "-C", str(repo), "commit", "-qam", "head"], check=True)
+            (repo / ".gitattributes").write_text("tracked.txt diff=attack\n")
+            subprocess.run(["git", "-C", str(repo), "add", "tracked.txt", ".gitattributes"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "head"], check=True)
             head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            textconv_marker = root / "textconv-was-run"
+            attacker_repo = root / "attacker.git"
+            subprocess.run(["git", "clone", "--bare", "-q", str(repo), str(attacker_repo)], check=True)
+            subprocess.run([
+                "git", "--git-dir", str(attacker_repo), "remote", "set-url", "origin",
+                "https://ambient-user:ambient-secret@attacker.invalid/repo.git",
+            ], check=True)
+            ambient_git = {
+                "GIT_DIR": str(attacker_repo),
+                "GIT_WORK_TREE": str(repo),
+                "GIT_INDEX_FILE": str(root / "attacker-index"),
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "diff.attack.textconv",
+                "GIT_CONFIG_VALUE_0": f"touch {textconv_marker}; cat",
+            }
             token_file = root / "review-token"
             token_file.write_text(TEST_SECRET)
             evidence = root / "evidence"
@@ -385,8 +402,9 @@ class DeepSeekReceiptTest(unittest.TestCase):
                     result = {"review_result": "PASS", "findings": []}
                 return subprocess.CompletedProcess(["claude"], 0, json.dumps(result), "")
 
-            with patch.object(review, "resolve_claude_launcher",
-                              return_value=("/trusted/bin/claude", "/trusted/bin:/usr/bin")), \
+            with patch.dict(os.environ, ambient_git), \
+                    patch.object(review, "resolve_claude_launcher",
+                                 return_value=("/trusted/bin/claude", "/trusted/bin:/usr/bin")), \
                     patch.object(review, "invoke_reviewer", side_effect=capture_invocation), \
                     contextlib.redirect_stdout(io.StringIO()) as captured:
                 review.run(args)
@@ -400,6 +418,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
                 second_result = json.loads(captured.getvalue())
 
             self.assertEqual(len(invocations), 4)
+            self.assertFalse(textconv_marker.exists())
             for command, env in invocations:
                 self.assertEqual(command[0], "/trusted/bin/claude")
                 self.assertEqual(env["PATH"], "/trusted/bin:/usr/bin")
@@ -424,12 +443,14 @@ class DeepSeekReceiptTest(unittest.TestCase):
             self.assertNotEqual(first_chunk, second_chunk)
             self.assertEqual(first_receipt.read_bytes(), first_receipt_before)
             self.assertEqual(first_chunk.read_bytes(), first_chunk_before)
-            for receipt_path in (first_receipt, second_receipt):
-                self.assertEqual(
-                    review.validate(json.loads(receipt_path.read_text()), base, head, repo,
-                                    receipt_path, "fixture", remote)["review_result"],
-                    "PASS",
-                )
+            with patch.dict(os.environ, ambient_git):
+                for receipt_path in (first_receipt, second_receipt):
+                    self.assertEqual(
+                        review.validate(json.loads(receipt_path.read_text()), base, head, repo,
+                                        receipt_path, "fixture", remote)["review_result"],
+                        "PASS",
+                    )
+            self.assertFalse(textconv_marker.exists())
 
     def test_run_does_not_publish_receipt_when_aggregate_omits_dispositions(self):
         with tempfile.TemporaryDirectory() as tmp:

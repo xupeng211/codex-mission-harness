@@ -307,6 +307,32 @@ class FootballPredictionAdapter:
                 return GateResult("BLOCKED_EXTERNAL", f"canonical review commit is unavailable: {revision}")
         return GateResult("PASS", "canonical policy will execute from trusted base")
 
+    @staticmethod
+    def _trusted_git_environment() -> dict[str, str]:
+        """Use Git without ambient repository, config, or attribute overrides."""
+        return {
+            "PATH": os.defpath,
+            "HOME": "/nonexistent",
+            "LANG": "C.UTF-8",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_COUNT": "0",
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+        }
+
+    def _trusted_git_output(self, root: Path, *args: str) -> str:
+        result = self._call(
+            ["git", "--no-replace-objects", "-C", str(root), *args],
+            cwd=str(root), env=self._trusted_git_environment(), inherit_environment=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "trusted Git command failed")
+        return result.stdout
+
     def _trusted_base_checkout(self, worktree: str, base: str) -> Path:
         """Return only a registered, byte-verified worktree of the exact base."""
         if not isinstance(base, str) or re.fullmatch(r"[0-9a-fA-F]{40}", base) is None:
@@ -332,21 +358,17 @@ class FootballPredictionAdapter:
                 "git", "-c", "core.hooksPath=/dev/null", "-c", "core.attributesFile=/dev/null",
                 "-c", "core.fsmonitor=false", "--no-replace-objects", "worktree", "add",
                 "--detach", str(root), base,
-            ], cwd=str(candidate))
+            ], cwd=str(candidate), env=self._trusted_git_environment(), inherit_environment=False)
             if added.returncode != 0:
                 raise RuntimeError(added.stderr.strip() or "cannot create trusted base checkout")
         root_info = root.lstat()
         if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
             raise RuntimeError("trusted base checkout path is not a real directory")
 
-        listing = self._call([
-            "git", "--no-replace-objects", "worktree", "list", "--porcelain",
-        ], cwd=str(candidate))
-        if listing.returncode != 0:
-            raise RuntimeError(listing.stderr.strip() or "cannot verify trusted worktree registration")
+        listing = self._trusted_git_output(candidate, "worktree", "list", "--porcelain")
         records: list[dict[str, str | bool]] = []
         record: dict[str, str | bool] = {}
-        for line in listing.stdout.splitlines() + [""]:
+        for line in listing.splitlines() + [""]:
             if not line:
                 if record:
                     records.append(record)
@@ -363,12 +385,12 @@ class FootballPredictionAdapter:
         if len(matching) != 1 or matching[0].get("head") != base or not matching[0].get("detached"):
             raise RuntimeError("trusted base checkout is not the registered detached worktree for this repository")
 
-        candidate_common = Path(self._run([
-            "git", "rev-parse", "--path-format=absolute", "--git-common-dir",
-        ], cwd=str(candidate)).strip()).resolve()
-        trusted_common = Path(self._run([
-            "git", "rev-parse", "--path-format=absolute", "--git-common-dir",
-        ], cwd=str(root)).strip()).resolve()
+        candidate_common = Path(self._trusted_git_output(
+            candidate, "rev-parse", "--path-format=absolute", "--git-common-dir",
+        ).strip()).resolve()
+        trusted_common = Path(self._trusted_git_output(
+            root, "rev-parse", "--path-format=absolute", "--git-common-dir",
+        ).strip()).resolve()
         git_file = root / ".git"
         git_file_info = git_file.lstat()
         if not stat.S_ISREG(git_file_info.st_mode) or stat.S_ISLNK(git_file_info.st_mode):
@@ -392,27 +414,25 @@ class FootballPredictionAdapter:
         if candidate_common != trusted_common:
             raise RuntimeError("trusted base checkout uses another Git common directory")
 
-        observed = self._run([
-            "git", "--no-replace-objects", "-c", "core.fsmonitor=false", "rev-parse", "HEAD",
-        ], cwd=str(root)).strip().lower()
-        dirty = self._run([
-            "git", "--no-replace-objects", "-c", "core.fsmonitor=false", "status",
+        observed = self._trusted_git_output(
+            root, "-c", "core.fsmonitor=false", "rev-parse", "HEAD",
+        ).strip().lower()
+        dirty = self._trusted_git_output(
+            root, "-c", "core.fsmonitor=false", "status",
             "--porcelain=v1", "--untracked-files=all",
-        ], cwd=str(root))
+        )
         if observed != base or dirty:
             raise RuntimeError("trusted base checkout identity is invalid")
         self._verify_trusted_policy_sources(candidate, root, base)
         return root
 
     def _verify_trusted_policy_sources(self, candidate: Path, trusted: Path, base: str) -> None:
-        result = self._call([
-            "git", "--no-replace-objects", "ls-tree", "-rz", "--full-tree", base,
+        tree = self._trusted_git_output(
+            candidate, "ls-tree", "-rz", "--full-tree", base,
             "--", "scripts", *self.REVIEW_CONTRACT_PATHS,
-        ], cwd=str(candidate))
-        if result.returncode != 0:
-            raise RuntimeError("cannot read trusted review policy tree")
+        )
         blobs: dict[str, tuple[str, str]] = {}
-        for item in result.stdout.split("\0"):
+        for item in tree.split("\0"):
             if not item:
                 continue
             try:

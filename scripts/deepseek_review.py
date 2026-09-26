@@ -15,6 +15,18 @@ VERSION = "cmh-deepseek-review/v4"
 MODEL = "deepseek-flash"
 ENDPOINT = "https://api.deepseek.com/anthropic"
 CHUNK_BYTES = 32000
+_GIT_ENV = {
+    "PATH": os.defpath,
+    "HOME": "/nonexistent",
+    "LANG": "C.UTF-8",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_COUNT": "0",
+    "GIT_ATTR_NOSYSTEM": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_OPTIONAL_LOCKS": "0",
+}
 
 _REVIEW_PROPERTIES = {
     "review_result": {"enum": ["PASS", "FAIL"]},
@@ -156,7 +168,11 @@ def indexed_chunk_findings(chunks_):
     return all_findings, required_dispositions
 
 
-def git(root, *args): return subprocess.check_output(["git", "-C", str(root), *args])
+def git(root, *args):
+    return subprocess.check_output(
+        ["git", "--no-replace-objects", "-C", str(root), *args],
+        env=_GIT_ENV,
+    )
 def full_sha(value):
     if len(value) != 40 or any(c not in "0123456789abcdef" for c in value.lower()): raise ValueError("full SHA required")
     return value.lower()
@@ -271,7 +287,7 @@ def validate(receipt, base, head, root=None, receipt_path=None, mission_id=None,
     if aggregate_result["findings"] != receipt["findings"]:
         raise ValueError("aggregate findings mismatch")
     if root is not None:
-        diff=git(Path(root).resolve(),"diff","--no-ext-diff","--binary",f"{base}..{head}")
+        diff=git(Path(root).resolve(),"diff","--no-ext-diff","--no-textconv","--binary",f"{base}..{head}")
         if position!=len(diff) or digest(diff)!=receipt["diff_sha256"]: raise ValueError("receipt diff coverage mismatch")
         if descriptors!=chunks(diff): raise ValueError("chunk manifest does not match exact diff")
         manifest={"version":"cmh-deepseek-chunks/v2","base_sha":base,"head_sha":head,"diff_sha256":digest(diff),"chunks":descriptors}
@@ -367,7 +383,7 @@ def run(args):
     root=Path(args.repo).resolve(); base=full_sha(args.base); head=full_sha(args.head)
     if git(root,"rev-parse","HEAD").decode().strip().lower()!=head: raise ValueError("worktree HEAD differs from requested HEAD")
     repository=repository_identity(git(root,"config","--get","remote.origin.url").decode().strip())
-    diff=git(root,"diff","--no-ext-diff","--binary",f"{base}..{head}"); plan=chunks(diff); diff_hash=digest(diff)
+    diff=git(root,"diff","--no-ext-diff","--no-textconv","--binary",f"{base}..{head}"); plan=chunks(diff); diff_hash=digest(diff)
     claude_executable,safe_path=resolve_claude_launcher(root,os.environ.get("PATH",""))
     manifest={"version":"cmh-deepseek-chunks/v2","base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"chunks":[dict(chunk) for chunk in plan]}; manifest_hash=digest(canon(manifest))
     evidence_root=Path(args.evidence).resolve(); evidence_root.mkdir(parents=True,exist_ok=True); os.chmod(evidence_root,0o700)
