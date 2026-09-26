@@ -5,6 +5,7 @@ import json
 import hashlib
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -302,8 +303,9 @@ class FootballPredictionAdapter:
     def review_preflight(self, worktree: str, base: str, head: str) -> GateResult:
         """Prove both immutable commits exist; policy executes from base checkout."""
         for revision in (base, head):
-            present = self._call(["git", "cat-file", "-e", f"{revision}^{{commit}}"], cwd=worktree)
-            if present.returncode != 0:
+            try:
+                self._trusted_git_output(Path(worktree), "cat-file", "-e", f"{revision}^{{commit}}")
+            except (OSError, RuntimeError):
                 return GateResult("BLOCKED_EXTERNAL", f"canonical review commit is unavailable: {revision}")
         return GateResult("PASS", "canonical policy will execute from trusted base")
 
@@ -332,6 +334,117 @@ class FootballPredictionAdapter:
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or "trusted Git command failed")
         return result.stdout
+
+    @staticmethod
+    def _trusted_python_interpreter() -> str:
+        """Resolve the already-running interpreter and reject writable launch paths."""
+        executable = Path(sys.executable)
+        if not executable.is_absolute():
+            raise RuntimeError("review interpreter path is not absolute")
+        try:
+            resolved = executable.resolve(strict=True)
+            info = resolved.stat()
+        except OSError as exc:
+            raise RuntimeError("review interpreter is unavailable") from exc
+        owners = {0, os.getuid()} if hasattr(os, "getuid") else {info.st_uid}
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid not in owners
+                or stat.S_IMODE(info.st_mode) & 0o022 or not os.access(resolved, os.X_OK)):
+            raise RuntimeError("review interpreter is not trusted")
+        for directory in (resolved.parent, *resolved.parent.parents):
+            try:
+                directory_info = directory.stat()
+            except OSError as exc:
+                raise RuntimeError("review interpreter directory is unavailable") from exc
+            if (not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_uid not in owners
+                    or stat.S_IMODE(directory_info.st_mode) & 0o022):
+                raise RuntimeError("review interpreter path contains an untrusted directory")
+        return str(resolved)
+
+    @staticmethod
+    def _trusted_review_path(worktree: str) -> str:
+        """Keep only absolute, owner-controlled PATH directories outside the reviewed tree."""
+        repository = Path(worktree).resolve(strict=True)
+        owners = {0, os.getuid()} if hasattr(os, "getuid") else {0}
+        safe: list[str] = []
+        for entry in os.environ.get("PATH", "").split(os.pathsep):
+            if not entry or not Path(entry).is_absolute():
+                continue
+            try:
+                directory = Path(entry).resolve(strict=True)
+            except OSError:
+                continue
+            if (not directory.is_dir() or directory == repository
+                    or directory in repository.parents or repository in directory.parents):
+                continue
+            trusted = True
+            for ancestor in (directory, *directory.parents):
+                try:
+                    info = ancestor.stat()
+                except OSError:
+                    trusted = False
+                    break
+                if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in owners
+                        or stat.S_IMODE(info.st_mode) & 0o022):
+                    trusted = False
+                    break
+            rendered = str(directory)
+            if trusted and rendered not in safe:
+                safe.append(rendered)
+        path = os.pathsep.join(safe)
+        if not path or not shutil.which("git", path=path):
+            raise RuntimeError("trusted reviewer PATH is unavailable")
+        return path
+
+    @classmethod
+    def review_environment(cls, reviewer: str, *, worktree: str) -> dict[str, str]:
+        """Build a restricted launcher environment for the trusted review wrapper."""
+        if reviewer not in {"codex", "deepseek"}:
+            raise ValueError(f"unsupported independent reviewer: {reviewer}")
+        environment = {
+            "PATH": cls._trusted_review_path(worktree),
+            "HOME": "/nonexistent",
+            "LANG": "C.UTF-8",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_COUNT": "0",
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+        }
+        for name in (
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+            "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+        ):
+            if name in os.environ:
+                environment[name] = os.environ[name]
+        ca_names = (
+            "CODEX_CA_CERTIFICATE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO",
+            "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "SSL_CERT_DIR", "SSL_CERT_FILE",
+        )
+        for name in ca_names:
+            value = os.environ.get(name, "")
+            if not value:
+                continue
+            paths = value.split(os.pathsep) if name == "SSL_CERT_DIR" else [value]
+            safe = True
+            for raw_path in paths:
+                path = Path(raw_path)
+                try:
+                    info = path.lstat()
+                except OSError:
+                    safe = False
+                    break
+                expected_type = stat.S_ISDIR(info.st_mode) if name == "SSL_CERT_DIR" else stat.S_ISREG(info.st_mode)
+                if (not path.is_absolute() or stat.S_ISLNK(info.st_mode) or not expected_type
+                        or info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022):
+                    safe = False
+                    break
+            if safe:
+                environment[name] = value
+        return environment
 
     def _trusted_base_checkout(self, worktree: str, base: str) -> Path:
         """Return only a registered, byte-verified worktree of the exact base."""
@@ -488,11 +601,12 @@ class FootballPredictionAdapter:
         common = ["--repo-root", worktree, "--base-sha", base, "--head-sha", head,
                   "--mission-id", mission_id, "--mission-scope-file", scope_file,
                   "--evidence-dir", evidence_dir]
+        python = self._trusted_python_interpreter()
         if reviewer == "codex":
-            return ["/usr/bin/env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-I", "-B",
+            return [python, "-I", "-B",
                     str(trusted / "scripts/devops/codex_independent_review.py"), "run", *common]
         if reviewer == "deepseek":
-            return ["/usr/bin/env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-I", "-B",
+            return [python, "-I", "-B",
                     str(trusted / "scripts/devops/claude_deepseek_independent_review.py"), *common]
         raise ValueError(f"unsupported independent reviewer: {reviewer}")
 
@@ -528,7 +642,7 @@ class FootballPredictionAdapter:
         receipt = str(receipt_path)
         if reviewer == "codex":
             trusted = self._trusted_base_checkout(worktree, base)
-            argv = ["python3", "-I", "-B", str(trusted / "scripts/devops/codex_independent_review.py"), "classify", "--repo-root", worktree,
+            argv = [self._trusted_python_interpreter(), "-I", "-B", str(trusted / "scripts/devops/codex_independent_review.py"), "classify", "--repo-root", worktree,
                     "--receipt", receipt, "--current-head", head, "--base-sha", base, "--mission-id", mission_id,
                     "--mission-scope-file", scope_file, "--json"]
         elif reviewer == "deepseek":
@@ -556,10 +670,9 @@ class FootballPredictionAdapter:
             if evidence.get("receipt_version") == "independent-review-receipt/v1":
                 try:
                     relative_scope = Path(scope_file).resolve().relative_to(Path(worktree).resolve()).as_posix()
-                    scope_bytes = subprocess.check_output(
-                        ["git", "show", f"{head}:{relative_scope}"], cwd=worktree,
-                        stderr=subprocess.PIPE, timeout=60,
-                    )
+                    scope_bytes = self._trusted_git_output(
+                        Path(worktree), "show", f"{head}:{relative_scope}"
+                    ).encode("utf-8")
                 except (OSError, ValueError, subprocess.SubprocessError) as exc:
                     return GateResult("BLOCKED_EXTERNAL", f"cannot bind reviewed mission scope: {exc}", receipt)
                 scope_hash = hashlib.sha256(scope_bytes).hexdigest()
@@ -570,7 +683,13 @@ class FootballPredictionAdapter:
                     "print(json.dumps(asdict(v(Path(sys.argv[1]),repo_root=Path(sys.argv[2]),"
                     "expected_base=sys.argv[3],expected_head=sys.argv[4],expected_mission_id=sys.argv[5],expected_scope_hash=sys.argv[6]))))"
                 )
-                checked = self._call(["python3", "-I", "-B", "-c", validator, receipt, worktree, base, head, mission_id, scope_hash], cwd=str(trusted), env={"PYTHONDONTWRITEBYTECODE": "1"})
+                validator_env = self._trusted_git_environment()
+                validator_env["PYTHONDONTWRITEBYTECODE"] = "1"
+                checked = self._call(
+                    [self._trusted_python_interpreter(), "-I", "-B", "-c", validator,
+                     receipt, worktree, base, head, mission_id, scope_hash],
+                    cwd=str(trusted), env=validator_env, inherit_environment=False,
+                )
                 canonical = self._json_last_text(checked.stdout)
                 if (checked.returncode != 0 or not isinstance(canonical, dict)
                         or canonical.get("trusted") is not True):
@@ -587,7 +706,11 @@ class FootballPredictionAdapter:
         else: return GateResult("BLOCKED_EXTERNAL", f"unknown reviewer {reviewer}")
         # The classifier is policy code from the trusted base checkout.  Its
         # imports must resolve there, never from the candidate HEAD worktree.
-        result = self._call(argv, cwd=str(trusted), env={"PYTHONDONTWRITEBYTECODE": "1"})
+        result = self._call(
+            argv, cwd=str(trusted),
+            env=self.review_environment(reviewer, worktree=worktree),
+            inherit_environment=False,
+        )
         if result.returncode != 0:
             return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or result.stdout.strip(), receipt)
         classification = self._json_last_text(result.stdout)

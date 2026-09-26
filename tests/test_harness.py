@@ -201,7 +201,9 @@ class HarnessTest(unittest.TestCase):
         adapter = FootballPredictionAdapter()
         supervisor = Supervisor(journal, process, self.codex, adapter)
 
+        reviewer_environment = {"PATH": "/trusted/bin", "HOME": "/nonexistent", "LANG": "C.UTF-8"}
         with patch.object(adapter, "review_argv", return_value=["canonical-review"]) as review_argv, \
+                patch.object(adapter, "review_environment", return_value=reviewer_environment) as review_env, \
                 patch.object(process, "start", return_value="review-job") as start:
             self.assertEqual(supervisor.step(spec.mission_id, spec), State.REVIEW)
 
@@ -209,6 +211,9 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(start.call_args.args[2], ["canonical-review"])
         self.assertEqual(start.call_args.args[3], str(context))
         self.assertEqual(start.call_args.args[5], head)
+        self.assertEqual(start.call_args.args[4], reviewer_environment)
+        self.assertFalse(start.call_args.kwargs["inherit_environment"])
+        review_env.assert_called_once_with("codex", worktree=str(context))
         self.assertEqual(review_argv.call_args.kwargs["worktree"], str(context))
         self.assertEqual(review_argv.call_args.kwargs["scope_file"], str(context / "scope.json"))
         self.assertEqual((context / "scope.json").read_text(encoding="utf-8"), '{"forbidden_actions":["live"]}\n')
@@ -1605,6 +1610,44 @@ class HarnessTest(unittest.TestCase):
         next(iter(process._children.values())).wait()
         process.poll(self.spec.mission_id)
 
+    def test_process_can_launch_with_explicit_environment_without_ambient_inheritance(self):
+        class CapturedStdin:
+            def __init__(self):
+                self.payload = b""
+                self.closed = False
+
+            def write(self, payload):
+                self.payload += payload
+                return len(payload)
+
+            def close(self):
+                self.closed = True
+
+        class Child:
+            pid = 34567
+
+            def __init__(self):
+                self.stdin = CapturedStdin()
+
+        process = self.supervisor.process
+        child = Child()
+        explicit_environment = {"PATH": "/trusted/bin", "HOME": "/nonexistent", "LANG": "C.UTF-8"}
+        with patch("harness.process.subprocess.Popen", return_value=child) as popen, \
+                patch("harness.process.os.getpgid", return_value=child.pid), \
+                patch("harness.process.proc_start_ticks", return_value="child-start"):
+            process.start(
+                self.spec.mission_id, "clean-review", ["/trusted/python", "review.py"],
+                str(self.worktree), explicit_environment, "a" * 40,
+                inherit_environment=False,
+            )
+
+        self.assertEqual(popen.call_args.kwargs["env"], {
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "HOME": "/nonexistent", "LANG": "C.UTF-8",
+        })
+        self.assertEqual(json.loads(child.stdin.payload)["env"], explicit_environment)
+        self.assertTrue(child.stdin.closed)
+
     def test_log_open_failure_retires_starting_reservation_and_allows_retry(self):
         process = self.supervisor.process
         with patch("harness.process.Path.open", side_effect=PermissionError("logs denied")):
@@ -2734,12 +2777,66 @@ class HarnessTest(unittest.TestCase):
                 mission_id="mission", scope_file=str(worktree / "scope.json"),
                 evidence_dir=str(evidence),
             )
-        self.assertEqual(argv[:6], [
-            "/usr/bin/env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-I", "-B",
-            str(trusted / "scripts/devops/codex_independent_review.py"),
+        self.assertTrue(Path(argv[0]).is_absolute())
+        self.assertEqual(argv[1:4], [
+            "-I", "-B", str(trusted / "scripts/devops/codex_independent_review.py"),
         ])
+        self.assertNotIn("/usr/bin/env", argv)
         self.assertEqual(argv[argv.index("--repo-root") + 1], str(worktree))
         self.assertIn("run", argv)
+
+    def test_review_environment_filters_ambient_execution_and_git_variables(self):
+        adapter = FootballPredictionAdapter()
+        worktree = Path(self.tmp.name) / "review-target"
+        worktree.mkdir(exist_ok=True)
+        attacker_bin = Path(self.tmp.name) / "attacker-bin"
+        attacker_bin.mkdir(mode=0o777)
+        attacker_bin.chmod(0o777)
+        hostile = {
+            "PATH": os.pathsep.join((str(attacker_bin), "/usr/bin")),
+            "GIT_DIR": "/attacker/repo.git",
+            "GIT_WORK_TREE": "/attacker/worktree",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.bare",
+            "GIT_CONFIG_VALUE_0": "true",
+            "PYTHONPATH": "/attacker/python",
+            "PYTHONHOME": "/attacker/python-home",
+            "CODEX_CLI_PATH": "/attacker/codex",
+            "OPENAI_API_KEY": "must-not-be-inherited",
+            "HTTPS_PROXY": "http://proxy.example.invalid:8080",
+        }
+        with patch.dict(os.environ, hostile, clear=True):
+            environment = adapter.review_environment("codex", worktree=str(worktree))
+
+        self.assertEqual(environment["PATH"], "/usr/bin")
+        self.assertEqual(environment["HTTPS_PROXY"], hostile["HTTPS_PROXY"])
+        self.assertEqual(environment["GIT_CONFIG_COUNT"], "0")
+        for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "PYTHONPATH",
+                     "PYTHONHOME", "CODEX_CLI_PATH", "OPENAI_API_KEY"):
+            self.assertNotIn(name, environment)
+        with self.assertRaisesRegex(ValueError, "unsupported independent reviewer"):
+            adapter.review_environment("other", worktree=str(worktree))
+
+    def test_trusted_git_output_ignores_ambient_git_overrides(self):
+        adapter = FootballPredictionAdapter()
+        hostile = {
+            "GIT_DIR": "/attacker/repo.git",
+            "GIT_WORK_TREE": "/attacker/worktree",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.bare",
+            "GIT_CONFIG_VALUE_0": "true",
+            "GIT_REPLACE_REF_BASE": "refs/replace-attacker/",
+        }
+        expected = subprocess.CompletedProcess([], 0, "committed scope\n", "")
+        with patch.dict(os.environ, hostile), patch.object(adapter, "_call", return_value=expected) as call:
+            self.assertEqual(adapter._trusted_git_output(Path(self.tmp.name), "show", "HEAD:scope.json"),
+                             "committed scope\n")
+        self.assertIn("--no-replace-objects", call.call_args.args[0])
+        self.assertFalse(call.call_args.kwargs["inherit_environment"])
+        self.assertNotIn("GIT_DIR", call.call_args.kwargs["env"])
+        self.assertNotIn("GIT_WORK_TREE", call.call_args.kwargs["env"])
+        self.assertNotIn("GIT_CONFIG_KEY_0", call.call_args.kwargs["env"])
+        self.assertEqual(call.call_args.kwargs["env"]["GIT_NO_REPLACE_OBJECTS"], "1")
 
     def test_codex_receipt_classifier_imports_policy_from_trusted_base(self):
         adapter, worktree, evidence_dir, receipt, stdout = self._review_fixture()
@@ -2804,23 +2901,35 @@ class HarnessTest(unittest.TestCase):
     def test_deepseek_validator_reimports_policy_from_trusted_cwd_in_isolated_python(self):
         adapter, worktree, evidence_dir, receipt, stdout = self._deepseek_review_fixture()
         trusted = Path(self.tmp.name) / "trusted-validator"
-        module = trusted / "scripts" / "devops" / "deepseek_receipt_evidence.py"
-        module.parent.mkdir(parents=True)
-        module.write_text(
-            "from dataclasses import dataclass\n"
-            "@dataclass\n"
-            "class Result:\n    trusted: bool = True\n    result: str = 'PASS'\n"
-            "def _deepseek_receipt_evidence(*args, **kwargs):\n    return Result()\n"
+        checked = subprocess.CompletedProcess(
+            [], 0, json.dumps({"trusted": True, "result": "PASS"}), "",
         )
+        ambient_git = {
+            "GIT_DIR": "/attacker/repo.git",
+            "GIT_WORK_TREE": "/attacker/worktree",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.bare",
+            "GIT_CONFIG_VALUE_0": "true",
+            "GIT_REPLACE_REF_BASE": "refs/replace-attacker/",
+        }
         with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
                 patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
-                patch("harness.adapters.subprocess.check_output", return_value=b"{}"):
+                patch.object(adapter, "_trusted_git_output", return_value="{}\n") as trusted_git, \
+                patch.object(adapter, "_call", return_value=checked) as validator_call, \
+                patch.dict(os.environ, ambient_git):
             result = adapter.review_result(
                 "deepseek", worktree=str(worktree), base="a" * 40, head="b" * 40,
                 mission_id="mission", scope_file=str(worktree / "scope.json"),
                 stdout_path=str(stdout), evidence_dir=str(evidence_dir),
             )
         self.assertEqual(result.status, "PASS")
+        trusted_git.assert_called_once()
+        self.assertEqual(trusted_git.call_args.args[1:], ("show", f"{'b' * 40}:scope.json"))
+        self.assertFalse(validator_call.call_args.kwargs["inherit_environment"])
+        self.assertEqual(validator_call.call_args.kwargs["env"]["GIT_NO_REPLACE_OBJECTS"], "1")
+        for name in ambient_git.keys() - {"GIT_CONFIG_COUNT"}:
+            self.assertNotIn(name, validator_call.call_args.kwargs["env"])
+        self.assertEqual(validator_call.call_args.kwargs["env"]["GIT_CONFIG_COUNT"], "0")
 
     def test_deepseek_validator_rejects_non_object_output_without_crashing(self):
         adapter, worktree, evidence_dir, _, stdout = self._deepseek_review_fixture()
@@ -2829,7 +2938,7 @@ class HarnessTest(unittest.TestCase):
         with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
                 patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
                 patch.object(adapter, "_call", return_value=checked), \
-                patch("harness.adapters.subprocess.check_output", return_value=b"{}"):
+                patch.object(adapter, "_trusted_git_output", return_value="{}\n"):
             result = adapter.review_result(
                 "deepseek", worktree=str(worktree), base="a" * 40, head="b" * 40,
                 mission_id="mission", scope_file=str(worktree / "scope.json"),

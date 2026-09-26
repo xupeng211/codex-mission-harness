@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -284,11 +285,15 @@ class DeepSeekReceiptTest(unittest.TestCase):
             review.validate(value, BASE, HEAD)
     def test_durable_artifact_result_must_match_receipt_chunk(self):
         with tempfile.TemporaryDirectory() as tmp:
-            evidence = Path(tmp)
+            evidence = Path(tmp) / "evidence"
+            evidence.mkdir(mode=0o700)
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
             artifact = evidence / "chunk-000.json"
             artifact.write_text(json.dumps({"review_result": "PASS", "findings": [
                 {"severity": "P3", "title": "artifact finding", "evidence": "durable"},
             ]}))
+            artifact.chmod(0o600)
             value = receipt()
             value["chunks"][0]["output_sha256"] = review.sha(artifact)
             source = b"fixture diff\n"
@@ -306,8 +311,93 @@ class DeepSeekReceiptTest(unittest.TestCase):
             value["auth_hmac_sha256"] = review.auth_digest(value, TEST_SECRET)
             with patch.object(review, "git", return_value=source), \
                     self.assertRaisesRegex(ValueError, "chunk result does not match"):
-                review.validate(value, BASE, HEAD, root=evidence,
+                review.validate(value, BASE, HEAD, root=repo,
                                 receipt_path=evidence / "receipt.json")
+
+    def test_evidence_directory_rejects_symlink_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            evidence_target = root / "evidence-target"
+            evidence_target.mkdir(mode=0o755)
+            evidence_target.chmod(0o755)
+            evidence_link = root / "evidence-link"
+            evidence_link.symlink_to(evidence_target, target_is_directory=True)
+            sentinel = evidence_target / "sentinel"
+            sentinel.write_text("untouched")
+
+            with self.assertRaises(OSError):
+                review.open_private_directory(evidence_link, repo)
+
+            self.assertEqual(sentinel.read_text(), "untouched")
+            self.assertEqual(stat.S_IMODE(evidence_target.stat().st_mode), 0o755)
+
+    def test_private_artifacts_are_fsynced_and_never_overwrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            evidence = root / "evidence"
+            evidence.mkdir(mode=0o700)
+            _, evidence_fd = review.open_private_directory(evidence, repo)
+            calls = []
+            real_fsync = os.fsync
+            try:
+                with patch.object(review.os, "fsync", side_effect=lambda fd: (calls.append(fd), real_fsync(fd))[1]):
+                    review.write_private_artifact(evidence_fd, "artifact.json", b"first", "run-a")
+                self.assertEqual(len(calls), 2)
+                artifact = evidence / "artifact.json"
+                self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600)
+                self.assertEqual(artifact.read_bytes(), b"first")
+
+                with self.assertRaises(FileExistsError):
+                    review.write_private_artifact(evidence_fd, "artifact.json", b"replacement", "run-b")
+                self.assertEqual(artifact.read_bytes(), b"first")
+            finally:
+                os.close(evidence_fd)
+
+    def test_private_artifact_reader_rejects_symlink_and_permissive_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            evidence = root / "evidence"
+            evidence.mkdir(mode=0o700)
+            _, evidence_fd = review.open_private_directory(evidence, repo)
+            try:
+                victim = root / "victim"
+                victim.write_text("not evidence")
+                victim.chmod(0o600)
+                (evidence / "linked.json").symlink_to(victim)
+                with self.assertRaises(OSError):
+                    review.read_private_artifact(evidence_fd, "linked.json")
+
+                permissive = evidence / "permissive.json"
+                permissive.write_text("{}")
+                permissive.chmod(0o644)
+                with self.assertRaisesRegex(ValueError, "private owner-owned"):
+                    review.read_private_artifact(evidence_fd, "permissive.json")
+            finally:
+                os.close(evidence_fd)
+
+    def test_token_reader_requires_private_regular_file_without_changing_parent_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            credential_dir = root / "credentials"
+            credential_dir.mkdir(mode=0o750)
+            token_file = credential_dir / "token"
+            token_file.write_text(TEST_SECRET)
+            token_file.chmod(0o600)
+
+            self.assertEqual(review.read_token_file(token_file, repo), TEST_SECRET)
+            self.assertEqual(stat.S_IMODE(credential_dir.stat().st_mode), 0o750)
+
+            token_file.chmod(0o640)
+            with self.assertRaisesRegex(ValueError, "mode 0600"):
+                review.read_token_file(token_file, repo)
     def test_non_utf8_chunk_is_embedded_as_exact_base64(self):
         source = b"diff --git a/x b/x\n+\xff\x00\n"
         chunk = {"index": 0, "start": 0, "end": len(source), "sha256": review.digest(source)}
@@ -386,16 +476,22 @@ class DeepSeekReceiptTest(unittest.TestCase):
                 "GIT_CONFIG_COUNT": "1",
                 "GIT_CONFIG_KEY_0": "diff.attack.textconv",
                 "GIT_CONFIG_VALUE_0": f"touch {textconv_marker}; cat",
+                "HTTPS_PROXY": "http://proxy.example.invalid:8080",
+                "OPENAI_API_KEY": "ambient-api-key-must-not-pass",
             }
             token_file = root / "review-token"
             token_file.write_text(TEST_SECRET)
+            token_file.chmod(0o600)
             evidence = root / "evidence"
             args = Namespace(repo=str(repo), base=base, head=head, mission_id="fixture",
                              evidence=str(evidence), token_file=str(token_file), timeout=1)
             invocations = []
 
             def capture_invocation(command, prompt_text, env, timeout):
-                invocations.append((command, env))
+                invocations.append((command, {
+                    name: value for name, value in env.items()
+                    if name not in {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}
+                }))
                 if prompt_text.startswith("You are the final independent reviewer"):
                     result = {"review_result": "PASS", "findings": [], "dispositions": []}
                 else:
@@ -422,6 +518,9 @@ class DeepSeekReceiptTest(unittest.TestCase):
             for command, env in invocations:
                 self.assertEqual(command[0], "/trusted/bin/claude")
                 self.assertEqual(env["PATH"], "/trusted/bin:/usr/bin")
+                self.assertEqual(env["HTTPS_PROXY"], ambient_git["HTTPS_PROXY"])
+                self.assertNotIn("GIT_DIR", env)
+                self.assertNotIn("OPENAI_API_KEY", env)
             second_receipt = Path(second_result["receipt"])
             self.assertNotEqual(first_receipt.parent, second_receipt.parent)
             self.assertTrue(first_receipt.is_file())
@@ -472,6 +571,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
             head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
             token_file = root / "review-token"
             token_file.write_text(TEST_SECRET)
+            token_file.chmod(0o600)
             evidence = root / "evidence"
             args = Namespace(repo=str(repo), base=base, head=head, mission_id="fixture",
                              evidence=str(evidence), token_file=str(token_file), timeout=1)

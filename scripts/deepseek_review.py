@@ -7,7 +7,7 @@ commit-last: an incomplete run has no receipt and is never an approval.
 """
 from __future__ import annotations
 
-import argparse, base64, hashlib, hmac, json, os, re, shutil, stat, subprocess, sys, tempfile, time, uuid
+import argparse, base64, hashlib, hmac, json, os, pwd, re, shutil, stat, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -20,6 +20,7 @@ _GIT_ENV = {
     "HOME": "/nonexistent",
     "LANG": "C.UTF-8",
     "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_SYSTEM": os.devnull,
     "GIT_CONFIG_GLOBAL": os.devnull,
     "GIT_CONFIG_COUNT": "0",
     "GIT_ATTR_NOSYSTEM": "1",
@@ -27,6 +28,14 @@ _GIT_ENV = {
     "GIT_TERMINAL_PROMPT": "0",
     "GIT_OPTIONAL_LOCKS": "0",
 }
+_PROXY_ENV_NAMES = (
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+)
+_CA_ENV_NAMES = (
+    "CODEX_CA_CERTIFICATE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO",
+    "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "SSL_CERT_DIR", "SSL_CERT_FILE",
+)
 
 _REVIEW_PROPERTIES = {
     "review_result": {"enum": ["PASS", "FAIL"]},
@@ -70,6 +79,226 @@ AGGREGATE_SCHEMA = {
 
 def canon(value): return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 def digest(value): return hashlib.sha256(value).hexdigest()
+
+def open_private_directory(path, repo_root, *, create=True, secure=True):
+    """Open an external owner-controlled directory without following links.
+
+    Evidence directories are tightened to 0700. Credential parent directories
+    are only checked for unsafe writes so reading an existing token never
+    changes its surrounding filesystem metadata.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory_flag is None or not hasattr(os, "open"):
+        raise ValueError("safe no-follow evidence access is unavailable")
+    supplied = Path(path)
+    if ".." in supplied.parts:
+        raise ValueError("evidence path cannot contain parent traversal")
+    target = Path(os.path.abspath(supplied))
+    repository = Path(repo_root).resolve(strict=True)
+    if target == repository or repository in target.parents:
+        raise ValueError("evidence directory must be outside the reviewed repository")
+
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    home = Path(pwd.getpwuid(uid).pw_dir) if uid is not None else Path.home()
+    try:
+        target.relative_to(home)
+        anchor, anchor_kind = home, "home"
+    except ValueError:
+        anchor, anchor_kind = Path("/"), "root"
+        for parent in target.parents:
+            try:
+                info = parent.lstat()
+            except OSError:
+                continue
+            if stat.S_IMODE(info.st_mode) & stat.S_ISVTX:
+                anchor, anchor_kind = parent, "sticky"
+                break
+
+    flags = os.O_RDONLY | directory_flag | nofollow | getattr(os, "O_CLOEXEC", 0)
+    current_path = Path("/")
+    current_fd = os.open("/", flags)
+    private_started = False
+    try:
+        for component in target.parts[1:]:
+            child_path = current_path / component
+            try:
+                child_fd = os.open(component, flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                if not create or not private_started:
+                    raise ValueError("evidence directory ancestor is unavailable")
+                os.mkdir(component, 0o700, dir_fd=current_fd)
+                child_fd = os.open(component, flags, dir_fd=current_fd)
+            info = os.fstat(child_fd)
+            if not stat.S_ISDIR(info.st_mode):
+                os.close(child_fd)
+                raise ValueError("evidence path contains a non-directory")
+            mode = stat.S_IMODE(info.st_mode)
+            at_anchor = child_path == anchor
+            if at_anchor:
+                if anchor_kind == "home":
+                    if uid is not None and info.st_uid != uid or mode & 0o022:
+                        os.close(child_fd)
+                        raise ValueError("owner home is not a stable evidence anchor")
+                elif anchor_kind == "sticky":
+                    if (uid is not None and info.st_uid not in {0, uid}) or not mode & stat.S_ISVTX:
+                        os.close(child_fd)
+                        raise ValueError("shared evidence anchor is not sticky and trusted")
+                elif info.st_uid != 0 or mode & 0o022:
+                    os.close(child_fd)
+                    raise ValueError("evidence path has an untrusted root ancestor")
+                private_started = True
+            elif private_started:
+                if uid is not None and info.st_uid != uid:
+                    os.close(child_fd)
+                    raise ValueError("private evidence directory is not owner-owned")
+                if secure:
+                    os.fchmod(child_fd, 0o700)
+                    if stat.S_IMODE(os.fstat(child_fd).st_mode) != 0o700:
+                        os.close(child_fd)
+                        raise ValueError("private evidence directory could not be secured")
+                elif mode & 0o022:
+                    os.close(child_fd)
+                    raise ValueError("credential directory is group- or world-writable")
+            else:
+                sticky_shared = bool(mode & stat.S_ISVTX and mode & 0o022 and info.st_uid in {0, uid})
+                if ((uid is not None and info.st_uid not in {0, uid})
+                        or (mode & 0o022 and not sticky_shared)):
+                    os.close(child_fd)
+                    raise ValueError("evidence path has an untrusted writable ancestor")
+            os.close(current_fd)
+            current_fd = child_fd
+            current_path = child_path
+        if not private_started:
+            raise ValueError("evidence directory is outside an owner-controlled anchor")
+        final_info = os.fstat(current_fd)
+        final_mode = stat.S_IMODE(final_info.st_mode)
+        if (not stat.S_ISDIR(final_info.st_mode)
+                or (uid is not None and final_info.st_uid != uid)
+                or (final_mode != 0o700 if secure else bool(final_mode & 0o022))):
+            raise ValueError("evidence directory is not owner-only" if secure
+                             else "credential directory has unsafe permissions")
+        result = current_fd
+        current_fd = -1
+        return target, result
+    finally:
+        if current_fd >= 0:
+            os.close(current_fd)
+
+def create_private_child_directory(parent_fd, name):
+    if not name or name in {".", ".."} or "/" in name:
+        raise ValueError("invalid evidence directory name")
+    os.mkdir(name, 0o700, dir_fd=parent_fd)
+    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=parent_fd)
+    info = os.fstat(fd)
+    if (not stat.S_ISDIR(info.st_mode)
+            or (hasattr(os, "getuid") and info.st_uid != os.getuid())
+            or stat.S_IMODE(info.st_mode) != 0o700):
+        os.close(fd)
+        raise ValueError("new evidence directory is not owner-only")
+    os.fsync(parent_fd)
+    return fd
+
+def write_private_artifact(directory_fd, name, data, run_id):
+    """Durably publish one owner-only artifact without following or replacing paths."""
+    if not name or name in {".", ".."} or "/" in name:
+        raise ValueError("invalid evidence artifact name")
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ValueError("safe no-follow evidence writes are unavailable")
+    temporary = f".{name}.{run_id}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode)
+                or (hasattr(os, "getuid") and info.st_uid != os.getuid())):
+            raise ValueError("evidence artifact is not a regular owner-owned file")
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb", closefd=True) as stream:
+            fd = -1
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
+        os.unlink(temporary, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except OSError:
+            pass
+        raise
+
+def read_private_artifact(directory_fd, name):
+    if not name or name in {".", ".."} or "/" in name:
+        raise ValueError("invalid evidence artifact name")
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=directory_fd)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode)
+                or (hasattr(os, "getuid") and info.st_uid != os.getuid())
+                or stat.S_IMODE(info.st_mode) & 0o077):
+            raise ValueError("evidence artifact is not a private owner-owned file")
+        chunks = []
+        while True:
+            block = os.read(fd, 1024 * 1024)
+            if not block:
+                return b"".join(chunks)
+            chunks.append(block)
+    finally:
+        os.close(fd)
+
+def read_token_file(path, repo_root):
+    """Read a current-owner 0600 credential without following a symlink."""
+    token_path = Path(path)
+    if not token_path.is_absolute():
+        raise ValueError("token file path must be absolute")
+    _, parent_fd = open_private_directory(
+        token_path.parent, repo_root, create=False, secure=False,
+    )
+    try:
+        fd = os.open(token_path.name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=parent_fd)
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode)
+                or (hasattr(os, "getuid") and info.st_uid != os.getuid())
+                or stat.S_IMODE(info.st_mode) != 0o600):
+            os.close(fd)
+            raise ValueError("token file must be a current-owner regular file with mode 0600")
+        try:
+            return os.read(fd, max(info.st_size, 1) + 1).decode("utf-8").strip()
+        finally:
+            os.close(fd)
+    finally:
+        os.close(parent_fd)
+
+def reviewer_transport_environment(source=None):
+    """Retain transport-only proxy and system-root CA settings, never auth/config."""
+    source = os.environ if source is None else source
+    environment = {name: source[name] for name in _PROXY_ENV_NAMES if name in source}
+    for name in _CA_ENV_NAMES:
+        value = source.get(name, "")
+        if not value:
+            continue
+        paths = value.split(os.pathsep) if name == "SSL_CERT_DIR" else [value]
+        safe = True
+        for raw_path in paths:
+            path = Path(raw_path)
+            try:
+                info = path.lstat()
+            except OSError:
+                safe = False
+                break
+            expected_type = stat.S_ISDIR(info.st_mode) if name == "SSL_CERT_DIR" else stat.S_ISREG(info.st_mode)
+            if (not path.is_absolute() or stat.S_ISLNK(info.st_mode) or not expected_type
+                    or info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022):
+                safe = False
+                break
+        if safe:
+            environment[name] = value
+    return environment
 def auth_digest(value, secret):
     if not isinstance(secret, str) or not secret:
         raise ValueError("review authentication key is required")
@@ -293,16 +522,21 @@ def validate(receipt, base, head, root=None, receipt_path=None, mission_id=None,
         manifest={"version":"cmh-deepseek-chunks/v2","base_sha":base,"head_sha":head,"diff_sha256":digest(diff),"chunks":descriptors}
         if digest(canon(manifest))!=receipt["manifest_sha256"]: raise ValueError("chunk manifest hash mismatch")
         if receipt_path is not None:
-            evidence=Path(receipt_path).resolve().parent
-            for chunk in chunks_:
-                artifact=evidence/f"chunk-{chunk['index']:03d}.json"
-                if not artifact.is_file() or sha(artifact)!=chunk["output_sha256"]: raise ValueError("chunk artifact mismatch")
-                if reviewer_result(artifact.read_text(), forbid_dispositions=True)!=chunk["result"]: raise ValueError("chunk result does not match durable artifact")
-            aggregate_artifact=evidence/"aggregate.json"
-            if not aggregate_artifact.is_file() or sha(aggregate_artifact) != receipt["aggregate_output_sha256"]:
-                raise ValueError("aggregate artifact mismatch")
-            if reviewer_result(aggregate_artifact.read_text(), require_dispositions=True) != aggregate_result:
-                raise ValueError("aggregate result does not match durable artifact")
+            evidence=Path(os.path.abspath(receipt_path)).parent
+            evidence_fd=None
+            try:
+                _, evidence_fd=open_private_directory(evidence, root)
+                for chunk in chunks_:
+                    artifact=read_private_artifact(evidence_fd,f"chunk-{chunk['index']:03d}.json")
+                    if digest(artifact)!=chunk["output_sha256"]: raise ValueError("chunk artifact mismatch")
+                    if reviewer_result(artifact.decode("utf-8"), forbid_dispositions=True)!=chunk["result"]: raise ValueError("chunk result does not match durable artifact")
+                aggregate_artifact=read_private_artifact(evidence_fd,"aggregate.json")
+                if digest(aggregate_artifact) != receipt["aggregate_output_sha256"]:
+                    raise ValueError("aggregate artifact mismatch")
+                if reviewer_result(aggregate_artifact.decode("utf-8"), require_dispositions=True) != aggregate_result:
+                    raise ValueError("aggregate result does not match durable artifact")
+            finally:
+                if evidence_fd is not None: os.close(evidence_fd)
     if receipt["review_result"] not in {"PASS", "FAIL"}:
         raise ValueError("invalid aggregate verdict")
     blocking=any(f.get("severity") in {"P0","P1","P2"} for f in receipt["findings"])
@@ -386,22 +620,28 @@ def run(args):
     diff=git(root,"diff","--no-ext-diff","--no-textconv","--binary",f"{base}..{head}"); plan=chunks(diff); diff_hash=digest(diff)
     claude_executable,safe_path=resolve_claude_launcher(root,os.environ.get("PATH",""))
     manifest={"version":"cmh-deepseek-chunks/v2","base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"chunks":[dict(chunk) for chunk in plan]}; manifest_hash=digest(canon(manifest))
-    evidence_root=Path(args.evidence).resolve(); evidence_root.mkdir(parents=True,exist_ok=True); os.chmod(evidence_root,0o700)
-    run_id=uuid.uuid4().hex; evidence=evidence_root/run_id; evidence.mkdir(mode=0o700)
-    token=Path(args.token_file).read_text().strip()
+    token=read_token_file(args.token_file,root)
     if not token: raise ValueError("empty DeepSeek token file")
-    settings=tempfile.NamedTemporaryFile(mode="w",delete=False); settings.write('{"permissions":{"allow":[],"deny":["Bash","Edit","Write","Read","Glob","Grep","WebFetch","WebSearch"]}}'); settings.close()
-    results=[]
-    common_command=[claude_executable,"--bare","--restricted","--print","--model",MODEL,"--settings",settings.name,"--tools","","--disallowed-tools","Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch","--output-format","json"]
-    chunk_command=common_command+["--json-schema",json.dumps(CHUNK_SCHEMA,separators=(",",":"))]
-    aggregate_command=common_command+["--json-schema",json.dumps(AGGREGATE_SCHEMA,separators=(",",":"))]
+    evidence_root_fd=None; evidence_fd=None; settings=None; env={}
     try:
-        env={"HOME":"/nonexistent","PATH":safe_path,"LANG":"C.UTF-8","ANTHROPIC_API_KEY":token,"ANTHROPIC_AUTH_TOKEN":token,"ANTHROPIC_BASE_URL":ENDPOINT,"CLAUDE_CODE_SIMPLE":"1"}
+        evidence_root,evidence_root_fd=open_private_directory(args.evidence,root)
+        run_id=uuid.uuid4().hex; evidence=evidence_root/run_id
+        evidence_fd=create_private_child_directory(evidence_root_fd,run_id)
+        settings=tempfile.NamedTemporaryFile(mode="w",delete=False)
+        settings.write('{"permissions":{"allow":[],"deny":["Bash","Edit","Write","Read","Glob","Grep","WebFetch","WebSearch"]}}')
+        settings.close()
+        common_command=[claude_executable,"--bare","--restricted","--print","--model",MODEL,"--settings",settings.name,"--tools","","--disallowed-tools","Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch","--output-format","json"]
+        chunk_command=common_command+["--json-schema",json.dumps(CHUNK_SCHEMA,separators=(",",":"))]
+        aggregate_command=common_command+["--json-schema",json.dumps(AGGREGATE_SCHEMA,separators=(",",":"))]
+        env={"HOME":"/nonexistent","PATH":safe_path,"LANG":"C.UTF-8","ANTHROPIC_API_KEY":token,"ANTHROPIC_AUTH_TOKEN":token,"ANTHROPIC_BASE_URL":ENDPOINT,"CLAUDE_CODE_SIMPLE":"1", **reviewer_transport_environment()}
+        results=[]
         for chunk in plan:
             source=diff[chunk["start"]:chunk["end"]]
             completed=invoke_reviewer(chunk_command,prompt(base,head,diff_hash,manifest_hash,chunk,source),env,args.timeout)
             if completed.returncode: raise RuntimeError(f"DeepSeek reviewer infrastructure failure: exit={completed.returncode}")
-            raw=completed.stdout.encode(); (evidence/f"chunk-{chunk['index']:03d}.json").write_bytes(raw)
+            raw=completed.stdout.encode()
+            if token.encode("utf-8") in raw: raise ValueError("DeepSeek output contained review credential")
+            write_private_artifact(evidence_fd,f"chunk-{chunk['index']:03d}.json",raw,run_id)
             result=reviewer_result(completed.stdout, forbid_dispositions=True)
             chunk["result"]=result; chunk["output_sha256"]=digest(raw); results.extend(result.get("findings",[]))
         chunk_findings, required_dispositions = indexed_chunk_findings(plan)
@@ -414,18 +654,26 @@ def run(args):
         if aggregate_call.returncode:
             raise RuntimeError(f"DeepSeek aggregate reviewer infrastructure failure: exit={aggregate_call.returncode}")
         aggregate_raw=aggregate_call.stdout.encode()
-        (evidence/"aggregate.json").write_bytes(aggregate_raw)
+        if token.encode("utf-8") in aggregate_raw: raise ValueError("DeepSeek output contained review credential")
+        write_private_artifact(evidence_fd,"aggregate.json",aggregate_raw,run_id)
         aggregate_result=reviewer_result(aggregate_call.stdout, require_dispositions=True)
         validate_blocker_dispositions(plan, aggregate_result)
+        verdict=aggregate_result["review_result"]
+        receipt={"version":VERSION,"repository":repository,"mission_id":args.mission_id,"base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"manifest_sha256":manifest_hash,"chunks":plan,"chunk_findings":results,"aggregate_result":aggregate_result,"aggregate_output_sha256":digest(aggregate_raw),"provider":"deepseek","model":MODEL,"command_sha256":digest(canon({"chunk":chunk_command,"aggregate":aggregate_command})),"started_at":int(time.time()),"completed_at":int(time.time()),"review_result":verdict,"findings":aggregate_result["findings"]}
+        receipt["integrity_sha256"]=digest(canon(receipt)); receipt["auth_hmac_sha256"]=auth_digest(receipt,token)
+        path=evidence/f"deepseek-receipt-{head[:12]}-{run_id}.json"
+        validate(receipt,base,head,root,path,args.mission_id,repository,secret=token)
+        write_private_artifact(evidence_fd,path.name,canon(receipt),run_id)
+        persisted=json.loads(read_private_artifact(evidence_fd,path.name))
+        validate(persisted,base,head,root,path,args.mission_id,repository,secret=token)
+        os.fsync(evidence_fd)
+        print(json.dumps({"status":verdict,"receipt":str(path),"review_receipt":str(path),"head_sha":head}))
     finally:
-        Path(settings.name).unlink(missing_ok=True)
-    verdict=aggregate_result["review_result"]
-    aggregate_findings=aggregate_result["findings"]
-    command_identity={"chunk":chunk_command,"aggregate":aggregate_command}
-    receipt={"version":VERSION,"repository":repository,"mission_id":args.mission_id,"base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"manifest_sha256":manifest_hash,"chunks":plan,"chunk_findings":results,"aggregate_result":aggregate_result,"aggregate_output_sha256":digest(aggregate_raw),"provider":"deepseek","model":MODEL,"command_sha256":digest(canon(command_identity)),"started_at":int(time.time()),"completed_at":int(time.time()),"review_result":verdict,"findings":aggregate_findings}
-    receipt["integrity_sha256"]=digest(canon(receipt)); receipt["auth_hmac_sha256"]=auth_digest(receipt, token)
-    path=evidence/f"deepseek-receipt-{head[:12]}-{uuid.uuid4().hex}.json"; path.write_bytes(canon(receipt)); os.chmod(path,0o600)
-    print(json.dumps({"status":verdict,"receipt":str(path),"review_receipt":str(path),"head_sha":head}))
+        if settings is not None:
+            Path(settings.name).unlink(missing_ok=True)
+        env.clear(); token=""
+        if evidence_fd is not None: os.close(evidence_fd)
+        if evidence_root_fd is not None: os.close(evidence_root_fd)
 def main():
     p=argparse.ArgumentParser(); sub=p.add_subparsers(dest="cmd",required=True)
     r=sub.add_parser("run"); r.add_argument("--repo",default="."); r.add_argument("--mission-id",default="codex-mission-harness"); r.add_argument("--base",required=True); r.add_argument("--head",required=True); r.add_argument("--evidence",required=True); r.add_argument("--token-file",required=True); r.add_argument("--timeout",type=int,default=900)
@@ -434,9 +682,16 @@ def main():
     try:
         if a.cmd=="run": run(a)
         else:
-            repository=git(Path(a.repo).resolve(),"config","--get","remote.origin.url").decode().strip()
-            token=Path(a.token_file).read_text().strip()
-            print(json.dumps({"status":validate(json.loads(Path(a.receipt).read_text()),full_sha(a.base),full_sha(a.head),a.repo,a.receipt,a.mission_id,repository,token)["review_result"]}))
+            root=Path(a.repo).resolve(); receipt_path=Path(a.receipt)
+            _,evidence_fd=open_private_directory(receipt_path.parent,root)
+            token=""
+            try:
+                receipt=json.loads(read_private_artifact(evidence_fd,receipt_path.name))
+                repository=repository_identity(git(root,"config","--get","remote.origin.url").decode().strip())
+                token=read_token_file(a.token_file,root)
+                print(json.dumps({"status":validate(receipt,full_sha(a.base),full_sha(a.head),root,receipt_path,a.mission_id,repository,secret=token)["review_result"]}))
+            finally:
+                token=""; os.close(evidence_fd)
     except Exception as exc: print(json.dumps({"status":"BLOCKED_EXTERNAL","error":str(exc)})); return 1
     return 0
 if __name__=="__main__": raise SystemExit(main())

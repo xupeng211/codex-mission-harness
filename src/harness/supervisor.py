@@ -554,10 +554,14 @@ class Supervisor:
                                 reviewer, worktree=str(review_root), base=row["base_sha"], head=head,
                                 mission_id=mission_id, scope_file=str(scope), evidence_dir=str(evidence),
                             )
+                            reviewer_env = self.adapter.review_environment(
+                                reviewer, worktree=str(review_root),
+                            )
                             self.journal.update(mission_id, pending_gate=f"review:{reviewer}")
                             self.process.start(
                                 mission_id, f"review:{reviewer}", argv,
-                                str(review_root), docker_env(mission_id), head,
+                                str(review_root), reviewer_env, head,
+                                inherit_environment=False,
                             )
                         except Exception as exc:
                             advance(State.BLOCKED_EXTERNAL,

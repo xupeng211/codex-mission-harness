@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .journal import Journal, now
-from .sandbox import SandboxUnavailable, preflight_project_gate, project_gate_invocation
+from .sandbox import SAFE_PATH, SandboxUnavailable, preflight_project_gate, project_gate_invocation
 
 
 BOOTSTRAP = """import json, os, sys
@@ -64,14 +64,17 @@ class ProcessSupervisor:
         log_root.mkdir(parents=True, exist_ok=True)
 
     def start(self, mission_id: str, name: str, argv: list[str], cwd: str, env: dict[str, str],
-              launch_head: str, sandbox_profile: str | None = None) -> str:
+              launch_head: str, sandbox_profile: str | None = None,
+              inherit_environment: bool = True) -> str:
         if self.launcher_start_ticks is None:
             raise RuntimeError("cannot reserve a gate without launcher process identity")
         job_id = uuid.uuid4().hex
         lease = uuid.uuid4().hex
         out, err = self.log_root / f"{job_id}.out", self.log_root / f"{job_id}.err"
-        child_env = {**os.environ, **env}
-        bootstrap_env = None
+        child_env = ({**os.environ, **env} if inherit_environment else dict(env))
+        bootstrap_env = None if inherit_environment else {
+            "PATH": SAFE_PATH, "HOME": "/nonexistent", "LANG": "C.UTF-8",
+        }
         if sandbox_profile is not None:
             if sandbox_profile != "project-gate":
                 raise ValueError(f"unsupported process sandbox profile: {sandbox_profile}")
