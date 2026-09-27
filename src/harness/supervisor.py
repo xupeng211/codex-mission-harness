@@ -146,6 +146,8 @@ class Supervisor:
                     "current_head": current,
                     "exit_code": result.exit_code,
                 })
+                self.journal.db.commit()
+                self.journal.retire_terminal_gate_job(mission_id, result.job_id)
                 continue
             job = self.journal.db.execute("SELECT name,stdout_path FROM jobs WHERE job_id=?", (result.job_id,)).fetchone()
             if job and str(job["name"]).startswith("review:"):
@@ -207,13 +209,21 @@ class Supervisor:
                         # to IMPLEMENT; no second transition can race it.
                         pass
                     continue
+            if (result.state in {"EXITED", "LOST"} and
+                    (not job or State(snapshot["current_state"]) != State.TEST
+                     or snapshot["pending_gate"] != job["name"])):
+                self.journal.retire_terminal_gate_job(mission_id, result.job_id)
+                continue
             if result.state == "EXITED" and result.exit_code == 0:
                 pending = snapshot["pending_gate"]
                 if pending:
                     self.journal.complete_gate(mission_id, pending, current)
+                self.journal.retire_terminal_gate_job(mission_id, result.job_id)
             elif result.state == "LOST":
                 # Canonical validation commands are idempotent: resume retries an unobserved outcome.
                 self.journal.event(mission_id, "process_retry_required", {"job_id": result.job_id})
+                self.journal.update(mission_id, pending_gate=None)
+                self.journal.retire_terminal_gate_job(mission_id, result.job_id)
             elif result.state == "EXITED" and result.exit_code != 0:
                 pending = snapshot["pending_gate"]
                 if pending and State(snapshot["current_state"]) == State.TEST:
@@ -229,12 +239,14 @@ class Supervisor:
                         f"owned process {result.state}: {result.exit_code}",
                         snapshot,
                     )
+                self.journal.retire_terminal_gate_job(mission_id, result.job_id)
             else:
                 reconcile_transition(
                     State.FAILED_FATAL,
                     f"owned process {result.state}: {result.exit_code}",
                     snapshot,
                 )
+                self.journal.retire_terminal_gate_job(mission_id, result.job_id)
 
     def _agent_turn(self, mission_id: str, prompt: str, forbidden_actions: tuple[str, ...]) -> bool:
         owner_pid, owner_start_ticks = self._merge_owner()

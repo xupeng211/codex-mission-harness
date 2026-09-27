@@ -1382,11 +1382,27 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(row["current_head"], "a" * 40)
         self.assertEqual(row["codex_thread_id"], "thread-1")
         self.assertEqual(self.journal.db.execute("SELECT count(*) FROM events WHERE kind='mission_created'").fetchone()[0], 1)
-        self.assertEqual(self.journal.db.execute("SELECT count(*) FROM jobs WHERE state='LOST'").fetchone()[0], 1)
+        self.assertEqual(self.journal.db.execute("SELECT count(*) FROM jobs WHERE state='CONSUMED'").fetchone()[0], 1)
         replacement.collect_jobs(self.spec.mission_id)
         self.supervisor = replacement
         self.assertEqual(self.drain(), State.PASS)
         self.assertEqual(self.journal.db.execute("SELECT count(*) FROM jobs WHERE name='verify-pr'").fetchone()[0], 2)
+
+    def test_terminal_gate_poll_replays_after_crash_before_publication(self):
+        self.advance_to_test()
+        self.supervisor.step(self.spec.mission_id, self.spec)
+        child = next(iter(self.supervisor.process._children.values()))
+        child.wait()
+        observed = self.supervisor.process.poll(self.spec.mission_id)
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0].state, "EXITED")
+        self.assertFalse(self.journal.gate_passed_at_head(self.spec.mission_id, "verify-pr", "a" * 40))
+        replacement = Supervisor(self.journal, ProcessSupervisor(
+            self.journal, Path(self.tmp.name) / "replay-gate-logs"), self.codex, self.adapter)
+        replacement.reconcile(self.spec.mission_id)
+        self.assertTrue(self.journal.gate_passed_at_head(self.spec.mission_id, "verify-pr", "a" * 40))
+        self.assertEqual(self.journal.db.execute(
+            "SELECT state FROM jobs WHERE job_id=?", (observed[0].job_id,)).fetchone()[0], "CONSUMED")
 
     def test_agent_prose_is_not_terminal_and_invalid_transition_fails_closed(self):
         self.advance_to_test()
@@ -3234,6 +3250,8 @@ class HarnessTest(unittest.TestCase):
             [], 0, json.dumps(report, indent=2) + "\n\nPost-merge completion evidence passed.\n", "",
         )
         with patch.object(adapter, "_trusted_base_checkout", return_value=Path("/trusted")), \
+                patch.object(adapter, "_assert_safe_local_git_config"), \
+                patch.object(adapter, "_repo_from_origin", return_value="owner/project"), \
                 patch.object(adapter, "_call", side_effect=[completed, subprocess.CompletedProcess([], 0, "", "")]), \
                 patch.object(adapter, "_run", side_effect=["", "d" * 40, "e" * 40]):
             result = adapter.post_merge("/worktree", merge_sha, 7, "owner/project", "feature", "b" * 40)
@@ -3249,6 +3267,8 @@ class HarnessTest(unittest.TestCase):
                   "ci_conclusion": "success", "verdict": "PASS", "failures": []}
         completed = subprocess.CompletedProcess([], 0, json.dumps(report), "")
         with patch.object(adapter, "_trusted_base_checkout", return_value=Path("/trusted")), \
+                patch.object(adapter, "_assert_safe_local_git_config"), \
+                patch.object(adapter, "_repo_from_origin", return_value="owner/project"), \
                 patch.object(adapter, "_call", side_effect=[completed, subprocess.CompletedProcess([], 0, "", "")]), \
                 patch.object(adapter, "_run", side_effect=["", main_sha, "e" * 40]) as run:
             result = adapter.post_merge("/worktree", merge_sha, 7, "owner/project", "feature", "b" * 40)
@@ -3265,6 +3285,8 @@ class HarnessTest(unittest.TestCase):
         }
         completed = subprocess.CompletedProcess([], 0, json.dumps(report), "")
         with patch.object(adapter, "_trusted_base_checkout", return_value=Path("/trusted")), \
+                patch.object(adapter, "_assert_safe_local_git_config"), \
+                patch.object(adapter, "_repo_from_origin", return_value="owner/project"), \
                 patch.object(adapter, "_trusted_python_interpreter", return_value="/trusted/python"), \
                 patch.object(adapter, "_call", side_effect=[completed, subprocess.CompletedProcess([], 0, "", "")]) as call, \
                 patch.object(adapter, "_run", side_effect=["", "d" * 40, "e" * 40]):
@@ -3620,6 +3642,20 @@ class HarnessTest(unittest.TestCase):
     def test_controller_subprocesses_ignore_global_git_configuration(self):
         child = FootballPredictionAdapter._trusted_subprocess_environment()
         self.assertEqual(child["GIT_CONFIG_GLOBAL"], os.devnull)
+
+    def test_trusted_checkout_rejects_local_checkout_filter_before_materialization(self):
+        repo = Path(self.tmp.name) / "filter-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Harness Test"], check=True)
+        (repo / "tracked.txt").write_text("safe\n")
+        subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+        head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+        subprocess.run(["git", "-C", str(repo), "config", "filter.evil.smudge", "false"], check=True)
+        with self.assertRaisesRegex(RuntimeError, "executable local Git configuration"):
+            FootballPredictionAdapter()._trusted_base_checkout(str(repo), head)
 
     def test_production_mission_rejects_unexecutable_post_merge_gates(self):
         raw = dict(self.spec.__dict__, adapter="footballprediction",

@@ -228,16 +228,13 @@ class ProcessSupervisor:
     def poll(self, mission_id: str) -> list[JobResult]:
         rows = self.journal.db.execute(
             "SELECT * FROM jobs WHERE mission_id=? AND "
-            "(state IN ('STARTING','RUNNING') OR "
-            "(state IN ('EXITED','LOST') AND name LIKE 'review:%'))",
+            "state IN ('STARTING','RUNNING','EXITED','LOST')",
             (mission_id,),
         ).fetchall()
         results = []
         for row in rows:
-            # Terminal review jobs remain visible until the supervisor consumes
-            # their receipt/result atomically.  This closes the crash window
-            # between child reaping and review state publication without
-            # treating an already-consumed job as active work.
+            # All terminal jobs remain visible until the supervisor has
+            # published or safely retired their exact-head result.
             if row["state"] in {"EXITED", "LOST"}:
                 results.append(JobResult(row["job_id"], row["state"], row["exit_code"], row["launch_head"]))
                 continue

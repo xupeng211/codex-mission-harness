@@ -317,6 +317,21 @@ class Journal:
             self.db.rollback()
             raise
 
+    def retire_terminal_gate_job(self, mission_id: str, job_id: str) -> bool:
+        """Consume a replayable terminal gate row after its result is reconciled."""
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            changed = self.db.execute(
+                "UPDATE jobs SET state='CONSUMED' WHERE job_id=? AND mission_id=? "
+                "AND state IN ('EXITED','LOST') AND name NOT LIKE 'review:%'",
+                (job_id, mission_id),
+            ).rowcount
+            self.db.commit()
+            return changed == 1
+        except Exception:
+            self.db.rollback()
+            raise
+
     def gate_passed_at_head(self, mission_id: str, gate: str, head: str) -> bool:
         gates = json.loads(self.mission(mission_id)["completed_gates_json"])
         return isinstance(gates, dict) and gates.get(gate) == head

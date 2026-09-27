@@ -81,14 +81,7 @@ class FootballPredictionAdapter:
         }
         # A writable candidate must not supply executable Git settings for a
         # controller operation (notably fsmonitor and checkout filters).
-        configured = subprocess.check_output(
-            ["git", "-C", str(candidate), "config", "--local", "--name-only", "--list"],
-            cwd=str(candidate), env=git_env, text=True, stderr=subprocess.PIPE, timeout=30,
-        ).splitlines()
-        if any(key.lower() == "core.fsmonitor" or
-               (key.lower().startswith("filter.") and key.lower().rsplit(".", 1)[-1]
-                in {"smudge", "clean", "process"}) for key in configured):
-            raise RuntimeError("review source has executable local Git configuration")
+        self._assert_safe_local_git_config(str(candidate), git_env)
         if not context.exists():
             created = self._call(
                 ["git", "-C", str(candidate), "-c", "core.hooksPath=/dev/null",
@@ -592,6 +585,25 @@ class FootballPredictionAdapter:
         return child_env
 
     @staticmethod
+    def _assert_safe_local_git_config(worktree: str, env: dict[str, str]) -> None:
+        """Reject local settings that can execute programs during trusted Git commands."""
+        configured = subprocess.check_output(
+            ["git", "-C", worktree, "config", "--local", "--name-only", "--list"],
+            cwd=worktree, env=env, text=True, stderr=subprocess.PIPE, timeout=30,
+        ).splitlines()
+        for raw in configured:
+            key = raw.lower()
+            suffix = key.rsplit(".", 1)[-1]
+            if (key in {"core.fsmonitor", "core.sshcommand", "credential.helper", "core.pager",
+                        "diff.external"}
+                    or key.startswith("include.") or key.startswith("includeif.")
+                    or key.startswith("url.") and suffix in {"insteadof", "pushinsteadof"}
+                    or key.startswith("filter.") and suffix in {"smudge", "clean", "process"}
+                    or key.startswith("remote.") and suffix in {"uploadpack", "receivepack"}
+                    or key.startswith("submodule.") and suffix == "update"):
+                raise RuntimeError("repository has executable local Git configuration")
+
+    @staticmethod
     def _trusted_review_path(worktree: str) -> str:
         """Keep only absolute, owner-controlled PATH directories outside the reviewed tree."""
         repository = Path(worktree).resolve(strict=True)
@@ -696,6 +708,9 @@ class FootballPredictionAdapter:
             root_parent.chmod(0o700)
             if stat.S_IMODE(root_parent.stat().st_mode) & 0o077:
                 raise RuntimeError("trusted base checkout parent is not owner-only")
+
+        self._assert_safe_local_git_config(str(candidate),
+                                           self._trusted_subprocess_environment())
 
         if not root.exists() and not root.is_symlink():
             added = self._call([
@@ -1369,6 +1384,10 @@ class FootballPredictionAdapter:
             return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "Production Gate command failed", data=data)
         if data.get("verdict") == "PASS":
             try:
+                self._assert_safe_local_git_config(
+                    worktree, self._trusted_subprocess_environment())
+                if self._repo_from_origin(worktree) != pr_repo:
+                    return GateResult("BLOCKED_EXTERNAL", "post-merge origin differs from the approved repository")
                 self._run(["git", "fetch", "origin", "main"], cwd=worktree)
                 # Capture the remote-tracking ref once, then derive every
                 # related fact from that immutable full SHA.  A concurrent

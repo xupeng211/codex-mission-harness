@@ -144,6 +144,14 @@ class ProjectGateSandboxTest(unittest.TestCase):
             with self.assertRaisesRegex(SandboxUnavailable, "bubblewrap is required"):
                 project_gate_invocation(["make", "verify-pr"], str(self.worktree), {}, self.logs, "no-bwrap")
 
+    def test_writable_bubblewrap_launcher_is_rejected_before_preflight(self):
+        fake = self.root / "bwrap"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(0o700)
+        with patch("harness.sandbox.shutil.which", return_value=str(fake)):
+            with self.assertRaisesRegex(SandboxUnavailable, "executable is not trusted"):
+                project_gate_invocation(["make", "verify-pr"], str(self.worktree), {}, self.logs, "fake-bwrap")
+
     def test_isolation_preflight_runs_only_a_harmless_command_and_fails_closed(self):
         invocation = self.build()
         success = subprocess.CompletedProcess([], 0, "", "")

@@ -5,6 +5,7 @@ import os
 import pwd
 import re
 import shutil
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -184,9 +185,24 @@ def project_gate_invocation(
     argv: list[str], cwd: str, env: dict[str, str], metadata_dir: Path, job_id: str,
 ) -> SandboxInvocation:
     """Build a bubblewrap command with no inherited credentials or network."""
-    executable = shutil.which("bwrap")
+    executable = shutil.which("bwrap", path=SAFE_PATH)
     if not executable:
         raise SandboxUnavailable("bubblewrap is required for candidate-controlled project gates")
+    candidate = Path(executable)
+    try:
+        resolved = candidate.resolve(strict=True)
+        paths = (candidate, *candidate.parents, resolved, *resolved.parents)
+        if (not stat.S_ISREG(resolved.stat().st_mode)
+                or resolved.stat().st_uid != 0
+                or stat.S_IMODE(resolved.stat().st_mode) & 0o022
+                or not os.access(resolved, os.X_OK)
+                or any(not stat.S_ISDIR(path.stat().st_mode) or path.stat().st_uid != 0
+                       or stat.S_IMODE(path.stat().st_mode) & 0o022
+                       for path in paths if path != candidate and path != resolved)):
+            raise SandboxUnavailable("bubblewrap executable is not trusted")
+    except OSError as exc:
+        raise SandboxUnavailable("bubblewrap executable is not trusted") from exc
+    executable = str(resolved)
     if (not isinstance(argv, list) or not argv or
             any(not isinstance(value, str) or "\x00" in value for value in argv)):
         raise SandboxUnavailable("project gate command is malformed")
