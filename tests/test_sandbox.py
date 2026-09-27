@@ -83,7 +83,7 @@ class ProjectGateSandboxTest(unittest.TestCase):
         self.assertEqual(invocation.env["COMPOSE_PROJECT_NAME"], "cmh-test")
 
     def test_regular_checkout_sanitizes_original_and_sandbox_git_config_paths(self):
-        with patch("harness.sandbox.shutil.which", return_value="/usr/bin/bwrap"):
+        with patch("harness.sandbox._trusted_bwrap", return_value="/usr/bin/bwrap"):
             invocation = project_gate_invocation(
                 ["make", "verify-pr"], str(self.repo), {}, self.logs, "regular-checkout",
             )
