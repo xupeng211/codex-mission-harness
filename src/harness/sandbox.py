@@ -181,10 +181,8 @@ def _system_runtime_mounts() -> list[str]:
     return command
 
 
-def project_gate_invocation(
-    argv: list[str], cwd: str, env: dict[str, str], metadata_dir: Path, job_id: str,
-) -> SandboxInvocation:
-    """Build a bubblewrap command with no inherited credentials or network."""
+def _trusted_bwrap() -> str:
+    """Resolve bubblewrap from system paths and validate every executable ancestor."""
     executable = shutil.which("bwrap", path=SAFE_PATH)
     if not executable:
         raise SandboxUnavailable("bubblewrap is required for candidate-controlled project gates")
@@ -202,7 +200,14 @@ def project_gate_invocation(
             raise SandboxUnavailable("bubblewrap executable is not trusted")
     except OSError as exc:
         raise SandboxUnavailable("bubblewrap executable is not trusted") from exc
-    executable = str(resolved)
+    return str(resolved)
+
+
+def project_gate_invocation(
+    argv: list[str], cwd: str, env: dict[str, str], metadata_dir: Path, job_id: str,
+) -> SandboxInvocation:
+    """Build a bubblewrap command with no inherited credentials or network."""
+    executable = _trusted_bwrap()
     if (not isinstance(argv, list) or not argv or
             any(not isinstance(value, str) or "\x00" in value for value in argv)):
         raise SandboxUnavailable("project gate command is malformed")

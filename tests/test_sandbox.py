@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from harness.sandbox import SandboxUnavailable, _git_config, preflight_project_gate, project_gate_invocation
+from harness.sandbox import SandboxUnavailable, _git_config, _trusted_bwrap, preflight_project_gate, project_gate_invocation
 
 
 class ProjectGateSandboxTest(unittest.TestCase):
@@ -41,7 +41,7 @@ class ProjectGateSandboxTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def build(self, job_id="sandbox-test", env=None, cwd=None):
-        with patch("harness.sandbox.shutil.which", return_value="/usr/bin/bwrap"):
+        with patch("harness.sandbox._trusted_bwrap", return_value="/usr/bin/bwrap"):
             return project_gate_invocation(
                 ["make", "verify-pr"], str(cwd or self.worktree), env or {}, self.logs, job_id,
             )
@@ -150,7 +150,7 @@ class ProjectGateSandboxTest(unittest.TestCase):
         fake.chmod(0o700)
         with patch("harness.sandbox.shutil.which", return_value=str(fake)):
             with self.assertRaisesRegex(SandboxUnavailable, "executable is not trusted"):
-                project_gate_invocation(["make", "verify-pr"], str(self.worktree), {}, self.logs, "fake-bwrap")
+                _trusted_bwrap()
 
     def test_isolation_preflight_runs_only_a_harmless_command_and_fails_closed(self):
         invocation = self.build()
