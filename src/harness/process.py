@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import signal
 import subprocess
 import sys
 import uuid
@@ -43,6 +44,19 @@ def proc_identity(pid: int) -> tuple[str, str | None]:
 def proc_start_ticks(pid: int) -> str | None:
     status, ticks = proc_identity(pid)
     return ticks if status == "PRESENT" else None
+
+
+def owned_group_quiescent(pgid: int | None) -> bool:
+    """Only a missing recorded process group proves retry is safe."""
+    if not isinstance(pgid, int) or pgid <= 0:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
 
 
 @dataclass(frozen=True)
@@ -188,20 +202,28 @@ class ProcessSupervisor:
             # RUNNING lease so neither this controller nor a restart can wait
             # forever on a bootstrap that will receive no further input.
             try:
-                proc.terminate()
+                if (proc_start_ticks(proc.pid) == child_start_ticks
+                        and os.getpgid(proc.pid) == pgid):
+                    os.killpg(pgid, signal.SIGTERM)
             except OSError:
                 pass
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 try:
-                    proc.kill()
+                    if (proc_start_ticks(proc.pid) == child_start_ticks
+                            and os.getpgid(proc.pid) == pgid):
+                        os.killpg(pgid, signal.SIGKILL)
                     proc.wait(timeout=5)
                 except (OSError, subprocess.TimeoutExpired):
                     pass
             except OSError:
                 pass
             self._children.pop(job_id, None)
+            if not owned_group_quiescent(pgid):
+                # A released wrapper may have left a provider child alive.
+                # Keep the durable RUNNING lease so retry cannot overlap it.
+                raise RuntimeError("released process group is not quiescent") from exc
             try:
                 self.journal.db.execute("BEGIN IMMEDIATE")
                 changed = self.journal.db.execute(
@@ -270,6 +292,9 @@ class ProcessSupervisor:
                 if code is None:
                     results.append(JobResult(row["job_id"], "RUNNING", None, row["launch_head"]))
                     continue
+                if not owned_group_quiescent(row["pgid"]):
+                    results.append(JobResult(row["job_id"], "RUNNING", None, row["launch_head"]))
+                    continue
                 self._children.pop(row["job_id"], None)
                 state = "EXITED"
                 changed = self.journal.db.execute(
@@ -292,6 +317,9 @@ class ProcessSupervisor:
                 results.append(JobResult(row["job_id"], "RUNNING", None, row["launch_head"]))
                 continue
             if ticks is not None and process_status == "PRESENT" and current == ticks:
+                results.append(JobResult(row["job_id"], "RUNNING", None, row["launch_head"]))
+                continue
+            if not owned_group_quiescent(row["pgid"]):
                 results.append(JobResult(row["job_id"], "RUNNING", None, row["launch_head"]))
                 continue
             # waitpid works for children; /proc absence after a restart is a safe, explicit LOST state.

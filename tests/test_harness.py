@@ -1753,8 +1753,13 @@ class HarnessTest(unittest.TestCase):
 
         child = LiveChild()
         process = self.supervisor.process
+        def kill_group(pgid, sig):
+            if sig == 0:
+                raise ProcessLookupError()
+            child.terminated = True
         with patch("harness.process.subprocess.Popen", return_value=child), \
                 patch("harness.process.os.getpgid", return_value=12345), \
+                patch("harness.process.os.killpg", side_effect=kill_group), \
                 patch("harness.process.proc_start_ticks", return_value="child-start"):
             with self.assertRaisesRegex(BrokenPipeError, "before release"):
                 process.start(
@@ -1778,6 +1783,25 @@ class HarnessTest(unittest.TestCase):
             ).fetchone()[0],
             0,
         )
+
+    def test_restart_does_not_retry_while_owned_process_group_survives(self):
+        job_id = "review-group-survives"
+        self.journal.db.execute(
+            "INSERT INTO jobs(job_id,mission_id,name,argv_json,launch_head,pid,pgid,"
+            "start_ticks,state,stdout_path,stderr_path,started_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (job_id, self.spec.mission_id, "review:codex", "[]", "a" * 40,
+             98765, 98765, "old-start", "RUNNING", "", "", "now"),
+        )
+        self.journal.db.commit()
+        resumed = ProcessSupervisor(self.journal, Path(self.tmp.name) / "group-replay-logs")
+        with patch("harness.process.proc_identity", return_value=("ABSENT", None)), \
+                patch("harness.process.os.killpg", return_value=None):
+            observed = resumed.poll(self.spec.mission_id)
+        self.assertEqual([(result.job_id, result.state) for result in observed],
+                         [(job_id, "RUNNING")])
+        self.assertEqual(self.journal.db.execute(
+            "SELECT state FROM jobs WHERE job_id=?", (job_id,)).fetchone()[0], "RUNNING")
 
     def test_terminal_poll_cas_cannot_overwrite_a_peer_terminal_result(self):
         job_id = "concurrent-terminal-poll"
