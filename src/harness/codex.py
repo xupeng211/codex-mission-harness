@@ -348,6 +348,14 @@ class AppServerCodex:
                     "writable_roots": [root],
                     "network_access": False,
                 },
+                # The App Server needs CODEX_HOME to authenticate, but its
+                # delegated shell commands must not inherit the path to that
+                # credential directory. This is an enforced subprocess
+                # environment filter, not an instruction to the model.
+                "shell_environment_policy": {
+                    "filters": {"CODEX_HOME": "exclude"},
+                    "ignore_default_excludes": False,
+                },
             },
         }
 

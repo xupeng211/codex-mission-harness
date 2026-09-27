@@ -866,7 +866,7 @@ class HarnessTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "differs"):
             adapter._policy_params("/caller-controlled")
 
-    def test_thread_start_and_resume_use_bound_turn_sandbox(self):
+    def test_thread_start_and_resume_use_bound_sandbox_and_exclude_auth_home(self):
         adapter = AppServerCodex.__new__(AppServerCodex)
         adapter._forbidden_actions = adapter._effective_policy(())
         adapter._policy_cwd = "/mission-worktree"
@@ -880,6 +880,10 @@ class HarnessTest(unittest.TestCase):
                 "sandbox_workspace_write": {
                     "writable_roots": ["/mission-worktree"],
                     "network_access": False,
+                },
+                "shell_environment_policy": {
+                    "filters": {"CODEX_HOME": "exclude"},
+                    "ignore_default_excludes": False,
                 },
             },
         }
