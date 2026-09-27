@@ -293,7 +293,7 @@ class HarnessTest(unittest.TestCase):
         self.assertIn("exact source evidence", prompt)
         self.assertEqual(resumed._async_review_repair_context(self.spec.mission_id, "b" * 40), "")
 
-    def test_dead_review_with_invalid_receipt_retries_once_then_blocks(self):
+    def test_dead_review_with_invalid_receipt_blocks_without_automatic_retry(self):
         head = "a" * 40
         spec = replace(self.spec, adapter="footballprediction", mission_scope_file="scope.json")
         (self.worktree / "scope.json").write_text("{}")
@@ -302,91 +302,28 @@ class HarnessTest(unittest.TestCase):
             current_state=State.REVIEW, pending_gate="review:codex",
         )
         stdout_path = Path(self.tmp.name) / "incomplete-review.stdout"
-        invalid_receipt = Path(self.tmp.name) / "invalid-receipt.json"
-        invalid_receipt.write_text("{}")
-        stdout_path.write_text(json.dumps({"review_receipt": str(invalid_receipt)}))
+        stdout_path.write_text("{}")
         self.journal.db.execute(
             "INSERT INTO jobs(job_id,mission_id,name,argv_json,launch_head,state,stdout_path,stderr_path,started_at) "
             "VALUES(?,?,?,?,?,?,?,?,?)",
-            ("incomplete-review-job", self.spec.mission_id, "review:codex", "[]", head, "LOST",
-             str(stdout_path), "", "2026-01-01T00:00:00+00:00"),
+            ("incomplete-review-job", self.spec.mission_id, "review:codex", "[]", head,
+             "LOST", str(stdout_path), "", "2026-01-01T00:00:00+00:00"),
         )
         self.journal.db.commit()
         with patch.object(self.supervisor.process, "poll", return_value=[
                 JobResult("incomplete-review-job", "LOST", None, head),
-        ]), patch("harness.supervisor.subprocess.run",
-                  return_value=subprocess.CompletedProcess([], 0, "", "")), \
-                patch.object(self.supervisor.adapter, "review_result", return_value=GateResult(
-                    "BLOCKED_EXTERNAL", "receipt did not validate",
-                )) as review_result:
+        ]), patch.object(self.supervisor.adapter, "review_result", return_value=GateResult(
+                "BLOCKED_EXTERNAL", "receipt did not validate")):
             self.supervisor.reconcile(self.spec.mission_id)
-        review_result.assert_called_once()
-        self.assertEqual(self.journal.mission(self.spec.mission_id)["current_state"], State.REVIEW)
-        self.assertIsNone(self.journal.mission(self.spec.mission_id)["pending_gate"])
-        self.assertEqual(
-            self.journal.db.execute(
-                "SELECT state FROM jobs WHERE job_id='incomplete-review-job'",
-            ).fetchone()[0],
-            "CONSUMED",
-        )
-        self.assertEqual(
-            self.journal.db.execute(
-                "SELECT count(*) FROM receipts WHERE mission_id=? AND head_sha=?",
-                (self.spec.mission_id, head),
-            ).fetchone()[0],
-            0,
-        )
-        retry_event = self.journal.db.execute(
-            "SELECT payload_json FROM events WHERE mission_id=? AND kind='review_retry_required'",
-            (self.spec.mission_id,),
-        ).fetchone()
-        retry_payload = json.loads(retry_event[0])
-        self.assertIsNone(retry_payload["artifact"])
-        self.assertEqual(retry_payload["retry_number"], 1)
-        self.assertEqual(retry_payload["max_retries"], 1)
-        self.assertNotIn(str(invalid_receipt), retry_event[0])
-
-        second_stdout = Path(self.tmp.name) / "second-incomplete-review.stdout"
-        second_stdout.write_text(json.dumps({"review_receipt": str(invalid_receipt)}))
-        self.journal.update(self.spec.mission_id, pending_gate="review:codex")
-        self.journal.db.execute(
-            "INSERT INTO jobs(job_id,mission_id,name,argv_json,launch_head,state,stdout_path,stderr_path,started_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
-            ("second-incomplete-review-job", self.spec.mission_id, "review:codex", "[]", head, "LOST",
-             str(second_stdout), "", "2026-01-01T00:00:02+00:00"),
-        )
-        self.journal.db.commit()
-        with patch.object(self.supervisor.process, "poll", return_value=[
-                JobResult("second-incomplete-review-job", "LOST", None, head),
-        ]), patch("harness.supervisor.subprocess.run",
-                  return_value=subprocess.CompletedProcess([], 0, "", "")), \
-                patch.object(self.supervisor.adapter, "review_result", return_value=GateResult(
-                    "BLOCKED_EXTERNAL", "receipt still did not validate",
-                )) as second_review_result:
-            self.supervisor.reconcile(self.spec.mission_id)
-
-        second_review_result.assert_called_once()
         mission = self.journal.mission(self.spec.mission_id)
         self.assertEqual(mission["current_state"], State.BLOCKED_EXTERNAL)
-        self.assertEqual(mission["terminal_state"], State.BLOCKED_EXTERNAL)
-        self.assertIsNone(mission["pending_gate"])
-        self.assertEqual(
-            self.journal.db.execute(
-                "SELECT count(*) FROM events WHERE mission_id=? AND kind='review_retry_required'",
-                (self.spec.mission_id,),
-            ).fetchone()[0],
-            1,
-        )
-        self.assertEqual(
-            self.journal.db.execute(
-                "SELECT result FROM receipts WHERE mission_id=? AND reviewer='codex' AND head_sha=?",
-                (self.spec.mission_id, head),
-            ).fetchone()[0],
-            "BLOCKED_EXTERNAL",
-        )
-        with patch.object(self.adapter, "exact_head", return_value=head), \
-                patch.object(self.supervisor.process, "poll", return_value=[]), \
-                patch.object(self.supervisor.process, "start") as duplicate_start:
+        self.assertEqual(self.journal.db.execute(
+            "SELECT state FROM jobs WHERE job_id='incomplete-review-job'").fetchone()[0],
+            "CONSUMED")
+        self.assertEqual(self.journal.db.execute(
+            "SELECT count(*) FROM events WHERE mission_id=? AND kind='review_retry_required'",
+            (self.spec.mission_id,)).fetchone()[0], 0)
+        with patch.object(self.supervisor.process, "start") as duplicate_start:
             self.assertEqual(self.supervisor.step(self.spec.mission_id, spec), State.BLOCKED_EXTERNAL)
         duplicate_start.assert_not_called()
 
@@ -1347,6 +1284,20 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(supervisor.step(spec.mission_id, spec), State.BLOCKED_EXTERNAL)
         self.assertNotEqual(journal.status(spec.mission_id).state, State.TEST)
 
+    def test_codex_checkpoint_rejects_executable_git_config_before_status(self):
+        class GuardedAdapter(FootballPredictionAdapter):
+            def _assert_safe_local_git_config(self, worktree, env):
+                raise RuntimeError("repository has executable local Git configuration")
+
+        adapter = GuardedAdapter()
+        supervisor = Supervisor(self.journal, self.supervisor.process, self.codex, adapter)
+        with patch.object(adapter, "_call") as status:
+            self.assertFalse(supervisor._codex_checkpoint_ready(
+                self.spec.mission_id, str(self.worktree),
+                expected_state=State.CREATED, expected_head=None))
+        status.assert_not_called()
+        self.assertEqual(self.journal.status(self.spec.mission_id).state, State.BLOCKED_EXTERNAL)
+
     def test_review_p1_and_ci_fail_are_repaired_not_blocked(self):
         self.adapter.reviews = ["FAIL", "PASS", "PASS"]
         self.adapter.ci_results = ["FAIL", "PASS"]
@@ -2190,6 +2141,31 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(self.journal.mission(self.spec.mission_id)["merge_invocation_started"], 0)
         self.assertEqual(adapter.merge_calls, 1)
 
+    def test_ambiguous_merge_remains_reconcilable_until_server_confirms_merge(self):
+        class DelayedMerge(SimulatedAdapter):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+                self.status_calls = 0
+
+            def merge(self, worktree, head, pr_number=None):
+                self.calls += 1
+                raise RuntimeError("response unavailable after invocation")
+
+            def merge_status(self, worktree, head, pr_number=None, pr_repo=None):
+                self.status_calls += 1
+                if self.status_calls == 1:
+                    return GateResult("BLOCKED_EXTERNAL", "GitHub state temporarily unavailable")
+                return GateResult("PASS", "merged", data={"merge_sha": "c" * 40})
+
+        adapter = DelayedMerge()
+        supervisor = Supervisor(self.journal, self.supervisor.process, self.codex, adapter)
+        self.journal.update(self.spec.mission_id, current_head="a" * 40,
+                            current_state=State.MERGE)
+        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.MERGE)
+        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.POST_MERGE)
+        self.assertEqual(adapter.calls, 1)
+
     def test_merge_failure_after_invocation_is_not_retried(self):
         class AlwaysUnavailable(SimulatedAdapter):
             def __init__(self):
@@ -2208,7 +2184,7 @@ class HarnessTest(unittest.TestCase):
         head = "a" * 40
         self.journal.update(self.spec.mission_id, current_head=head, current_state=State.MERGE,
                             merge_claim_head=None, merge_claim_pid=None, merge_claim_start_ticks=None)
-        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
+        self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.MERGE)
         self.assertEqual(adapter.merge_calls, 1)
 
     def test_invoked_merge_not_started_status_is_ambiguous_and_never_retried(self):
@@ -2263,7 +2239,7 @@ class HarnessTest(unittest.TestCase):
             self.codex, adapter,
         )
         with patch.object(self.journal, "_proc_identity", side_effect=proc_identity):
-            self.assertEqual(restarted.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL)
+            self.assertEqual(restarted.step(self.spec.mission_id, self.spec), State.MERGE)
         self.assertEqual(adapter.status_calls, 1)
         self.assertEqual(adapter.merge_calls, 1)
 
@@ -2541,7 +2517,7 @@ class HarnessTest(unittest.TestCase):
             # before status is queried; NOT_STARTED is still ambiguous after
             # an invocation may have begun, so it must not be retried.
             owner_alive["value"] = False
-            self.assertEqual(recovery.step(self_spec.mission_id, self_spec), State.BLOCKED_EXTERNAL)
+            self.assertEqual(recovery.step(self_spec.mission_id, self_spec), State.MERGE)
 
         recovery_owner = recovery._merge_owner()
         self.assertEqual(status_claim_owners, [recovery_owner])

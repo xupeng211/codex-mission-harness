@@ -34,6 +34,8 @@ Each writable mission worktree is created from `origin/main`, records base SHA/b
 
 The adapter calls only its canonical commands (`make verify-targeted`, `make verify-pr`, `make verify-strict`, `make agent-preflight`) and asks the project workflow for independent reviews. It does not contain quota, candidate, authorization, provider or live-request logic. In particular, this project does not invoke FootballPrediction Stage D or provider traffic.
 
+The mission's `live_provider_request` and `quota_consumption` deny-list entries govern FootballPrediction data providers and Stage D. A requested `review:codex` or `review:deepseek` calls the independent AI reviewer service under the separate review policy; it does not authorize any FootballPrediction data-provider request.
+
 ## Using Harness with FootballPrediction
 
 Copy `missions/examples/footballprediction-development.json`, give it a new

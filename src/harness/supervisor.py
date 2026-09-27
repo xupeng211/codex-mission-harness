@@ -74,12 +74,13 @@ class Supervisor:
         if isinstance(self.adapter, SimulatedAdapter):
             return True
         try:
-            dirty = subprocess.run(
-                ["git", "-C", worktree, "status", "--porcelain=v1",
-                 "--untracked-files=all"],
-                text=True, capture_output=True, check=False,
+            self.adapter._assert_safe_local_git_config(
+                worktree, self.adapter._trusted_subprocess_environment())
+            dirty = self.adapter._call(
+                ["git", "-c", "core.fsmonitor=false", "-C", worktree,
+                 "status", "--porcelain=v1", "--untracked-files=all"], cwd=worktree,
             )
-        except OSError as exc:
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
             self.journal.transition(
                 mission_id, State.BLOCKED_EXTERNAL,
                 f"cannot inspect Codex worktree checkpoint: {exc}",
@@ -181,15 +182,13 @@ class Supervisor:
                             "BLOCKED_EXTERNAL", f"canonical review receipt validation failed: {exc}",
                         )
                     if reviewed.status == "BLOCKED_EXTERNAL":
-                        # The process is conclusively terminal, so one
-                        # incomplete or rejected receipt can be retried safely.
-                        # The journal bounds this per reviewer and exact HEAD;
-                        # repeated failure becomes terminal BLOCKED_EXTERNAL.
+                        # An escaped descendant can outlive the recorded
+                        # process group. An incomplete review therefore needs
+                        # external reconciliation before any new invocation.
                         self.journal.complete_review_job(
                             mission_id, result.job_id, reviewer, current,
-                            "RETRY", reviewed.artifact, reviewed.evidence or
+                            "BLOCKED_EXTERNAL", reviewed.artifact, reviewed.evidence or
                             "canonical review writer exited without a durable receipt",
-                            retry=True,
                         )
                         continue
                     details = reviewed.data if isinstance(reviewed.data, dict) else {}
@@ -414,14 +413,16 @@ class Supervisor:
                         pr_base_sha=self.journal.mission(mission_id)["merge_claim_pr_base_sha"],
                     )
                 except Exception as exc:
-                    advance(State.BLOCKED_EXTERNAL,
-                            f"cannot reconcile ambiguous merge outcome: {reason}; {exc}")
-                    return State.BLOCKED_EXTERNAL
+                    self.journal.event(mission_id, "merge_reconcile_pending",
+                                       {"head": head, "reason": reason, "error": str(exc)})
+                    self.journal.db.commit()
+                    return State.MERGE
                 if status.status == "PASS":
                     return finish_merge(status)
-                advance(State.BLOCKED_EXTERNAL,
-                        status.evidence or f"ambiguous merge outcome: {reason}")
-                return State.BLOCKED_EXTERNAL
+                self.journal.event(mission_id, "merge_reconcile_pending",
+                                   {"head": head, "reason": status.evidence or reason})
+                self.journal.db.commit()
+                return State.MERGE
 
             try:
                 identity = self.journal.mission(mission_id)
@@ -712,6 +713,7 @@ class Supervisor:
                     mission_id, claim_head, owner_pid, owner_start_ticks,
                 )
                 resume_owned_pending_ci = False
+                resume_owned_ambiguous = False
                 if recovery == "ACTIVE":
                     # The same still-running controller may resume its own
                     # uninvoked claim after pre-merge CI returned PENDING.
@@ -723,12 +725,18 @@ class Supervisor:
                             and claim_head == row["current_head"]):
                         resume_owned_pending_ci = True
                         row = self.journal.mission(mission_id)
+                    elif (row["merge_claim_pid"] == owner_pid
+                          and row["merge_claim_start_ticks"] == owner_start_ticks
+                          and row["merge_invocation_started"] == 1
+                          and row["pending_gate"] == "merge-outcome-unknown"
+                          and claim_head == row["current_head"]):
+                        resume_owned_ambiguous = True
                     else:
                         return State.MERGE
                 if recovery == "UNKNOWN":
                     advance(State.BLOCKED_EXTERNAL, "merge claim owner identity is unavailable")
                     return State.BLOCKED_EXTERNAL
-                if not resume_owned_pending_ci and recovery != "RECOVERY_CLAIMED":
+                if not (resume_owned_pending_ci or resume_owned_ambiguous) and recovery != "RECOVERY_CLAIMED":
                     return State(self.journal.mission(mission_id)["current_state"])
                 if not resume_owned_pending_ci:
                     row = self.journal.mission(mission_id)
@@ -742,17 +750,16 @@ class Supervisor:
                                 pr_base_sha=row["merge_claim_pr_base_sha"],
                             )
                         except Exception as exc:
-                            advance(State.BLOCKED_EXTERNAL, f"cannot reconcile uncertain merge: {exc}")
-                            return State.BLOCKED_EXTERNAL
+                            self.journal.update(mission_id, pending_gate="merge-outcome-unknown")
+                            return State.MERGE
                         if status.status == "PASS":
                             if claim_head != row["current_head"]:
                                 advance(State.BLOCKED_EXTERNAL,
                                         "merge completed for a stale claimed HEAD after canonical HEAD drift")
                                 return State.BLOCKED_EXTERNAL
                             return finish_merge(status)
-                        advance(State.BLOCKED_EXTERNAL, status.evidence or
-                                "merge invocation may have started; outcome remains ambiguous")
-                        return State.BLOCKED_EXTERNAL
+                        self.journal.update(mission_id, pending_gate="merge-outcome-unknown")
+                        return State.MERGE
                     retry = self.journal.confirm_merge_retry_safe(
                         mission_id, claim_head, owner_pid, owner_start_ticks,
                     )
