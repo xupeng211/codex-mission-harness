@@ -28,7 +28,10 @@ class Supervisor:
     def create(self, spec: MissionSpec, worktree: str, base_sha: str, branch: str) -> None:
         # Mission identity and its isolation metadata are one journal record;
         # a restart can never observe a half-created mission.
-        self.journal.create(spec, worktree=worktree, base_sha=base_sha, branch=branch)
+        origin_repo = (self.adapter._repo_from_origin(spec.repository)
+                       if spec.adapter == "footballprediction" else None)
+        self.journal.create(spec, worktree=worktree, base_sha=base_sha,
+                            branch=branch, origin_repo=origin_repo)
 
     def _merge_owner(self) -> tuple[int, str]:
         """Return this controller's pid/start-time identity for durable claims."""
@@ -331,6 +334,17 @@ class Supervisor:
                 mission_id, target, reason,
                 expected_state=state, expected_head=expected_head,
             )
+
+        if (spec.adapter == "footballprediction" and state not in TERMINAL
+                and state in {State.CI, State.MERGE, State.WAITING_APPROVAL, State.POST_MERGE}):
+            try:
+                current_origin = self.adapter._repo_from_origin(row["worktree"])
+            except Exception:
+                current_origin = None
+            if not row["origin_repo"] or current_origin != row["origin_repo"]:
+                advance(State.BLOCKED_EXTERNAL,
+                        "GitHub origin differs from the pinned mission repository")
+                return State.BLOCKED_EXTERNAL
 
         def finish_merge(result: GateResult) -> State:
             """Classify merge outcomes without treating provider failure as policy denial."""

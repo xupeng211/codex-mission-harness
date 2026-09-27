@@ -31,7 +31,8 @@ class Journal:
             PRAGMA foreign_keys=ON;
             CREATE TABLE IF NOT EXISTS missions (
               mission_id TEXT PRIMARY KEY, spec_json TEXT NOT NULL, repo TEXT NOT NULL,
-              base_sha TEXT, branch TEXT, worktree TEXT, current_head TEXT, codex_thread_id TEXT,
+              base_sha TEXT, branch TEXT, worktree TEXT, origin_repo TEXT,
+              current_head TEXT, codex_thread_id TEXT,
               codex_turn_id TEXT, codex_turn_state TEXT, codex_turn_pid INTEGER,
               codex_turn_start_ticks TEXT, codex_turn_source_state TEXT,
               codex_turn_source_head TEXT,
@@ -103,7 +104,8 @@ class Journal:
         mission_columns = {row[1] for row in self.db.execute("PRAGMA table_info(missions)")}
         for name, definition in (("pr_number", "INTEGER"), ("pr_repo", "TEXT"),
                                  ("pr_base_sha", "TEXT"), ("merge_sha", "TEXT"),
-                                 ("main_sha", "TEXT"), ("tree_sha", "TEXT")):
+                                 ("main_sha", "TEXT"), ("tree_sha", "TEXT"),
+                                 ("origin_repo", "TEXT")):
             if name not in mission_columns:
                 self.db.execute(f"ALTER TABLE missions ADD COLUMN {name} {definition}")
         approval_columns = {row[1] for row in self.db.execute("PRAGMA table_info(approvals)")}
@@ -112,15 +114,20 @@ class Journal:
         self.db.commit()
 
     def create(self, spec: MissionSpec, *, worktree: str | None = None,
-               base_sha: str | None = None, branch: str | None = None) -> None:
+               base_sha: str | None = None, branch: str | None = None,
+               origin_repo: str | None = None) -> None:
+        if spec.adapter == "footballprediction" and (
+                not isinstance(origin_repo, str) or
+                re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", origin_repo) is None):
+            raise ValueError("production mission requires a pinned GitHub repository identity")
         stamp = now()
         try:
             self.db.execute("BEGIN IMMEDIATE")
             self.db.execute(
-                "INSERT INTO missions(mission_id,spec_json,repo,base_sha,branch,worktree,current_state,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO missions(mission_id,spec_json,repo,base_sha,branch,worktree,origin_repo,current_state,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (spec.mission_id, json.dumps(spec.__dict__), spec.repository, base_sha, branch,
-                 worktree, State.CREATED, stamp, stamp),
+                 worktree, origin_repo, State.CREATED, stamp, stamp),
             )
             self.event(spec.mission_id, "mission_created", {"schema_version": spec.schema_version})
             self.db.commit()
@@ -325,13 +332,14 @@ class Journal:
         try:
             self.db.execute("BEGIN IMMEDIATE")
             row = self.db.execute(
-                "SELECT current_state,current_head,pr_number,pr_repo,pr_base_sha,merge_claim_head "
+                "SELECT current_state,current_head,pr_number,pr_repo,pr_base_sha,merge_claim_head,origin_repo "
                 "FROM missions WHERE mission_id=?",
                 (mission_id,),
             ).fetchone()
             if (row is None or State(row["current_state"]) not in {State.CI, State.MERGE}
                     or row["current_head"] != head
                     or row["pr_number"] not in {None, pr_number}
+                    or (row["origin_repo"] is not None and row["origin_repo"] != pr_repo)
                     or row["pr_repo"] not in {None, pr_repo}
                     or row["pr_base_sha"] not in {None, pr_base_sha.lower()}
                     or (State(row["current_state"]) == State.MERGE and row["merge_claim_head"] is not None)):

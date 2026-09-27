@@ -195,7 +195,8 @@ class HarnessTest(unittest.TestCase):
             required_gates=(), reviews=("codex",), mission_scope_file="scope.json",
         )
         journal = Journal(Path(self.tmp.name) / "review-launch.sqlite")
-        journal.create(spec, worktree=str(repo), base_sha=base, branch="harness/review-launch")
+        journal.create(spec, worktree=str(repo), base_sha=base,
+                       branch="harness/review-launch", origin_repo="fixture/repo")
         journal.update(spec.mission_id, current_head=head, current_state=State.REVIEW)
         process = ProcessSupervisor(journal, Path(self.tmp.name) / "review-launch-logs")
         adapter = FootballPredictionAdapter()
@@ -690,7 +691,7 @@ class HarnessTest(unittest.TestCase):
         spec = replace(self.spec, adapter="footballprediction", mission_scope_file="scope.json")
         journal = Journal(Path(self.tmp.name) / "completed-dirty.sqlite")
         journal.create(spec, worktree=str(repo), base_sha="b" * 40,
-                       branch="harness/completed-dirty")
+                       branch="harness/completed-dirty", origin_repo="fixture/repo")
         journal.update(spec.mission_id, current_head=head, current_state=State.IMPLEMENT)
         owner_pid, owner_start = self.supervisor._merge_owner()
         self.assertEqual(journal.claim_codex_turn(spec.mission_id, owner_pid, owner_start), "CLAIMED")
@@ -1339,7 +1340,8 @@ class HarnessTest(unittest.TestCase):
         journal = Journal(Path(self.tmp.name) / "dirty.sqlite")
         supervisor = Supervisor(journal, ProcessSupervisor(journal, Path(self.tmp.name) / "dirty-logs"),
                                 DirtyCodex(), FootballPredictionAdapter())
-        supervisor.create(spec, str(repo), "b" * 40, "harness/dirty")
+        with patch.object(supervisor.adapter, "_repo_from_origin", return_value="fixture/repo"):
+            supervisor.create(spec, str(repo), "b" * 40, "harness/dirty")
         supervisor.step(spec.mission_id, spec)
         supervisor.step(spec.mission_id, spec)
         self.assertEqual(supervisor.step(spec.mission_id, spec), State.BLOCKED_EXTERNAL)
@@ -3556,6 +3558,9 @@ class HarnessTest(unittest.TestCase):
             def exact_head(self, worktree):
                 return "a" * 40
 
+            def _repo_from_origin(self, worktree):
+                return "fixture/repo"
+
             def ci(self, worktree, head, pr_number=None, pr_repo=None, base_sha=None):
                 return GateResult("PASS", "exact CI", data={
                     "pr_number": pr_number, "pr_repo": pr_repo, "pr_base_sha": "b" * 40,
@@ -3576,6 +3581,7 @@ class HarnessTest(unittest.TestCase):
         self.journal.update(
             self.spec.mission_id, spec_json=json.dumps(spec.__dict__), current_head="a" * 40,
             current_state=State.MERGE, pr_number=7, pr_repo="fixture/repo", pr_base_sha="b" * 40,
+            origin_repo="fixture/repo",
         )
         supervisor = Supervisor(
             self.journal, ProcessSupervisor(self.journal, Path(self.tmp.name) / "approval-boundary"),
@@ -3584,6 +3590,42 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(supervisor.step(self.spec.mission_id, spec), State.WAITING_APPROVAL)
         self.assertEqual(adapter.merge_ready_calls, 0)
         self.assertEqual(adapter.merge_calls, 0)
+
+    def test_pr_binding_rejects_repository_other_than_pinned_origin(self):
+        self.journal.update(self.spec.mission_id, current_head="a" * 40,
+                            current_state=State.CI, origin_repo="owner/original")
+        self.assertFalse(self.journal.bind_pr_identity(
+            self.spec.mission_id, "a" * 40, 7, "attacker/alternate", "b" * 40))
+        self.assertIsNone(self.journal.mission(self.spec.mission_id)["pr_repo"])
+
+    def test_changed_origin_blocks_production_before_ci(self):
+        class RedirectedOrigin(FootballPredictionAdapter):
+            def exact_head(self, worktree):
+                return "a" * 40
+
+            def _repo_from_origin(self, worktree):
+                return "attacker/alternate"
+
+            def discover_pr(self, worktree, head):
+                raise AssertionError("redirected origin must not reach PR discovery")
+
+        spec = replace(self.spec, adapter="footballprediction", mission_scope_file="scope.json")
+        self.journal.update(self.spec.mission_id, spec_json=json.dumps(spec.__dict__),
+                            current_head="a" * 40, current_state=State.CI,
+                            origin_repo="owner/original")
+        supervisor = Supervisor(self.journal, self.supervisor.process, self.codex,
+                                RedirectedOrigin())
+        self.assertEqual(supervisor.step(self.spec.mission_id, spec), State.BLOCKED_EXTERNAL)
+
+    def test_controller_subprocesses_ignore_global_git_configuration(self):
+        child = FootballPredictionAdapter._trusted_subprocess_environment()
+        self.assertEqual(child["GIT_CONFIG_GLOBAL"], os.devnull)
+
+    def test_production_mission_rejects_unexecutable_post_merge_gates(self):
+        raw = dict(self.spec.__dict__, adapter="footballprediction",
+                   post_merge_gates=["unsupported-production-gate"])
+        with self.assertRaisesRegex(ValueError, "post_merge_gates are unsupported"):
+            MissionSpec.from_mapping(raw)
 
     def test_ci_malformed_json_evidence_fails_closed(self):
         adapter = FootballPredictionAdapter()

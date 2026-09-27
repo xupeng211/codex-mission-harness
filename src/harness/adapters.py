@@ -580,6 +580,7 @@ class FootballPredictionAdapter:
         child_env.update({
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CONFIG_COUNT": "0",
             "GIT_ATTR_NOSYSTEM": "1",
             "GIT_NO_REPLACE_OBJECTS": "1",

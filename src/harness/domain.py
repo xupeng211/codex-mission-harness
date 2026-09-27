@@ -79,6 +79,8 @@ class MissionSpec:
         adapter = data.get("adapter", "footballprediction")
         if not isinstance(adapter, str) or adapter not in {"footballprediction", "simulation"}:
             raise ValueError("adapter must be exactly footballprediction or simulation")
+        if adapter == "footballprediction" and data.get("post_merge_gates"):
+            raise ValueError("footballprediction post_merge_gates are unsupported; use the canonical Production Gate")
         scope = data.get("mission_scope_file")
         if scope is not None and not isinstance(scope, str):
             raise ValueError("mission_scope_file must be a string when provided")
