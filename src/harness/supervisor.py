@@ -10,7 +10,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from .adapters import GateResult, SimulatedAdapter
+from .adapters import GateResult, ReviewTransportFailure, SimulatedAdapter
 from .codex import CodexAdapter
 from .domain import MissionSpec, State, TERMINAL
 from .isolation import docker_env
@@ -41,41 +41,19 @@ class Supervisor:
         return self.process.launcher_pid, start_ticks
 
     @staticmethod
-    def _review_transport_failure(result, job, reviewed: GateResult) -> bool:
-        """Recognize only explicit transport symptoms as retryable.
+    def _review_transport_failure(result, reviewed: GateResult) -> bool:
+        """Retry only a trusted adapter's typed transport classification.
 
-        Missing or malformed receipts are contract failures by default.  A
-        retry is allowed when the adapter explicitly labels the failure as
-        transport, or when a receipt-less terminal process left one of the
-        narrow connection/timeout markers in its private logs.  Findings,
-        policy/authentication errors, and any artifact-bearing invalid receipt
-        therefore remain terminal and are never retried automatically.
+        Reviewer stdout/stderr and receipt contents are untrusted and are never
+        inspected for retry signals.  The adapter may set this field only when
+        it has classified a transport exception independently of reviewer
+        output. Findings, malformed receipts, and policy/auth failures remain
+        terminal.
         """
-        details = reviewed.data if isinstance(reviewed.data, dict) else {}
-        if (details.get("retryable") is True
-                and details.get("classification") == "transport"):
-            return True
-        if reviewed.artifact:
+        if (reviewed.status != "BLOCKED_EXTERNAL" or reviewed.artifact is not None
+                or result.state not in {"EXITED", "LOST"}):
             return False
-        if result.state not in {"EXITED", "LOST"}:
-            return False
-        paths = [job["stdout_path"], job["stderr_path"]]
-        fragments: list[str] = []
-        for raw_path in paths:
-            if not raw_path:
-                continue
-            try:
-                fragments.append(Path(raw_path).read_text(encoding="utf-8", errors="replace")[-20000:])
-            except OSError:
-                continue
-        text = "\n".join(fragments).lower()
-        markers = (
-            "request timeout", "timed out", "timeout", "connection reset",
-            "connection closed", "connection refused", "transient tls",
-            "tls handshake", "websocket", "service unavailable",
-            "temporarily unavailable", "reconnecting", "reconnect loop",
-        )
-        return any(marker in text for marker in markers)
+        return isinstance(reviewed.transport_failure, ReviewTransportFailure)
 
     @staticmethod
     def _invoke_pr_adapter(method, worktree: str, head: str,
@@ -222,7 +200,7 @@ class Supervisor:
                             "BLOCKED_EXTERNAL", f"canonical review receipt validation failed: {exc}",
                         )
                     if reviewed.status == "BLOCKED_EXTERNAL":
-                        retryable = self._review_transport_failure(result, job, reviewed)
+                        retryable = self._review_transport_failure(result, reviewed)
                         # ProcessSupervisor publishes a terminal result only
                         # after the owned process group is quiescent.  That
                         # makes a transport retry safe; malformed receipts or

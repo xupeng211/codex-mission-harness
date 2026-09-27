@@ -5,6 +5,7 @@ import unittest
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -14,7 +15,9 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from harness.adapters import FootballPredictionAdapter, GateResult, SimulatedAdapter
+from harness.adapters import (
+    FootballPredictionAdapter, GateResult, ReviewTransportFailure, SimulatedAdapter,
+)
 from harness.cli import approval_head, build, load_spec, main as cli_main, reconcile_supplied_spec
 from harness.codex import AppServerCodex, FixtureCodex, Turn
 from harness.domain import InvalidTransition, MissionSpec, State
@@ -352,7 +355,8 @@ class HarnessTest(unittest.TestCase):
         with patch.object(self.supervisor.process, "poll", return_value=[
                 JobResult("transport-review-1", "LOST", None, head),
         ]), patch.object(self.supervisor.adapter, "review_result", return_value=GateResult(
-                "BLOCKED_EXTERNAL", "review transport failed")):
+                "BLOCKED_EXTERNAL", "review transport failed",
+                transport_failure=ReviewTransportFailure.REQUEST_TIMEOUT)):
             self.supervisor.reconcile(self.spec.mission_id)
         mission = self.journal.mission(self.spec.mission_id)
         self.assertEqual(mission["current_state"], State.REVIEW)
@@ -376,7 +380,8 @@ class HarnessTest(unittest.TestCase):
         with patch.object(self.supervisor.process, "poll", return_value=[
                 JobResult("transport-review-2", "LOST", None, head),
         ]), patch.object(self.supervisor.adapter, "review_result", return_value=GateResult(
-                "BLOCKED_EXTERNAL", "review transport failed")):
+                "BLOCKED_EXTERNAL", "review transport failed",
+                transport_failure=ReviewTransportFailure.CONNECTION)):
             self.supervisor.reconcile(self.spec.mission_id)
         self.assertEqual(self.journal.mission(self.spec.mission_id)["current_state"], State.REVIEW)
         self.assertGreaterEqual(float(self.journal.mission(self.spec.mission_id)["review_retry_after"]),
@@ -388,13 +393,35 @@ class HarnessTest(unittest.TestCase):
         with patch.object(self.supervisor.process, "poll", return_value=[
                 JobResult("transport-review-3", "LOST", None, head),
         ]), patch.object(self.supervisor.adapter, "review_result", return_value=GateResult(
-                "BLOCKED_EXTERNAL", "review transport failed")):
+                "BLOCKED_EXTERNAL", "review transport failed",
+                transport_failure=ReviewTransportFailure.SERVICE_UNAVAILABLE)):
             self.supervisor.reconcile(self.spec.mission_id)
         self.assertEqual(self.journal.mission(self.spec.mission_id)["current_state"], State.BLOCKED_EXTERNAL)
         self.assertEqual(self.journal.db.execute(
             "SELECT count(*) FROM events WHERE mission_id=? AND kind='review_retry_required'",
             (self.spec.mission_id,),
         ).fetchone()[0], 2)
+
+    def test_review_text_and_untyped_payload_cannot_trigger_transport_retry(self):
+        terminal = JobResult("review-job", "EXITED", 1, "a" * 40)
+        malformed = GateResult(
+            "BLOCKED_EXTERNAL", "malformed response: request timeout while reconnecting",
+            data={"retryable": True, "classification": "transport"},
+        )
+        self.assertFalse(Supervisor._review_transport_failure(terminal, malformed))
+        self.assertFalse(Supervisor._review_transport_failure(
+            JobResult("review-job", "RUNNING", None, "a" * 40),
+            GateResult("BLOCKED_EXTERNAL", transport_failure=ReviewTransportFailure.TLS),
+        ))
+        self.assertFalse(Supervisor._review_transport_failure(
+            terminal, GateResult("FAIL", transport_failure=ReviewTransportFailure.TLS),
+        ))
+        self.assertTrue(Supervisor._review_transport_failure(
+            terminal, GateResult(
+                "BLOCKED_EXTERNAL", "trusted adapter classified timeout",
+                transport_failure=ReviewTransportFailure.REQUEST_TIMEOUT,
+            ),
+        ))
 
     def test_stale_terminal_review_job_is_consumed_once_after_head_change(self):
         old_head, current_head = "a" * 40, "b" * 40
@@ -842,19 +869,20 @@ class HarnessTest(unittest.TestCase):
         adapter = AppServerCodex.__new__(AppServerCodex)
         adapter._forbidden_actions = ("live_provider_request", "quota_consumption")
         adapter._policy_cwd = "/tmp/mission-worktree"
+        adapter._permissions_profile = "cmh_delegated_test"
         params = adapter._policy_params("/tmp/mission-worktree")
         self.assertEqual(params["approvalPolicy"], "never")
-        self.assertFalse(params["sandboxPolicy"]["networkAccess"])
-        self.assertEqual(params["sandboxPolicy"]["writableRoots"], ["/tmp/mission-worktree"])
+        self.assertEqual(params["permissions"], "cmh_delegated_test")
 
     def test_codex_policy_baseline_is_not_optional(self):
         adapter = AppServerCodex.__new__(AppServerCodex)
         adapter._configured_forbidden_actions = adapter._effective_policy(())
         adapter._forbidden_actions = adapter._effective_policy(())
         adapter._policy_cwd = "/tmp/mission-worktree"
+        adapter._permissions_profile = "cmh_delegated_test"
         params = adapter._policy_params("/tmp/mission-worktree")
         self.assertEqual(params["approvalPolicy"], "never")
-        self.assertFalse(params["sandboxPolicy"]["networkAccess"])
+        self.assertEqual(params["permissions"], "cmh_delegated_test")
 
     def test_codex_policy_never_falls_back_to_caller_cwd(self):
         adapter = AppServerCodex.__new__(AppServerCodex)
@@ -870,17 +898,14 @@ class HarnessTest(unittest.TestCase):
         adapter = AppServerCodex.__new__(AppServerCodex)
         adapter._forbidden_actions = adapter._effective_policy(())
         adapter._policy_cwd = "/mission-worktree"
+        adapter._permissions_profile = "cmh_delegated_test"
         expected_policy = {
             "cwd": "/mission-worktree",
             "model": "gpt-5.6-sol",
             "approvalPolicy": "never",
-            "sandbox": "workspace-write",
+            "permissions": "cmh_delegated_test",
             "developerInstructions": adapter._authority_instructions("/mission-worktree"),
             "config": {
-                "sandbox_workspace_write": {
-                    "writable_roots": ["/mission-worktree"],
-                    "network_access": False,
-                },
                 "shell_environment_policy": {
                     "filters": {"CODEX_HOME": "exclude"},
                     "ignore_default_excludes": False,
@@ -888,15 +913,132 @@ class HarnessTest(unittest.TestCase):
             },
         }
         with patch.object(
-                adapter, "_request", return_value={"thread": {"id": "thread-1"}}) as request:
+                adapter, "_request", return_value={
+                    "thread": {"id": "thread-1"},
+                    "activePermissionProfile": {"id": "cmh_delegated_test"},
+                }) as request:
             self.assertEqual(adapter.start_or_resume(None, "/mission-worktree"), "thread-1")
             request.assert_called_once_with("thread/start", expected_policy)
         with patch.object(
-                adapter, "_request", return_value={"thread": {"id": "thread-1"}}) as request:
+                adapter, "_request", return_value={
+                    "thread": {"id": "thread-1"},
+                    "activePermissionProfile": {"id": "cmh_delegated_test"},
+                }) as request:
             self.assertEqual(adapter.start_or_resume("thread-1", "/mission-worktree"), "thread-1")
             request.assert_called_once_with(
                 "thread/resume", {"threadId": "thread-1", **expected_policy},
             )
+
+    def test_thread_start_rejects_implicit_permission_profile_fallback(self):
+        adapter = AppServerCodex.__new__(AppServerCodex)
+        adapter._forbidden_actions = adapter._effective_policy(())
+        adapter._policy_cwd = "/mission-worktree"
+        adapter._permissions_profile = "cmh_delegated_expected"
+        with patch.object(adapter, "_request", return_value={
+                "thread": {"id": "thread-1"},
+                "activePermissionProfile": {"id": ":workspace"},
+        }), self.assertRaisesRegex(RuntimeError, "did not activate"):
+            adapter.start_or_resume(None, "/mission-worktree")
+
+    @unittest.skipUnless(
+        shutil.which("codex") or Path("/usr/lib/chatgpt/resources/codex").is_file(),
+        "Codex App Server is not installed",
+    )
+    def test_app_server_activates_auth_read_denial_before_any_turn(self):
+        executable = shutil.which("codex") or "/usr/lib/chatgpt/resources/codex"
+        with tempfile.TemporaryDirectory(prefix="cmh-app-server-profile-") as temp:
+            root = Path(temp)
+            codex_home = root / "codex.home"
+            codex_home.mkdir(mode=0o700)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            subprocess.run(["git", "init", "-q", str(worktree)], check=True)
+            with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=True):
+                adapter = AppServerCodex(executable=executable, worktree=str(worktree))
+                try:
+                    thread_id = adapter.start_or_resume(None, str(worktree))
+                finally:
+                    adapter.close()
+        self.assertTrue(thread_id)
+
+    def test_turn_start_keeps_the_bound_filesystem_permission_profile(self):
+        adapter = AppServerCodex.__new__(AppServerCodex)
+        adapter._forbidden_actions = adapter._effective_policy(())
+        adapter._policy_cwd = "/mission-worktree"
+        adapter._permissions_profile = "cmh_delegated_test"
+        adapter.proc = type("Process", (), {"stdin": StringIO()})()
+        with patch.object(adapter, "_request", return_value={"turn": {"id": "turn-1"}}) as request, \
+                patch.object(adapter, "_turn_completed", return_value={
+                    "items": [{"type": "agentMessage", "text": "done"}],
+                }):
+            turn = adapter.turn("thread-1", "prompt", "/mission-worktree")
+        self.assertEqual(turn.text, "done")
+        params = request.call_args.args[1]
+        self.assertEqual(params["permissions"], "cmh_delegated_test")
+        self.assertEqual(params["cwd"], "/mission-worktree")
+        self.assertNotIn("runtimeWorkspaceRoots", params)
+        self.assertNotIn("sandboxPolicy", params)
+
+    @unittest.skipUnless(
+        shutil.which("codex") or Path("/usr/lib/chatgpt/resources/codex").is_file(),
+        "Codex CLI is not installed",
+    )
+    def test_codex_profile_denies_known_and_proc_recovered_auth_paths(self):
+        executable = shutil.which("codex") or "/usr/lib/chatgpt/resources/codex"
+        root = Path(self.tmp.name)
+        codex_home = root / "codex.home"
+        codex_home.mkdir(mode=0o700)
+        marker = codex_home / "auth-fixture.txt"
+        marker.write_text("fixture-only-credential-marker", encoding="utf-8")
+        workspace = root / "sandbox-workspace"
+        workspace.mkdir()
+        profile = "cmh_delegated_adversarial"
+        script = """import os,sys
+expected=sys.argv[2]
+paths=[sys.argv[1]]
+open(os.path.join(sys.argv[3],'write-check.txt'),'w').write('workspace-write-ok')
+parent=os.getppid()
+home=''
+for _ in range(24):
+    try:
+        raw=open(f'/proc/{parent}/environ','rb').read()
+        env=dict(item.split(b'=',1) for item in raw.split(b'\\0') if b'=' in item)
+        found=env.get(b'CODEX_HOME',b'').decode()
+        if found:
+            home=found
+            break
+        stat=open(f'/proc/{parent}/stat','r').read()
+        fields=stat[stat.rfind(')')+2:].split()
+        parent=int(fields[1])
+        if parent <= 1:
+            break
+    except (OSError,ValueError,IndexError):
+        break
+if home == expected:
+    paths.append(home+'/auth-fixture.txt')
+for path in dict.fromkeys(paths):
+    try:
+        with open(path,'r') as stream:
+            print('READ:'+stream.read())
+        sys.exit(3)
+    except OSError:
+        pass
+print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
+        command = [
+            executable, *AppServerCodex._permissions_profile_overrides(str(codex_home), profile),
+            "-C", str(workspace), "sandbox", "--permission-profile", profile,
+            "--", sys.executable, "-I", "-c", script, str(marker), str(codex_home),
+            str(workspace),
+        ]
+        env = {
+            "PATH": os.defpath, "HOME": "/nonexistent", "LANG": "C.UTF-8",
+            "CODEX_HOME": str(codex_home),
+        }
+        completed = subprocess.run(command, env=env, text=True, capture_output=True, timeout=30)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(completed.stdout.strip(), {"BLOCKED:PROC", "BLOCKED:DIRECT_ONLY"})
+        self.assertNotIn("fixture-only-credential-marker", completed.stdout + completed.stderr)
+        self.assertEqual((workspace / "write-check.txt").read_text(), "workspace-write-ok")
 
     def test_codex_policy_is_constructor_bound_to_canonical_git_worktree(self):
         first = Path(self.tmp.name) / "first-policy-repo"
@@ -913,11 +1055,27 @@ class HarnessTest(unittest.TestCase):
         with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}), \
                 patch("harness.codex.subprocess.Popen", return_value=process) as launch, \
                 patch.object(AppServerCodex, "_canonical_worktree", return_value=str(first)), \
-                patch.object(AppServerCodex, "_request", return_value={}):
+                patch.object(AppServerCodex, "_request", return_value={}) as request:
             adapter = AppServerCodex(executable="/usr/bin/true", worktree=str(first))
+        request.assert_called_once_with("initialize", {
+            "clientInfo": {"name": "codex-mission-harness", "version": "0.1"},
+            "capabilities": {"experimentalApi": True},
+        })
         self.assertEqual(launch.call_args.args[0][1:5], [
             "-c", 'model="gpt-5.6-sol"', "-c", 'model_reasoning_effort="high"',
         ])
+        launch_argv = launch.call_args.args[0]
+        self.assertIn('-c', launch_argv)
+        self.assertIn('default_permissions=":workspace"', launch_argv)
+        self.assertIn(f'permissions.{adapter._permissions_profile}.extends=":workspace"', launch_argv)
+        self.assertIn(
+            f'permissions.{adapter._permissions_profile}.filesystem={{"{codex_home}" = "deny"}}',
+            launch_argv,
+        )
+        self.assertIn(
+            f"permissions.{adapter._permissions_profile}.network.enabled=false", launch_argv,
+        )
+        self.assertFalse((codex_home / "config.toml").exists())
         adapter.set_policy((), str(first))
         self.assertEqual(adapter._policy_cwd, str(first))
         with self.assertRaisesRegex(RuntimeError, "immutable"):
@@ -1785,7 +1943,16 @@ class HarnessTest(unittest.TestCase):
 
     def test_log_open_failure_retires_starting_reservation_and_allows_retry(self):
         process = self.supervisor.process
-        with patch("harness.process.Path.open", side_effect=PermissionError("logs denied")):
+        real_open = os.open
+
+        def fail_log_open(path, flags, mode=0o777, *, dir_fd=None):
+            if str(path).endswith(".out"):
+                raise PermissionError("logs denied")
+            if dir_fd is None:
+                return real_open(path, flags, mode)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with patch("harness.process.os.open", side_effect=fail_log_open):
             with self.assertRaisesRegex(PermissionError, "logs denied"):
                 process.start(
                     self.spec.mission_id, "log-open-fails", ["/bin/sh", "-c", "exit 0"],
@@ -1809,7 +1976,6 @@ class HarnessTest(unittest.TestCase):
             "SELECT 1 FROM events WHERE mission_id=? AND kind='process_launch_failed'",
             (self.spec.mission_id,),
         ).fetchone())
-
         retried = process.start(
             self.spec.mission_id, "log-open-fails", ["/bin/sh", "-c", "exit 0"],
             str(self.worktree), {}, "a" * 40,
@@ -1817,6 +1983,23 @@ class HarnessTest(unittest.TestCase):
         self.assertNotEqual(retried, failed["job_id"])
         process._children[retried].wait()
         process.poll(self.spec.mission_id)
+
+    def test_process_log_directory_and_files_are_owner_only(self):
+        process = self.supervisor.process
+        self.assertEqual(process.log_root.stat().st_mode & 0o777, 0o700)
+        job_id = process.start(
+            self.spec.mission_id, "private-logs", ["/bin/sh", "-c", "printf safe"],
+            str(self.worktree), {}, "a" * 40,
+        )
+        process.wait_for_mission(self.spec.mission_id)
+        process.poll(self.spec.mission_id)
+        row = self.journal.db.execute(
+            "SELECT stdout_path,stderr_path FROM jobs WHERE job_id=?", (job_id,),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        for key in ("stdout_path", "stderr_path"):
+            path = Path(row[key])
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def test_release_pipe_failure_reaps_child_and_retires_running_lease(self):
         class FailingStdin:

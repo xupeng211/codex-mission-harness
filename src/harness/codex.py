@@ -8,6 +8,7 @@ import stat
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -44,11 +45,19 @@ class AppServerCodex:
         self._forbidden_actions = self._effective_policy(forbidden_actions)
         self._configured_forbidden_actions = self._effective_policy(forbidden_actions)
         self._policy_cwd = self._canonical_worktree(worktree)
-        self.proc = subprocess.Popen([executable, "-c", f'model="{self.MODEL}"',
-                                      "-c", f'model_reasoning_effort="{self.REASONING_EFFORT}"',
-                                      "app-server", "--stdio"], stdin=subprocess.PIPE,
+        self._permissions_profile = f"cmh_delegated_{uuid.uuid4().hex}"
+        codex_home = self._codex_home()
+        app_server_argv = [executable, "-c", f'model="{self.MODEL}"',
+                           "-c", f'model_reasoning_effort="{self.REASONING_EFFORT}"',
+                           "-c", 'default_permissions=":workspace"',
+                           *self._permissions_profile_overrides(codex_home, self._permissions_profile),
+                           "app-server", "--stdio"]
+        self.proc = subprocess.Popen(app_server_argv, stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, text=True, bufsize=1,
-                                     env=self._app_server_environment(executable, self._policy_cwd))
+                                     cwd=self._policy_cwd,
+                                     env=self._app_server_environment(
+                                         executable, self._policy_cwd, codex_home=codex_home,
+                                     ))
         self.seq = 0
         self._pending_messages: list[dict] = []
         self._reader_queue: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -56,6 +65,7 @@ class AppServerCodex:
         try:
             self._request("initialize", {
                 "clientInfo": {"name": "codex-mission-harness", "version": "0.1"},
+                "capabilities": {"experimentalApi": True},
             })
         except Exception:
             self.close()
@@ -221,7 +231,8 @@ class AppServerCodex:
         return str(resolved)
 
     @classmethod
-    def _app_server_environment(cls, executable: str, forbidden_root: str | None = None) -> dict[str, str]:
+    def _app_server_environment(cls, executable: str, forbidden_root: str | None = None,
+                                *, codex_home: str | None = None) -> dict[str, str]:
         """Build the App Server's explicit environment allowlist.
 
         Authentication is carried by the deliberately selected ``CODEX_HOME``
@@ -229,7 +240,7 @@ class AppServerCodex:
         while controller credentials, SSH agents, and arbitrary execution
         controls are excluded from the child environment.
         """
-        code_home = cls._codex_home()
+        code_home = codex_home or cls._codex_home()
         environment = {
             "PATH": cls._trusted_environment_path(executable, forbidden_root),
             "HOME": "/nonexistent",
@@ -271,6 +282,25 @@ class AppServerCodex:
             if safe:
                 environment[name] = value
         return environment
+
+    @staticmethod
+    def _permissions_profile_overrides(codex_home: str, profile: str) -> list[str]:
+        """Define a per-process workspace profile that cannot read Codex auth.
+
+        The inline TOML table keeps the absolute path in a value, so paths with
+        dots are not misparsed as config-key separators.  No config file is
+        written into the authenticated CODEX_HOME.
+        """
+        if (not Path(codex_home).is_absolute()
+                or not profile.startswith("cmh_delegated_")
+                or not profile.replace("_", "").isalnum()):
+            raise RuntimeError("Codex delegated permission profile is invalid")
+        filesystem = "{" + json.dumps(codex_home) + ' = "deny"}'
+        return [
+            "-c", f'permissions.{profile}.extends=":workspace"',
+            "-c", f"permissions.{profile}.filesystem={filesystem}",
+            "-c", f"permissions.{profile}.network.enabled=false",
+        ]
 
     def set_policy(self, forbidden_actions: tuple[str, ...], cwd: str) -> None:
         """Verify constructor-bound mission controls before a turn is started.
@@ -326,32 +356,24 @@ class AppServerCodex:
             raise RuntimeError("Codex caller cwd differs from the bound mission worktree")
         return {
             "approvalPolicy": "never",
-            "sandboxPolicy": {
-                "type": "workspaceWrite",
-                "writableRoots": [root],
-                "networkAccess": False,
-            },
+            "permissions": getattr(self, "_permissions_profile", "cmh_delegated"),
         }
 
     def _thread_policy_params(self, cwd: str) -> dict:
         """Express the turn sandbox equivalently in thread start/resume schema."""
         policy = self._policy_params(cwd)
-        root = policy["sandboxPolicy"]["writableRoots"][0]
+        root = self._policy_cwd
         return {
             "cwd": root,
             "model": self.MODEL,
             "approvalPolicy": policy["approvalPolicy"],
-            "sandbox": "workspace-write",
+            "permissions": policy["permissions"],
             "developerInstructions": self._authority_instructions(root),
             "config": {
-                "sandbox_workspace_write": {
-                    "writable_roots": [root],
-                    "network_access": False,
-                },
                 # The App Server needs CODEX_HOME to authenticate, but its
                 # delegated shell commands must not inherit the path to that
-                # credential directory. This is an enforced subprocess
-                # environment filter, not an instruction to the model.
+                # credential directory. The named permission profile above
+                # separately denies filesystem reads under CODEX_HOME.
                 "shell_environment_policy": {
                     "filters": {"CODEX_HOME": "exclude"},
                     "ignore_default_excludes": False,
@@ -569,7 +591,17 @@ class AppServerCodex:
         else:
             params = dict(policy)
             result = self._request("thread/start", params)
-        return result["thread"]["id"]
+        thread = result.get("thread") if isinstance(result, dict) else None
+        active = result.get("activePermissionProfile") if isinstance(result, dict) else None
+        if (not isinstance(active, dict)
+                or active.get("id") != policy["permissions"]):
+            raise RuntimeError("Codex App Server did not activate the delegated filesystem profile")
+        if not isinstance(thread, dict):
+            raise RuntimeError("Codex App Server returned an invalid thread identity")
+        thread_id = thread.get("id")
+        if not isinstance(thread_id, str) or not thread_id:
+            raise RuntimeError("Codex App Server returned an invalid thread identity")
+        return thread_id
 
     def turn(self, thread_id: str, prompt: str, cwd: str) -> Turn:
         params = {"threadId": thread_id, "input": [{"type": "text", "text": prompt}],

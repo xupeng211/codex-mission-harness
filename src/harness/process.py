@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import signal
+import stat
 import subprocess
 import sys
 import uuid
@@ -75,7 +76,48 @@ class ProcessSupervisor:
         self._children: dict[str, subprocess.Popen[bytes]] = {}
         self.launcher_pid = os.getpid()
         self.launcher_start_ticks = proc_start_ticks(self.launcher_pid)
-        log_root.mkdir(parents=True, exist_ok=True)
+        self._secure_log_root()
+
+    def _secure_log_root(self) -> None:
+        self.log_root = Path(self.log_root).absolute()
+        self.log_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            info = self.log_root.lstat()
+        except OSError as exc:
+            raise RuntimeError("process log directory is unavailable") from exc
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                or (hasattr(os, "getuid") and info.st_uid != os.getuid())):
+            raise RuntimeError("process log directory must be an owned real directory")
+        try:
+            os.chmod(self.log_root, 0o700)
+            secured = self.log_root.lstat()
+        except OSError as exc:
+            raise RuntimeError("process log directory could not be secured") from exc
+        if stat.S_IMODE(secured.st_mode) & 0o077:
+            raise RuntimeError("process log directory is not private")
+        self.log_root = self.log_root.resolve(strict=True)
+
+    @staticmethod
+    def _open_private_log(path: Path):
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            raise RuntimeError("private process logs require no-follow file creation")
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow
+                 | getattr(os, "O_CLOEXEC", 0))
+        fd = os.open(path, flags, 0o600)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode)
+                    or (hasattr(os, "getuid") and info.st_uid != os.getuid())):
+                raise RuntimeError("process log file is not an owned regular file")
+            os.fchmod(fd, 0o600)
+            if stat.S_IMODE(os.fstat(fd).st_mode) & 0o077:
+                raise RuntimeError("process log file is not private")
+            return os.fdopen(fd, "wb")
+        except Exception:
+            os.close(fd)
+            path.unlink(missing_ok=True)
+            raise
 
     def start(self, mission_id: str, name: str, argv: list[str], cwd: str, env: dict[str, str],
               launch_head: str, sandbox_profile: str | None = None,
@@ -114,7 +156,14 @@ class ProcessSupervisor:
             self.journal.db.rollback()
             raise
         try:
-            with out.open("wb") as stdout, err.open("wb") as stderr:
+            stdout_log = self._open_private_log(out)
+            try:
+                stderr_log = self._open_private_log(err)
+            except Exception:
+                stdout_log.close()
+                out.unlink(missing_ok=True)
+                raise
+            with stdout_log as stdout, stderr_log as stderr:
                 # The bootstrap cannot run the gate until its PID has been journaled. If
                 # this controller dies before publication its stdin closes and no gate runs.
                 proc = subprocess.Popen([sys.executable, "-c", BOOTSTRAP], stdin=subprocess.PIPE, stdout=stdout, stderr=stderr,

@@ -593,6 +593,13 @@ def invoke_reviewer(command, prompt_text, env, timeout):
     return subprocess.run(command, input=prompt_text, env=env, capture_output=True,
                           text=True, timeout=timeout)
 
+def reject_credential_echo(completed, token):
+    """Reject secrets on either captured stream without reflecting the stream."""
+    secret = token.encode("utf-8")
+    for output in (completed.stdout, completed.stderr):
+        if isinstance(output, str) and secret in output.encode("utf-8"):
+            raise ValueError("DeepSeek output contained review credential")
+
 def resolve_claude_launcher(root, path_value):
     """Resolve the owner-installed CLI without searching the reviewed tree or CWD."""
     repository=Path(root).resolve()
@@ -654,9 +661,9 @@ def run(args):
         for chunk in plan:
             source=diff[chunk["start"]:chunk["end"]]
             completed=invoke_reviewer(chunk_command,prompt(base,head,diff_hash,manifest_hash,chunk,source),env,args.timeout)
+            reject_credential_echo(completed, token)
             if completed.returncode: raise RuntimeError(f"DeepSeek reviewer infrastructure failure: exit={completed.returncode}")
             raw=completed.stdout.encode()
-            if token.encode("utf-8") in raw: raise ValueError("DeepSeek output contained review credential")
             write_private_artifact(evidence_fd,f"chunk-{chunk['index']:03d}.json",raw,run_id)
             result=reviewer_result(completed.stdout, forbid_dispositions=True)
             chunk["result"]=result; chunk["output_sha256"]=digest(raw); results.extend(result.get("findings",[]))
@@ -667,10 +674,10 @@ def run(args):
                              chunk_findings, required_dispositions),
             env, args.timeout,
         )
+        reject_credential_echo(aggregate_call, token)
         if aggregate_call.returncode:
             raise RuntimeError(f"DeepSeek aggregate reviewer infrastructure failure: exit={aggregate_call.returncode}")
         aggregate_raw=aggregate_call.stdout.encode()
-        if token.encode("utf-8") in aggregate_raw: raise ValueError("DeepSeek output contained review credential")
         write_private_artifact(evidence_fd,"aggregate.json",aggregate_raw,run_id)
         aggregate_result=reviewer_result(aggregate_call.stdout, require_dispositions=True)
         validate_blocker_dispositions(plan, aggregate_result)

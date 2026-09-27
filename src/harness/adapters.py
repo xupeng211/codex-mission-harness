@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
@@ -21,6 +22,17 @@ class GateResult:
     evidence: str = ""
     artifact: str | None = None
     data: dict[str, Any] | None = None
+    transport_failure: "ReviewTransportFailure | None" = None
+
+
+class ReviewTransportFailure(Enum):
+    """Trusted adapter classification for a reviewer transport failure."""
+
+    REQUEST_TIMEOUT = "request_timeout"
+    CONNECTION = "connection"
+    TLS = "tls"
+    WEBSOCKET = "websocket"
+    SERVICE_UNAVAILABLE = "service_unavailable"
 
 
 class FootballPredictionAdapter:

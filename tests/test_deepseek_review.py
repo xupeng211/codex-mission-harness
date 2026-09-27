@@ -593,6 +593,20 @@ class DeepSeekReceiptTest(unittest.TestCase):
             args = Namespace(repo=str(repo), base=base, head=head, mission_id="fixture",
                              evidence=str(evidence), token_file=str(token_file), timeout=1)
 
+            def echo_credential_on_stderr(command, prompt_text, env, timeout):
+                return subprocess.CompletedProcess(["claude"], 1, "", TEST_SECRET)
+
+            with patch.object(review, "resolve_claude_launcher",
+                              return_value=("/trusted/bin/claude", "/trusted/bin:/usr/bin")), \
+                    patch.object(review, "invoke_reviewer", side_effect=echo_credential_on_stderr), \
+                    self.assertRaisesRegex(ValueError, "output contained review credential") as caught:
+                review.run(args)
+            self.assertNotIn(TEST_SECRET, str(caught.exception))
+            self.assertEqual(list(evidence.rglob("deepseek-receipt-*.json")), [])
+            for artifact in evidence.rglob("*"):
+                if artifact.is_file():
+                    self.assertNotIn(TEST_SECRET.encode(), artifact.read_bytes())
+
             def omit_aggregate_dispositions(command, prompt_text, env, timeout):
                 return subprocess.CompletedProcess(
                     ["claude"], 0,
