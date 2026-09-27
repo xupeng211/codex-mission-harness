@@ -120,6 +120,22 @@ def open_private_directory(path, repo_root, *, create=True, secure=True):
     current_fd = os.open("/", flags)
     private_started = False
     try:
+        # ``Path.parts`` omits the root component when slicing with [1:], so
+        # a root anchor would otherwise never be observed inside the loop.
+        # Validate and activate it before walking its children.
+        if anchor == Path("/"):
+            root_info = os.fstat(current_fd)
+            root_mode = stat.S_IMODE(root_info.st_mode)
+            if anchor_kind == "home":
+                if (uid is not None and root_info.st_uid != uid) or root_mode & 0o022:
+                    raise ValueError("owner home is not a stable evidence anchor")
+            elif anchor_kind == "sticky":
+                if ((uid is not None and root_info.st_uid not in {0, uid})
+                        or not root_mode & stat.S_ISVTX):
+                    raise ValueError("shared evidence anchor is not sticky and trusted")
+            elif root_info.st_uid != 0 or root_mode & 0o022:
+                raise ValueError("evidence path has an untrusted root ancestor")
+            private_started = True
         for component in target.parts[1:]:
             child_path = current_path / component
             try:

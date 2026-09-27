@@ -333,6 +333,23 @@ class DeepSeekReceiptTest(unittest.TestCase):
             self.assertEqual(sentinel.read_text(), "untouched")
             self.assertEqual(stat.S_IMODE(evidence_target.stat().st_mode), 0o755)
 
+    def test_private_evidence_directory_accepts_filesystem_root_anchor(self):
+        # Exercise the root-anchor branch directly.  A root anchor is selected
+        # when the target is outside the configured owner home, and must be
+        # activated before the walk over target.parts[1:].
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            evidence = root / "evidence"
+            fake_home = type("Pwd", (), {"pw_dir": "/home/owner-home-not-present"})()
+            with patch.object(review.pwd, "getpwuid", return_value=fake_home):
+                _, evidence_fd = review.open_private_directory(evidence, repo)
+            try:
+                self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o700)
+            finally:
+                os.close(evidence_fd)
+
     def test_private_artifacts_are_fsynced_and_never_overwrite(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
