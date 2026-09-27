@@ -79,6 +79,16 @@ class FootballPredictionAdapter:
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_OPTIONAL_LOCKS": "0",
         }
+        # A writable candidate must not supply executable Git settings for a
+        # controller operation (notably fsmonitor and checkout filters).
+        configured = subprocess.check_output(
+            ["git", "-C", str(candidate), "config", "--local", "--name-only", "--list"],
+            cwd=str(candidate), env=git_env, text=True, stderr=subprocess.PIPE, timeout=30,
+        ).splitlines()
+        if any(key.lower() == "core.fsmonitor" or
+               (key.lower().startswith("filter.") and key.lower().rsplit(".", 1)[-1]
+                in {"smudge", "clean", "process"}) for key in configured):
+            raise RuntimeError("review source has executable local Git configuration")
         if not context.exists():
             created = self._call(
                 ["git", "-C", str(candidate), "-c", "core.hooksPath=/dev/null",
@@ -97,7 +107,7 @@ class FootballPredictionAdapter:
 
         def git_text(root: Path, *args: str) -> str:
             return subprocess.check_output(
-                ["git", "--no-replace-objects", "-C", str(root), *args],
+                ["git", "-c", "core.fsmonitor=false", "--no-replace-objects", "-C", str(root), *args],
                 cwd=str(candidate), env=git_env, text=True, stderr=subprocess.PIPE,
                 timeout=60,
             ).strip()
@@ -172,7 +182,8 @@ class FootballPredictionAdapter:
         return evidence_dir.resolve(strict=True)
 
     def exact_head(self, worktree: str) -> str:
-        dirty = self._run(["git", "-C", worktree, "status", "--porcelain=v1", "--untracked-files=all"])
+        dirty = self._run(["git", "-c", "core.fsmonitor=false", "-C", worktree,
+                           "status", "--porcelain=v1", "--untracked-files=all"])
         if dirty:
             raise RuntimeError("canonical evidence requires a clean committed worktree")
         return self._run(["git", "-C", worktree, "rev-parse", "HEAD"]).strip().lower()
@@ -1270,6 +1281,18 @@ class FootballPredictionAdapter:
         admins = protection.get("enforce_admins")
         if not isinstance(admins, dict) or admins.get("enabled") is not True:
             return GateResult("BLOCKED_POLICY", "GitHub strict base protection does not cover administrators")
+        rules_result = self._call(self._gh(
+            "api", f"repos/{pr_repo}/rules/branches/main"), cwd=worktree)
+        if rules_result.returncode != 0:
+            return GateResult("BLOCKED_POLICY", "cannot prove GitHub main has no merge queue rule")
+        try:
+            rules = json.loads(rules_result.stdout)
+        except (TypeError, json.JSONDecodeError):
+            return GateResult("BLOCKED_POLICY", "GitHub main branch rules response is invalid")
+        if not isinstance(rules, list) or any(not isinstance(rule, dict) for rule in rules):
+            return GateResult("BLOCKED_POLICY", "GitHub main branch rules response is malformed")
+        if any(rule.get("type") == "merge_queue" for rule in rules):
+            return GateResult("BLOCKED_POLICY", "GitHub main branch uses a merge queue")
         return GateResult("PASS", "GitHub enforces strict up-to-date checks for main and administrators")
 
     def merge_status(self, worktree: str, reviewed_head: str, pr_number: int | None = None,

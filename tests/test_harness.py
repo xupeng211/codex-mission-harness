@@ -865,6 +865,7 @@ class HarnessTest(unittest.TestCase):
         adapter._policy_cwd = "/mission-worktree"
         expected_policy = {
             "cwd": "/mission-worktree",
+            "model": "gpt-5.6-sol",
             "approvalPolicy": "never",
             "sandbox": "workspace-write",
             "developerInstructions": adapter._authority_instructions("/mission-worktree"),
@@ -896,10 +897,13 @@ class HarnessTest(unittest.TestCase):
             "poll": lambda self: 0,
         })()
         self.assertEqual(AppServerCodex._canonical_worktree(str(first)), str(first))
-        with patch("harness.codex.subprocess.Popen", return_value=process), \
+        with patch("harness.codex.subprocess.Popen", return_value=process) as launch, \
                 patch.object(AppServerCodex, "_canonical_worktree", return_value=str(first)), \
                 patch.object(AppServerCodex, "_request", return_value={}):
             adapter = AppServerCodex(worktree=str(first))
+        self.assertEqual(launch.call_args.args[0][1:5], [
+            "-c", 'model="gpt-5.6-sol"', "-c", 'model_reasoning_effort="high"',
+        ])
         adapter.set_policy((), str(first))
         self.assertEqual(adapter._policy_cwd, str(first))
         with self.assertRaisesRegex(RuntimeError, "immutable"):
@@ -980,6 +984,26 @@ class HarnessTest(unittest.TestCase):
         (repo / "tracked.txt").write_text("dirty\n")
         with self.assertRaisesRegex(RuntimeError, "clean committed worktree"):
             adapter.exact_head(str(repo))
+
+    def test_git_fsmonitor_cannot_execute_during_exact_head_or_review_materialization(self):
+        repo = Path(self.tmp.name) / "fsmonitor-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Harness Test"], check=True)
+        (repo / "tracked.txt").write_text("clean\n")
+        subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+        marker = Path(self.tmp.name) / "fsmonitor-ran"
+        hook = Path(self.tmp.name) / "fsmonitor.sh"
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        hook.chmod(0o700)
+        subprocess.run(["git", "-C", str(repo), "config", "core.fsmonitor", str(hook)], check=True)
+        adapter = FootballPredictionAdapter()
+        head = adapter.exact_head(str(repo))
+        with self.assertRaisesRegex(RuntimeError, "executable local Git configuration"):
+            adapter.review_context_worktree(str(repo), "mission", head)
+        self.assertFalse(marker.exists())
 
     def test_docker_namespace_is_unique_and_non_destructive(self):
         self.assertNotEqual(compose_namespace("same mission"), compose_namespace("same/mission"))
@@ -3296,7 +3320,9 @@ class HarnessTest(unittest.TestCase):
         }), "")
         with patch.object(adapter, "discover_pr") as discover, \
                 patch.object(adapter, "merge_status", side_effect=[not_started, merged]) as status, \
-                patch.object(adapter, "_call", side_effect=[protection, completed]) as call:
+                patch.object(adapter, "_call", side_effect=[
+                    protection, subprocess.CompletedProcess([], 0, "[]", ""), completed,
+                ]) as call:
             result = adapter.merge("/candidate", "a" * 40, 17, "fixture/repo", base_sha)
         self.assertEqual(result.status, "PASS")
         discover.assert_not_called()
@@ -3305,10 +3331,13 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(call.call_args_list[0].args[0], [
             "gh", "api", "repos/fixture/repo/branches/main/protection",
         ])
-        self.assertEqual(call.call_args_list[1].args[0][:6], [
+        self.assertEqual(call.call_args_list[1].args[0], [
+            "gh", "api", "repos/fixture/repo/rules/branches/main",
+        ])
+        self.assertEqual(call.call_args_list[2].args[0][:6], [
             "gh", "pr", "merge", "17", "--repo", "fixture/repo",
         ])
-        self.assertIn("--match-head-commit", call.call_args_list[1].args[0])
+        self.assertIn("--match-head-commit", call.call_args_list[2].args[0])
 
     def test_merge_fails_closed_without_server_enforced_base_freshness(self):
         adapter = FootballPredictionAdapter()
@@ -3324,6 +3353,20 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(call.call_args.args[0], [
             "gh", "api", "repos/fixture/repo/branches/main/protection",
         ])
+
+    def test_merge_queue_rule_blocks_before_merge_invocation(self):
+        adapter = FootballPredictionAdapter()
+        protection = subprocess.CompletedProcess([], 0, json.dumps({
+            "required_status_checks": {"strict": True, "contexts": ["verify"]},
+            "enforce_admins": {"enabled": True},
+        }), "")
+        rules = subprocess.CompletedProcess([], 0, json.dumps([{"type": "merge_queue"}]), "")
+        with patch.object(adapter, "merge_status", return_value=GateResult("NOT_STARTED", "safe")), \
+                patch.object(adapter, "_call", side_effect=[protection, rules]) as call:
+            result = adapter.merge("/candidate", "a" * 40, 17, "fixture/repo", "b" * 40)
+        self.assertEqual(result.status, "BLOCKED_POLICY")
+        self.assertIn("merge queue", result.evidence)
+        self.assertEqual(call.call_count, 2)
 
     def test_merge_requires_strict_statuses_and_admin_enforcement(self):
         adapter = FootballPredictionAdapter()

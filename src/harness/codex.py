@@ -26,6 +26,8 @@ class CodexAdapter(Protocol):
 
 class AppServerCodex:
     """Thin JSON-RPC adapter for the locally installed App Server; protocol stays here."""
+    MODEL = "gpt-5.6-sol"
+    REASONING_EFFORT = "high"
     RESPONSE_TIMEOUT_SECONDS = 300.0
     MAX_PENDING_MESSAGES = 256
 
@@ -39,7 +41,9 @@ class AppServerCodex:
         self._forbidden_actions = self._effective_policy(forbidden_actions)
         self._configured_forbidden_actions = self._effective_policy(forbidden_actions)
         self._policy_cwd = self._canonical_worktree(worktree)
-        self.proc = subprocess.Popen([executable, "app-server", "--stdio"], stdin=subprocess.PIPE,
+        self.proc = subprocess.Popen([executable, "-c", f'model="{self.MODEL}"',
+                                      "-c", f'model_reasoning_effort="{self.REASONING_EFFORT}"',
+                                      "app-server", "--stdio"], stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, text=True, bufsize=1)
         self.seq = 0
         self._pending_messages: list[dict] = []
@@ -120,6 +124,7 @@ class AppServerCodex:
         root = policy["sandboxPolicy"]["writableRoots"][0]
         return {
             "cwd": root,
+            "model": self.MODEL,
             "approvalPolicy": policy["approvalPolicy"],
             "sandbox": "workspace-write",
             "developerInstructions": self._authority_instructions(root),
@@ -344,7 +349,8 @@ class AppServerCodex:
         return result["thread"]["id"]
 
     def turn(self, thread_id: str, prompt: str, cwd: str) -> Turn:
-        params = {"threadId": thread_id, "input": [{"type": "text", "text": prompt}], "cwd": cwd}
+        params = {"threadId": thread_id, "input": [{"type": "text", "text": prompt}],
+                  "cwd": cwd, "model": self.MODEL, "effort": self.REASONING_EFFORT}
         params.update(self._policy_params(cwd))
         result = self._request("turn/start", params)
         turn_id = result["turn"]["id"]
