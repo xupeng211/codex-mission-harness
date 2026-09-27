@@ -903,8 +903,11 @@ class HarnessTest(unittest.TestCase):
             "stdin": StringIO(), "stdout": StringIO(), "stderr": None,
             "poll": lambda self: 0,
         })()
+        codex_home = Path(self.tmp.name) / "codex-home"
+        codex_home.mkdir(mode=0o700)
         self.assertEqual(AppServerCodex._canonical_worktree(str(first)), str(first))
-        with patch("harness.codex.subprocess.Popen", return_value=process) as launch, \
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}), \
+                patch("harness.codex.subprocess.Popen", return_value=process) as launch, \
                 patch.object(AppServerCodex, "_canonical_worktree", return_value=str(first)), \
                 patch.object(AppServerCodex, "_request", return_value={}):
             adapter = AppServerCodex(worktree=str(first))
