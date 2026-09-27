@@ -41,6 +41,43 @@ class Supervisor:
         return self.process.launcher_pid, start_ticks
 
     @staticmethod
+    def _review_transport_failure(result, job, reviewed: GateResult) -> bool:
+        """Recognize only explicit transport symptoms as retryable.
+
+        Missing or malformed receipts are contract failures by default.  A
+        retry is allowed when the adapter explicitly labels the failure as
+        transport, or when a receipt-less terminal process left one of the
+        narrow connection/timeout markers in its private logs.  Findings,
+        policy/authentication errors, and any artifact-bearing invalid receipt
+        therefore remain terminal and are never retried automatically.
+        """
+        details = reviewed.data if isinstance(reviewed.data, dict) else {}
+        if (details.get("retryable") is True
+                and details.get("classification") == "transport"):
+            return True
+        if reviewed.artifact:
+            return False
+        if result.state not in {"EXITED", "LOST"}:
+            return False
+        paths = [job["stdout_path"], job["stderr_path"]]
+        fragments: list[str] = []
+        for raw_path in paths:
+            if not raw_path:
+                continue
+            try:
+                fragments.append(Path(raw_path).read_text(encoding="utf-8", errors="replace")[-20000:])
+            except OSError:
+                continue
+        text = "\n".join(fragments).lower()
+        markers = (
+            "request timeout", "timed out", "timeout", "connection reset",
+            "connection closed", "connection refused", "transient tls",
+            "tls handshake", "websocket", "service unavailable",
+            "temporarily unavailable", "reconnecting", "reconnect loop",
+        )
+        return any(marker in text for marker in markers)
+
+    @staticmethod
     def _invoke_pr_adapter(method, worktree: str, head: str,
                            pr_number: int | None, pr_repo: str | None,
                            base_sha: str | None = None,
@@ -150,7 +187,10 @@ class Supervisor:
                 self.journal.db.commit()
                 self.journal.retire_terminal_gate_job(mission_id, result.job_id)
                 continue
-            job = self.journal.db.execute("SELECT name,stdout_path FROM jobs WHERE job_id=?", (result.job_id,)).fetchone()
+            job = self.journal.db.execute(
+                "SELECT name,stdout_path,stderr_path FROM jobs WHERE job_id=?",
+                (result.job_id,),
+            ).fetchone()
             if job and str(job["name"]).startswith("review:"):
                 reviewer = str(job["name"]).split(":", 1)[1]
                 spec = self.journal.spec(mission_id)
@@ -182,13 +222,17 @@ class Supervisor:
                             "BLOCKED_EXTERNAL", f"canonical review receipt validation failed: {exc}",
                         )
                     if reviewed.status == "BLOCKED_EXTERNAL":
-                        # An escaped descendant can outlive the recorded
-                        # process group. An incomplete review therefore needs
-                        # external reconciliation before any new invocation.
+                        retryable = self._review_transport_failure(result, job, reviewed)
+                        # ProcessSupervisor publishes a terminal result only
+                        # after the owned process group is quiescent.  That
+                        # makes a transport retry safe; malformed receipts or
+                        # policy/authentication failures remain terminal.
                         self.journal.complete_review_job(
                             mission_id, result.job_id, reviewer, current,
-                            "BLOCKED_EXTERNAL", reviewed.artifact, reviewed.evidence or
+                            "RETRY" if retryable else "BLOCKED_EXTERNAL",
+                            reviewed.artifact, reviewed.evidence or
                             "canonical review writer exited without a durable receipt",
+                            retry=retryable,
                         )
                         continue
                     details = reviewed.data if isinstance(reviewed.data, dict) else {}
@@ -538,6 +582,20 @@ class Supervisor:
                     return state
             advance(State.REVIEW, "local canonical gates pass")
         elif state == State.REVIEW:
+            retry_after = row["review_retry_after"]
+            if retry_after is not None:
+                try:
+                    retry_after = float(retry_after)
+                except (TypeError, ValueError):
+                    self.journal.update(mission_id, review_retry_after=None)
+                    retry_after = None
+                if retry_after is not None and retry_after > time.time():
+                    # A durable transport backoff survives a controller
+                    # restart and prevents an outage from becoming a hot loop.
+                    return state
+                if retry_after is not None:
+                    self.journal.update(mission_id, review_retry_after=None)
+                    row = self.journal.mission(mission_id)
             head = row["current_head"]
             valid = self.journal.valid_reviews(mission_id, head)
             for reviewer in spec.reviews:
@@ -584,7 +642,10 @@ class Supervisor:
                             reviewer_env = self.adapter.review_environment(
                                 reviewer, worktree=str(review_root),
                             )
-                            self.journal.update(mission_id, pending_gate=f"review:{reviewer}")
+                            self.journal.update(
+                                mission_id, pending_gate=f"review:{reviewer}",
+                                review_retry_after=None,
+                            )
                             self.process.start(
                                 mission_id, f"review:{reviewer}", argv,
                                 str(review_root), reviewer_env, head,

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
+import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -44,7 +47,8 @@ class AppServerCodex:
         self.proc = subprocess.Popen([executable, "-c", f'model="{self.MODEL}"',
                                       "-c", f'model_reasoning_effort="{self.REASONING_EFFORT}"',
                                       "app-server", "--stdio"], stdin=subprocess.PIPE,
-                                     stdout=subprocess.PIPE, text=True, bufsize=1)
+                                     stdout=subprocess.PIPE, text=True, bufsize=1,
+                                     env=self._app_server_environment(executable))
         self.seq = 0
         self._pending_messages: list[dict] = []
         self._reader_queue: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -56,6 +60,130 @@ class AppServerCodex:
         except Exception:
             self.close()
             raise
+
+    @staticmethod
+    def _trusted_environment_path(executable: str) -> str:
+        """Return a PATH made only from owner-controlled executable directories.
+
+        The App Server is a controller child, so it must not inherit a caller
+        PATH that can select repository-controlled launchers.  Keep the
+        resolved executable's directory when it is trusted, then add the
+        standard system directories needed by Codex's child tools.
+        """
+        owners = {0, os.getuid()} if hasattr(os, "getuid") else {0}
+        candidates: list[Path] = []
+        resolved_executable = shutil.which(executable, path=os.environ.get("PATH", os.defpath))
+        if resolved_executable:
+            try:
+                candidates.append(Path(resolved_executable).resolve(strict=True).parent)
+            except OSError:
+                pass
+        candidates.extend(Path(entry) for entry in (
+            "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin",
+            "/sbin", "/bin",
+        ))
+        trusted: list[str] = []
+        for directory in candidates:
+            try:
+                resolved = directory.resolve(strict=True)
+            except OSError:
+                continue
+            if not resolved.is_dir() or str(resolved) in trusted:
+                continue
+            safe = True
+            for ancestor in (resolved, *resolved.parents):
+                try:
+                    info = ancestor.stat()
+                except OSError:
+                    safe = False
+                    break
+                if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in owners
+                        or stat.S_IMODE(info.st_mode) & 0o022):
+                    safe = False
+                    break
+            if safe:
+                trusted.append(str(resolved))
+        if not trusted:
+            raise RuntimeError("trusted Codex App Server PATH is unavailable")
+        return os.pathsep.join(trusted)
+
+    @staticmethod
+    def _codex_home() -> str:
+        """Select the authenticated Codex home without inheriting a broad HOME."""
+        raw = os.environ.get("CODEX_HOME")
+        if raw:
+            candidate = Path(raw)
+            if not candidate.is_absolute():
+                raise RuntimeError("CODEX_HOME must be an absolute path")
+        else:
+            candidate = Path.home() / ".codex"
+        try:
+            original_info = candidate.lstat()
+            if stat.S_ISLNK(original_info.st_mode):
+                raise RuntimeError("Codex authentication home must not be a symlink")
+            resolved = candidate.resolve(strict=True)
+            info = resolved.lstat()
+        except OSError as exc:
+            raise RuntimeError("Codex authentication home is unavailable") from exc
+        except RuntimeError:
+            raise
+        uid = os.getuid() if hasattr(os, "getuid") else info.st_uid
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != uid
+                or stat.S_ISLNK(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o002):
+            raise RuntimeError("Codex authentication home is not owner-controlled")
+        return str(resolved)
+
+    @classmethod
+    def _app_server_environment(cls, executable: str) -> dict[str, str]:
+        """Build the App Server's explicit environment allowlist.
+
+        Authentication is carried by the deliberately selected ``CODEX_HOME``
+        directory.  Proxy and CA settings are retained for the service request,
+        while controller credentials, SSH agents, and arbitrary execution
+        controls are excluded from the child environment.
+        """
+        code_home = cls._codex_home()
+        environment = {
+            "PATH": cls._trusted_environment_path(executable),
+            "HOME": "/nonexistent",
+            "CODEX_HOME": code_home,
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+            "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+            "NO_COLOR": "1",
+        }
+        for name in (
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+            "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+        ):
+            value = os.environ.get(name)
+            if value:
+                environment[name] = value
+        # These variables point at system-managed CA material rather than
+        # carrying credentials.  Ignore non-absolute or user-writable paths.
+        for name in (
+            "CODEX_CA_CERTIFICATE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO",
+            "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "SSL_CERT_DIR", "SSL_CERT_FILE",
+        ):
+            value = os.environ.get(name, "")
+            if not value:
+                continue
+            paths = value.split(os.pathsep) if name == "SSL_CERT_DIR" else [value]
+            safe = True
+            for raw_path in paths:
+                path = Path(raw_path)
+                try:
+                    info = path.lstat()
+                except OSError:
+                    safe = False
+                    break
+                expected = stat.S_ISDIR(info.st_mode) if name == "SSL_CERT_DIR" else stat.S_ISREG(info.st_mode)
+                if (not path.is_absolute() or stat.S_ISLNK(info.st_mode)
+                        or not expected or info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022):
+                    safe = False
+                    break
+            if safe:
+                environment[name] = value
+        return environment
 
     def set_policy(self, forbidden_actions: tuple[str, ...], cwd: str) -> None:
         """Verify constructor-bound mission controls before a turn is started.

@@ -8,6 +8,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import replace
 from io import StringIO
 from pathlib import Path
@@ -326,6 +327,74 @@ class HarnessTest(unittest.TestCase):
         with patch.object(self.supervisor.process, "start") as duplicate_start:
             self.assertEqual(self.supervisor.step(self.spec.mission_id, spec), State.BLOCKED_EXTERNAL)
         duplicate_start.assert_not_called()
+
+    def test_transport_review_failure_uses_two_bounded_retries_with_backoff(self):
+        head = "a" * 40
+        spec = replace(self.spec, adapter="footballprediction", mission_scope_file="scope.json")
+        (self.worktree / "scope.json").write_text("{}")
+        self.journal.update(
+            self.spec.mission_id, spec_json=json.dumps(spec.__dict__), current_head=head,
+            current_state=State.REVIEW, pending_gate="review:codex",
+        )
+
+        def add_job(job_id):
+            stderr = Path(self.tmp.name) / f"{job_id}.err"
+            stderr.write_text("request timeout while reconnecting\n")
+            self.journal.db.execute(
+                "INSERT INTO jobs(job_id,mission_id,name,argv_json,launch_head,state,"
+                "stdout_path,stderr_path,started_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (job_id, self.spec.mission_id, "review:codex", "[]", head,
+                 "LOST", "", str(stderr), "2026-01-01T00:00:00+00:00"),
+            )
+            self.journal.db.commit()
+
+        add_job("transport-review-1")
+        with patch.object(self.supervisor.process, "poll", return_value=[
+                JobResult("transport-review-1", "LOST", None, head),
+        ]), patch.object(self.supervisor.adapter, "review_result", return_value=GateResult(
+                "BLOCKED_EXTERNAL", "review transport failed")):
+            self.supervisor.reconcile(self.spec.mission_id)
+        mission = self.journal.mission(self.spec.mission_id)
+        self.assertEqual(mission["current_state"], State.REVIEW)
+        self.assertIsNone(mission["pending_gate"])
+        self.assertGreaterEqual(float(mission["review_retry_after"]), time.time() + 29)
+        self.assertEqual(self.journal.db.execute(
+            "SELECT count(*) FROM events WHERE mission_id=? AND kind='review_retry_required'",
+            (self.spec.mission_id,),
+        ).fetchone()[0], 1)
+
+        # The persisted deadline prevents a hot-loop restart.
+        with patch.object(self.supervisor.process, "start") as duplicate_start:
+            self.assertEqual(self.supervisor.step(self.spec.mission_id, spec), State.REVIEW)
+        duplicate_start.assert_not_called()
+
+        # Consume retry two after its deadline, then prove the third failure
+        # becomes terminal instead of creating a fourth invocation.
+        self.journal.update(self.spec.mission_id, pending_gate="review:codex",
+                            review_retry_after=time.time() - 1)
+        add_job("transport-review-2")
+        with patch.object(self.supervisor.process, "poll", return_value=[
+                JobResult("transport-review-2", "LOST", None, head),
+        ]), patch.object(self.supervisor.adapter, "review_result", return_value=GateResult(
+                "BLOCKED_EXTERNAL", "review transport failed")):
+            self.supervisor.reconcile(self.spec.mission_id)
+        self.assertEqual(self.journal.mission(self.spec.mission_id)["current_state"], State.REVIEW)
+        self.assertGreaterEqual(float(self.journal.mission(self.spec.mission_id)["review_retry_after"]),
+                                time.time() + 89)
+
+        self.journal.update(self.spec.mission_id, pending_gate="review:codex",
+                            review_retry_after=time.time() - 1)
+        add_job("transport-review-3")
+        with patch.object(self.supervisor.process, "poll", return_value=[
+                JobResult("transport-review-3", "LOST", None, head),
+        ]), patch.object(self.supervisor.adapter, "review_result", return_value=GateResult(
+                "BLOCKED_EXTERNAL", "review transport failed")):
+            self.supervisor.reconcile(self.spec.mission_id)
+        self.assertEqual(self.journal.mission(self.spec.mission_id)["current_state"], State.BLOCKED_EXTERNAL)
+        self.assertEqual(self.journal.db.execute(
+            "SELECT count(*) FROM events WHERE mission_id=? AND kind='review_retry_required'",
+            (self.spec.mission_id,),
+        ).fetchone()[0], 2)
 
     def test_stale_terminal_review_job_is_consumed_once_after_head_change(self):
         old_head, current_head = "a" * 40, "b" * 40
@@ -854,6 +923,40 @@ class HarnessTest(unittest.TestCase):
         unbound._configured_forbidden_actions = unbound._effective_policy(())
         with self.assertRaisesRegex(RuntimeError, "not constructor-bound"):
             unbound.set_policy((), str(first))
+
+    def test_app_server_uses_explicit_environment_allowlist(self):
+        first = Path(self.tmp.name) / "app-server-env-repo"
+        subprocess.run(["git", "init", "-q", str(first)], check=True)
+        codex_home = Path(self.tmp.name) / "codex-home"
+        codex_home.mkdir(mode=0o700)
+        attacker_bin = Path(self.tmp.name) / "attacker-bin"
+        attacker_bin.mkdir(mode=0o700)
+        hostile = {
+            "PATH": str(attacker_bin),
+            "HOME": str(Path.home()),
+            "CODEX_HOME": str(codex_home),
+            "OPENAI_API_KEY": "ambient-api-key-must-not-pass",
+            "GH_TOKEN": "ambient-gh-token-must-not-pass",
+            "SSH_AUTH_SOCK": "/tmp/ambient-agent.sock",
+            "HTTPS_PROXY": "http://proxy.example.invalid:8080",
+        }
+        process = type("Process", (), {
+            "stdin": StringIO(), "stdout": StringIO(), "stderr": None,
+            "poll": lambda self: 0,
+        })()
+        with patch.dict(os.environ, hostile, clear=True), \
+                patch("harness.codex.subprocess.Popen", return_value=process) as launch, \
+                patch.object(AppServerCodex, "_canonical_worktree", return_value=str(first)), \
+                patch.object(AppServerCodex, "_request", return_value={}):
+            adapter = AppServerCodex(executable="/usr/bin/true", worktree=str(first))
+        child_env = launch.call_args.kwargs["env"]
+        self.assertEqual(child_env["CODEX_HOME"], str(codex_home))
+        self.assertEqual(child_env["HOME"], "/nonexistent")
+        self.assertEqual(child_env["HTTPS_PROXY"], hostile["HTTPS_PROXY"])
+        for name in ("OPENAI_API_KEY", "GH_TOKEN", "SSH_AUTH_SOCK"):
+            self.assertNotIn(name, child_env)
+        self.assertNotIn(str(attacker_bin), child_env["PATH"])
+        adapter.close()
 
     def test_codex_thread_receives_explicit_sensitive_action_boundary(self):
         adapter = AppServerCodex.__new__(AppServerCodex)

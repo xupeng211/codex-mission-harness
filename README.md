@@ -6,6 +6,8 @@ Harness is a small local supervisor for one primary Codex mission. It orchestrat
 
 Python 3.11+ standard library is used for durable SQLite state, POSIX process supervision and Linux portability. The Codex adapter starts the locally installed `codex app-server --stdio` and isolates JSON-RPC protocol details (`thread/start`, `thread/resume`, `turn/start`) in one module. A stored thread ID is resumed for subsequent turns; if the backend rejects a resume, that failure is explicit rather than silently presented as the original thread.
 
+The primary App Server receives an explicit environment allowlist. Its selected `CODEX_HOME` supplies authentication, approved proxy and CA settings supply service connectivity, and ambient GitHub credentials, provider keys, SSH agents and arbitrary execution controls are excluded.
+
 `data/harness.sqlite` is an orchestration journal/cache. Git exact HEAD, GitHub checks, project canonical gates and production gate artifacts remain source of truth. Resume always reconciles them before deciding the next transition.
 
 ## State machine
@@ -57,6 +59,8 @@ occurs only after explicit owner approval and the canonical merge gates pass.
 ## Approval and review rules
 
 Source fixes, local gates and in-scope review/CI repairs auto-continue. Live providers, quota/spending, protected production changes, credentials, unknown-resource deletion and owner-controlled merge require persistent approval decisions. Review receipts are exact-HEAD-bound; reconciliation invalidates both Codex and DeepSeek receipts whenever HEAD changes, forcing fresh validation/review.
+
+Receipt-less reviewer failures are retried only when classified as transport failures. The retry budget is three total attempts per reviewer and exact HEAD, with persisted 30-second and 90-second backoffs; malformed receipts, findings, policy failures and authentication failures remain terminal.
 
 ## v0.1 limits
 

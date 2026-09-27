@@ -5,6 +5,7 @@ import hashlib
 import os
 import re
 import sqlite3
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,12 @@ from typing import Any
 from .domain import InvalidTransition, MissionSpec, Observation, State, TERMINAL, ALLOWED
 from .policy import Decision, SENSITIVE, decide
 
-MAX_REVIEW_RETRIES_PER_HEAD = 1
+# One initial review plus two fresh transport retries is the complete bounded
+# review budget. The backoff is persisted with the mission so a restart cannot
+# turn a transport outage into an unbounded request loop.
+MAX_REVIEW_ATTEMPTS_PER_HEAD = 3
+MAX_REVIEW_RETRIES_PER_HEAD = MAX_REVIEW_ATTEMPTS_PER_HEAD - 1
+REVIEW_RETRY_BACKOFF_SECONDS = (30.0, 90.0)
 
 
 def now() -> str:
@@ -47,6 +53,7 @@ class Journal:
               merge_claim_start_ticks TEXT,
               pr_number INTEGER, pr_repo TEXT, pr_base_sha TEXT,
               merge_sha TEXT, main_sha TEXT, tree_sha TEXT,
+              review_retry_after REAL,
               created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS events (
               seq INTEGER PRIMARY KEY AUTOINCREMENT, mission_id TEXT NOT NULL, kind TEXT NOT NULL,
@@ -89,7 +96,8 @@ class Journal:
         for name, definition in (("codex_turn_id", "TEXT"), ("codex_turn_state", "TEXT"),
                                  ("codex_turn_pid", "INTEGER"), ("codex_turn_start_ticks", "TEXT"),
                                  ("codex_turn_source_state", "TEXT"),
-                                 ("codex_turn_source_head", "TEXT")):
+                                 ("codex_turn_source_head", "TEXT"),
+                                 ("review_retry_after", "REAL")):
             if name not in mission_columns:
                 self.db.execute(f"ALTER TABLE missions ADD COLUMN {name} {definition}")
         mission_columns = {row[1] for row in self.db.execute("PRAGMA table_info(missions)")}
@@ -247,7 +255,7 @@ class Journal:
                     or row["pr_base_sha"] != pr_base_sha.lower()):
                 raise InvalidTransition("merge completion lost its exact claim or PR identity")
             changed = self.db.execute(
-                "UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,"
+                "UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,review_retry_after=NULL,"
                 "pr_number=?,pr_repo=?,merge_sha=?,merge_claim_head=NULL,"
                 "merge_claim_pr_number=NULL,merge_claim_pr_repo=NULL,merge_claim_pr_base_sha=NULL,"
                 "merge_invocation_started=0,"
@@ -418,6 +426,7 @@ class Journal:
                 return False
 
             retry_exhausted = False
+            retry_after = None
             retries_used = 0
             if retry:
                 retry_rows = self.db.execute(
@@ -447,6 +456,7 @@ class Journal:
                     )
                 else:
                     retry_number = retries_used + 1
+                    retry_after = time.time() + REVIEW_RETRY_BACKOFF_SECONDS[retry_number - 1]
                     changed = self.db.execute(
                         "UPDATE jobs SET state='CONSUMED',ended_at=COALESCE(ended_at,?) "
                         "WHERE job_id=? AND mission_id=? AND state IN ('EXITED','LOST')",
@@ -456,15 +466,17 @@ class Journal:
                         self.db.commit()
                         return False
                     self.db.execute(
-                        "UPDATE missions SET pending_gate=NULL,updated_at=? WHERE mission_id=? "
+                        "UPDATE missions SET pending_gate=NULL,review_retry_after=?,updated_at=? WHERE mission_id=? "
                         "AND current_state=? AND current_head=? AND pending_gate=?",
-                        (now(), mission_id, State.REVIEW, head, f"review:{reviewer}"),
+                        (retry_after, now(), mission_id, State.REVIEW, head, f"review:{reviewer}"),
                     )
                     self.event(mission_id, "review_retry_required", {
                         "job_id": job_id, "reviewer": reviewer, "head": head,
                         "artifact": artifact, "evidence": evidence,
                         "retry_number": retry_number,
                         "max_retries": MAX_REVIEW_RETRIES_PER_HEAD,
+                        "backoff_seconds": REVIEW_RETRY_BACKOFF_SECONDS[retry_number - 1],
+                        "retry_after": retry_after,
                     })
                     self.db.commit()
                     return True
@@ -495,7 +507,7 @@ class Journal:
             elif result != "PASS":
                 target = State.BLOCKED_EXTERNAL
             self.db.execute(
-                "UPDATE missions SET pending_gate=NULL,current_state=COALESCE(?,current_state),"
+                "UPDATE missions SET pending_gate=NULL,review_retry_after=NULL,current_state=COALESCE(?,current_state),"
                 "terminal_state=CASE WHEN ? IS NULL THEN terminal_state WHEN ? IN (?,?) THEN ? ELSE NULL END,"
                 "updated_at=? WHERE mission_id=? AND current_state=? AND current_head=? "
                 "AND pending_gate=?",
@@ -622,7 +634,7 @@ class Journal:
             invalidated = self.db.execute("UPDATE receipts SET invalidated=1 WHERE mission_id=? AND head_sha<>? AND invalidated=0",
                                           (mission_id, head)).rowcount
             if source == State.PASS:
-                changed = self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',pr_number=NULL,pr_repo=NULL,pr_base_sha=NULL,merge_sha=NULL,main_sha=NULL,tree_sha=NULL,merge_claim_head=NULL,merge_claim_pr_number=NULL,merge_claim_pr_repo=NULL,merge_claim_pr_base_sha=NULL,merge_invocation_started=0,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=? AND current_state=? AND current_head=?",
+                changed = self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,review_retry_after=NULL,ci_state=NULL,approval_state='NONE',pr_number=NULL,pr_repo=NULL,pr_base_sha=NULL,merge_sha=NULL,main_sha=NULL,tree_sha=NULL,merge_claim_head=NULL,merge_claim_pr_number=NULL,merge_claim_pr_repo=NULL,merge_claim_pr_base_sha=NULL,merge_invocation_started=0,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=? AND current_state=? AND current_head=?",
                                           (State.TEST, now(), mission_id, source, head)).rowcount
                 if changed != 1:
                     raise InvalidTransition("PASS reopen lost its reconciled source snapshot")
@@ -633,7 +645,7 @@ class Journal:
                 # claim. Preserve it until canonical merge status and the
                 # recorded owner identity prove that retrying is safe.
                 changed = self.db.execute(
-                    "UPDATE missions SET terminal_state=NULL,pending_gate=NULL,ci_state=NULL,"
+                    "UPDATE missions SET terminal_state=NULL,pending_gate=NULL,review_retry_after=NULL,ci_state=NULL,"
                     "approval_state='NONE',updated_at=? WHERE mission_id=? "
                     "AND current_state=? AND current_head=? AND merge_claim_head=?",
                     (now(), mission_id, source, head, row["merge_claim_head"]),
@@ -644,7 +656,7 @@ class Journal:
                     "claim_head": row["merge_claim_head"], "current_head": head,
                 })
             elif source in {State.REVIEW, State.CI, State.MERGE, State.WAITING_APPROVAL, State.POST_MERGE, State.DELIVER}:
-                changed = self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',pr_number=NULL,pr_repo=NULL,pr_base_sha=NULL,merge_sha=NULL,main_sha=NULL,tree_sha=NULL,merge_claim_head=NULL,merge_claim_pr_number=NULL,merge_claim_pr_repo=NULL,merge_claim_pr_base_sha=NULL,merge_invocation_started=0,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=? AND current_state=? AND current_head=?",
+                changed = self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,review_retry_after=NULL,ci_state=NULL,approval_state='NONE',pr_number=NULL,pr_repo=NULL,pr_base_sha=NULL,merge_sha=NULL,main_sha=NULL,tree_sha=NULL,merge_claim_head=NULL,merge_claim_pr_number=NULL,merge_claim_pr_repo=NULL,merge_claim_pr_base_sha=NULL,merge_invocation_started=0,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=? AND current_state=? AND current_head=?",
                                           (State.TEST, now(), mission_id, source, head)).rowcount
                 if changed != 1:
                     raise InvalidTransition("state rewind lost its reconciled source snapshot")
@@ -1197,7 +1209,7 @@ class Journal:
             current_head = row["current_head"]
             if current_head != claim_head:
                 changed = self.db.execute(
-                    "UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,"
+                    "UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,review_retry_after=NULL,"
                     "ci_state=NULL,approval_state='NONE',pr_number=NULL,pr_repo=NULL,pr_base_sha=NULL,merge_sha=NULL,main_sha=NULL,tree_sha=NULL,merge_claim_head=NULL,"
                     "merge_claim_pr_number=NULL,merge_claim_pr_repo=NULL,merge_claim_pr_base_sha=NULL,merge_invocation_started=0,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? "
                     "WHERE mission_id=? AND current_state=? AND current_head IS ? "
