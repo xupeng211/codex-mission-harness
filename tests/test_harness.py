@@ -910,7 +910,7 @@ class HarnessTest(unittest.TestCase):
                 patch("harness.codex.subprocess.Popen", return_value=process) as launch, \
                 patch.object(AppServerCodex, "_canonical_worktree", return_value=str(first)), \
                 patch.object(AppServerCodex, "_request", return_value={}):
-            adapter = AppServerCodex(worktree=str(first))
+            adapter = AppServerCodex(executable="/usr/bin/true", worktree=str(first))
         self.assertEqual(launch.call_args.args[0][1:5], [
             "-c", 'model="gpt-5.6-sol"', "-c", 'model_reasoning_effort="high"',
         ])
@@ -971,6 +971,7 @@ class HarnessTest(unittest.TestCase):
         codex_home.chmod(0o700)
         parent = Path(self.tmp.name) / "group-writable-codex-parent"
         parent.mkdir(mode=0o770)
+        parent.chmod(0o770)
         nested = parent / "home"
         nested.mkdir(mode=0o700)
         with patch.dict(os.environ, {"CODEX_HOME": str(nested)}):
