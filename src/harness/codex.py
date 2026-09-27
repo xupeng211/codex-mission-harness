@@ -48,7 +48,7 @@ class AppServerCodex:
                                       "-c", f'model_reasoning_effort="{self.REASONING_EFFORT}"',
                                       "app-server", "--stdio"], stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, text=True, bufsize=1,
-                                     env=self._app_server_environment(executable))
+                                     env=self._app_server_environment(executable, self._policy_cwd))
         self.seq = 0
         self._pending_messages: list[dict] = []
         self._reader_queue: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -62,7 +62,76 @@ class AppServerCodex:
             raise
 
     @staticmethod
-    def _trusted_environment_path(executable: str) -> str:
+    def _trusted_executable(executable: str, forbidden_root: str | None = None) -> Path:
+        """Resolve a launcher only when its file and path are trusted.
+
+        The launcher runs before the App Server sandbox exists, with the
+        authenticated ``CODEX_HOME`` in its environment.  A path supplied by
+        a mission therefore must never select a candidate-controlled file.
+        Keep the lexical path check as well as the resolved target check so a
+        symlink placed in the mission worktree cannot escape this boundary.
+        """
+        resolved_name = shutil.which(executable, path=os.environ.get("PATH", os.defpath))
+        if not resolved_name:
+            raise RuntimeError("trusted Codex App Server launcher is unavailable")
+        try:
+            lexical = Path(resolved_name).absolute()
+            target = lexical.resolve(strict=True)
+            root = Path(forbidden_root).resolve(strict=True) if forbidden_root else None
+        except (OSError, RuntimeError) as exc:
+            raise RuntimeError("trusted Codex App Server launcher is unavailable") from exc
+        for candidate in (lexical, target):
+            if root is not None:
+                try:
+                    candidate.relative_to(root)
+                except ValueError:
+                    pass
+                else:
+                    raise RuntimeError("Codex App Server launcher cannot be inside the mission worktree")
+
+        owners = {0, os.getuid()} if hasattr(os, "getuid") else {0}
+        for ancestor in (lexical.parent, *lexical.parent.parents):
+            try:
+                source = ancestor.lstat()
+            except OSError as exc:
+                raise RuntimeError("trusted Codex App Server launcher is unavailable") from exc
+            source_mode = stat.S_IMODE(source.st_mode)
+            private_group_write = (source.st_gid == source.st_uid
+                                   and source_mode & 0o020
+                                   and not source_mode & 0o002)
+            if (not stat.S_ISDIR(source.st_mode) or source.st_uid not in owners
+                    or (source_mode & 0o022 and not private_group_write)):
+                raise RuntimeError("trusted Codex App Server launcher is not owner-controlled")
+        try:
+            info = target.lstat()
+        except OSError as exc:
+            raise RuntimeError("trusted Codex App Server launcher is unavailable") from exc
+        # A user-owned npm launcher is commonly group-writable by the user's
+        # private primary group.  Allow that case, while rejecting writes by a
+        # different group or by others.
+        group_write_is_private = info.st_gid == info.st_uid
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid not in owners
+                or not (stat.S_IMODE(info.st_mode) & 0o111)
+                or stat.S_IMODE(info.st_mode) & 0o002
+                or (stat.S_IMODE(info.st_mode) & 0o020 and not group_write_is_private)):
+            raise RuntimeError("trusted Codex App Server launcher is not owner-controlled")
+
+        for ancestor in (target.parent, *target.parent.parents):
+            try:
+                directory = ancestor.lstat()
+            except OSError as exc:
+                raise RuntimeError("trusted Codex App Server launcher is unavailable") from exc
+            directory_mode = stat.S_IMODE(directory.st_mode)
+            private_group_write = (directory.st_gid == directory.st_uid
+                                   and directory_mode & 0o020
+                                   and not directory_mode & 0o002)
+            if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid not in owners
+                    or (directory_mode & 0o022 and not private_group_write)):
+                raise RuntimeError("trusted Codex App Server launcher is not owner-controlled")
+        return target
+
+    @staticmethod
+    def _trusted_environment_path(executable: str, forbidden_root: str | None = None) -> str:
         """Return a PATH made only from owner-controlled executable directories.
 
         The App Server is a controller child, so it must not inherit a caller
@@ -72,12 +141,7 @@ class AppServerCodex:
         """
         owners = {0, os.getuid()} if hasattr(os, "getuid") else {0}
         candidates: list[Path] = []
-        resolved_executable = shutil.which(executable, path=os.environ.get("PATH", os.defpath))
-        if resolved_executable:
-            try:
-                candidates.append(Path(resolved_executable).resolve(strict=True).parent)
-            except OSError:
-                pass
+        candidates.append(AppServerCodex._trusted_executable(executable, forbidden_root).parent)
         candidates.extend(Path(entry) for entry in (
             "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin",
             "/sbin", "/bin",
@@ -90,6 +154,13 @@ class AppServerCodex:
                 continue
             if not resolved.is_dir() or str(resolved) in trusted:
                 continue
+            if forbidden_root is not None:
+                try:
+                    resolved.relative_to(Path(forbidden_root).resolve(strict=True))
+                except ValueError:
+                    pass
+                else:
+                    continue
             safe = True
             for ancestor in (resolved, *resolved.parents):
                 try:
@@ -97,8 +168,12 @@ class AppServerCodex:
                 except OSError:
                     safe = False
                     break
+                directory_mode = stat.S_IMODE(info.st_mode)
+                private_group_write = (info.st_gid == info.st_uid
+                                       and directory_mode & 0o020
+                                       and not directory_mode & 0o002)
                 if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in owners
-                        or stat.S_IMODE(info.st_mode) & 0o022):
+                        or (directory_mode & 0o022 and not private_group_write)):
                     safe = False
                     break
             if safe:
@@ -118,23 +193,35 @@ class AppServerCodex:
         else:
             candidate = Path.home() / ".codex"
         try:
-            original_info = candidate.lstat()
-            if stat.S_ISLNK(original_info.st_mode):
-                raise RuntimeError("Codex authentication home must not be a symlink")
-            resolved = candidate.resolve(strict=True)
-            info = resolved.lstat()
+            lexical = candidate.absolute()
+            resolved = lexical.resolve(strict=True)
+            if lexical != resolved:
+                raise RuntimeError("Codex authentication home must not contain symlinks")
+            uid = os.getuid() if hasattr(os, "getuid") else resolved.lstat().st_uid
+            owners = {0, uid}
+            parts = lexical.parts
+            current = Path(parts[0])
+            for index, component in enumerate(parts):
+                if index == 0:
+                    current = Path(component)
+                else:
+                    current /= component
+                info = current.lstat()
+                mode = stat.S_IMODE(info.st_mode)
+                ancestor = index < len(parts) - 1
+                sticky_shared = ancestor and bool(info.st_mode & stat.S_ISVTX) and bool(mode & 0o022)
+                if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                        or info.st_uid not in (owners if ancestor else {uid})
+                        or (mode & 0o022 and not sticky_shared)):
+                    raise RuntimeError("Codex authentication home is not owner-controlled")
         except OSError as exc:
             raise RuntimeError("Codex authentication home is unavailable") from exc
         except RuntimeError:
             raise
-        uid = os.getuid() if hasattr(os, "getuid") else info.st_uid
-        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != uid
-                or stat.S_ISLNK(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o002):
-            raise RuntimeError("Codex authentication home is not owner-controlled")
         return str(resolved)
 
     @classmethod
-    def _app_server_environment(cls, executable: str) -> dict[str, str]:
+    def _app_server_environment(cls, executable: str, forbidden_root: str | None = None) -> dict[str, str]:
         """Build the App Server's explicit environment allowlist.
 
         Authentication is carried by the deliberately selected ``CODEX_HOME``
@@ -144,7 +231,7 @@ class AppServerCodex:
         """
         code_home = cls._codex_home()
         environment = {
-            "PATH": cls._trusted_environment_path(executable),
+            "PATH": cls._trusted_environment_path(executable, forbidden_root),
             "HOME": "/nonexistent",
             "CODEX_HOME": code_home,
             "LANG": os.environ.get("LANG", "C.UTF-8"),

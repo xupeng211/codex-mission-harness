@@ -961,6 +961,37 @@ class HarnessTest(unittest.TestCase):
         self.assertNotIn(str(attacker_bin), child_env["PATH"])
         adapter.close()
 
+    def test_codex_home_rejects_group_writable_directory_chain(self):
+        codex_home = Path(self.tmp.name) / "group-writable-codex-home"
+        codex_home.mkdir(mode=0o700)
+        codex_home.chmod(0o770)
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
+            with self.assertRaisesRegex(RuntimeError, "owner-controlled"):
+                AppServerCodex._codex_home()
+        codex_home.chmod(0o700)
+        parent = Path(self.tmp.name) / "group-writable-codex-parent"
+        parent.mkdir(mode=0o770)
+        nested = parent / "home"
+        nested.mkdir(mode=0o700)
+        with patch.dict(os.environ, {"CODEX_HOME": str(nested)}):
+            with self.assertRaisesRegex(RuntimeError, "owner-controlled"):
+                AppServerCodex._codex_home()
+        parent.chmod(0o700)
+
+    def test_app_server_rejects_launcher_from_bound_worktree(self):
+        repo = Path(self.tmp.name) / "launcher-repo"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        launcher = repo / "codex"
+        launcher.write_text("#!/bin/sh\nexit 0\n")
+        launcher.chmod(0o755)
+        codex_home = Path(self.tmp.name) / "launcher-codex-home"
+        codex_home.mkdir(mode=0o700)
+        with patch.dict(os.environ, {
+                "PATH": f"{repo}:/usr/bin:/bin", "CODEX_HOME": str(codex_home),
+        }, clear=True), self.assertRaisesRegex(
+                RuntimeError, "inside the mission worktree"):
+            AppServerCodex(worktree=str(repo))
+
     def test_codex_thread_receives_explicit_sensitive_action_boundary(self):
         adapter = AppServerCodex.__new__(AppServerCodex)
         adapter._forbidden_actions = adapter._effective_policy(("merge",))
