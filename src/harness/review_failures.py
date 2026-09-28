@@ -127,7 +127,11 @@ def classify_review_failure(values: Iterable[str]) -> ReviewFailureDetails:
         reason, diagnostic = "transport_interrupted", "reviewer provider transport was interrupted"
     elif status == 400 or any(marker in folded for marker in (
             "invalid_request", "review contract", "receipt missing", "receipt validation",
-            "challenge mismatch", "policy refusal", "policy failure")):
+            "challenge mismatch", "policy refusal", "policy failure",
+            "unrecognized argument", "unrecognized option", "unknown argument", "unknown option",
+            "unexpected argument", "invalid command-line", "invalid cli argument",
+            "configuration error", "failed to parse configuration", "failed to load configuration",
+            "unknown configuration key", "invalid configuration")):
         classification = ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE
         reason, diagnostic = "review_contract_rejected", "review request or receipt contract was rejected"
     elif any(marker in folded for marker in (

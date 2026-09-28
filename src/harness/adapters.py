@@ -1097,26 +1097,27 @@ class FootballPredictionAdapter:
         """Extract only provider error fields from a structured failure event."""
         fields: list[str] = []
         if isinstance(value, dict):
-            for name in ("code", "type", "status", "status_code", "http_status", "message"):
+            status_names = {"status", "status_code", "http_status", "statuscode", "httpstatus"}
+            for name in ("code", "type", "status", "status_code", "http_status",
+                         "statusCode", "httpStatus", "message"):
                 item = value.get(name)
                 if isinstance(item, (str, int)) and not isinstance(item, bool):
-                    fields.append(str(item))
+                    rendered = str(item)
+                    if name.casefold() in status_names:
+                        normalized_status = rendered.strip()
+                        status_text = (normalized_status[5:].strip()
+                                       if normalized_status[:5].casefold() == "http "
+                                       else normalized_status)
+                        if (len(status_text) == 3 and status_text.isdigit()
+                                and status_text[0] in "12345"):
+                            rendered = f"HTTP {status_text}"
+                    fields.append(rendered)
             nested = value.get("error")
             if isinstance(nested, (dict, str)):
                 fields.extend(FootballPredictionAdapter._review_error_fields(nested))
         elif isinstance(value, str):
             fields.append(value)
         return fields
-
-    @staticmethod
-    def _classify_review_error_text(value: str) -> tuple[ReviewFailureClassification, str] | None:
-        """Map bounded error evidence to a type and safe reason code."""
-        details = classify_review_failure([value])
-        if details.classification == ReviewFailureClassification.UNKNOWN_EXTERNAL_FAILURE:
-            # Preserve established behavior for ordinary reviewer prose: only
-            # known, explicit failure signals can drive a retry decision.
-            return None
-        return details.classification, details.reason_code
 
     def _receiptless_review_failure(
         self, *, reviewer: str, worktree: str, base: str, head: str, mission_id: str,
@@ -1131,12 +1132,14 @@ class FootballPredictionAdapter:
             pass
 
         model, reasoning = self.REVIEWER_PROVENANCE.get(reviewer, ("unknown", None))
+        codex_home: str | None = None
         codex_binary: str | None = None
         if reviewer == "codex":
             model, reasoning = "gpt-5.6-sol", "high"
             if not contract_failure:
                 try:
                     policy = self._canonical_codex_reviewer_policy(worktree=worktree, base=base)
+                    codex_home = policy["codex_home"]
                     codex_binary = policy["codex_binary"]
                     model = policy["model"]
                     reasoning = policy["reasoning_effort"]
@@ -1171,9 +1174,14 @@ class FootballPredictionAdapter:
                 if event_type == "turn.completed":
                     turn_completed = True
                 elif event_type in {"turn.failed", "error"}:
-                    error = event.get("error")
-                    if isinstance(error, (dict, str)):
-                        signals.extend(self._review_error_fields(error))
+                    # Codex versions emit both nested errors and flat error
+                    # events (for example {"type":"error","code":...}).
+                    # Read only the allowlisted diagnostic fields and bind
+                    # them together so structured status/code pairs classify.
+                    error_event = {key: value for key, value in event.items() if key != "type"}
+                    error_fields = self._review_error_fields(error_event)
+                    if error_fields:
+                        signals.append(" ".join(error_fields))
                         signal_sources.append("codex_jsonl:" + str(event_type))
 
         if reviewer_stderr is not None:
@@ -1182,6 +1190,13 @@ class FootballPredictionAdapter:
                 signal_sources.append("codex_stderr")
             except UnicodeDecodeError:
                 pass
+        if process_stderr is not None:
+            # The outer process log can contain a CLI/provider diagnostic even
+            # when Codex emitted no JSONL error event. It is inspected in
+            # memory; only its hash and the normalized classification below
+            # are persisted.
+            signals.append(process_stderr[0].decode("utf-8", errors="replace"))
+            signal_sources.append("process_stderr")
 
         # The trusted wrapper's --json failure object is a structured terminal
         # record. Ordinary reviewer text and untyped JSON never enter the
@@ -1213,10 +1228,12 @@ class FootballPredictionAdapter:
                         wrapper_failure = typed_wrapper_failure
                         signal_sources.append("validated_deepseek_failure_artifact")
 
+        failure_details = None
         if contract_failure or turn_completed:
             classification = ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE
             reason_code = ("invalid_receipt_binding" if contract_failure
                            else "completed_turn_without_valid_receipt")
+            failure_details = classify_review_failure(["review contract rejected"])
         elif typed_wrapper_failure is not None:
             classification = ReviewFailureClassification(
                 typed_wrapper_failure["failure_classification"],
@@ -1225,6 +1242,7 @@ class FootballPredictionAdapter:
         else:
             classification = ReviewFailureClassification.UNKNOWN_EXTERNAL_FAILURE
             reason_code = "unclassified_external_failure"
+            failure_details = classify_review_failure([])
             # Prefer non-retryable categories if conflicting diagnostics were
             # captured; only clean capacity/transport evidence may retry.
             for category in (
@@ -1236,11 +1254,11 @@ class FootballPredictionAdapter:
                 ReviewFailureClassification.TRANSIENT_CAPACITY,
                 ReviewFailureClassification.TRANSIENT_TRANSPORT,
             ):
-                match = next((found for signal in signals
-                              if (found := self._classify_review_error_text(signal)) is not None
-                              and found[0] == category), None)
+                match = next((details for signal in signals
+                              if (details := classify_review_failure([signal])).classification == category), None)
                 if match is not None:
-                    classification, reason_code = match
+                    classification, reason_code = match.classification, match.reason_code
+                    failure_details = match
                     break
 
         event_artifact = None
@@ -1258,7 +1276,9 @@ class FootballPredictionAdapter:
             "reviewer": reviewer,
             "model": model,
             "reasoning_effort": reasoning,
+            "codex_home": codex_home,
             "codex_binary": codex_binary,
+            "stage": "review",
             "attempt_id": attempt_id,
             "terminal_status": terminal_status or "UNKNOWN",
             "exit_code": exit_code,
@@ -1267,6 +1287,11 @@ class FootballPredictionAdapter:
             "failure_classification": classification.value,
             "retryable": classification.retryable,
             "reason_code": reason_code,
+            "sanitized_diagnostic": (failure_details.sanitized_diagnostic
+                                     if failure_details is not None else None),
+            "http_status": failure_details.http_status if failure_details is not None else None,
+            "provider_error_code": (failure_details.provider_error_code
+                                    if failure_details is not None else None),
             "signal_sources": sorted(set(signal_sources)),
             "event_log": event_artifact,
             "codex_stderr_log": codex_stderr_artifact,

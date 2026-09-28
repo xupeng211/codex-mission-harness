@@ -130,7 +130,7 @@ class HarnessTest(unittest.TestCase):
         path.chmod(0o600)
 
     def _receiptless_codex_attempt(self, *, error: str, events: list[dict] | None,
-                                   attempt_id: str = "a" * 32):
+                                   attempt_id: str = "a" * 32, stderr: str = ""):
         adapter, worktree, evidence, _, stdout = self._review_fixture()
         self._write_private_review_log(stdout, json.dumps({"status": "FAIL", "error": error}) + "\n")
         event_path = evidence / f"codex-review-output-{'b' * 12}-{attempt_id}.jsonl"
@@ -140,7 +140,7 @@ class HarnessTest(unittest.TestCase):
                 "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
             )
         process_stderr = Path(self.tmp.name) / f"{attempt_id}.stderr"
-        self._write_private_review_log(process_stderr, b"")
+        self._write_private_review_log(process_stderr, stderr)
         with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
                 patch.object(adapter, "_repo_from_origin", return_value="owner/project"), \
                 patch.object(adapter, "_canonical_codex_reviewer_policy", return_value={
@@ -3615,6 +3615,9 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
                 self.assertEqual(evidence["head_sha"], "b" * 40)
                 self.assertEqual(evidence["model"], "gpt-5.6-sol")
                 self.assertEqual(evidence["reasoning_effort"], "high")
+                self.assertEqual(evidence["codex_home"], "/private/canonical-codex-reviewer")
+                self.assertEqual(evidence["codex_binary"], "/usr/lib/chatgpt/resources/codex")
+                self.assertEqual(evidence["stage"], "review")
                 self.assertEqual(evidence["attempt_id"], attempt_id)
                 self.assertEqual(evidence["terminal_status"], "EXITED")
                 self.assertEqual(evidence["failure_classification"], classification.value)
@@ -3626,6 +3629,87 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
                 )
                 self.assertNotIn("fixture-secret", evidence_bytes.decode("utf-8"))
                 self.assertNotIn("access_token", evidence_bytes.decode("utf-8"))
+
+    def test_codex_failure_evidence_classifies_flat_events_and_process_stderr(self):
+        cases = (
+            (
+                "flat_capacity", "outer reviewer exited 1",
+                [{"type": "error", "status": 429, "code": "overloaded_error",
+                  "message": "Selected model is at capacity"}], "",
+                ReviewFailureClassification.TRANSIENT_CAPACITY, True, 429,
+                "overloaded_error",
+                "provider returned HTTP 429; provider capacity is temporarily unavailable",
+            ),
+            (
+                "flat_auth", "outer reviewer exited 1",
+                [{"type": "error", "status": 401, "code": "token_revoked",
+                  "message": "authorization failed"}], "",
+                ReviewFailureClassification.AUTHENTICATION_FAILURE, False, 401,
+                "token_revoked", "provider returned HTTP 401; provider rejected reviewer authentication",
+            ),
+            (
+                "flat_model", "outer reviewer exited 1",
+                [{"type": "turn.failed", "error": {
+                    "code": "unsupported_model", "message": "model not supported",
+                }}], "",
+                ReviewFailureClassification.MODEL_UNAVAILABLE_OR_UNSUPPORTED, False, None,
+                "unsupported_model", "requested reviewer model is unavailable or unsupported",
+            ),
+            (
+                "stderr_transport", "outer reviewer exited 1", [],
+                "request timeout; ETIMEDOUT while connecting",
+                ReviewFailureClassification.TRANSIENT_TRANSPORT, True, None,
+                "etimedout", "reviewer provider transport was interrupted",
+            ),
+            (
+                "local_cli", "outer reviewer exited 1", [],
+                "error: unexpected argument --ask-for-approval",
+                ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE, False, None,
+                None, "review request or receipt contract was rejected",
+            ),
+            (
+                "opaque", "outer reviewer exited 1", [], "opaque subprocess failure",
+                ReviewFailureClassification.UNKNOWN_EXTERNAL_FAILURE, False, None,
+                None, "reviewer failure did not match a known safe diagnostic",
+            ),
+        )
+        for attempt_number, (name, wrapper_error, events, stderr, classification,
+                             retryable, http_status, provider_code, diagnostic) in enumerate(cases, 20):
+            with self.subTest(name=name):
+                result, _ = self._receiptless_codex_attempt(
+                    error=wrapper_error, events=events,
+                    attempt_id=f"{attempt_number:032x}", stderr=stderr,
+                )
+                self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+                self.assertIsNone(result.artifact)
+                self.assertEqual(result.failure_classification, classification)
+                self.assertEqual(result.data["retryable"], retryable)
+                record = json.loads(Path(result.data["failure_evidence_path"]).read_text())
+                self.assertEqual(record["failure_classification"], classification.value)
+                self.assertEqual(record["retryable"], retryable)
+                self.assertEqual(record["http_status"], http_status)
+                self.assertEqual(record["provider_error_code"], provider_code)
+                self.assertEqual(record["sanitized_diagnostic"], diagnostic)
+                self.assertEqual(record["turn_completed"], False)
+                self.assertEqual(record["exit_code"], 1)
+
+    def test_codex_failure_evidence_never_echoes_secret_diagnostic(self):
+        secret = "sk-fixture-secret-never-persist"
+        result, _ = self._receiptless_codex_attempt(
+            error=f"Selected model is at capacity; bearer {secret}",
+            events=[{"type": "error", "message": f"capacity; access_token={secret}"}],
+            attempt_id="f" * 32,
+        )
+        evidence_path = Path(result.data["failure_evidence_path"])
+        evidence_bytes = evidence_path.read_bytes()
+        evidence = json.loads(evidence_bytes)
+        self.assertEqual(result.failure_classification,
+                         ReviewFailureClassification.TRANSIENT_CAPACITY)
+        self.assertEqual(evidence["sanitized_diagnostic"],
+                         "provider capacity is temporarily unavailable")
+        self.assertNotIn(secret.encode(), evidence_bytes)
+        self.assertNotIn(b"bearer", evidence_bytes.lower())
+        self.assertNotIn(b"access_token", evidence_bytes.lower())
 
     def _deepseek_receiptless_wrapper_result(self, *, tamper_sidecar=False):
         adapter, worktree, evidence_dir, _, stdout = self._review_fixture("deepseek")
