@@ -26,16 +26,46 @@ review.validate = _validated
 
 def receipt(**overrides):
     source = b"fixture diff\n"
-    aggregate = {"review_result": "PASS", "findings": [], "dispositions": []}
     value = {"version": review.VERSION, "repository": "fixture", "mission_id": "fixture", "base_sha": BASE, "head_sha": HEAD,
              "diff_sha256": "d" * 64, "manifest_sha256": "e" * 64,
              "chunks": [{"index": 0, "start": 0, "end": len(source), "sha256": review.digest(source),
                          "output_sha256": "f" * 64, "result": {"review_result": "PASS", "findings": []}}],
-             "chunk_findings": [], "aggregate_result": aggregate,
+             "groups": [], "group_manifest_sha256": "e" * 64,
+             "chunk_findings": [],
              "aggregate_output_sha256": "g" * 64,
              "provider": "deepseek", "model": review.MODEL, "command_sha256": "c" * 64,
+             "aggregate_result": {"review_result": "PASS", "findings": [], "dispositions": []},
              "review_result": "PASS", "findings": []}
-    value.update(overrides); value["integrity_sha256"] = review.digest(review.canon(value)); value["auth_hmac_sha256"] = review.auth_digest(value, TEST_SECRET); return value
+    value.update(overrides)
+    if "chunk_findings" not in overrides:
+        value["chunk_findings"]=[finding for chunk in value["chunks"]
+                                 for finding in chunk.get("result",{}).get("findings",[])]
+    if "groups" not in overrides:
+        try: layout=review.aggregate_group_layout(value["chunks"])
+        except (KeyError,TypeError): layout=[]
+        groups=[]
+        for item in layout:
+            selected=[chunk for chunk in value["chunks"] if chunk["index"] in item["chunk_indexes"]]
+            _,required=review.indexed_chunk_findings(selected)
+            dispositions=[{**entry,"decision":"DISPUTED",
+                           "rationale":"The complete bounded group source disproves this finding."}
+                          for entry in required]
+            result={"review_result":"PASS","findings":[],"dispositions":dispositions,
+                    "summary":"The reviewed group changes no interfaces or state transitions."}
+            groups.append({**item,"sha256":"d"*64,"output_sha256":"h"*64,"result":result})
+        value["groups"]=groups
+    if "aggregate_result" not in overrides:
+        value["aggregate_result"]={"review_result":"PASS","findings":[],"dispositions":[]}
+    if "review_result" not in overrides:
+        value["review_result"]=value["aggregate_result"]["review_result"]
+    if "findings" not in overrides:
+        value["findings"]=value["aggregate_result"]["findings"]
+    if "group_manifest_sha256" not in overrides:
+        value["group_manifest_sha256"] = review.aggregate_group_manifest_hash(
+            value["base_sha"], value["head_sha"], value["diff_sha256"],
+            value["manifest_sha256"], value["groups"],
+        )
+    value["integrity_sha256"] = review.digest(review.canon(value)); value["auth_hmac_sha256"] = review.auth_digest(value, TEST_SECRET); return value
 
 def disposition_for(item, *, decision="DISPUTED", chunk_index=0, finding_index=0):
     rationale = (
@@ -50,6 +80,16 @@ def disposition_for(item, *, decision="DISPUTED", chunk_index=0, finding_index=0
         "finding_sha256": review.digest(review.canon(item)),
         "decision": decision,
         "rationale": rationale,
+    }
+
+def group_disposition_for(item, *, decision="UPHELD", group_index=0, finding_index=0):
+    return {
+        "group_index": group_index,
+        "finding_index": finding_index,
+        "source_severity": item["severity"],
+        "finding_sha256": review.digest(review.canon(item)),
+        "decision": decision,
+        "rationale": "The bounded group review confirms this finding across the edited source.",
     }
 
 
@@ -79,7 +119,11 @@ def run_fixture(root, *, large_diff=False):
 class DeepSeekReceiptTest(unittest.TestCase):
     def test_chunk_and_aggregate_schemas_have_separate_disposition_contracts(self):
         self.assertNotIn("dispositions", review.CHUNK_SCHEMA["properties"])
-        self.assertIn("dispositions", review.AGGREGATE_SCHEMA["properties"])
+        self.assertIn("dispositions", review.GROUP_SCHEMA["properties"])
+        self.assertIn("summary", review.GROUP_SCHEMA["required"])
+        self.assertIn("chunk_index", review.GROUP_SCHEMA["properties"]["dispositions"]["items"]["properties"])
+        self.assertIn("group_index", review.AGGREGATE_SCHEMA["properties"]["dispositions"]["items"]["properties"])
+        self.assertEqual(review.AGGREGATE_SCHEMA["properties"]["dispositions"]["items"]["properties"]["decision"]["enum"],["UPHELD"])
         self.assertIn("dispositions", review.AGGREGATE_SCHEMA["required"])
 
     def test_claude_launcher_resolution_excludes_relative_and_reviewed_tree_paths(self):
@@ -138,6 +182,15 @@ class DeepSeekReceiptTest(unittest.TestCase):
         first, second = review.chunks(diff), review.chunks(diff)
         self.assertEqual(first, second); self.assertEqual(first[0]["start"], 0); self.assertEqual(first[-1]["end"], len(diff))
         self.assertEqual(b"".join(diff[c["start"]:c["end"]] for c in first), diff)
+    def test_aggregate_groups_are_deterministic_bounded_and_cover_every_chunk(self):
+        diff=(b"line\n"*120000); plan=review.chunks(diff)
+        first=review.aggregate_groups(diff,plan); second=review.aggregate_groups(diff,plan)
+        self.assertEqual(first,second)
+        self.assertGreater(len(first),1)
+        self.assertEqual([i for group in first for i in group["chunk_indexes"]],
+                         list(range(len(plan))))
+        self.assertEqual(b"".join(diff[g["start"]:g["end"]] for g in first),diff)
+        self.assertTrue(all(g["end"]-g["start"]<=review.AGGREGATE_GROUP_BYTES for g in first))
     def test_valid_exact_receipt(self): self.assertEqual(review.validate(receipt(), BASE, HEAD)["review_result"], "PASS")
     def test_wrong_head_and_base_rejected(self):
         with self.assertRaises(ValueError): review.validate(receipt(), BASE, "c" * 40)
@@ -166,23 +219,35 @@ class DeepSeekReceiptTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "authentication"):
             _validate(value, BASE, HEAD, secret="wrong-secret")
         self.assertEqual(_validate(value, BASE, HEAD, secret=TEST_SECRET)["review_result"], "PASS")
+
+    def test_group_manifest_binds_exact_group_coverage_and_source_hashes(self):
+        value=receipt(); value["groups"][0]["sha256"]="0"*64
+        value["integrity_sha256"]=review.digest(review.canon({k:v for k,v in value.items()
+                                                               if k not in {"integrity_sha256","auth_hmac_sha256"}}))
+        value["auth_hmac_sha256"]=review.auth_digest(value,TEST_SECRET)
+        with self.assertRaisesRegex(ValueError,"aggregate group manifest hash mismatch"):
+            review.validate(value,BASE,HEAD)
     def test_blocking_finding_requires_fail(self):
         finding = {"severity": "P1", "title": "x", "evidence": "y"}
         with self.assertRaises(ValueError): review.validate(receipt(findings=[finding]), BASE, HEAD)
         chunks = receipt()["chunks"]; chunks[0]["result"] = {"review_result": "FAIL", "findings": [finding]}
+        group = receipt(chunks=chunks)["groups"][0]
+        group["result"] = {"review_result": "FAIL", "findings": [finding],
+                           "dispositions": [disposition_for(finding, decision="UPHELD")],
+                           "summary": "The group review confirms the finding across the edited source."}
         value = receipt(review_result="FAIL", findings=[finding], chunks=chunks,
-                        chunk_findings=[finding],
-                        aggregate_result={"review_result": "FAIL", "findings": [finding],
-                                          "dispositions": [disposition_for(finding, decision="UPHELD")]})
+                        chunk_findings=[finding], groups=[group],
+                        aggregate_result={"review_result":"FAIL","findings":[finding],
+                                          "dispositions":[group_disposition_for(finding)]})
         self.assertEqual(review.validate(value, BASE, HEAD)["review_result"], "FAIL")
 
     def test_v2_deepseek_receipt_is_stale_under_disposition_policy(self):
         with self.assertRaisesRegex(ValueError, "exact-head binding"):
             review.validate(receipt(version="cmh-deepseek-review/v2"), BASE, HEAD)
 
-    def test_v3_deepseek_receipt_is_stale_under_credential_free_repository_policy(self):
+    def test_v4_deepseek_receipt_is_stale_under_bounded_aggregation_policy(self):
         with self.assertRaisesRegex(ValueError, "exact-head binding"):
-            review.validate(receipt(version="cmh-deepseek-review/v3"), BASE, HEAD)
+            review.validate(receipt(version="cmh-deepseek-review/v4"), BASE, HEAD)
 
     def test_repository_identity_removes_remote_credentials_and_query_data(self):
         cases = {
@@ -208,26 +273,17 @@ class DeepSeekReceiptTest(unittest.TestCase):
         finding = {"severity": "P2", "title": "localized concern", "evidence": "chunk evidence"}
         chunks = receipt()["chunks"]
         chunks[0]["result"] = {"review_result": "FAIL", "findings": [finding]}
-        value = receipt(
-            chunks=chunks,
-            chunk_findings=[finding],
-            aggregate_result={
-                "review_result": "PASS", "findings": [],
-                "dispositions": [disposition_for(finding)],
-            },
-            review_result="PASS", findings=[],
-        )
+        value = receipt(chunks=chunks,chunk_findings=[finding])
         self.assertEqual(review.validate(value, BASE, HEAD)["review_result"], "PASS")
 
     def test_blocking_chunk_finding_cannot_be_silently_dropped(self):
         finding = {"severity": "P1", "title": "must be accounted for", "evidence": "chunk"}
         chunks = receipt()["chunks"]
         chunks[0]["result"] = {"review_result": "FAIL", "findings": [finding]}
-        value = receipt(
-            chunks=chunks, chunk_findings=[finding],
-            aggregate_result={"review_result": "PASS", "findings": [], "dispositions": []},
-            review_result="PASS", findings=[],
-        )
+        group=receipt(chunks=chunks)["groups"][0]
+        group["result"]={"review_result":"PASS","findings":[],"dispositions":[],
+                         "summary":"The group review does not identify any changed interfaces."}
+        value = receipt(chunks=chunks,chunk_findings=[finding],groups=[group])
         with self.assertRaisesRegex(ValueError, "omitted a blocking chunk finding disposition"):
             review.validate(value, BASE, HEAD)
 
@@ -237,12 +293,10 @@ class DeepSeekReceiptTest(unittest.TestCase):
         chunks[0]["result"] = {"review_result": "FAIL", "findings": [finding]}
         bad_disposition = disposition_for(finding)
         bad_disposition["finding_sha256"] = "0" * 64
-        value = receipt(
-            chunks=chunks, chunk_findings=[finding],
-            aggregate_result={"review_result": "PASS", "findings": [],
-                              "dispositions": [bad_disposition]},
-            review_result="PASS", findings=[],
-        )
+        group=receipt(chunks=chunks)["groups"][0]
+        group["result"]={"review_result":"PASS","findings":[],"dispositions":[bad_disposition],
+                         "summary":"The group review does not identify any changed interfaces."}
+        value = receipt(chunks=chunks,chunk_findings=[finding],groups=[group])
         with self.assertRaisesRegex(ValueError, "does not bind the chunk finding"):
             review.validate(value, BASE, HEAD)
 
@@ -250,12 +304,11 @@ class DeepSeekReceiptTest(unittest.TestCase):
         finding = {"severity": "P1", "title": "upheld concern", "evidence": "chunk"}
         chunks = receipt()["chunks"]
         chunks[0]["result"] = {"review_result": "FAIL", "findings": [finding]}
-        value = receipt(
-            chunks=chunks, chunk_findings=[finding],
-            aggregate_result={"review_result": "PASS", "findings": [],
-                              "dispositions": [disposition_for(finding, decision="UPHELD")]},
-            review_result="PASS", findings=[],
-        )
+        group=receipt(chunks=chunks)["groups"][0]
+        group["result"]={"review_result":"PASS","findings":[],
+                         "dispositions":[disposition_for(finding,decision="UPHELD")],
+                         "summary":"The group review does not identify any changed interfaces."}
+        value = receipt(chunks=chunks,chunk_findings=[finding],groups=[group])
         with self.assertRaisesRegex(ValueError, "omitted an upheld blocking chunk finding"):
             review.validate(value, BASE, HEAD)
 
@@ -263,12 +316,11 @@ class DeepSeekReceiptTest(unittest.TestCase):
         finding = {"severity": "P2", "title": "disputed concern", "evidence": "chunk"}
         chunks = receipt()["chunks"]
         chunks[0]["result"] = {"review_result": "FAIL", "findings": [finding]}
-        value = receipt(
-            chunks=chunks, chunk_findings=[finding],
-            aggregate_result={"review_result": "FAIL", "findings": [finding],
-                              "dispositions": [disposition_for(finding)]},
-            review_result="FAIL", findings=[finding],
-        )
+        group=receipt(chunks=chunks)["groups"][0]
+        group["result"]={"review_result":"FAIL","findings":[finding],
+                         "dispositions":[disposition_for(finding)],
+                         "summary":"The group review confirms the finding across the edited source."}
+        value = receipt(chunks=chunks,chunk_findings=[finding],groups=[group])
         with self.assertRaisesRegex(ValueError, "both disputed and upheld"):
             review.validate(value, BASE, HEAD)
 
@@ -300,12 +352,14 @@ class DeepSeekReceiptTest(unittest.TestCase):
         finding = {"severity": "P1", "title": "must survive", "evidence": "chunk"}
         chunks = receipt()["chunks"]
         chunks[0]["result"] = {"review_result": "FAIL", "findings": [finding]}
-        value = receipt(
-            chunks=chunks, chunk_findings=[finding],
-            aggregate_result={"review_result": "PASS", "findings": []},
-            findings=[], review_result="PASS",
-        )
-        with self.assertRaisesRegex(ValueError, "omitted blocker dispositions"):
+        group=receipt(chunks=chunks)["groups"][0]
+        group["result"]={"review_result":"FAIL","findings":[finding],
+                         "dispositions":[disposition_for(finding,decision="UPHELD")],
+                         "summary":"The group review confirms the finding across the edited source."}
+        value = receipt(chunks=chunks,chunk_findings=[finding],groups=[group],
+                        aggregate_result={"review_result":"FAIL","findings":[finding],"dispositions":[]},
+                        findings=[finding],review_result="FAIL")
+        with self.assertRaisesRegex(ValueError, "omitted a blocking chunk finding disposition"):
             review.validate(value, BASE, HEAD)
     def test_durable_artifact_result_must_match_receipt_chunk(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -322,6 +376,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
             value["chunks"][0]["output_sha256"] = review.sha(artifact)
             source = b"fixture diff\n"
             value["diff_sha256"] = review.digest(source)
+            value["groups"][0]["sha256"] = review.digest(source)
             manifest = {
                 "version": "cmh-deepseek-chunks/v2", "base_sha": BASE,
                 "head_sha": HEAD, "diff_sha256": value["diff_sha256"],
@@ -329,6 +384,9 @@ class DeepSeekReceiptTest(unittest.TestCase):
                             for key in ("index", "start", "end", "sha256")}],
             }
             value["manifest_sha256"] = review.digest(review.canon(manifest))
+            value["group_manifest_sha256"] = review.aggregate_group_manifest_hash(
+                BASE,HEAD,value["diff_sha256"],value["manifest_sha256"],value["groups"],
+            )
             payload = {key: item for key, item in value.items()
                        if key not in {"integrity_sha256", "auth_hmac_sha256"}}
             value["integrity_sha256"] = review.digest(review.canon(payload))
@@ -447,21 +505,34 @@ class DeepSeekReceiptTest(unittest.TestCase):
         self.assertIn("ZGlmZiAtLWdpdCBhL3ggYi94Civ/AAo=", rendered)
         self.assertNotIn("\ufffd", rendered)
 
-    def test_aggregate_prompt_provides_precomputed_blocker_indices_and_hashes(self):
+    def test_group_and_final_prompts_bind_blocker_dispositions(self):
         blocker = {"severity": "P2", "title": "concern", "evidence": "chunk detail"}
-        chunks = [{"index": 2, "result": {"findings": [blocker]}}]
+        chunks = [{"index": 2,"start":0,"end":11,"sha256":"a"*64,
+                   "result": {"findings": [blocker]}}]
         indexed, required = review.indexed_chunk_findings(chunks)
         source = b"exact diff\n"
-        rendered = review.aggregate_prompt(
-            BASE, HEAD, "d" * 64, "e" * 64, chunks, source, indexed, required,
+        group={"index":0,"start":0,"end":len(source),"chunk_indexes":[2],
+               "sha256":review.digest(source)}
+        group_rendered = review.aggregate_group_prompt(
+            BASE,HEAD,"d"*64,"e"*64,"f"*64,group,chunks,source,indexed,required,
         )
         self.assertEqual(required, [{
             "chunk_index": 2, "finding_index": 0, "source_severity": "P2",
             "finding_sha256": review.digest(review.canon(blocker)),
         }])
-        self.assertIn('"chunk_index": 2', rendered)
-        self.assertIn('"finding_sha256": "' + review.digest(review.canon(blocker)) + '"', rendered)
-        self.assertIn("do not calculate, modify, omit, or duplicate these values", rendered)
+        self.assertIn('"chunk_index": 2', group_rendered)
+        self.assertIn('"finding_sha256": "' + review.digest(review.canon(blocker)) + '"', group_rendered)
+        self.assertIn("do not calculate, modify, omit, or duplicate these values", group_rendered)
+        group_result={"review_result":"FAIL","findings":[blocker],"summary":"A bounded group summary."}
+        groups=[{**group,"output_sha256":"0"*64,"result":group_result}]
+        final_findings,final_required=review.indexed_chunk_findings(
+            [{"index":0,"result":group_result}],source_index_field="group_index",
+        )
+        final_rendered=review.aggregate_prompt(
+            BASE,HEAD,"d"*64,"e"*64,"f"*64,groups,final_findings,final_required,
+        )
+        self.assertIn('"group_index": 0',final_rendered)
+        self.assertIn("this synthesis does not have the source needed to dispute one",final_rendered)
     def test_reviewer_result_rejects_invalid_shape(self):
         with self.assertRaisesRegex(ValueError, "invalid reviewer output"):
             review.reviewer_result('{"review_result":"PASS","findings":"not-a-list"}')
@@ -533,8 +604,11 @@ class DeepSeekReceiptTest(unittest.TestCase):
                     name: value for name, value in env.items()
                     if name not in {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}
                 }))
-                if prompt_text.startswith("You are the final independent reviewer"):
+                if prompt_text.startswith("You are the final cross-group independent reviewer"):
                     result = {"review_result": "PASS", "findings": [], "dispositions": []}
+                elif prompt_text.startswith("You are an independent synthesis reviewer"):
+                    result = {"review_result":"PASS","findings":[],"dispositions":[],
+                              "summary":"The reviewed group changes no interfaces or state transitions."}
                 else:
                     result = {"review_result": "PASS", "findings": []}
                 return subprocess.CompletedProcess(["claude"], 0, json.dumps(result), "")
@@ -554,7 +628,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
                 review.run(args)
                 second_result = json.loads(captured.getvalue())
 
-            self.assertEqual(len(invocations), 4)
+            self.assertEqual(len(invocations), 6)
             self.assertFalse(textconv_marker.exists())
             for command, env in invocations:
                 self.assertEqual(command[0], "/trusted/bin/claude")
@@ -573,7 +647,8 @@ class DeepSeekReceiptTest(unittest.TestCase):
                 for credential in (b"review-user", b"review-password", b"review-token"):
                     self.assertNotIn(credential, receipt_bytes)
             expected_command_hash = review.digest(review.canon({
-                "chunk": invocations[0][0], "aggregate": invocations[1][0],
+                "chunk": invocations[0][0], "group": invocations[1][0],
+                "aggregate": invocations[2][0],
             }))
             self.assertEqual(
                 json.loads(first_receipt.read_text())["command_sha256"],
@@ -592,6 +667,90 @@ class DeepSeekReceiptTest(unittest.TestCase):
                     )
             self.assertFalse(textconv_marker.exists())
 
+    def test_large_diff_uses_bounded_hierarchy_and_commit_last_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args,evidence=run_fixture(Path(tmp),large_diff=True)
+            diff=subprocess.check_output([
+                "git","-C",args.repo,"diff","--no-ext-diff","--no-textconv",
+                "--binary",f"{args.base}..{args.head}",
+            ])
+            invocations=[]
+            def responder(command,prompt_text,env,timeout):
+                invocations.append(prompt_text)
+                if self._aggregate_prompt(prompt_text):
+                    self.assertFalse(list(evidence.rglob("aggregate.json")))
+                    self.assertFalse(list(evidence.rglob("deepseek-receipt-*.json")))
+                    result={"review_result":"PASS","findings":[],"dispositions":[]}
+                elif self._group_prompt(prompt_text):
+                    result={"review_result":"PASS","findings":[],"dispositions":[],
+                            "summary":"This group changes no interfaces or state transitions."}
+                else:
+                    result={"review_result":"PASS","findings":[]}
+                self.assertLessEqual(len(prompt_text.encode()),review.MAX_REVIEW_PROMPT_BYTES)
+                return subprocess.CompletedProcess(["claude"],0,json.dumps(result),"")
+            with contextlib.redirect_stdout(io.StringIO()) as captured:
+                self._execute_review(args,responder)
+            payload=json.loads(captured.getvalue()); receipt_path=Path(payload["receipt"])
+            receipt_value=json.loads(receipt_path.read_text())
+            self.assertEqual(payload["status"],"PASS")
+            self.assertEqual(receipt_value["diff_sha256"],review.digest(diff))
+            self.assertEqual(len(receipt_value["chunks"]),len(review.chunks(diff)))
+            groups=receipt_value["groups"]
+            self.assertGreater(len(groups),1)
+            self.assertEqual([index for group in groups for index in group["chunk_indexes"]],
+                             list(range(len(receipt_value["chunks"]))))
+            self.assertTrue(all(group["end"]-group["start"]<=review.AGGREGATE_GROUP_BYTES
+                                for group in groups))
+            final_prompt=invocations[-1]
+            self.assertIn("ReviewedGroupSummaries=",final_prompt)
+            self.assertNotIn("UTF-8 COMPLETE DIFF:",final_prompt)
+            self.assertNotIn("diff --git",final_prompt)
+            self.assertEqual(len(invocations),len(receipt_value["chunks"])+len(groups)+1)
+            self.assertEqual(review.validate(
+                receipt_value,args.base,args.head,args.repo,receipt_path,"fixture",
+                "git@github.com:fixture/repo.git",
+            )["review_result"],"PASS")
+            for group in groups:
+                artifact=receipt_path.parent/f"group-{group['index']:03d}.json"
+                self.assertEqual(review.sha(artifact),group["output_sha256"])
+
+    def test_group_cannot_omit_chunk_blocker_or_publish_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args,evidence=run_fixture(Path(tmp)); finding={
+                "severity":"P1","title":"chunk blocker","evidence":"exact chunk evidence",
+            }
+            def responder(command,prompt_text,env,timeout):
+                if self._aggregate_prompt(prompt_text):
+                    self.fail("final aggregation must not run after a group drops a blocker")
+                if self._group_prompt(prompt_text):
+                    result={"review_result":"PASS","findings":[],"dispositions":[],
+                            "summary":"The group summary intentionally omits a source blocker."}
+                else:
+                    result={"review_result":"FAIL","findings":[finding]}
+                return subprocess.CompletedProcess(["claude"],0,json.dumps(result),"")
+            with self.assertRaises(review.ReviewAttemptFailure) as caught:
+                self._execute_review(args,responder)
+            record,_=self._failure_record(caught)
+            self.assertEqual(record["stage"],"aggregate_group")
+            self.assertEqual(record["group_index"],0)
+            self.assertEqual(record["failure_classification"],"POLICY_OR_CONTRACT_FAILURE")
+            self.assertEqual(len(record["completed_chunk_artifacts"]),1)
+            self.assertFalse(record["completed_group_artifacts"])
+            self.assertTrue(list(evidence.rglob("chunk-000.json")))
+            self.assertFalse(list(evidence.rglob("group-000.json")))
+            self.assertFalse(list(evidence.rglob("aggregate.json")))
+            self.assertFalse(list(evidence.rglob("deepseek-receipt-*.json")))
+
+    def test_final_synthesis_cannot_dispute_a_group_blocker(self):
+        finding={"severity":"P1","title":"group blocker","evidence":"bounded source evidence"}
+        groups=[{"index":0,"result":{"findings":[finding]}}]
+        required=group_disposition_for(finding,decision="DISPUTED")
+        with self.assertRaisesRegex(ValueError,"cannot dispute"):
+            review.validate_blocker_dispositions(
+                groups,{"findings":[],"dispositions":[required]},
+                allow_disputes=False,source_index_field="group_index",
+            )
+
     def _execute_review(self, args, responder):
         with patch.object(review, "resolve_claude_launcher",
                           return_value=("/trusted/bin/claude", "/trusted/bin:/usr/bin")), \
@@ -603,9 +762,21 @@ class DeepSeekReceiptTest(unittest.TestCase):
             ["claude"], 0, json.dumps({"review_result": "PASS", "findings": []}), "",
         )
 
+    def _successful_group(self):
+        result={"review_result":"PASS","findings":[],"dispositions":[],
+                "summary":"The reviewed group changes no interfaces or state transitions."}
+        return subprocess.CompletedProcess(["claude"],0,json.dumps(result),"")
+
     @staticmethod
     def _aggregate_prompt(prompt_text):
-        return prompt_text.startswith("You are the final independent reviewer")
+        return prompt_text.startswith("You are the final cross-group independent reviewer")
+
+    @staticmethod
+    def _group_prompt(prompt_text):
+        return prompt_text.startswith("You are an independent synthesis reviewer")
+
+    def _successful_nonfinal_prompt(self,prompt_text):
+        return self._successful_group() if self._group_prompt(prompt_text) else self._successful_chunk()
 
     def _failure_record(self, caught):
         self.assertIsNotNone(caught.exception.evidence_path)
@@ -651,7 +822,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
 
                 def responder(command, prompt_text, env, timeout):
                     if not self._aggregate_prompt(prompt_text):
-                        return self._successful_chunk()
+                        return self._successful_nonfinal_prompt(prompt_text)
                     return subprocess.CompletedProcess(["claude"], 1, stdout, stderr)
 
                 with self.assertRaises(review.ReviewAttemptFailure) as caught:
@@ -684,7 +855,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
 
             def responder(command, prompt_text, env, timeout):
                 if not self._aggregate_prompt(prompt_text):
-                    return self._successful_chunk()
+                    return self._successful_nonfinal_prompt(prompt_text)
                 raise subprocess.TimeoutExpired(command, timeout, output=b"request timed out")
 
             with self.assertRaises(review.ReviewAttemptFailure) as caught:
@@ -707,8 +878,9 @@ class DeepSeekReceiptTest(unittest.TestCase):
 
             def responder(command, prompt_text, env, timeout):
                 if not self._aggregate_prompt(prompt_text):
-                    completed.append(prompt_text)
-                    return self._successful_chunk()
+                    if not self._group_prompt(prompt_text):
+                        completed.append(prompt_text)
+                    return self._successful_nonfinal_prompt(prompt_text)
                 return subprocess.CompletedProcess(
                     ["claude"], 1, "Selected model is at capacity", "",
                 )
@@ -720,9 +892,12 @@ class DeepSeekReceiptTest(unittest.TestCase):
             self.assertEqual(record["stage"], "aggregate")
             self.assertEqual(record["failure_classification"], "TRANSIENT_CAPACITY")
             self.assertEqual(len(record["completed_chunk_artifacts"]), 17)
+            self.assertGreater(len(record["completed_group_artifacts"]),1)
             failure_dir = Path(caught.exception.evidence_path).parent
             self.assertTrue(all((failure_dir / item["path"]).is_file()
                                 for item in record["completed_chunk_artifacts"]))
+            self.assertTrue(all((failure_dir / item["path"]).is_file()
+                                for item in record["completed_group_artifacts"]))
             self.assertEqual(len(list(evidence.rglob("chunk-*.json"))), 17)
             self.assertFalse(list(evidence.rglob("aggregate.json")))
             self.assertFalse(list(evidence.rglob("deepseek-receipt-*.json")))
@@ -733,7 +908,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
 
             def responder(command, prompt_text, env, timeout):
                 if not self._aggregate_prompt(prompt_text):
-                    return self._successful_chunk()
+                    return self._successful_nonfinal_prompt(prompt_text)
                 return subprocess.CompletedProcess(["claude"], 0, "not-json", "")
 
             with self.assertRaises(review.ReviewAttemptFailure) as caught:
@@ -767,7 +942,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
 
             def responder(command, prompt_text, env, timeout):
                 if not self._aggregate_prompt(prompt_text):
-                    return self._successful_chunk()
+                    return self._successful_nonfinal_prompt(prompt_text)
                 return subprocess.CompletedProcess(["claude"], 1, "", TEST_SECRET)
 
             with self.assertRaises(review.ReviewAttemptFailure) as caught:
@@ -788,7 +963,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
 
             def responder(command, prompt_text, env, timeout):
                 if not self._aggregate_prompt(prompt_text):
-                    return self._successful_chunk()
+                    return self._successful_nonfinal_prompt(prompt_text)
                 return subprocess.CompletedProcess(
                     ["claude"], 0,
                     json.dumps({"review_result": "PASS", "findings": []}), "",

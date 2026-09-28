@@ -21,10 +21,12 @@ from harness.review_failures import (  # noqa: E402
     classify_review_failure,
 )
 
-VERSION = "cmh-deepseek-review/v4"
+VERSION = "cmh-deepseek-review/v5"
 MODEL = "deepseek-flash"
 ENDPOINT = "https://api.deepseek.com/anthropic"
 CHUNK_BYTES = 32000
+AGGREGATE_GROUP_BYTES = 96000
+MAX_REVIEW_PROMPT_BYTES = 400000
 _GIT_ENV = {
     "PATH": os.defpath,
     "HOME": "/nonexistent",
@@ -74,6 +76,21 @@ _DISPOSITION_SCHEMA = {
         },
     },
 }
+_FINAL_DISPOSITION_SCHEMA = {
+    "type": "array", "items": {
+        "type": "object", "additionalProperties": False,
+        "required": ["group_index", "finding_index", "source_severity",
+                     "finding_sha256", "decision", "rationale"],
+        "properties": {
+            "group_index": {"type": "integer", "minimum": 0},
+            "finding_index": {"type": "integer", "minimum": 0},
+            "source_severity": {"enum": ["P0", "P1", "P2"]},
+            "finding_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "decision": {"enum": ["UPHELD"]},
+            "rationale": {"type": "string", "minLength": 24},
+        },
+    },
+}
 CHUNK_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -84,7 +101,17 @@ AGGREGATE_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "required": ["review_result", "findings", "dispositions"],
-    "properties": {**_REVIEW_PROPERTIES, "dispositions": _DISPOSITION_SCHEMA},
+    "properties": {**_REVIEW_PROPERTIES, "dispositions": _FINAL_DISPOSITION_SCHEMA},
+}
+GROUP_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["review_result", "findings", "dispositions", "summary"],
+    "properties": {
+        **_REVIEW_PROPERTIES,
+        "dispositions": _DISPOSITION_SCHEMA,
+        "summary": {"type": "string", "minLength": 32, "maxLength": 4000},
+    },
 }
 
 def canon(value): return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
@@ -337,7 +364,9 @@ def finding(value):
             and value.get("severity") in {"P0","P1","P2","P3"}
             and isinstance(value.get("title"),str) and bool(value["title"])
             and isinstance(value.get("evidence"),str) and bool(value["evidence"]))
-def reviewer_result(raw, *, require_dispositions=False, forbid_dispositions=False):
+def reviewer_result(raw, *, require_dispositions=False, forbid_dispositions=False,
+                    allow_summary=False, require_summary=False,
+                    disposition_index_field="chunk_index"):
     try:
         value = json.loads(raw)
     except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
@@ -349,6 +378,8 @@ def reviewer_result(raw, *, require_dispositions=False, forbid_dispositions=Fals
         raise ValueError("invalid reviewer output")
     required = {"review_result", "findings"}
     allowed = required | {"dispositions"}
+    if allow_summary:
+        allowed.add("summary")
     if (not isinstance(result, dict) or not required <= set(result)
             or set(result) - allowed or result.get("review_result") not in {"PASS", "FAIL"}
             or not isinstance(result.get("findings"), list)
@@ -358,14 +389,20 @@ def reviewer_result(raw, *, require_dispositions=False, forbid_dispositions=Fals
         raise ValueError("chunk reviewer output cannot contain aggregate dispositions")
     if require_dispositions and not isinstance(result.get("dispositions"), list):
         raise ValueError("aggregate reviewer omitted blocker dispositions")
+    if require_summary and "summary" not in result:
+        raise ValueError("aggregate group reviewer omitted its bounded summary")
+    if "summary" in result and (
+            not allow_summary or not isinstance(result["summary"], str)
+            or len(result["summary"]) > 4000 or len(result["summary"].strip()) < 32):
+        raise ValueError("invalid aggregate group summary")
     if "dispositions" in result:
         if not isinstance(result["dispositions"], list):
             raise ValueError("invalid reviewer dispositions")
-        fields = {"chunk_index", "finding_index", "source_severity", "finding_sha256",
+        fields = {disposition_index_field, "finding_index", "source_severity", "finding_sha256",
                   "decision", "rationale"}
         for item in result["dispositions"]:
             if (not isinstance(item, dict) or set(item) != fields
-                    or type(item.get("chunk_index")) is not int or item["chunk_index"] < 0
+                    or type(item.get(disposition_index_field)) is not int or item[disposition_index_field] < 0
                     or type(item.get("finding_index")) is not int or item["finding_index"] < 0
                     or item.get("source_severity") not in {"P0", "P1", "P2"}
                     or not isinstance(item.get("finding_sha256"), str)
@@ -380,7 +417,8 @@ def reviewer_result(raw, *, require_dispositions=False, forbid_dispositions=Fals
     return result
 
 
-def validate_blocker_dispositions(chunks_, aggregate_result):
+def validate_blocker_dispositions(chunks_, aggregate_result, *, allow_disputes=True,
+                                  source_index_field="chunk_index"):
     """Require an auditable aggregate decision for every blocking chunk finding."""
     expected = {}
     for chunk in chunks_:
@@ -391,7 +429,7 @@ def validate_blocker_dispositions(chunks_, aggregate_result):
 
     observed = {}
     for item in aggregate_result.get("dispositions", []):
-        identity = (item["chunk_index"], item["finding_index"])
+        identity = (item[source_index_field], item["finding_index"])
         source = expected.get(identity)
         if source is None:
             raise ValueError("aggregate disposition refers to no blocking chunk finding")
@@ -404,25 +442,27 @@ def validate_blocker_dispositions(chunks_, aggregate_result):
             raise ValueError("aggregate omitted an upheld blocking chunk finding")
         if item["decision"] == "DISPUTED" and source in aggregate_result["findings"]:
             raise ValueError("aggregate both disputed and upheld the same chunk finding")
+        if not allow_disputes and item["decision"] != "UPHELD":
+            raise ValueError("final synthesis cannot dispute a bounded group finding")
         observed[identity] = item
     if set(observed) != set(expected):
         raise ValueError("aggregate omitted a blocking chunk finding disposition")
 
 
-def indexed_chunk_findings(chunks_):
+def indexed_chunk_findings(chunks_, *, source_index_field="chunk_index"):
     """Build the aggregate's indexed findings and precomputed blocker hashes."""
     all_findings = []
     required_dispositions = []
     for chunk in chunks_:
         for finding_index, item in enumerate(chunk["result"]["findings"]):
             all_findings.append({
-                "chunk_index": chunk["index"],
+                source_index_field: chunk["index"],
                 "finding_index": finding_index,
                 "finding": item,
             })
             if item["severity"] in {"P0", "P1", "P2"}:
                 required_dispositions.append({
-                    "chunk_index": chunk["index"],
+                    source_index_field: chunk["index"],
                     "finding_index": finding_index,
                     "source_severity": item["severity"],
                     "finding_sha256": digest(canon(item)),
@@ -506,8 +546,38 @@ def chunks(diff):
         if cut > start: end=cut+1
         source=diff[start:end]; out.append({"index":len(out),"start":start,"end":end,"sha256":digest(source)}) ; start=end
     return out
+
+def aggregate_group_layout(plan):
+    """Partition consecutive reviewed chunks into deterministic bounded groups."""
+    groups=[]; current=[]
+    for chunk in plan:
+        if current and chunk["end"] - current[0]["start"] > AGGREGATE_GROUP_BYTES:
+            first,last=current[0],current[-1]
+            groups.append({"index":len(groups),"start":first["start"],"end":last["end"],
+                           "chunk_indexes":[item["index"] for item in current]})
+            current=[]
+        current.append(chunk)
+    if current:
+        first,last=current[0],current[-1]
+        groups.append({"index":len(groups),"start":first["start"],"end":last["end"],
+                       "chunk_indexes":[item["index"] for item in current]})
+    return groups
+
+def aggregate_groups(diff, plan):
+    """Bind each deterministic group to its exact byte range."""
+    return [{**group,"sha256":digest(diff[group["start"]:group["end"]])}
+            for group in aggregate_group_layout(plan)]
+
+def aggregate_group_manifest_hash(base, head, diff_hash, manifest_hash, groups):
+    descriptors=[{key:group[key] for key in ("index","start","end","chunk_indexes","sha256")}
+                 for group in groups]
+    manifest={"version":"cmh-deepseek-aggregate-groups/v1","base_sha":base,
+              "head_sha":head,"diff_sha256":diff_hash,"chunk_manifest_sha256":manifest_hash,
+              "groups":descriptors}
+    return digest(canon(manifest))
+
 def validate(receipt, base, head, root=None, receipt_path=None, mission_id=None, repository=None, secret=None):
-    required={"version","repository","mission_id","base_sha","head_sha","diff_sha256","manifest_sha256","chunks","chunk_findings","aggregate_result","aggregate_output_sha256","provider","model","command_sha256","review_result","findings","integrity_sha256","auth_hmac_sha256"}
+    required={"version","repository","mission_id","base_sha","head_sha","diff_sha256","manifest_sha256","group_manifest_sha256","chunks","groups","chunk_findings","aggregate_result","aggregate_output_sha256","provider","model","command_sha256","review_result","findings","integrity_sha256","auth_hmac_sha256"}
     optional={"started_at","completed_at"}
     if not isinstance(receipt,dict) or not required <= set(receipt) or set(receipt)-required-optional: raise ValueError("incomplete or unknown receipt fields")
     if receipt["version"] != VERSION or receipt["base_sha"] != base or receipt["head_sha"] != head: raise ValueError("receipt exact-head binding mismatch")
@@ -535,17 +605,45 @@ def validate(receipt, base, head, root=None, receipt_path=None, mission_id=None,
         descriptors.append({"index":chunk["index"],"start":start,"end":end,"sha256":chunk["sha256"]})
         chunk_findings.extend(result["findings"]); position=end
     if chunk_findings != receipt["chunk_findings"]: raise ValueError("chunk findings mismatch")
+    groups=receipt["groups"]
+    if not isinstance(groups,list) or not groups: raise ValueError("missing aggregate groups")
+    expected_groups=aggregate_group_layout(descriptors)
+    if len(groups)!=len(expected_groups): raise ValueError("aggregate group coverage mismatch")
+    group_results=[]; group_descriptors=[]
+    for index,(group,expected) in enumerate(zip(groups,expected_groups)):
+        if (not isinstance(group,dict)
+                or set(group)!={"index","start","end","chunk_indexes","sha256","output_sha256","result"}
+                or any(group.get(key)!=expected[key] for key in ("index","start","end","chunk_indexes"))
+                or not isinstance(group.get("sha256"),str) or len(group["sha256"])!=64
+                or not isinstance(group.get("output_sha256"),str) or len(group["output_sha256"])!=64):
+            raise ValueError("aggregate group coverage or identity mismatch")
+        group_result=reviewer_result(json.dumps(group["result"]),require_dispositions=True,
+                                     allow_summary=True,require_summary=True)
+        selected_chunks=[chunks_[chunk_index] for chunk_index in expected["chunk_indexes"]]
+        validate_blocker_dispositions(selected_chunks,group_result)
+        group_results.append({"index":index,"result":group_result})
+        group_descriptors.append({key:group[key] for key in
+                                  ("index","start","end","chunk_indexes","sha256")})
+    expected_group_manifest={"version":"cmh-deepseek-aggregate-groups/v1",
+                             "base_sha":base,"head_sha":head,
+                             "diff_sha256":receipt["diff_sha256"],
+                             "chunk_manifest_sha256":receipt["manifest_sha256"],
+                             "groups":group_descriptors}
+    if digest(canon(expected_group_manifest))!=receipt["group_manifest_sha256"]:
+        raise ValueError("aggregate group manifest hash mismatch")
     aggregate_result = reviewer_result(
-        json.dumps(receipt["aggregate_result"]), require_dispositions=True
+        json.dumps(receipt["aggregate_result"]), require_dispositions=True,
+        disposition_index_field="group_index",
     )
     if not isinstance(receipt["aggregate_output_sha256"], str) or len(receipt["aggregate_output_sha256"]) != 64:
         raise ValueError("aggregate output identity is incomplete")
     if receipt["review_result"] != aggregate_result["review_result"]:
         raise ValueError("aggregate verdict mismatch")
-    # Every blocking chunk finding remains in the receipt and must be explicitly
-    # upheld or disputed by the complete-diff aggregate. The decision is bound
-    # to the exact chunk finding and its rationale is part of the signed receipt.
-    validate_blocker_dispositions(chunks_, aggregate_result)
+    # The final cross-group synthesis has only bounded group summaries, so it
+    # must carry every group blocker forward rather than disputing source it did
+    # not receive. Group reviewers can dispute chunk findings after seeing source.
+    validate_blocker_dispositions(group_results, aggregate_result,allow_disputes=False,
+                                  source_index_field="group_index")
     if aggregate_result["findings"] != receipt["findings"]:
         raise ValueError("aggregate findings mismatch")
     if root is not None:
@@ -554,6 +652,10 @@ def validate(receipt, base, head, root=None, receipt_path=None, mission_id=None,
         if descriptors!=chunks(diff): raise ValueError("chunk manifest does not match exact diff")
         manifest={"version":"cmh-deepseek-chunks/v2","base_sha":base,"head_sha":head,"diff_sha256":digest(diff),"chunks":descriptors}
         if digest(canon(manifest))!=receipt["manifest_sha256"]: raise ValueError("chunk manifest hash mismatch")
+        expected_group_sources=aggregate_groups(diff,descriptors)
+        for observed,expected in zip(groups,expected_group_sources):
+            if observed["sha256"]!=expected["sha256"]:
+                raise ValueError("aggregate group source hash mismatch")
         if receipt_path is not None:
             evidence=Path(os.path.abspath(receipt_path)).parent
             evidence_fd=None
@@ -563,10 +665,17 @@ def validate(receipt, base, head, root=None, receipt_path=None, mission_id=None,
                     artifact=read_private_artifact(evidence_fd,f"chunk-{chunk['index']:03d}.json")
                     if digest(artifact)!=chunk["output_sha256"]: raise ValueError("chunk artifact mismatch")
                     if reviewer_result(artifact.decode("utf-8"), forbid_dispositions=True)!=chunk["result"]: raise ValueError("chunk result does not match durable artifact")
+                for group in groups:
+                    artifact=read_private_artifact(evidence_fd,f"group-{group['index']:03d}.json")
+                    if digest(artifact)!=group["output_sha256"]: raise ValueError("aggregate group artifact mismatch")
+                    if reviewer_result(artifact.decode("utf-8"),require_dispositions=True,
+                                       allow_summary=True,require_summary=True)!=group["result"]:
+                        raise ValueError("aggregate group result does not match durable artifact")
                 aggregate_artifact=read_private_artifact(evidence_fd,"aggregate.json")
                 if digest(aggregate_artifact) != receipt["aggregate_output_sha256"]:
                     raise ValueError("aggregate artifact mismatch")
-                if reviewer_result(aggregate_artifact.decode("utf-8"), require_dispositions=True) != aggregate_result:
+                if reviewer_result(aggregate_artifact.decode("utf-8"), require_dispositions=True,
+                                   disposition_index_field="group_index") != aggregate_result:
                     raise ValueError("aggregate result does not match durable artifact")
             finally:
                 if evidence_fd is not None: os.close(evidence_fd)
@@ -583,30 +692,64 @@ def prompt(base, head, diff_hash, manifest_hash, chunk, source):
             f"Base={base}\nHead={head}\nDiffSHA256={diff_hash}\nManifestSHA256={manifest_hash}\n"
             f"Chunk={chunk['index']} range={chunk['start']}:{chunk['end']} SHA256={chunk['sha256']}\n"+rendered)
 
-def aggregate_prompt(base, head, diff_hash, manifest_hash, plan, source, chunk_findings,
-                     required_dispositions):
-    """Ask the independent reviewer to inspect the complete diff once.
+def aggregate_group_prompt(base, head, diff_hash, manifest_hash, group_manifest_hash,
+                           group, plan, source, chunk_findings, required_dispositions):
+    """Review a bounded exact-source range and reconcile its underlying chunks."""
+    try: rendered = "UTF-8 EXACT GROUP DIFF:\n" + source.decode("utf-8")
+    except UnicodeDecodeError: rendered = "BASE64-ENCODED EXACT GROUP DIFF BYTES:\n" + base64.b64encode(source).decode("ascii")
+    group_chunks=[chunk for chunk in plan if chunk["index"] in group["chunk_indexes"]]
+    return ("You are an independent synthesis reviewer for one bounded source group. Do not use tools or filesystem. "
+            "Review the exact group source and interactions among every included chunk. Return only JSON matching the schema. "
+            "PASS only when P0/P1/P2 are absent. Account for every P0/P1/P2 chunk finding in dispositions. "
+            "Copy each chunk_index, finding_index, source_severity, and finding_sha256 exactly from RequiredDispositions; "
+            "do not calculate, modify, omit, or duplicate these values. Use UPHELD when valid and include the exact finding; "
+            "use DISPUTED only when this group's complete source disproves it, with a specific rationale. "
+            "Write a concise summary (32 to 4000 characters) of edited files, changed interfaces/data/control flows, "
+            "state transitions, and relevant dependencies so a later cross-group reviewer can compare interactions.\n"
+            f"Base={base}\nHead={head}\nDiffSHA256={diff_hash}\nChunkManifestSHA256={manifest_hash}\n"
+            f"GroupManifestSHA256={group_manifest_hash}\nGroupIndex={group['index']} "
+            f"ChunkIndexes={json.dumps(group['chunk_indexes'])} Range={group['start']}:{group['end']} "
+            f"GroupDiffSHA256={group['sha256']}\n"
+            f"ChunkDescriptors={json.dumps(group_chunks,sort_keys=True)}\n"
+            f"ChunkFindings={json.dumps(chunk_findings,sort_keys=True)}\n"
+            f"RequiredDispositions={json.dumps(required_dispositions,sort_keys=True)}\n"+rendered)
 
-    Chunk reviews provide durable localized evidence.  This final pass prevents
-    a cross-chunk defect from disappearing merely because each slice looked
-    locally plausible; it receives the same exact bytes and hashes.
-    """
-    try: rendered = "UTF-8 COMPLETE DIFF:\n" + source.decode("utf-8")
-    except UnicodeDecodeError: rendered = "BASE64-ENCODED EXACT COMPLETE DIFF BYTES:\n" + base64.b64encode(source).decode("ascii")
-    return ("You are the final independent reviewer for the complete exact diff. Do not use tools or filesystem. "
+def aggregate_prompt(base, head, diff_hash, manifest_hash, group_manifest_hash,
+                     groups, group_findings, required_dispositions):
+    """Synthesize cross-group interactions without resending the unbounded diff."""
+    summaries=[{"group_index":group["index"],"start":group["start"],"end":group["end"],
+                "chunk_indexes":group["chunk_indexes"],"group_sha256":group["sha256"],
+                "output_sha256":group["output_sha256"],"summary":group["result"]["summary"],
+                "review_result":group["result"]["review_result"],
+                "findings":group["result"]["findings"]} for group in groups]
+    return ("You are the final cross-group independent reviewer for this exact diff. Do not use tools or filesystem. "
+            "The diff was partitioned into non-overlapping source groups, each reviewed with its exact source by an independent pass. "
+            "Compare all group summaries for cross-file/cross-group interactions, including API/data contracts, state transitions, "
+            "error handling, and security boundaries; add findings for risks visible only across groups. "
             "Return only JSON matching the schema. PASS only when P0/P1/P2 are absent. "
-            "Review cross-file and cross-chunk interactions, state transitions, and security boundaries. "
-            "Account for every P0/P1/P2 chunk finding in dispositions. Copy each chunk_index, finding_index, source_severity, and finding_sha256 exactly from RequiredDispositions; do not calculate, modify, omit, or duplicate these values. Use UPHELD when the finding is valid and include the exact finding object in findings; use DISPUTED only when the complete diff disproves it, with a specific rationale grounded in the diff. A disputed finding stays in the durable receipt with its rationale. PASS is allowed only when findings contain no P0/P1/P2.\n"
-            f"Base={base}\nHead={head}\nDiffSHA256={diff_hash}\nManifestSHA256={manifest_hash}\n"
-            f"ChunkCount={len(plan)}\nChunkFindings={json.dumps(chunk_findings, sort_keys=True)}\n"
-            f"RequiredDispositions={json.dumps(required_dispositions, sort_keys=True)}\n" + rendered)
+            "Account for every P0/P1/P2 group finding in dispositions. Copy each group_index, finding_index, source_severity, "
+            "and finding_sha256 exactly from RequiredDispositions; do not modify or omit them. Mark every supplied group blocker UPHELD "
+            "and include its exact finding in findings; this synthesis does not have the source needed to dispute one. "
+            "PASS is allowed only when findings contain no P0/P1/P2.\n"
+            f"Base={base}\nHead={head}\nDiffSHA256={diff_hash}\nChunkManifestSHA256={manifest_hash}\n"
+            f"GroupManifestSHA256={group_manifest_hash}\nGroupCount={len(groups)}\n"
+            f"GroupFindings={json.dumps(group_findings,sort_keys=True)}\n"
+            f"RequiredDispositions={json.dumps(required_dispositions,sort_keys=True)}\n"
+            f"ReviewedGroupSummaries={json.dumps(summaries,sort_keys=True)}")
+
+def reviewer_group_result(raw):
+    return reviewer_result(raw,require_dispositions=True,allow_summary=True,require_summary=True)
+
+def bounded_prompt_bytes(prompt_text):
+    rendered=prompt_text.encode("utf-8")
+    if len(rendered)>MAX_REVIEW_PROMPT_BYTES:
+        raise ValueError("review request exceeds the configured bounded prompt size")
+    return rendered
 
 def invoke_reviewer(command, prompt_text, env, timeout):
-    # Keep the exact diff in the reviewer's input, but do not put the complete
-    # synthesis prompt in argv.  Large release diffs can exceed ARG_MAX (the
-    # chunk prompts happen to fit while the full-diff prompt does not).  Claude
-    # Code's print mode explicitly supports text prompts on stdin, which also
-    # avoids exposing source bytes through process listings.
+    # Keep source and synthesis prompts on stdin, not argv. The bounded request
+    # limit is enforced before this call, independently of the operating system's
+    # argv limit. Claude Code print mode supports prompts on stdin.
     return subprocess.run(command, input=prompt_text.encode("utf-8"), env=env,
                           capture_output=True, timeout=timeout)
 
@@ -662,7 +805,7 @@ def _output_failure_details(error):
     """Map local output validation errors without retaining their raw text."""
     message = str(error).casefold()
     if any(marker in message for marker in (
-            "disposition", "review contract", "verdict mismatch")):
+            "disposition", "review contract", "verdict mismatch", "cannot dispute")):
         return ReviewFailureDetails(
             ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE,
             "review_contract_rejected",
@@ -678,7 +821,8 @@ def _output_failure_details(error):
 def _publish_attempt_failure(
         *, evidence_fd, evidence_dir, run_id, repository, mission_id, base, head, diff_hash,
         stage, chunk_index, started_at, completed_at, terminal_status, exit_code,
-        command, stdout, stderr, token, details=None, completed_chunks=()):
+        command, stdout, stderr, token, details=None, completed_chunks=(),
+        group_index=None, completed_groups=()):
     """Commit one sanitized typed failure artifact; never persist raw streams."""
     stdout_bytes = _captured_bytes(stdout)
     stderr_bytes = _captured_bytes(stderr)
@@ -702,6 +846,15 @@ def _publish_attempt_failure(
         for chunk in completed_chunks
         if isinstance(chunk, dict) and isinstance(chunk.get("output_sha256"), str)
     ]
+    completed_group_artifacts = [
+        {
+            "group_index": group.get("index"),
+            "path": f"group-{group.get('index', 0):03d}.json",
+            "sha256": group.get("output_sha256"),
+        }
+        for group in completed_groups
+        if isinstance(group, dict) and isinstance(group.get("output_sha256"), str)
+    ]
     record = {
         "schema_version": "cmh-review-attempt-failure/v1",
         "repository": repository,
@@ -716,6 +869,7 @@ def _publish_attempt_failure(
         "attempt_id": run_id,
         "stage": stage,
         "chunk_index": chunk_index,
+        "group_index": group_index,
         "terminal_status": terminal_status,
         "exit_code": exit_code,
         "turn_completed": None,
@@ -731,11 +885,17 @@ def _publish_attempt_failure(
         "process_stderr_sha256": digest(stderr_bytes),
         "command_sha256": digest(canon(command)) if command else None,
         "completed_chunk_artifacts": completed_artifacts,
+        "completed_group_artifacts": completed_group_artifacts,
         "receipt_written": False,
     }
     record["integrity_sha256"] = digest(canon(record))
     rendered = canon(record) + b"\n"
-    stage_name = f"{stage}-{chunk_index:03d}" if chunk_index is not None else stage
+    if chunk_index is not None:
+        stage_name = f"{stage}-{chunk_index:03d}"
+    elif group_index is not None:
+        stage_name = f"{stage}-{group_index:03d}"
+    else:
+        stage_name = stage
     name = f"review-attempt-failure-{stage_name}-{run_id}.json"
     try:
         write_private_artifact(evidence_fd, name, rendered, run_id)
@@ -866,6 +1026,9 @@ def run(args):
         chunk_command = common_command + [
             "--json-schema", json.dumps(CHUNK_SCHEMA, separators=(",", ":")),
         ]
+        group_command = common_command + [
+            "--json-schema", json.dumps(GROUP_SCHEMA, separators=(",", ":")),
+        ]
         aggregate_command = common_command + [
             "--json-schema", json.dumps(AGGREGATE_SCHEMA, separators=(",", ":")),
         ]
@@ -876,9 +1039,13 @@ def run(args):
             **reviewer_transport_environment(),
         }
         results = []
+        groups = aggregate_groups(diff, plan)
+        group_manifest_hash = aggregate_group_manifest_hash(
+            base, head, diff_hash, manifest_hash, groups,
+        )
 
         def fail(stage, chunk_index, command, started_at, terminal_status, exit_code,
-                 stdout="", stderr="", details=None):
+                 stdout="", stderr="", details=None, group_index=None):
             _raise_attempt_failure(
                 evidence_fd=evidence_fd, evidence_dir=evidence, run_id=run_id,
                 repository=repository, mission_id=args.mission_id, base=base, head=head,
@@ -886,7 +1053,8 @@ def run(args):
                 started_at=started_at, completed_at=time.time(),
                 terminal_status=terminal_status, exit_code=exit_code, command=command,
                 stdout=stdout, stderr=stderr, token=token, details=details,
-                completed_chunks=plan,
+                completed_chunks=plan, group_index=group_index,
+                completed_groups=groups,
             )
 
         for chunk in plan:
@@ -937,49 +1105,115 @@ def run(args):
             chunk["output_sha256"] = digest(raw)
             results.extend(result.get("findings", []))
 
-        chunk_findings, required_dispositions = indexed_chunk_findings(plan)
-        call_started_at = time.time()
-        try:
-            aggregate_call = invoke_reviewer(
-                aggregate_command,
-                aggregate_prompt(base, head, diff_hash, manifest_hash, plan, diff,
-                                 chunk_findings, required_dispositions),
-                env, args.timeout,
+        for group in groups:
+            group_chunks=[chunk for chunk in plan if chunk["index"] in group["chunk_indexes"]]
+            group_findings, group_required = indexed_chunk_findings(group_chunks)
+            group_text=aggregate_group_prompt(
+                base,head,diff_hash,manifest_hash,group_manifest_hash,group,
+                plan,diff[group["start"]:group["end"]],group_findings,group_required,
             )
+            try:
+                bounded_prompt_bytes(group_text)
+            except ValueError as exc:
+                fail("aggregate_group",None,group_command,time.time(),"NOT_STARTED",None,
+                     details=ReviewFailureDetails(
+                         ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE,
+                         "bounded_group_prompt_rejected",
+                         "aggregate group request exceeded the safe prompt size limit",
+                     ),group_index=group["index"])
+            call_started_at=time.time()
+            try:
+                group_call=invoke_reviewer(group_command,group_text,env,args.timeout)
+            except subprocess.TimeoutExpired as exc:
+                fail("aggregate_group",None,group_command,call_started_at,
+                     "TIMED_OUT",None,exc.stdout,exc.stderr,
+                     ReviewFailureDetails(
+                         ReviewFailureClassification.TRANSIENT_TRANSPORT,
+                         "reviewer_request_timeout",
+                         "reviewer subprocess exceeded the configured request timeout",
+                     ),group_index=group["index"])
+            except OSError:
+                fail("aggregate_group",None,group_command,call_started_at,
+                     "NOT_STARTED",None,details=ReviewFailureDetails(
+                         ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE,
+                         "reviewer_process_start_failed",
+                         "trusted reviewer process could not be started",
+                     ),group_index=group["index"])
+            if _credential_echoed(group_call.stdout,group_call.stderr,token):
+                fail("aggregate_group",None,group_command,call_started_at,
+                     "OUTPUT_REJECTED",group_call.returncode,group_call.stdout,
+                     group_call.stderr,group_index=group["index"])
+            if group_call.returncode:
+                fail("aggregate_group",None,group_command,call_started_at,
+                     "EXITED",group_call.returncode,group_call.stdout,group_call.stderr,
+                     group_index=group["index"])
+            try:
+                group_result=reviewer_group_result(group_call.stdout)
+                validate_blocker_dispositions(group_chunks,group_result)
+            except (ValueError,TypeError) as exc:
+                fail("aggregate_group",None,group_command,call_started_at,
+                     "OUTPUT_REJECTED",group_call.returncode,group_call.stdout,
+                     group_call.stderr,_output_failure_details(exc),group_index=group["index"])
+            group_raw=_captured_bytes(group_call.stdout)
+            write_private_artifact(evidence_fd,f"group-{group['index']:03d}.json",group_raw,run_id)
+            group["result"]=group_result
+            group["output_sha256"]=digest(group_raw)
+
+        group_findings, required_dispositions = indexed_chunk_findings(
+            groups, source_index_field="group_index",
+        )
+        aggregate_text=aggregate_prompt(
+            base,head,diff_hash,manifest_hash,group_manifest_hash,groups,
+            group_findings,required_dispositions,
+        )
+        try:
+            bounded_prompt_bytes(aggregate_text)
+        except ValueError:
+            fail("aggregate",None,aggregate_command,time.time(),"NOT_STARTED",None,
+                 details=ReviewFailureDetails(
+                     ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE,
+                     "bounded_aggregate_prompt_rejected",
+                     "final aggregate request exceeded the safe prompt size limit",
+                 ))
+        call_started_at=time.time()
+        try:
+            aggregate_call=invoke_reviewer(aggregate_command,aggregate_text,env,args.timeout)
         except subprocess.TimeoutExpired as exc:
-            fail(
-                "aggregate", None, aggregate_command, call_started_at,
-                "TIMED_OUT", None, exc.stdout, exc.stderr,
-                ReviewFailureDetails(
-                    ReviewFailureClassification.TRANSIENT_TRANSPORT,
-                    "reviewer_request_timeout",
-                    "reviewer subprocess exceeded the configured request timeout",
-                ),
-            )
+            fail("aggregate",None,aggregate_command,call_started_at,
+                 "TIMED_OUT",None,exc.stdout,exc.stderr,
+                 ReviewFailureDetails(
+                     ReviewFailureClassification.TRANSIENT_TRANSPORT,
+                     "reviewer_request_timeout",
+                     "reviewer subprocess exceeded the configured request timeout",
+                 ))
         except OSError:
-            fail(
-                "aggregate", None, aggregate_command, call_started_at,
-                "NOT_STARTED", None, details=ReviewFailureDetails(
-                    ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE,
-                    "reviewer_process_start_failed",
-                    "trusted reviewer process could not be started",
-                ),
-            )
-        if _credential_echoed(aggregate_call.stdout, aggregate_call.stderr, token):
-            fail("aggregate", None, aggregate_command, call_started_at,
-                 "OUTPUT_REJECTED", aggregate_call.returncode,
-                 aggregate_call.stdout, aggregate_call.stderr)
+            fail("aggregate",None,aggregate_command,call_started_at,
+                 "NOT_STARTED",None,details=ReviewFailureDetails(
+                     ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE,
+                     "reviewer_process_start_failed",
+                     "trusted reviewer process could not be started",
+                 ))
+        if _credential_echoed(aggregate_call.stdout,aggregate_call.stderr,token):
+            fail("aggregate",None,aggregate_command,call_started_at,
+                 "OUTPUT_REJECTED",aggregate_call.returncode,
+                 aggregate_call.stdout,aggregate_call.stderr)
         if aggregate_call.returncode:
-            fail("aggregate", None, aggregate_command, call_started_at,
-                 "EXITED", aggregate_call.returncode,
-                 aggregate_call.stdout, aggregate_call.stderr)
+            fail("aggregate",None,aggregate_command,call_started_at,
+                 "EXITED",aggregate_call.returncode,
+                 aggregate_call.stdout,aggregate_call.stderr)
         try:
-            aggregate_result = reviewer_result(aggregate_call.stdout, require_dispositions=True)
-            validate_blocker_dispositions(plan, aggregate_result)
-        except (ValueError, TypeError) as exc:
-            fail("aggregate", None, aggregate_command, call_started_at,
-                 "OUTPUT_REJECTED", aggregate_call.returncode,
-                 aggregate_call.stdout, aggregate_call.stderr, _output_failure_details(exc))
+            aggregate_result=reviewer_result(
+                aggregate_call.stdout,require_dispositions=True,
+                disposition_index_field="group_index",
+            )
+            validate_blocker_dispositions(
+                [{"index":group["index"],"result":group["result"]} for group in groups],
+                aggregate_result,allow_disputes=False,source_index_field="group_index",
+            )
+        except (ValueError,TypeError) as exc:
+            fail("aggregate",None,aggregate_command,call_started_at,
+                 "OUTPUT_REJECTED",aggregate_call.returncode,
+                 aggregate_call.stdout,aggregate_call.stderr,_output_failure_details(exc))
 
         aggregate_raw = _captured_bytes(aggregate_call.stdout)
         write_private_artifact(evidence_fd, "aggregate.json", aggregate_raw, run_id)
@@ -987,11 +1221,14 @@ def run(args):
         receipt = {
             "version": VERSION, "repository": repository, "mission_id": args.mission_id,
             "base_sha": base, "head_sha": head, "diff_sha256": diff_hash,
-            "manifest_sha256": manifest_hash, "chunks": plan,
+            "manifest_sha256": manifest_hash,
+            "group_manifest_sha256": group_manifest_hash,
+            "chunks": plan, "groups": groups,
             "chunk_findings": results, "aggregate_result": aggregate_result,
             "aggregate_output_sha256": digest(aggregate_raw), "provider": "deepseek",
             "model": MODEL,
             "command_sha256": digest(canon({"chunk": chunk_command,
+                                             "group": group_command,
                                              "aggregate": aggregate_command})),
             "started_at": int(run_started_at), "completed_at": int(time.time()),
             "review_result": verdict, "findings": aggregate_result["findings"],
