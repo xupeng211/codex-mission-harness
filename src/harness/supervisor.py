@@ -8,9 +8,10 @@ import re
 import stat
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
-from .adapters import GateResult, ReviewTransportFailure, SimulatedAdapter
+from .adapters import GateResult, ReviewFailureClassification, SimulatedAdapter
 from .codex import CodexAdapter
 from .domain import MissionSpec, State, TERMINAL
 from .isolation import docker_env
@@ -41,19 +42,30 @@ class Supervisor:
         return self.process.launcher_pid, start_ticks
 
     @staticmethod
-    def _review_transport_failure(result, reviewed: GateResult) -> bool:
-        """Retry only a trusted adapter's typed transport classification.
+    def _review_retryable_failure(result, reviewed: GateResult) -> bool:
+        """Retry only explicitly retryable typed failures from a trusted adapter.
 
         Reviewer stdout/stderr and receipt contents are untrusted and are never
-        inspected for retry signals.  The adapter may set this field only when
-        it has classified a transport exception independently of reviewer
-        output. Findings, malformed receipts, and policy/auth failures remain
-        terminal.
+        inspected here for retry signals. The adapter may set this field only
+        after classifying structured terminal provider/transport evidence.
+        Findings, malformed receipts, and policy/auth failures remain terminal.
         """
         if (reviewed.status != "BLOCKED_EXTERNAL" or reviewed.artifact is not None
                 or result.state not in {"EXITED", "LOST"}):
             return False
-        return isinstance(reviewed.transport_failure, ReviewTransportFailure)
+        return (isinstance(reviewed.failure_classification, ReviewFailureClassification)
+                and reviewed.failure_classification.retryable)
+
+    @staticmethod
+    def _review_attempt_id(argv_json: str, fallback: str) -> str:
+        """Read the run identity that was durably bound into the reviewer argv."""
+        try:
+            argv = json.loads(argv_json)
+            index = argv.index("--run-id")
+            candidate = argv[index + 1]
+        except (TypeError, ValueError, IndexError, json.JSONDecodeError):
+            return fallback
+        return candidate if isinstance(candidate, str) and re.fullmatch(r"[0-9a-f]{32}", candidate) else fallback
 
     @staticmethod
     def _invoke_pr_adapter(method, worktree: str, head: str,
@@ -166,7 +178,7 @@ class Supervisor:
                 self.journal.retire_terminal_gate_job(mission_id, result.job_id)
                 continue
             job = self.journal.db.execute(
-                "SELECT name,stdout_path,stderr_path FROM jobs WHERE job_id=?",
+                "SELECT name,stdout_path,stderr_path,argv_json FROM jobs WHERE job_id=?",
                 (result.job_id,),
             ).fetchone()
             if job and str(job["name"]).startswith("review:"):
@@ -194,13 +206,16 @@ class Supervisor:
                             reviewer, worktree=str(review_root), base=snapshot["base_sha"], head=current,
                             mission_id=mission_id, scope_file=str(scope_path),
                             stdout_path=job["stdout_path"], evidence_dir=str(evidence_dir),
+                            attempt_id=self._review_attempt_id(job["argv_json"], result.job_id),
+                            terminal_status=result.state, exit_code=result.exit_code,
+                            stderr_path=job["stderr_path"],
                         )
                     except Exception as exc:
                         reviewed = GateResult(
                             "BLOCKED_EXTERNAL", f"canonical review receipt validation failed: {exc}",
                         )
                     if reviewed.status == "BLOCKED_EXTERNAL":
-                        retryable = self._review_transport_failure(result, reviewed)
+                        retryable = self._review_retryable_failure(result, reviewed)
                         # ProcessSupervisor publishes a terminal result only
                         # after the owned process group is quiescent.  That
                         # makes a transport retry safe; malformed receipts or
@@ -616,9 +631,10 @@ class Supervisor:
                             argv = self.adapter.review_argv(
                                 reviewer, worktree=str(review_root), base=row["base_sha"], head=head,
                                 mission_id=mission_id, scope_file=str(scope), evidence_dir=str(evidence),
+                                attempt_id=uuid.uuid4().hex,
                             )
                             reviewer_env = self.adapter.review_environment(
-                                reviewer, worktree=str(review_root),
+                                reviewer, worktree=str(review_root), base=row["base_sha"],
                             )
                             self.journal.update(
                                 mission_id, pending_gate=f"review:{reviewer}",

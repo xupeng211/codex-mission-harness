@@ -22,17 +22,25 @@ class GateResult:
     evidence: str = ""
     artifact: str | None = None
     data: dict[str, Any] | None = None
-    transport_failure: "ReviewTransportFailure | None" = None
+    failure_classification: "ReviewFailureClassification | None" = None
 
 
-class ReviewTransportFailure(Enum):
-    """Trusted adapter classification for a reviewer transport failure."""
+class ReviewFailureClassification(str, Enum):
+    """Typed, fail-closed classification for receipt-less reviewer attempts."""
 
-    REQUEST_TIMEOUT = "request_timeout"
-    CONNECTION = "connection"
-    TLS = "tls"
-    WEBSOCKET = "websocket"
-    SERVICE_UNAVAILABLE = "service_unavailable"
+    TRANSIENT_TRANSPORT = "TRANSIENT_TRANSPORT"
+    TRANSIENT_CAPACITY = "TRANSIENT_CAPACITY"
+    AUTHENTICATION_FAILURE = "AUTHENTICATION_FAILURE"
+    MODEL_UNAVAILABLE_OR_UNSUPPORTED = "MODEL_UNAVAILABLE_OR_UNSUPPORTED"
+    POLICY_OR_CONTRACT_FAILURE = "POLICY_OR_CONTRACT_FAILURE"
+    UNKNOWN_EXTERNAL_FAILURE = "UNKNOWN_EXTERNAL_FAILURE"
+
+    @property
+    def retryable(self) -> bool:
+        return self in {
+            ReviewFailureClassification.TRANSIENT_TRANSPORT,
+            ReviewFailureClassification.TRANSIENT_CAPACITY,
+        }
 
 
 class FootballPredictionAdapter:
@@ -41,6 +49,7 @@ class FootballPredictionAdapter:
              "verify-strict": ["make", "verify-strict"], "agent-preflight": ["make", "agent-preflight"]}
     REVIEW_CONTRACT_PATHS = (
         "Makefile", "scripts/devops/codex_independent_review.py",
+        "scripts/devops/codex_reviewer_isolation.py",
         "scripts/devops/codex_review_classification.py", "scripts/devops/codex_review_contract.py",
         "scripts/devops/codex_review_output.py", "scripts/devops/codex_review_provenance.py",
         "scripts/devops/codex_review_receipt.py", "scripts/devops/claude_deepseek_independent_review.py",
@@ -52,6 +61,10 @@ class FootballPredictionAdapter:
         "schemas/agentic/codex_review_result.schema.json", "schemas/agentic/codex_review_receipt.schema.json",
         "schemas/agentic/independent_review_result.schema.json", "schemas/agentic/independent_review_receipt.schema.json",
     )
+    REVIEWER_PROVENANCE = {
+        "codex": ("gpt-5.6-sol", "high"),
+        "deepseek": ("deepseek-flash", None),
+    }
 
     @staticmethod
     def _safe_mission_id(mission_id: str) -> str:
@@ -257,19 +270,23 @@ class FootballPredictionAdapter:
         return path
 
     @staticmethod
-    def _write_private_file(path: Path, content: str) -> None:
+    def _write_private_file(path: Path, content: str, *, exclusive: bool = False) -> None:
         nofollow = getattr(os, "O_NOFOLLOW", None)
         if nofollow is None:
             raise RuntimeError("safe no-follow evidence writes are unavailable")
         fd: int | None = None
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | nofollow, 0o600)
+            flags = os.O_WRONLY | os.O_CREAT | nofollow
+            if exclusive:
+                flags |= os.O_EXCL
+            fd = os.open(path, flags, 0o600)
             info = os.fstat(fd)
             if (not stat.S_ISREG(info.st_mode)
                     or (hasattr(os, "getuid") and info.st_uid != os.getuid())):
                 raise RuntimeError("evidence file is not a regular current-user-owned file")
             os.fchmod(fd, 0o600)
-            os.ftruncate(fd, 0)
+            if not exclusive:
+                os.ftruncate(fd, 0)
             stream = os.fdopen(fd, "w", encoding="utf-8")
             fd = None
             with stream:
@@ -650,13 +667,89 @@ class FootballPredictionAdapter:
             raise RuntimeError("trusted reviewer PATH is unavailable")
         return path
 
-    @classmethod
-    def review_environment(cls, reviewer: str, *, worktree: str) -> dict[str, str]:
+    @staticmethod
+    def _validate_canonical_codex_home(raw_home: object, *, worktree: str) -> str:
+        """Validate the policy-selected credential directory without reading secrets."""
+        if not isinstance(raw_home, str) or not raw_home:
+            raise RuntimeError("trusted reviewer policy omitted CODEX_HOME")
+        home = Path(raw_home)
+        if not home.is_absolute():
+            raise RuntimeError("trusted reviewer CODEX_HOME must be absolute")
+        try:
+            resolved = home.resolve(strict=True)
+            info = home.lstat()
+            auth = home / "auth.json"
+            auth_info = auth.lstat()
+            repo = Path(worktree).resolve(strict=True)
+        except OSError as exc:
+            raise RuntimeError("trusted reviewer CODEX_HOME or auth metadata is unavailable") from exc
+        if resolved != home or not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise RuntimeError("trusted reviewer CODEX_HOME is not a canonical real directory")
+        if (hasattr(os, "getuid") and info.st_uid != os.getuid()) or stat.S_IMODE(info.st_mode) != 0o700:
+            raise RuntimeError("trusted reviewer CODEX_HOME must be owner-only")
+        if (not stat.S_ISREG(auth_info.st_mode) or stat.S_ISLNK(auth_info.st_mode)
+                or (hasattr(os, "getuid") and auth_info.st_uid != os.getuid())
+                or stat.S_IMODE(auth_info.st_mode) != 0o600):
+            raise RuntimeError("trusted reviewer authentication file must be owner-only")
+        if home == repo or home in repo.parents:
+            raise RuntimeError("trusted reviewer CODEX_HOME must remain outside the reviewed repository")
+        return str(home)
+
+    def _canonical_codex_reviewer_policy(self, *, worktree: str, base: str) -> dict[str, str]:
+        """Read reviewer settings from the byte-verified target policy module.
+
+        The target policy remains the single authority for the canonical auth
+        home, absolute executable, model, and reasoning effort. Only these
+        non-secret values cross back into Harness; no credential data is read.
+        """
+        trusted = self._trusted_base_checkout(worktree, base)
+        policy_query = (
+            "import json,sys; from pathlib import Path; sys.path.insert(0,str(Path.cwd())); "
+            "from scripts.devops.codex_reviewer_isolation import "
+            "canonical_codex_binary,canonical_reviewer_environment; "
+            "from scripts.devops.codex_review_contract import "
+            "REVIEW_MODEL_PINNED,REVIEW_REASONING_EFFORT_PINNED; "
+            "environment=canonical_reviewer_environment(source={}); "
+            "binary=canonical_codex_binary(); "
+            "print(json.dumps({'codex_home':environment.get('CODEX_HOME'),"
+            "'codex_binary':str(binary),'model':REVIEW_MODEL_PINNED,"
+            "'reasoning_effort':REVIEW_REASONING_EFFORT_PINNED}))"
+        )
+        result = self._call(
+            [self._trusted_python_interpreter(), "-I", "-B", "-c", policy_query],
+            cwd=str(trusted), env=self._trusted_git_environment(), inherit_environment=False,
+        )
+        policy = self._json_last_text(result.stdout)
+        if result.returncode != 0 or not isinstance(policy, dict):
+            raise RuntimeError("trusted canonical Codex reviewer policy could not be loaded")
+        codex_binary = policy.get("codex_binary")
+        model = policy.get("model")
+        reasoning = policy.get("reasoning_effort")
+        if (not isinstance(codex_binary, str) or not Path(codex_binary).is_absolute()
+                or model != "gpt-5.6-sol" or reasoning != "high"):
+            raise RuntimeError("trusted Codex reviewer executable or model provenance is invalid")
+        return {
+            "codex_home": self._validate_canonical_codex_home(policy.get("codex_home"), worktree=worktree),
+            "codex_binary": codex_binary,
+            "model": model,
+            "reasoning_effort": reasoning,
+        }
+
+    def review_environment(self, reviewer: str, *, worktree: str,
+                           base: str | None = None) -> dict[str, str]:
         """Build a restricted launcher environment for the trusted review wrapper."""
         if reviewer not in {"codex", "deepseek"}:
             raise ValueError(f"unsupported independent reviewer: {reviewer}")
+        if reviewer == "codex":
+            if not isinstance(base, str) or re.fullmatch(r"[0-9a-fA-F]{40}", base) is None:
+                raise RuntimeError("canonical Codex reviewer environment requires an exact base SHA")
+            codex_home = self._canonical_codex_reviewer_policy(
+                worktree=worktree, base=base,
+            )["codex_home"]
+        else:
+            codex_home = None
         environment = {
-            "PATH": cls._trusted_review_path(worktree),
+            "PATH": self._trusted_review_path(worktree),
             "HOME": "/nonexistent",
             "LANG": "C.UTF-8",
             "PYTHONDONTWRITEBYTECODE": "1",
@@ -669,6 +762,8 @@ class FootballPredictionAdapter:
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_OPTIONAL_LOCKS": "0",
         }
+        if codex_home is not None:
+            environment["CODEX_HOME"] = codex_home
         for name in (
             "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
             "http_proxy", "https_proxy", "all_proxy", "no_proxy",
@@ -850,11 +945,13 @@ class FootballPredictionAdapter:
                 raise RuntimeError("trusted base policy source content differs from the commit")
 
     def review_argv(self, reviewer: str, *, worktree: str, base: str, head: str, mission_id: str,
-                    scope_file: str, evidence_dir: str) -> list[str]:
+                    scope_file: str, evidence_dir: str, attempt_id: str) -> list[str]:
         expected_evidence = self.review_evidence_dir(worktree, mission_id, reviewer, head)
         if Path(evidence_dir).resolve(strict=False) != expected_evidence.resolve(strict=False):
             raise ValueError("review evidence directory does not match the exact mission/reviewer/HEAD")
         self._validate_review_evidence_dir(expected_evidence)
+        if not isinstance(attempt_id, str) or re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None:
+            raise ValueError("review attempt identity must be 32 lowercase hexadecimal characters")
         trusted = self._trusted_base_checkout(worktree, base)
         common = ["--repo-root", worktree, "--base-sha", base, "--head-sha", head,
                   "--mission-id", mission_id, "--mission-scope-file", scope_file,
@@ -862,7 +959,8 @@ class FootballPredictionAdapter:
         python = self._trusted_python_interpreter()
         if reviewer == "codex":
             return [python, "-I", "-B",
-                    str(trusted / "scripts/devops/codex_independent_review.py"), "run", *common]
+                    str(trusted / "scripts/devops/codex_independent_review.py"), "run", *common,
+                    "--run-id", attempt_id, "--json"]
         if reviewer == "deepseek":
             return [python, "-I", "-B",
                     str(trusted / "scripts/devops/claude_deepseek_independent_review.py"), *common]
@@ -876,8 +974,256 @@ class FootballPredictionAdapter:
         """
         return GateResult("BLOCKED_EXTERNAL", "review requires mission_scope_file and exact base/worktree context")
 
+    @staticmethod
+    def _read_private_review_log(path: Path) -> tuple[bytes, str] | None:
+        """Read and hash one owner-only review log without following links."""
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            return None
+        try:
+            fd = os.open(path, os.O_RDONLY | nofollow)
+        except OSError:
+            return None
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode)
+                    or (hasattr(os, "getuid") and info.st_uid != os.getuid())
+                    or stat.S_IMODE(info.st_mode) & 0o077):
+                return None
+            if info.st_size > 512 * 1024 * 1024:
+                return None
+            with os.fdopen(fd, "rb") as stream:
+                fd = -1
+                digest = hashlib.sha256()
+                tail = bytearray()
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+                    tail.extend(chunk)
+                    if len(tail) > 8 * 1024 * 1024:
+                        del tail[:-8 * 1024 * 1024]
+            return bytes(tail), digest.hexdigest()
+        except OSError:
+            return None
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+    @staticmethod
+    def _review_error_fields(value: object) -> list[str]:
+        """Extract only provider error fields from a structured failure event."""
+        fields: list[str] = []
+        if isinstance(value, dict):
+            for name in ("code", "type", "status", "status_code", "http_status", "message"):
+                item = value.get(name)
+                if isinstance(item, (str, int)) and not isinstance(item, bool):
+                    fields.append(str(item))
+            nested = value.get("error")
+            if isinstance(nested, (dict, str)):
+                fields.extend(FootballPredictionAdapter._review_error_fields(nested))
+        elif isinstance(value, str):
+            fields.append(value)
+        return fields
+
+    @staticmethod
+    def _classify_review_error_text(value: str) -> tuple[ReviewFailureClassification, str] | None:
+        """Map bounded error evidence to a type and safe reason code."""
+        text = value.casefold()
+        if (text.strip() == "401" or any(marker in text for marker in (
+                "token_revoked", "http 401", "status 401", "unauthorized", "authentication failed",
+                "invalid api key", "invalid authentication", "authentication file missing",
+                "authentication file must", "canonical codex auth file", "codex authentication",
+                "reviewer was not authenticated", "canonical reviewer 未建立"))):
+            return ReviewFailureClassification.AUTHENTICATION_FAILURE, "authentication_rejected"
+        if any(marker in text for marker in (
+                "unsupported model", "model unsupported", "model is not supported", "model not supported",
+                "not supported for model", "model_unavailable", "model unavailable",
+                "model_not_found", "model not found", "unknown model", "model does not exist")):
+            return ReviewFailureClassification.MODEL_UNAVAILABLE_OR_UNSUPPORTED, "model_unavailable"
+        if any(marker in text for marker in (
+                "selected model is at capacity", "model at capacity", "at capacity",
+                "rate_limit", "rate limit", "too many requests", "http 429", "status 429")):
+            return ReviewFailureClassification.TRANSIENT_CAPACITY, "provider_capacity"
+        if any(marker in text for marker in (
+                "request timeout", "timed out", "timeout", "connection reset", "connection refused",
+                "connection closed", "websocket", "tls handshake", "ssl error", "https transport",
+                "reconnect", "service unavailable", "http 502", "http 503", "http 504",
+                "status 502", "status 503", "status 504", "http 408", "status 408",
+                "server disconnected", "socket hang up", "network error")):
+            return ReviewFailureClassification.TRANSIENT_TRANSPORT, "transport_interrupted"
+        if any(marker in text for marker in (
+                "invalid_request", "invalid review result", "review contract", "receipt missing",
+                "receipt validation", "output schema", "turn.completed", "challenge mismatch",
+                "policy refusal", "policy failure")):
+            return ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE, "review_contract_rejected"
+        return None
+
+    def _receiptless_review_failure(
+        self, *, reviewer: str, worktree: str, base: str, head: str, mission_id: str,
+        evidence_dir: Path, attempt_id: str | None, stdout_path: str, stderr_path: str | None,
+        terminal_status: str | None, exit_code: int | None, contract_failure: bool = False,
+    ) -> GateResult:
+        """Persist a sanitized typed result when a review ends without a receipt."""
+        repository = "unknown/unknown"
+        try:
+            repository = self._repo_from_origin(worktree)
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            pass
+
+        model, reasoning = self.REVIEWER_PROVENANCE.get(reviewer, ("unknown", None))
+        codex_binary: str | None = None
+        if reviewer == "codex":
+            model, reasoning = "gpt-5.6-sol", "high"
+            if not contract_failure:
+                try:
+                    policy = self._canonical_codex_reviewer_policy(worktree=worktree, base=base)
+                    codex_binary = policy["codex_binary"]
+                    model = policy["model"]
+                    reasoning = policy["reasoning_effort"]
+                except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+                    pass
+
+        events_path: Path | None = None
+        codex_stderr_path: Path | None = None
+        signal_sources: list[str] = []
+        if (reviewer == "codex" and isinstance(attempt_id, str)
+                and re.fullmatch(r"[0-9a-f]{32}", attempt_id)):
+            events_path = evidence_dir / f"codex-review-output-{head[:12]}-{attempt_id}.jsonl"
+            codex_stderr_path = evidence_dir / f"codex-review-stderr-{head[:12]}-{attempt_id}.log"
+
+        event_log = self._read_private_review_log(events_path) if events_path else None
+        reviewer_stderr = self._read_private_review_log(codex_stderr_path) if codex_stderr_path else None
+        process_stdout = self._read_private_review_log(Path(stdout_path))
+        process_stderr = self._read_private_review_log(Path(stderr_path)) if stderr_path else None
+
+        turn_completed = False
+        signals: list[str] = []
+        if event_log is not None:
+            raw_events = event_log[0]
+            for line in raw_events.splitlines():
+                try:
+                    event = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                event_type = event.get("type")
+                if event_type == "turn.completed":
+                    turn_completed = True
+                elif event_type in {"turn.failed", "error"}:
+                    error = event.get("error")
+                    if isinstance(error, (dict, str)):
+                        signals.extend(self._review_error_fields(error))
+                        signal_sources.append("codex_jsonl:" + str(event_type))
+
+        if reviewer_stderr is not None:
+            try:
+                signals.append(reviewer_stderr[0].decode("utf-8", errors="replace"))
+                signal_sources.append("codex_stderr")
+            except UnicodeDecodeError:
+                pass
+
+        # The trusted wrapper's --json failure object is a structured terminal
+        # record. Ordinary reviewer text and untyped JSON never enter the
+        # classifier.
+        wrapper_failure: dict[str, Any] = {}
+        if process_stdout is not None:
+            try:
+                wrapper_payload = self._json_last_text(process_stdout[0].decode("utf-8", errors="replace"))
+            except (UnicodeDecodeError, ValueError):
+                wrapper_payload = {}
+            if (isinstance(wrapper_payload, dict)
+                    and wrapper_payload.get("status") in {"FAIL", "BLOCKED_EXTERNAL"}
+                    and isinstance(wrapper_payload.get("error"), str)):
+                signals.append(wrapper_payload["error"])
+                wrapper_failure = {"status": str(wrapper_payload["status"])}
+                signal_sources.append("trusted_wrapper_json_error")
+
+        if contract_failure or turn_completed:
+            classification = ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE
+            reason_code = ("invalid_receipt_binding" if contract_failure
+                           else "completed_turn_without_valid_receipt")
+        else:
+            classification = ReviewFailureClassification.UNKNOWN_EXTERNAL_FAILURE
+            reason_code = "unclassified_external_failure"
+            # Prefer non-retryable categories if conflicting diagnostics were
+            # captured; only clean capacity/transport evidence may retry.
+            for category in (
+                ReviewFailureClassification.AUTHENTICATION_FAILURE,
+                ReviewFailureClassification.MODEL_UNAVAILABLE_OR_UNSUPPORTED,
+                ReviewFailureClassification.TRANSIENT_CAPACITY,
+                ReviewFailureClassification.TRANSIENT_TRANSPORT,
+                ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE,
+            ):
+                match = next((found for signal in signals
+                              if (found := self._classify_review_error_text(signal)) is not None
+                              and found[0] == category), None)
+                if match is not None:
+                    classification, reason_code = match
+                    break
+
+        event_artifact = None
+        if event_log is not None and events_path is not None:
+            event_artifact = {"path": str(events_path), "sha256": event_log[1]}
+        codex_stderr_artifact = None
+        if reviewer_stderr is not None and codex_stderr_path is not None:
+            codex_stderr_artifact = {"path": str(codex_stderr_path), "sha256": reviewer_stderr[1]}
+        failure_record = {
+            "schema_version": "cmh-review-attempt-failure/v1",
+            "repository": repository,
+            "mission_id": mission_id,
+            "base_sha": base.lower(),
+            "head_sha": head.lower(),
+            "reviewer": reviewer,
+            "model": model,
+            "reasoning_effort": reasoning,
+            "codex_binary": codex_binary,
+            "attempt_id": attempt_id,
+            "terminal_status": terminal_status or "UNKNOWN",
+            "exit_code": exit_code,
+            "turn_completed": turn_completed,
+            "wrapper_failure": wrapper_failure,
+            "failure_classification": classification.value,
+            "retryable": classification.retryable,
+            "reason_code": reason_code,
+            "signal_sources": sorted(set(signal_sources)),
+            "event_log": event_artifact,
+            "codex_stderr_log": codex_stderr_artifact,
+            "process_stdout_sha256": process_stdout[1] if process_stdout is not None else None,
+            "process_stderr_sha256": process_stderr[1] if process_stderr is not None else None,
+        }
+        attempt_component = attempt_id if isinstance(attempt_id, str) and re.fullmatch(
+            r"[0-9a-f]{32}", attempt_id,
+        ) else hashlib.sha256(f"{mission_id}:{head}:{terminal_status}:{exit_code}".encode()).hexdigest()[:32]
+        record_path = evidence_dir / f"attempt-failure-{attempt_component}.json"
+        rendered = json.dumps(failure_record, sort_keys=True, separators=(",", ":")) + "\n"
+        try:
+            self._write_private_file(record_path, rendered, exclusive=True)
+        except (OSError, RuntimeError):
+            return GateResult(
+                "BLOCKED_EXTERNAL", "receipt-less reviewer failure evidence could not be persisted",
+                failure_classification=ReviewFailureClassification.UNKNOWN_EXTERNAL_FAILURE,
+            )
+        evidence_sha256 = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+        data = {
+            "failure_classification": classification.value,
+            "retryable": classification.retryable,
+            "failure_evidence_path": str(record_path),
+            "failure_evidence_sha256": evidence_sha256,
+            "event_log": event_artifact,
+            "codex_stderr_log": codex_stderr_artifact,
+        }
+        return GateResult(
+            "BLOCKED_EXTERNAL",
+            f"receipt-less reviewer attempt classified as {classification.value}; "
+            f"failure evidence {record_path} sha256={evidence_sha256}",
+            data=data,
+            failure_classification=classification,
+        )
+
     def review_result(self, reviewer: str, *, worktree: str, base: str, head: str, mission_id: str,
-                      scope_file: str, stdout_path: str, evidence_dir: str) -> GateResult:
+                      scope_file: str, stdout_path: str, evidence_dir: str,
+                      attempt_id: str | None = None, terminal_status: str | None = None,
+                      exit_code: int | None = None, stderr_path: str | None = None) -> GateResult:
         """Accept only a canonical receipt, revalidated against exact inputs."""
         preflight = self.review_preflight(worktree, base, head)
         if preflight.status != "PASS":
@@ -889,14 +1235,32 @@ class FootballPredictionAdapter:
             if Path(evidence_dir).resolve(strict=True) != expected_evidence.resolve(strict=True):
                 raise RuntimeError("review evidence directory does not match exact inputs")
             expected_evidence = self._validate_review_evidence_dir(expected_evidence)
-            receipt_path = Path(receipt) if isinstance(receipt, str) else None
-            if (receipt_path is None or not receipt_path.is_absolute()
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return GateResult(
+                "BLOCKED_EXTERNAL", "canonical review evidence directory is unavailable",
+                failure_classification=ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE,
+            )
+        if not isinstance(receipt, str):
+            return self._receiptless_review_failure(
+                reviewer=reviewer, worktree=worktree, base=base, head=head,
+                mission_id=mission_id, evidence_dir=expected_evidence,
+                attempt_id=attempt_id, stdout_path=stdout_path, stderr_path=stderr_path,
+                terminal_status=terminal_status, exit_code=exit_code,
+            )
+        try:
+            receipt_path = Path(receipt)
+            if (not receipt_path.is_absolute()
                     or receipt_path.parent.resolve(strict=True) != expected_evidence
                     or receipt_path.is_symlink()
                     or not stat.S_ISREG(receipt_path.lstat().st_mode)):
                 raise RuntimeError("reviewer receipt is outside the prevalidated evidence directory")
         except (OSError, RuntimeError, TypeError, ValueError):
-            return GateResult("BLOCKED_EXTERNAL", "canonical review did not publish a receipt")
+            return self._receiptless_review_failure(
+                reviewer=reviewer, worktree=worktree, base=base, head=head,
+                mission_id=mission_id, evidence_dir=expected_evidence,
+                attempt_id=attempt_id, stdout_path=stdout_path, stderr_path=stderr_path,
+                terminal_status=terminal_status, exit_code=exit_code, contract_failure=True,
+            )
         receipt = str(receipt_path)
         if reviewer == "codex":
             trusted = self._trusted_base_checkout(worktree, base)
@@ -966,7 +1330,7 @@ class FootballPredictionAdapter:
         # imports must resolve there, never from the candidate HEAD worktree.
         result = self._call(
             argv, cwd=str(trusted),
-            env=self.review_environment(reviewer, worktree=worktree),
+            env=self.review_environment(reviewer, worktree=worktree, base=base),
             inherit_environment=False,
         )
         if result.returncode != 0:

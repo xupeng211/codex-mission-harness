@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import json
+import hashlib
 import os
 import queue
 import shutil
@@ -16,7 +17,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness.adapters import (
-    FootballPredictionAdapter, GateResult, ReviewTransportFailure, SimulatedAdapter,
+    FootballPredictionAdapter, GateResult, ReviewFailureClassification, SimulatedAdapter,
 )
 from harness.cli import approval_head, build, load_spec, main as cli_main, reconcile_supplied_spec
 from harness.codex import AppServerCodex, FixtureCodex, Turn
@@ -101,6 +102,59 @@ class HarnessTest(unittest.TestCase):
             "integrity": {"sha256": "d" * 64},
         }))
         return adapter, worktree, evidence_dir, receipt, stdout
+
+    def _trusted_codex_policy_fixture(self, root: Path, codex_home: Path,
+                                      codex_binary: str = "/usr/bin/python3") -> Path:
+        trusted = root / "trusted-codex-policy"
+        scripts = trusted / "scripts" / "devops"
+        scripts.mkdir(parents=True, exist_ok=True)
+        (scripts / "codex_reviewer_isolation.py").write_text(
+            "from pathlib import Path\n"
+            f"CANONICAL_HOME = Path({str(codex_home)!r})\n"
+            "def canonical_reviewer_environment(source=None):\n"
+            "    return {'CODEX_HOME': str(CANONICAL_HOME)}\n"
+            f"def canonical_codex_binary(): return Path({codex_binary!r})\n",
+            encoding="utf-8",
+        )
+        (scripts / "codex_review_contract.py").write_text(
+            "REVIEW_MODEL_PINNED = 'gpt-5.6-sol'\n"
+            "REVIEW_REASONING_EFFORT_PINNED = 'high'\n",
+            encoding="utf-8",
+        )
+        return trusted
+
+    @staticmethod
+    def _write_private_review_log(path: Path, content: bytes | str) -> None:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.write_bytes(content.encode("utf-8") if isinstance(content, str) else content)
+        path.chmod(0o600)
+
+    def _receiptless_codex_attempt(self, *, error: str, events: list[dict] | None,
+                                   attempt_id: str = "a" * 32):
+        adapter, worktree, evidence, _, stdout = self._review_fixture()
+        self._write_private_review_log(stdout, json.dumps({"status": "FAIL", "error": error}) + "\n")
+        event_path = evidence / f"codex-review-output-{'b' * 12}-{attempt_id}.jsonl"
+        if events is not None:
+            self._write_private_review_log(
+                event_path,
+                "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+            )
+        process_stderr = Path(self.tmp.name) / f"{attempt_id}.stderr"
+        self._write_private_review_log(process_stderr, b"")
+        with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
+                patch.object(adapter, "_repo_from_origin", return_value="owner/project"), \
+                patch.object(adapter, "_canonical_codex_reviewer_policy", return_value={
+                    "codex_home": "/private/canonical-codex-reviewer",
+                    "codex_binary": "/usr/lib/chatgpt/resources/codex",
+                    "model": "gpt-5.6-sol", "reasoning_effort": "high",
+                }):
+            result = adapter.review_result(
+                "codex", worktree=str(worktree), base="a" * 40, head="b" * 40,
+                mission_id="mission", scope_file=str(worktree / "scope.json"),
+                stdout_path=str(stdout), evidence_dir=str(evidence), attempt_id=attempt_id,
+                terminal_status="EXITED", exit_code=1, stderr_path=str(process_stderr),
+            )
+        return result, event_path
 
     def _prepare_agent_preflight(self, adapter, worktree):
         with patch.object(adapter, "discover_pr", return_value=GateResult(
@@ -218,9 +272,10 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(start.call_args.args[5], head)
         self.assertEqual(start.call_args.args[4], reviewer_environment)
         self.assertFalse(start.call_args.kwargs["inherit_environment"])
-        review_env.assert_called_once_with("codex", worktree=str(context))
+        review_env.assert_called_once_with("codex", worktree=str(context), base=base)
         self.assertEqual(review_argv.call_args.kwargs["worktree"], str(context))
         self.assertEqual(review_argv.call_args.kwargs["scope_file"], str(context / "scope.json"))
+        self.assertRegex(review_argv.call_args.kwargs["attempt_id"], r"^[0-9a-f]{32}$")
         self.assertEqual((context / "scope.json").read_text(encoding="utf-8"), '{"forbidden_actions":["live"]}\n')
 
     def test_background_verify_continues_same_mission_without_duplicate(self):
@@ -331,7 +386,7 @@ class HarnessTest(unittest.TestCase):
             self.assertEqual(self.supervisor.step(self.spec.mission_id, spec), State.BLOCKED_EXTERNAL)
         duplicate_start.assert_not_called()
 
-    def test_transport_review_failure_uses_two_bounded_retries_with_backoff(self):
+    def test_typed_review_failure_uses_two_bounded_retries_with_backoff(self):
         head = "a" * 40
         spec = replace(self.spec, adapter="footballprediction", mission_scope_file="scope.json")
         (self.worktree / "scope.json").write_text("{}")
@@ -355,8 +410,8 @@ class HarnessTest(unittest.TestCase):
         with patch.object(self.supervisor.process, "poll", return_value=[
                 JobResult("transport-review-1", "LOST", None, head),
         ]), patch.object(self.supervisor.adapter, "review_result", return_value=GateResult(
-                "BLOCKED_EXTERNAL", "review transport failed",
-                transport_failure=ReviewTransportFailure.REQUEST_TIMEOUT)):
+                "BLOCKED_EXTERNAL", "review capacity failure",
+                failure_classification=ReviewFailureClassification.TRANSIENT_CAPACITY)):
             self.supervisor.reconcile(self.spec.mission_id)
         mission = self.journal.mission(self.spec.mission_id)
         self.assertEqual(mission["current_state"], State.REVIEW)
@@ -381,7 +436,7 @@ class HarnessTest(unittest.TestCase):
                 JobResult("transport-review-2", "LOST", None, head),
         ]), patch.object(self.supervisor.adapter, "review_result", return_value=GateResult(
                 "BLOCKED_EXTERNAL", "review transport failed",
-                transport_failure=ReviewTransportFailure.CONNECTION)):
+                failure_classification=ReviewFailureClassification.TRANSIENT_TRANSPORT)):
             self.supervisor.reconcile(self.spec.mission_id)
         self.assertEqual(self.journal.mission(self.spec.mission_id)["current_state"], State.REVIEW)
         self.assertGreaterEqual(float(self.journal.mission(self.spec.mission_id)["review_retry_after"]),
@@ -394,7 +449,7 @@ class HarnessTest(unittest.TestCase):
                 JobResult("transport-review-3", "LOST", None, head),
         ]), patch.object(self.supervisor.adapter, "review_result", return_value=GateResult(
                 "BLOCKED_EXTERNAL", "review transport failed",
-                transport_failure=ReviewTransportFailure.SERVICE_UNAVAILABLE)):
+                failure_classification=ReviewFailureClassification.TRANSIENT_CAPACITY)):
             self.supervisor.reconcile(self.spec.mission_id)
         self.assertEqual(self.journal.mission(self.spec.mission_id)["current_state"], State.BLOCKED_EXTERNAL)
         self.assertEqual(self.journal.db.execute(
@@ -408,18 +463,26 @@ class HarnessTest(unittest.TestCase):
             "BLOCKED_EXTERNAL", "malformed response: request timeout while reconnecting",
             data={"retryable": True, "classification": "transport"},
         )
-        self.assertFalse(Supervisor._review_transport_failure(terminal, malformed))
-        self.assertFalse(Supervisor._review_transport_failure(
+        self.assertFalse(Supervisor._review_retryable_failure(terminal, malformed))
+        self.assertFalse(Supervisor._review_retryable_failure(
             JobResult("review-job", "RUNNING", None, "a" * 40),
-            GateResult("BLOCKED_EXTERNAL", transport_failure=ReviewTransportFailure.TLS),
+            GateResult("BLOCKED_EXTERNAL",
+                       failure_classification=ReviewFailureClassification.TRANSIENT_TRANSPORT),
         ))
-        self.assertFalse(Supervisor._review_transport_failure(
-            terminal, GateResult("FAIL", transport_failure=ReviewTransportFailure.TLS),
+        self.assertFalse(Supervisor._review_retryable_failure(
+            terminal, GateResult("FAIL",
+                                 failure_classification=ReviewFailureClassification.TRANSIENT_TRANSPORT),
         ))
-        self.assertTrue(Supervisor._review_transport_failure(
+        self.assertTrue(Supervisor._review_retryable_failure(
             terminal, GateResult(
                 "BLOCKED_EXTERNAL", "trusted adapter classified timeout",
-                transport_failure=ReviewTransportFailure.REQUEST_TIMEOUT,
+                failure_classification=ReviewFailureClassification.TRANSIENT_TRANSPORT,
+            ),
+        ))
+        self.assertTrue(Supervisor._review_retryable_failure(
+            terminal, GateResult(
+                "BLOCKED_EXTERNAL", "trusted adapter classified capacity",
+                failure_classification=ReviewFailureClassification.TRANSIENT_CAPACITY,
             ),
         ))
 
@@ -3214,7 +3277,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
             argv = adapter.review_argv(
                 "codex", worktree=str(worktree), base="a" * 40, head="b" * 40,
                 mission_id="mission", scope_file=str(worktree / "scope.json"),
-                evidence_dir=str(evidence),
+                evidence_dir=str(evidence), attempt_id="a" * 32,
             )
         self.assertTrue(Path(argv[0]).is_absolute())
         self.assertEqual(argv[1:4], [
@@ -3222,6 +3285,8 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         ])
         self.assertNotIn("/usr/bin/env", argv)
         self.assertEqual(argv[argv.index("--repo-root") + 1], str(worktree))
+        self.assertEqual(argv[argv.index("--run-id") + 1], "a" * 32)
+        self.assertIn("--json", argv)
         self.assertIn("run", argv)
 
     def test_trusted_python_interpreter_uses_system_path_when_running_python_is_untrusted(self):
@@ -3256,11 +3321,24 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         adapter = FootballPredictionAdapter()
         worktree = Path(self.tmp.name) / "review-target"
         worktree.mkdir(exist_ok=True)
+        codex_home = Path(self.tmp.name) / ".footballprediction" / "canonical-codex-reviewer"
+        codex_home.mkdir(mode=0o700, parents=True)
+        codex_home.chmod(0o700)
+        auth_file = codex_home / "auth.json"
+        auth_file.write_text("credential-content-must-never-leak", encoding="utf-8")
+        auth_file.chmod(0o600)
+        trusted = self._trusted_codex_policy_fixture(Path(self.tmp.name), codex_home)
         attacker_bin = Path(self.tmp.name) / "attacker-bin"
         attacker_bin.mkdir(mode=0o777)
         attacker_bin.chmod(0o777)
         hostile = {
             "PATH": os.pathsep.join((str(attacker_bin), "/usr/bin")),
+            "CODEX_HOME": str(attacker_bin),
+            "CODEX_API_KEY": "builder-codex-key",
+            "OPENAI_API_KEY": "must-not-be-inherited",
+            "OPENAI_BASE_URL": "https://builder-provider.invalid/v1",
+            "OPENAI_MODEL": "builder-model",
+            "CLIPROXY_BASE_URL": "https://builder-proxy.invalid/v1",
             "GIT_DIR": "/attacker/repo.git",
             "GIT_WORK_TREE": "/attacker/worktree",
             "GIT_CONFIG_COUNT": "1",
@@ -3272,17 +3350,63 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
             "OPENAI_API_KEY": "must-not-be-inherited",
             "HTTPS_PROXY": "http://proxy.example.invalid:8080",
         }
-        with patch.dict(os.environ, hostile, clear=True):
-            environment = adapter.review_environment("codex", worktree=str(worktree))
+        with patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
+                patch.object(adapter, "_trusted_python_interpreter", return_value=sys.executable), \
+                patch.object(adapter, "_trusted_review_path", return_value="/usr/bin"), \
+                patch.object(adapter, "_call", wraps=adapter._call) as policy_call, \
+                patch.dict(os.environ, hostile, clear=True):
+            environment = adapter.review_environment("codex", worktree=str(worktree), base="a" * 40)
+            policy = adapter._canonical_codex_reviewer_policy(
+                worktree=str(worktree), base="a" * 40,
+            )
 
         self.assertEqual(environment["PATH"], "/usr/bin")
+        self.assertEqual(environment["CODEX_HOME"], str(codex_home))
+        self.assertNotEqual(environment["CODEX_HOME"], hostile["CODEX_HOME"])
         self.assertEqual(environment["HTTPS_PROXY"], hostile["HTTPS_PROXY"])
         self.assertEqual(environment["GIT_CONFIG_COUNT"], "0")
         for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "PYTHONPATH",
-                     "PYTHONHOME", "CODEX_CLI_PATH", "OPENAI_API_KEY"):
+                     "PYTHONHOME", "CODEX_CLI_PATH", "CODEX_API_KEY", "OPENAI_API_KEY",
+                     "OPENAI_BASE_URL", "OPENAI_MODEL", "CLIPROXY_BASE_URL"):
             self.assertNotIn(name, environment)
+        self.assertNotIn("credential-content-must-never-leak", repr(environment))
+        self.assertNotIn("credential-content-must-never-leak", repr(policy_call.call_args))
+        self.assertEqual(policy["codex_binary"], "/usr/bin/python3")
+        self.assertTrue(Path(policy["codex_binary"]).is_absolute())
+        self.assertEqual((policy["model"], policy["reasoning_effort"]), ("gpt-5.6-sol", "high"))
+        with patch.object(adapter, "_trusted_review_path", return_value="/usr/bin"):
+            deepseek_env = adapter.review_environment("deepseek", worktree=str(worktree))
+        self.assertNotIn("CODEX_HOME", deepseek_env)
         with self.assertRaisesRegex(ValueError, "unsupported independent reviewer"):
-            adapter.review_environment("other", worktree=str(worktree))
+            adapter.review_environment("other", worktree=str(worktree), base="a" * 40)
+
+    def test_codex_review_environment_fails_closed_when_canonical_home_is_missing(self):
+        adapter = FootballPredictionAdapter()
+        worktree = Path(self.tmp.name) / "missing-home-review-target"
+        worktree.mkdir()
+        missing_home = Path(self.tmp.name) / "missing-canonical-reviewer-home"
+        trusted = self._trusted_codex_policy_fixture(Path(self.tmp.name), missing_home)
+        hostile = {"CODEX_HOME": str(Path(self.tmp.name) / "builder-home")}
+        with patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
+                patch.object(adapter, "_trusted_python_interpreter", return_value=sys.executable), \
+                patch.object(adapter, "_trusted_review_path", return_value="/usr/bin"), \
+                patch.dict(os.environ, hostile, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "CODEX_HOME or auth metadata is unavailable"):
+                adapter.review_environment("codex", worktree=str(worktree), base="a" * 40)
+
+        invalid_home = Path(self.tmp.name) / "invalid-canonical-reviewer-home"
+        invalid_home.mkdir(mode=0o755)
+        invalid_home.chmod(0o755)
+        auth = invalid_home / "auth.json"
+        auth.write_text("fixture", encoding="utf-8")
+        auth.chmod(0o600)
+        trusted = self._trusted_codex_policy_fixture(Path(self.tmp.name), invalid_home)
+        with patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
+                patch.object(adapter, "_trusted_python_interpreter", return_value=sys.executable), \
+                patch.object(adapter, "_trusted_review_path", return_value="/usr/bin"), \
+                patch.dict(os.environ, hostile, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "CODEX_HOME must be owner-only"):
+                adapter.review_environment("codex", worktree=str(worktree), base="a" * 40)
 
     def test_authority_call_ignores_ambient_path_and_execution_overrides(self):
         adapter = FootballPredictionAdapter()
@@ -3392,6 +3516,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         )
         with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
                 patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
+                patch.object(adapter, "review_environment", return_value={"PATH": "/usr/bin"}), \
                 patch.object(adapter, "_call", return_value=classified) as call:
             result = adapter.review_result(
                 "codex", worktree=str(worktree), base="a" * 40, head="b" * 40,
@@ -3419,6 +3544,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
                 )
                 with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
                         patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
+                        patch.object(adapter, "review_environment", return_value={"PATH": "/usr/bin"}), \
                         patch.object(adapter, "_call", return_value=classified):
                     result = adapter.review_result(
                         "codex", worktree=str(worktree), base="a" * 40, head="b" * 40,
@@ -3426,6 +3552,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
                         stdout_path=str(stdout), evidence_dir=str(evidence_dir),
                     )
                 self.assertEqual(result.status, expected)
+                self.assertIsNone(result.failure_classification)
 
     def test_codex_classifier_without_receipt_verdict_fails_closed(self):
         adapter, worktree, evidence_dir, receipt, stdout = self._review_fixture()
@@ -3435,6 +3562,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         )
         with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
                 patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
+                patch.object(adapter, "review_environment", return_value={"PATH": "/usr/bin"}), \
                 patch.object(adapter, "_call", return_value=classified):
             result = adapter.review_result(
                 "codex", worktree=str(worktree), base="a" * 40, head="b" * 40,
@@ -3442,6 +3570,106 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
                 stdout_path=str(stdout), evidence_dir=str(evidence_dir),
             )
         self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+
+    def test_receiptless_codex_failures_get_typed_classification_and_private_evidence(self):
+        cases = (
+            ("capacity", "Selected model is at capacity; access_token=fixture-secret",
+             ReviewFailureClassification.TRANSIENT_CAPACITY, True),
+            ("timeout", "request timeout while waiting for response",
+             ReviewFailureClassification.TRANSIENT_TRANSPORT, True),
+            ("reset", "connection reset by peer",
+             ReviewFailureClassification.TRANSIENT_TRANSPORT, True),
+            ("auth", "token_revoked: HTTP 401",
+             ReviewFailureClassification.AUTHENTICATION_FAILURE, False),
+            ("unsupported", "unsupported model gpt-5.6-sol",
+             ReviewFailureClassification.MODEL_UNAVAILABLE_OR_UNSUPPORTED, False),
+            ("reconnect", "reconnecting after WebSocket failure; no turn.completed",
+             ReviewFailureClassification.TRANSIENT_TRANSPORT, True),
+        )
+        for attempt_number, (name, message, classification, retryable) in enumerate(cases, 1):
+            with self.subTest(name=name):
+                attempt_id = f"{attempt_number:032x}"
+                result, event_path = self._receiptless_codex_attempt(
+                    error=message,
+                    events=[{"type": "turn.failed", "error": {"message": message}}],
+                    attempt_id=attempt_id,
+                )
+                self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+                self.assertIsNone(result.artifact)
+                self.assertEqual(result.failure_classification, classification)
+                self.assertEqual(classification.retryable, retryable)
+                evidence_path = Path(result.data["failure_evidence_path"])
+                evidence_bytes = evidence_path.read_bytes()
+                evidence = json.loads(evidence_bytes)
+                self.assertEqual(
+                    hashlib.sha256(evidence_bytes).hexdigest(),
+                    result.data["failure_evidence_sha256"],
+                )
+                self.assertEqual(evidence["schema_version"], "cmh-review-attempt-failure/v1")
+                self.assertEqual(evidence["repository"], "owner/project")
+                self.assertEqual(evidence["mission_id"], "mission")
+                self.assertEqual(evidence["base_sha"], "a" * 40)
+                self.assertEqual(evidence["head_sha"], "b" * 40)
+                self.assertEqual(evidence["model"], "gpt-5.6-sol")
+                self.assertEqual(evidence["reasoning_effort"], "high")
+                self.assertEqual(evidence["attempt_id"], attempt_id)
+                self.assertEqual(evidence["terminal_status"], "EXITED")
+                self.assertEqual(evidence["failure_classification"], classification.value)
+                self.assertEqual(evidence["retryable"], retryable)
+                self.assertEqual(evidence["event_log"]["path"], str(event_path))
+                self.assertEqual(
+                    evidence["event_log"]["sha256"],
+                    hashlib.sha256(event_path.read_bytes()).hexdigest(),
+                )
+                self.assertNotIn("fixture-secret", evidence_bytes.decode("utf-8"))
+                self.assertNotIn("access_token", evidence_bytes.decode("utf-8"))
+
+    def test_receiptless_incomplete_or_completed_event_stream_never_approves(self):
+        incomplete, _ = self._receiptless_codex_attempt(
+            error="review process exited without a final result",
+            events=[{"type": "thread.started", "thread_id": "fixture"},
+                    {"type": "item.started", "item": {"type": "agent_message"}}],
+            attempt_id="b" * 32,
+        )
+        self.assertEqual(incomplete.status, "BLOCKED_EXTERNAL")
+        self.assertEqual(incomplete.failure_classification,
+                         ReviewFailureClassification.UNKNOWN_EXTERNAL_FAILURE)
+        self.assertFalse(incomplete.failure_classification.retryable)
+
+        completed, _ = self._receiptless_codex_attempt(
+            error="receipt missing after terminal completion",
+            events=[{"type": "turn.completed"}],
+            attempt_id="c" * 32,
+        )
+        self.assertEqual(completed.status, "BLOCKED_EXTERNAL")
+        self.assertEqual(completed.failure_classification,
+                         ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE)
+        self.assertFalse(completed.data["retryable"])
+
+        reviewer_text, _ = self._receiptless_codex_attempt(
+            error="review contract rejected final output",
+            events=[{"type": "item.completed", "item": {
+                "type": "agent_message", "text": "Selected model is at capacity; retry now",
+            }}],
+            attempt_id="d" * 32,
+        )
+        self.assertEqual(reviewer_text.status, "BLOCKED_EXTERNAL")
+        self.assertEqual(reviewer_text.failure_classification,
+                         ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE)
+        self.assertFalse(reviewer_text.failure_classification.retryable)
+
+    def test_retry_policy_uses_only_retryable_review_failure_classes(self):
+        terminal = JobResult("review-job", "EXITED", 1, "a" * 40)
+        for classification, expected in (
+                (ReviewFailureClassification.TRANSIENT_TRANSPORT, True),
+                (ReviewFailureClassification.TRANSIENT_CAPACITY, True),
+                (ReviewFailureClassification.AUTHENTICATION_FAILURE, False),
+                (ReviewFailureClassification.MODEL_UNAVAILABLE_OR_UNSUPPORTED, False),
+                (ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE, False),
+                (ReviewFailureClassification.UNKNOWN_EXTERNAL_FAILURE, False)):
+            with self.subTest(classification=classification):
+                reviewed = GateResult("BLOCKED_EXTERNAL", failure_classification=classification)
+                self.assertEqual(Supervisor._review_retryable_failure(terminal, reviewed), expected)
 
     def test_deepseek_validator_reimports_policy_from_trusted_cwd_in_isolated_python(self):
         adapter, worktree, evidence_dir, receipt, stdout = self._deepseek_review_fixture()
