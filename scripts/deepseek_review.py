@@ -11,6 +11,16 @@ import argparse, base64, hashlib, hmac, json, os, pwd, re, shutil, stat, subproc
 from pathlib import Path
 from urllib.parse import urlsplit
 
+_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from harness.review_failures import (  # noqa: E402
+    ReviewFailureClassification,
+    ReviewFailureDetails,
+    classify_review_failure,
+)
+
 VERSION = "cmh-deepseek-review/v4"
 MODEL = "deepseek-flash"
 ENDPOINT = "https://api.deepseek.com/anthropic"
@@ -328,8 +338,15 @@ def finding(value):
             and isinstance(value.get("title"),str) and bool(value["title"])
             and isinstance(value.get("evidence"),str) and bool(value["evidence"]))
 def reviewer_result(raw, *, require_dispositions=False, forbid_dispositions=False):
-    value = json.loads(raw)
+    try:
+        value = json.loads(raw)
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("invalid reviewer output") from None
+    if not isinstance(value, dict):
+        raise ValueError("invalid reviewer output")
     result = value.get("structured_output") or value.get("result") or value
+    if not isinstance(result, dict):
+        raise ValueError("invalid reviewer output")
     required = {"review_result", "findings"}
     allowed = required | {"dispositions"}
     if (not isinstance(result, dict) or not required <= set(result)
@@ -590,15 +607,156 @@ def invoke_reviewer(command, prompt_text, env, timeout):
     # chunk prompts happen to fit while the full-diff prompt does not).  Claude
     # Code's print mode explicitly supports text prompts on stdin, which also
     # avoids exposing source bytes through process listings.
-    return subprocess.run(command, input=prompt_text, env=env, capture_output=True,
-                          text=True, timeout=timeout)
+    return subprocess.run(command, input=prompt_text.encode("utf-8"), env=env,
+                          capture_output=True, timeout=timeout)
+
+
+class ReviewAttemptFailure(RuntimeError):
+    """Safe typed failure raised only after publishing durable attempt evidence."""
+
+    def __init__(self, details, evidence_path=None, evidence_sha256=None):
+        self.classification = details.classification
+        self.retryable = details.retryable
+        self.reason_code = details.reason_code
+        self.diagnostic = details.sanitized_diagnostic
+        self.evidence_path = str(evidence_path) if evidence_path is not None else None
+        self.evidence_sha256 = evidence_sha256
+        super().__init__(
+            f"DeepSeek review attempt failed: {self.classification.value}; "
+            f"retryable={str(self.retryable).lower()}"
+        )
+
+    def as_payload(self):
+        """Return the bounded machine-readable failure contract for callers."""
+        return {
+            "status": "BLOCKED_EXTERNAL",
+            "error": self.diagnostic,
+            "failure_classification": self.classification.value,
+            "retryable": self.retryable,
+            "reason_code": self.reason_code,
+            "failure_evidence_path": self.evidence_path,
+            "failure_evidence_sha256": self.evidence_sha256,
+        }
+
+
+def _captured_bytes(value):
+    if value is None:
+        return b""
+    if isinstance(value, bytes):
+        return value
+    return str(value).encode("utf-8", errors="replace")
+
+
+def _captured_text(value):
+    return _captured_bytes(value).decode("utf-8", errors="replace")
+
+
+def _credential_echoed(stdout, stderr, token):
+    if not token:
+        return False
+    secret = token.encode("utf-8")
+    return any(secret in _captured_bytes(value) for value in (stdout, stderr))
+
+
+def _output_failure_details(error):
+    """Map local output validation errors without retaining their raw text."""
+    message = str(error).casefold()
+    if any(marker in message for marker in (
+            "disposition", "review contract", "verdict mismatch")):
+        return ReviewFailureDetails(
+            ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE,
+            "review_contract_rejected",
+            "reviewer output violated the required review contract",
+        )
+    return ReviewFailureDetails(
+        ReviewFailureClassification.INVALID_REVIEWER_OUTPUT,
+        "invalid_reviewer_output",
+        "reviewer response did not match the required output schema",
+    )
+
+
+def _publish_attempt_failure(
+        *, evidence_fd, evidence_dir, run_id, repository, mission_id, base, head, diff_hash,
+        stage, chunk_index, started_at, completed_at, terminal_status, exit_code,
+        command, stdout, stderr, token, details=None, completed_chunks=()):
+    """Commit one sanitized typed failure artifact; never persist raw streams."""
+    stdout_bytes = _captured_bytes(stdout)
+    stderr_bytes = _captured_bytes(stderr)
+    if _credential_echoed(stdout, stderr, token):
+        details = ReviewFailureDetails(
+            ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE,
+            "credential_echo_detected",
+            "reviewer output contained the configured credential; raw output discarded",
+        )
+    elif details is None:
+        details = classify_review_failure((
+            _captured_text(stdout), _captured_text(stderr),
+        ))
+
+    completed_artifacts = [
+        {
+            "chunk_index": chunk.get("index"),
+            "path": f"chunk-{chunk.get('index', 0):03d}.json",
+            "sha256": chunk.get("output_sha256"),
+        }
+        for chunk in completed_chunks
+        if isinstance(chunk, dict) and isinstance(chunk.get("output_sha256"), str)
+    ]
+    record = {
+        "schema_version": "cmh-review-attempt-failure/v1",
+        "repository": repository,
+        "mission_id": mission_id,
+        "base_sha": base,
+        "head_sha": head,
+        "diff_sha256": diff_hash,
+        "reviewer": "deepseek",
+        "provider": "deepseek",
+        "model": MODEL,
+        "reasoning_effort": None,
+        "attempt_id": run_id,
+        "stage": stage,
+        "chunk_index": chunk_index,
+        "terminal_status": terminal_status,
+        "exit_code": exit_code,
+        "turn_completed": None,
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "failure_classification": details.classification.value,
+        "retryable": details.retryable,
+        "reason_code": details.reason_code,
+        "http_status": details.http_status,
+        "provider_error_code": details.provider_error_code,
+        "sanitized_diagnostic": details.sanitized_diagnostic,
+        "process_stdout_sha256": digest(stdout_bytes),
+        "process_stderr_sha256": digest(stderr_bytes),
+        "command_sha256": digest(canon(command)) if command else None,
+        "completed_chunk_artifacts": completed_artifacts,
+        "receipt_written": False,
+    }
+    record["integrity_sha256"] = digest(canon(record))
+    rendered = canon(record) + b"\n"
+    stage_name = f"{stage}-{chunk_index:03d}" if chunk_index is not None else stage
+    name = f"review-attempt-failure-{stage_name}-{run_id}.json"
+    try:
+        write_private_artifact(evidence_fd, name, rendered, run_id)
+    except (OSError, ValueError):
+        failed_details = ReviewFailureDetails(
+            ReviewFailureClassification.UNKNOWN_EXTERNAL_FAILURE,
+            "failure_evidence_persistence_failed",
+            "typed reviewer failure evidence could not be persisted",
+        )
+        raise ReviewAttemptFailure(failed_details) from None
+    return ReviewAttemptFailure(details, evidence_dir / name, digest(rendered))
+
+
+def _raise_attempt_failure(**kwargs):
+    raise _publish_attempt_failure(**kwargs)
+
 
 def reject_credential_echo(completed, token):
     """Reject secrets on either captured stream without reflecting the stream."""
-    secret = token.encode("utf-8")
-    for output in (completed.stdout, completed.stderr):
-        if isinstance(output, str) and secret in output.encode("utf-8"):
-            raise ValueError("DeepSeek output contained review credential")
+    if _credential_echoed(completed.stdout, completed.stderr, token):
+        raise ValueError("DeepSeek output contained review credential")
 
 def resolve_claude_launcher(root, path_value):
     """Resolve the owner-installed CLI without searching the reviewed tree or CWD."""
@@ -637,66 +795,226 @@ def resolve_claude_launcher(root, path_value):
     return str(resolved),safe_path
 
 def run(args):
-    root=Path(args.repo).resolve(); base=full_sha(args.base); head=full_sha(args.head)
-    if git(root,"rev-parse","HEAD").decode().strip().lower()!=head: raise ValueError("worktree HEAD differs from requested HEAD")
-    repository=repository_identity(git(root,"config","--get","remote.origin.url").decode().strip())
-    diff=git(root,"diff","--no-ext-diff","--no-textconv","--binary",f"{base}..{head}"); plan=chunks(diff); diff_hash=digest(diff)
-    claude_executable,safe_path=resolve_claude_launcher(root,os.environ.get("PATH",""))
-    manifest={"version":"cmh-deepseek-chunks/v2","base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"chunks":[dict(chunk) for chunk in plan]}; manifest_hash=digest(canon(manifest))
-    token=read_token_file(args.token_file,root)
-    if not token: raise ValueError("empty DeepSeek token file")
-    evidence_root_fd=None; evidence_fd=None; settings=None; env={}
+    root = Path(args.repo).resolve()
+    base = full_sha(args.base)
+    head = full_sha(args.head)
+    if git(root, "rev-parse", "HEAD").decode().strip().lower() != head:
+        raise ValueError("worktree HEAD differs from requested HEAD")
+    repository = repository_identity(git(root, "config", "--get", "remote.origin.url").decode().strip())
+    diff = git(root, "diff", "--no-ext-diff", "--no-textconv", "--binary", f"{base}..{head}")
+    plan = chunks(diff)
+    diff_hash = digest(diff)
+    manifest = {
+        "version": "cmh-deepseek-chunks/v2", "base_sha": base, "head_sha": head,
+        "diff_sha256": diff_hash, "chunks": [dict(chunk) for chunk in plan],
+    }
+    manifest_hash = digest(canon(manifest))
+
+    evidence_root_fd = None
+    evidence_fd = None
+    settings = None
+    env = {}
+    token = ""
     try:
-        evidence_root,evidence_root_fd=open_private_directory(args.evidence,root)
-        run_id=uuid.uuid4().hex; evidence=evidence_root/run_id
-        evidence_fd=create_private_child_directory(evidence_root_fd,run_id)
-        settings=tempfile.NamedTemporaryFile(mode="w",delete=False)
-        settings.write('{"permissions":{"allow":[],"deny":["Bash","Edit","Write","Read","Glob","Grep","WebFetch","WebSearch"]}}')
-        settings.close()
-        common_command=[claude_executable,"--bare","--restricted","--print","--model",MODEL,"--settings",settings.name,"--tools","","--disallowed-tools","Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch","--output-format","json"]
-        chunk_command=common_command+["--json-schema",json.dumps(CHUNK_SCHEMA,separators=(",",":"))]
-        aggregate_command=common_command+["--json-schema",json.dumps(AGGREGATE_SCHEMA,separators=(",",":"))]
-        env={"HOME":"/nonexistent","PATH":safe_path,"LANG":"C.UTF-8","ANTHROPIC_API_KEY":token,"ANTHROPIC_AUTH_TOKEN":token,"ANTHROPIC_BASE_URL":ENDPOINT,"CLAUDE_CODE_SIMPLE":"1", **reviewer_transport_environment()}
-        results=[]
-        for chunk in plan:
-            source=diff[chunk["start"]:chunk["end"]]
-            completed=invoke_reviewer(chunk_command,prompt(base,head,diff_hash,manifest_hash,chunk,source),env,args.timeout)
-            reject_credential_echo(completed, token)
-            if completed.returncode: raise RuntimeError(f"DeepSeek reviewer infrastructure failure: exit={completed.returncode}")
-            raw=completed.stdout.encode()
-            write_private_artifact(evidence_fd,f"chunk-{chunk['index']:03d}.json",raw,run_id)
-            result=reviewer_result(completed.stdout, forbid_dispositions=True)
-            chunk["result"]=result; chunk["output_sha256"]=digest(raw); results.extend(result.get("findings",[]))
-        chunk_findings, required_dispositions = indexed_chunk_findings(plan)
-        aggregate_call=invoke_reviewer(
-            aggregate_command,
-            aggregate_prompt(base, head, diff_hash, manifest_hash, plan, diff,
-                             chunk_findings, required_dispositions),
-            env, args.timeout,
+        evidence_root, evidence_root_fd = open_private_directory(args.evidence, root)
+        run_id = uuid.uuid4().hex
+        evidence = evidence_root / run_id
+        evidence_fd = create_private_child_directory(evidence_root_fd, run_id)
+        run_started_at = time.time()
+
+        try:
+            claude_executable, safe_path = resolve_claude_launcher(
+                root, os.environ.get("PATH", ""),
+            )
+            token = read_token_file(args.token_file, root)
+            if not token:
+                raise ValueError("empty DeepSeek token file")
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+            message = str(exc).casefold()
+            if "token" in message or "authentication" in message:
+                details = ReviewFailureDetails(
+                    ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE,
+                    "reviewer_credential_policy_failure",
+                    "reviewer credential file is missing or violates its security policy",
+                )
+            else:
+                details = ReviewFailureDetails(
+                    ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE,
+                    "trusted_reviewer_launcher_unavailable",
+                    "trusted DeepSeek reviewer executable could not be resolved",
+                )
+            _raise_attempt_failure(
+                evidence_fd=evidence_fd, evidence_dir=evidence, run_id=run_id,
+                repository=repository, mission_id=args.mission_id, base=base, head=head,
+                diff_hash=diff_hash, stage="setup", chunk_index=None,
+                started_at=run_started_at, completed_at=time.time(),
+                terminal_status="NOT_STARTED", exit_code=None, command=None,
+                stdout="", stderr="", token="", details=details,
+            )
+
+        settings = tempfile.NamedTemporaryFile(mode="w", delete=False)
+        settings.write(
+            '{"permissions":{"allow":[],"deny":["Bash","Edit","Write","Read",'
+            '"Glob","Grep","WebFetch","WebSearch"]}}'
         )
-        reject_credential_echo(aggregate_call, token)
+        settings.close()
+        common_command = [
+            claude_executable, "--bare", "--restricted", "--print", "--model", MODEL,
+            "--settings", settings.name, "--tools", "", "--disallowed-tools",
+            "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch", "--output-format", "json",
+        ]
+        chunk_command = common_command + [
+            "--json-schema", json.dumps(CHUNK_SCHEMA, separators=(",", ":")),
+        ]
+        aggregate_command = common_command + [
+            "--json-schema", json.dumps(AGGREGATE_SCHEMA, separators=(",", ":")),
+        ]
+        env = {
+            "HOME": "/nonexistent", "PATH": safe_path, "LANG": "C.UTF-8",
+            "ANTHROPIC_API_KEY": token, "ANTHROPIC_AUTH_TOKEN": token,
+            "ANTHROPIC_BASE_URL": ENDPOINT, "CLAUDE_CODE_SIMPLE": "1",
+            **reviewer_transport_environment(),
+        }
+        results = []
+
+        def fail(stage, chunk_index, command, started_at, terminal_status, exit_code,
+                 stdout="", stderr="", details=None):
+            _raise_attempt_failure(
+                evidence_fd=evidence_fd, evidence_dir=evidence, run_id=run_id,
+                repository=repository, mission_id=args.mission_id, base=base, head=head,
+                diff_hash=diff_hash, stage=stage, chunk_index=chunk_index,
+                started_at=started_at, completed_at=time.time(),
+                terminal_status=terminal_status, exit_code=exit_code, command=command,
+                stdout=stdout, stderr=stderr, token=token, details=details,
+                completed_chunks=plan,
+            )
+
+        for chunk in plan:
+            source = diff[chunk["start"]:chunk["end"]]
+            call_started_at = time.time()
+            try:
+                completed = invoke_reviewer(
+                    chunk_command,
+                    prompt(base, head, diff_hash, manifest_hash, chunk, source),
+                    env, args.timeout,
+                )
+            except subprocess.TimeoutExpired as exc:
+                fail(
+                    "chunk", chunk["index"], chunk_command, call_started_at,
+                    "TIMED_OUT", None, exc.stdout, exc.stderr,
+                    ReviewFailureDetails(
+                        ReviewFailureClassification.TRANSIENT_TRANSPORT,
+                        "reviewer_request_timeout",
+                        "reviewer subprocess exceeded the configured request timeout",
+                    ),
+                )
+            except OSError:
+                fail(
+                    "chunk", chunk["index"], chunk_command, call_started_at,
+                    "NOT_STARTED", None, details=ReviewFailureDetails(
+                        ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE,
+                        "reviewer_process_start_failed",
+                        "trusted reviewer process could not be started",
+                    ),
+                )
+            if _credential_echoed(completed.stdout, completed.stderr, token):
+                fail("chunk", chunk["index"], chunk_command, call_started_at,
+                     "OUTPUT_REJECTED", completed.returncode,
+                     completed.stdout, completed.stderr)
+            if completed.returncode:
+                fail("chunk", chunk["index"], chunk_command, call_started_at,
+                     "EXITED", completed.returncode,
+                     completed.stdout, completed.stderr)
+            try:
+                result = reviewer_result(completed.stdout, forbid_dispositions=True)
+            except (ValueError, TypeError) as exc:
+                fail("chunk", chunk["index"], chunk_command, call_started_at,
+                     "OUTPUT_REJECTED", completed.returncode,
+                     completed.stdout, completed.stderr, _output_failure_details(exc))
+            raw = _captured_bytes(completed.stdout)
+            write_private_artifact(evidence_fd, f"chunk-{chunk['index']:03d}.json", raw, run_id)
+            chunk["result"] = result
+            chunk["output_sha256"] = digest(raw)
+            results.extend(result.get("findings", []))
+
+        chunk_findings, required_dispositions = indexed_chunk_findings(plan)
+        call_started_at = time.time()
+        try:
+            aggregate_call = invoke_reviewer(
+                aggregate_command,
+                aggregate_prompt(base, head, diff_hash, manifest_hash, plan, diff,
+                                 chunk_findings, required_dispositions),
+                env, args.timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            fail(
+                "aggregate", None, aggregate_command, call_started_at,
+                "TIMED_OUT", None, exc.stdout, exc.stderr,
+                ReviewFailureDetails(
+                    ReviewFailureClassification.TRANSIENT_TRANSPORT,
+                    "reviewer_request_timeout",
+                    "reviewer subprocess exceeded the configured request timeout",
+                ),
+            )
+        except OSError:
+            fail(
+                "aggregate", None, aggregate_command, call_started_at,
+                "NOT_STARTED", None, details=ReviewFailureDetails(
+                    ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE,
+                    "reviewer_process_start_failed",
+                    "trusted reviewer process could not be started",
+                ),
+            )
+        if _credential_echoed(aggregate_call.stdout, aggregate_call.stderr, token):
+            fail("aggregate", None, aggregate_command, call_started_at,
+                 "OUTPUT_REJECTED", aggregate_call.returncode,
+                 aggregate_call.stdout, aggregate_call.stderr)
         if aggregate_call.returncode:
-            raise RuntimeError(f"DeepSeek aggregate reviewer infrastructure failure: exit={aggregate_call.returncode}")
-        aggregate_raw=aggregate_call.stdout.encode()
-        write_private_artifact(evidence_fd,"aggregate.json",aggregate_raw,run_id)
-        aggregate_result=reviewer_result(aggregate_call.stdout, require_dispositions=True)
-        validate_blocker_dispositions(plan, aggregate_result)
-        verdict=aggregate_result["review_result"]
-        receipt={"version":VERSION,"repository":repository,"mission_id":args.mission_id,"base_sha":base,"head_sha":head,"diff_sha256":diff_hash,"manifest_sha256":manifest_hash,"chunks":plan,"chunk_findings":results,"aggregate_result":aggregate_result,"aggregate_output_sha256":digest(aggregate_raw),"provider":"deepseek","model":MODEL,"command_sha256":digest(canon({"chunk":chunk_command,"aggregate":aggregate_command})),"started_at":int(time.time()),"completed_at":int(time.time()),"review_result":verdict,"findings":aggregate_result["findings"]}
-        receipt["integrity_sha256"]=digest(canon(receipt)); receipt["auth_hmac_sha256"]=auth_digest(receipt,token)
-        path=evidence/f"deepseek-receipt-{head[:12]}-{run_id}.json"
-        validate(receipt,base,head,root,path,args.mission_id,repository,secret=token)
-        write_private_artifact(evidence_fd,path.name,canon(receipt),run_id)
-        persisted=json.loads(read_private_artifact(evidence_fd,path.name))
-        validate(persisted,base,head,root,path,args.mission_id,repository,secret=token)
+            fail("aggregate", None, aggregate_command, call_started_at,
+                 "EXITED", aggregate_call.returncode,
+                 aggregate_call.stdout, aggregate_call.stderr)
+        try:
+            aggregate_result = reviewer_result(aggregate_call.stdout, require_dispositions=True)
+            validate_blocker_dispositions(plan, aggregate_result)
+        except (ValueError, TypeError) as exc:
+            fail("aggregate", None, aggregate_command, call_started_at,
+                 "OUTPUT_REJECTED", aggregate_call.returncode,
+                 aggregate_call.stdout, aggregate_call.stderr, _output_failure_details(exc))
+
+        aggregate_raw = _captured_bytes(aggregate_call.stdout)
+        write_private_artifact(evidence_fd, "aggregate.json", aggregate_raw, run_id)
+        verdict = aggregate_result["review_result"]
+        receipt = {
+            "version": VERSION, "repository": repository, "mission_id": args.mission_id,
+            "base_sha": base, "head_sha": head, "diff_sha256": diff_hash,
+            "manifest_sha256": manifest_hash, "chunks": plan,
+            "chunk_findings": results, "aggregate_result": aggregate_result,
+            "aggregate_output_sha256": digest(aggregate_raw), "provider": "deepseek",
+            "model": MODEL,
+            "command_sha256": digest(canon({"chunk": chunk_command,
+                                             "aggregate": aggregate_command})),
+            "started_at": int(run_started_at), "completed_at": int(time.time()),
+            "review_result": verdict, "findings": aggregate_result["findings"],
+        }
+        receipt["integrity_sha256"] = digest(canon(receipt))
+        receipt["auth_hmac_sha256"] = auth_digest(receipt, token)
+        path = evidence / f"deepseek-receipt-{head[:12]}-{run_id}.json"
+        validate(receipt, base, head, root, path, args.mission_id, repository, secret=token)
+        write_private_artifact(evidence_fd, path.name, canon(receipt), run_id)
+        persisted = json.loads(read_private_artifact(evidence_fd, path.name))
+        validate(persisted, base, head, root, path, args.mission_id, repository, secret=token)
         os.fsync(evidence_fd)
-        print(json.dumps({"status":verdict,"receipt":str(path),"review_receipt":str(path),"head_sha":head}))
+        print(json.dumps({"status": verdict, "receipt": str(path),
+                          "review_receipt": str(path), "head_sha": head}))
     finally:
         if settings is not None:
             Path(settings.name).unlink(missing_ok=True)
-        env.clear(); token=""
-        if evidence_fd is not None: os.close(evidence_fd)
-        if evidence_root_fd is not None: os.close(evidence_root_fd)
+        env.clear()
+        token = ""
+        if evidence_fd is not None:
+            os.close(evidence_fd)
+        if evidence_root_fd is not None:
+            os.close(evidence_root_fd)
 def main():
     p=argparse.ArgumentParser(); sub=p.add_subparsers(dest="cmd",required=True)
     r=sub.add_parser("run"); r.add_argument("--repo",default="."); r.add_argument("--mission-id",default="codex-mission-harness"); r.add_argument("--base",required=True); r.add_argument("--head",required=True); r.add_argument("--evidence",required=True); r.add_argument("--token-file",required=True); r.add_argument("--timeout",type=int,default=900)
@@ -715,6 +1033,18 @@ def main():
                 print(json.dumps({"status":validate(receipt,full_sha(a.base),full_sha(a.head),root,receipt_path,a.mission_id,repository,secret=token)["review_result"]}))
             finally:
                 token=""; os.close(evidence_fd)
-    except Exception as exc: print(json.dumps({"status":"BLOCKED_EXTERNAL","error":str(exc)})); return 1
+    except ReviewAttemptFailure as exc:
+        print(json.dumps(exc.as_payload(), sort_keys=True, separators=(",", ":")))
+        return 1
+    except Exception:
+        # Unexpected local errors must fail closed without reflecting command,
+        # environment, credential-file, or provider data into the log.
+        print(json.dumps({
+            "status": "BLOCKED_EXTERNAL",
+            "failure_classification": ReviewFailureClassification.UNKNOWN_EXTERNAL_FAILURE.value,
+            "retryable": False,
+            "error": "DeepSeek review failed before a valid receipt was produced",
+        }, sort_keys=True, separators=(",", ":")))
+        return 1
     return 0
 if __name__=="__main__": raise SystemExit(main())

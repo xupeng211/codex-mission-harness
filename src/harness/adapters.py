@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import hmac
 import os
 import re
 import shutil
@@ -10,10 +11,11 @@ import stat
 import subprocess
 import sys
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
+
+from .review_failures import ReviewFailureClassification, classify_review_failure
 
 
 @dataclass(frozen=True)
@@ -23,24 +25,6 @@ class GateResult:
     artifact: str | None = None
     data: dict[str, Any] | None = None
     failure_classification: "ReviewFailureClassification | None" = None
-
-
-class ReviewFailureClassification(str, Enum):
-    """Typed, fail-closed classification for receipt-less reviewer attempts."""
-
-    TRANSIENT_TRANSPORT = "TRANSIENT_TRANSPORT"
-    TRANSIENT_CAPACITY = "TRANSIENT_CAPACITY"
-    AUTHENTICATION_FAILURE = "AUTHENTICATION_FAILURE"
-    MODEL_UNAVAILABLE_OR_UNSUPPORTED = "MODEL_UNAVAILABLE_OR_UNSUPPORTED"
-    POLICY_OR_CONTRACT_FAILURE = "POLICY_OR_CONTRACT_FAILURE"
-    UNKNOWN_EXTERNAL_FAILURE = "UNKNOWN_EXTERNAL_FAILURE"
-
-    @property
-    def retryable(self) -> bool:
-        return self in {
-            ReviewFailureClassification.TRANSIENT_TRANSPORT,
-            ReviewFailureClassification.TRANSIENT_CAPACITY,
-        }
 
 
 class FootballPredictionAdapter:
@@ -1008,6 +992,106 @@ class FootballPredictionAdapter:
             if fd >= 0:
                 os.close(fd)
 
+    def _deepseek_wrapper_failure(
+        self, payload: dict[str, Any], *, evidence_dir: Path, mission_id: str,
+        base: str, head: str, repository: str,
+    ) -> dict[str, Any] | None:
+        """Accept a DeepSeek typed failure only with its exact private sidecar."""
+        try:
+            classification = ReviewFailureClassification(payload.get("failure_classification"))
+        except (TypeError, ValueError):
+            return None
+        retryable = payload.get("retryable")
+        evidence_path = payload.get("failure_evidence_path")
+        expected_sha = payload.get("failure_evidence_sha256")
+        if (payload.get("status") != "BLOCKED_EXTERNAL"
+                or not isinstance(retryable, bool) or retryable != classification.retryable
+                or not isinstance(evidence_path, str) or not Path(evidence_path).is_absolute()
+                or not isinstance(expected_sha, str)
+                or re.fullmatch(r"[0-9a-f]{64}", expected_sha) is None):
+            return None
+
+        path = Path(evidence_path)
+        if (path.is_symlink() or path.name.startswith(".")
+                or not path.name.startswith("review-attempt-failure-")
+                or path.suffix != ".json"):
+            return None
+        try:
+            expected_root = evidence_dir.resolve(strict=True)
+            parent = path.parent
+            parent_info = parent.lstat()
+            if (stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode)
+                    or (hasattr(os, "getuid") and parent_info.st_uid != os.getuid())
+                    or stat.S_IMODE(parent_info.st_mode) != 0o700
+                    or parent.resolve(strict=True).parent != expected_root
+                    or path.resolve(strict=True).parent != parent.resolve(strict=True)):
+                return None
+        except OSError:
+            return None
+
+        private_artifact = self._read_private_review_log(path)
+        if private_artifact is None or private_artifact[1] != expected_sha:
+            return None
+        try:
+            record = json.loads(private_artifact[0].decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(record, dict):
+            return None
+        integrity = record.get("integrity_sha256")
+        unsigned = {key: value for key, value in record.items() if key != "integrity_sha256"}
+        canonical = json.dumps(
+            unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+        if (not isinstance(integrity, str)
+                or not hmac.compare_digest(hashlib.sha256(canonical).hexdigest(), integrity)):
+            return None
+
+        attempt_id = record.get("attempt_id")
+        diff_sha = record.get("diff_sha256")
+        record_repository = record.get("repository")
+        record_remote = urlsplit(record_repository) if isinstance(record_repository, str) else None
+        record_parts = (record_remote.path.strip("/").split("/")
+                        if record_remote is not None else [])
+        record_identity = None
+        if (record_remote is not None and record_remote.hostname is not None
+                and record_remote.hostname.lower() == "github.com"
+                and record_remote.scheme in {"https", "ssh"}
+                and record_remote.username is None and record_remote.password is None
+                and not record_remote.query and not record_remote.fragment
+                and len(record_parts) == 2):
+            record_owner, record_name = record_parts
+            if record_name.endswith(".git"):
+                record_name = record_name[:-4]
+            record_identity = f"{record_owner}/{record_name}"
+        if (record.get("schema_version") != "cmh-review-attempt-failure/v1"
+                or record.get("provider") != "deepseek"
+                or record.get("model") != "deepseek-flash"
+                or record_identity != repository
+                or record.get("mission_id") != mission_id
+                or record.get("base_sha") != base.lower()
+                or record.get("head_sha") != head.lower()
+                or not isinstance(attempt_id, str)
+                or re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None
+                or path.parent.name != attempt_id
+                or not isinstance(diff_sha, str)
+                or re.fullmatch(r"[0-9a-f]{64}", diff_sha) is None
+                or record.get("failure_classification") != classification.value
+                or record.get("retryable") is not retryable
+                or record.get("receipt_written") is not False):
+            return None
+        return {
+            "status": "BLOCKED_EXTERNAL",
+            "failure_classification": classification.value,
+            "retryable": retryable,
+            "reason_code": record.get("reason_code"),
+            "stage": record.get("stage"),
+            "attempt_id": attempt_id,
+            "failure_evidence_path": str(path),
+            "failure_evidence_sha256": expected_sha,
+            "diff_sha256": diff_sha,
+        }
+
     @staticmethod
     def _review_error_fields(value: object) -> list[str]:
         """Extract only provider error fields from a structured failure event."""
@@ -1027,35 +1111,12 @@ class FootballPredictionAdapter:
     @staticmethod
     def _classify_review_error_text(value: str) -> tuple[ReviewFailureClassification, str] | None:
         """Map bounded error evidence to a type and safe reason code."""
-        text = value.casefold()
-        if (text.strip() == "401" or any(marker in text for marker in (
-                "token_revoked", "http 401", "status 401", "unauthorized", "authentication failed",
-                "invalid api key", "invalid authentication", "authentication file missing",
-                "authentication file must", "canonical codex auth file", "codex authentication",
-                "reviewer was not authenticated", "canonical reviewer 未建立"))):
-            return ReviewFailureClassification.AUTHENTICATION_FAILURE, "authentication_rejected"
-        if any(marker in text for marker in (
-                "unsupported model", "model unsupported", "model is not supported", "model not supported",
-                "not supported for model", "model_unavailable", "model unavailable",
-                "model_not_found", "model not found", "unknown model", "model does not exist")):
-            return ReviewFailureClassification.MODEL_UNAVAILABLE_OR_UNSUPPORTED, "model_unavailable"
-        if any(marker in text for marker in (
-                "selected model is at capacity", "model at capacity", "at capacity",
-                "rate_limit", "rate limit", "too many requests", "http 429", "status 429")):
-            return ReviewFailureClassification.TRANSIENT_CAPACITY, "provider_capacity"
-        if any(marker in text for marker in (
-                "request timeout", "timed out", "timeout", "connection reset", "connection refused",
-                "connection closed", "websocket", "tls handshake", "ssl error", "https transport",
-                "reconnect", "service unavailable", "http 502", "http 503", "http 504",
-                "status 502", "status 503", "status 504", "http 408", "status 408",
-                "server disconnected", "socket hang up", "network error")):
-            return ReviewFailureClassification.TRANSIENT_TRANSPORT, "transport_interrupted"
-        if any(marker in text for marker in (
-                "invalid_request", "invalid review result", "review contract", "receipt missing",
-                "receipt validation", "output schema", "turn.completed", "challenge mismatch",
-                "policy refusal", "policy failure")):
-            return ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE, "review_contract_rejected"
-        return None
+        details = classify_review_failure([value])
+        if details.classification == ReviewFailureClassification.UNKNOWN_EXTERNAL_FAILURE:
+            # Preserve established behavior for ordinary reviewer prose: only
+            # known, explicit failure signals can drive a retry decision.
+            return None
+        return details.classification, details.reason_code
 
     def _receiptless_review_failure(
         self, *, reviewer: str, worktree: str, base: str, head: str, mission_id: str,
@@ -1126,6 +1187,7 @@ class FootballPredictionAdapter:
         # record. Ordinary reviewer text and untyped JSON never enter the
         # classifier.
         wrapper_failure: dict[str, Any] = {}
+        typed_wrapper_failure: dict[str, Any] | None = None
         if process_stdout is not None:
             try:
                 wrapper_payload = self._json_last_text(process_stdout[0].decode("utf-8", errors="replace"))
@@ -1134,14 +1196,32 @@ class FootballPredictionAdapter:
             if (isinstance(wrapper_payload, dict)
                     and wrapper_payload.get("status") in {"FAIL", "BLOCKED_EXTERNAL"}
                     and isinstance(wrapper_payload.get("error"), str)):
-                signals.append(wrapper_payload["error"])
                 wrapper_failure = {"status": str(wrapper_payload["status"])}
-                signal_sources.append("trusted_wrapper_json_error")
+                if reviewer != "deepseek":
+                    signals.append(wrapper_payload["error"])
+                    signal_sources.append("trusted_wrapper_json_error")
+                elif wrapper_payload.get("status") == "BLOCKED_EXTERNAL":
+                    try:
+                        repository = self._repo_from_origin(worktree)
+                    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+                        repository = "unknown/unknown"
+                    typed_wrapper_failure = self._deepseek_wrapper_failure(
+                        wrapper_payload, evidence_dir=evidence_dir, mission_id=mission_id,
+                        base=base, head=head, repository=repository,
+                    )
+                    if typed_wrapper_failure is not None:
+                        wrapper_failure = typed_wrapper_failure
+                        signal_sources.append("validated_deepseek_failure_artifact")
 
         if contract_failure or turn_completed:
             classification = ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE
             reason_code = ("invalid_receipt_binding" if contract_failure
                            else "completed_turn_without_valid_receipt")
+        elif typed_wrapper_failure is not None:
+            classification = ReviewFailureClassification(
+                typed_wrapper_failure["failure_classification"],
+            )
+            reason_code = str(typed_wrapper_failure.get("reason_code") or "deepseek_attempt_failed")
         else:
             classification = ReviewFailureClassification.UNKNOWN_EXTERNAL_FAILURE
             reason_code = "unclassified_external_failure"
@@ -1149,10 +1229,12 @@ class FootballPredictionAdapter:
             # captured; only clean capacity/transport evidence may retry.
             for category in (
                 ReviewFailureClassification.AUTHENTICATION_FAILURE,
+                ReviewFailureClassification.PAYMENT_OR_BILLING_FAILURE,
                 ReviewFailureClassification.MODEL_UNAVAILABLE_OR_UNSUPPORTED,
+                ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE,
+                ReviewFailureClassification.INVALID_REVIEWER_OUTPUT,
                 ReviewFailureClassification.TRANSIENT_CAPACITY,
                 ReviewFailureClassification.TRANSIENT_TRANSPORT,
-                ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE,
             ):
                 match = next((found for signal in signals
                               if (found := self._classify_review_error_text(signal)) is not None
@@ -1209,6 +1291,7 @@ class FootballPredictionAdapter:
             "retryable": classification.retryable,
             "failure_evidence_path": str(record_path),
             "failure_evidence_sha256": evidence_sha256,
+            "wrapper_failure": wrapper_failure,
             "event_log": event_artifact,
             "codex_stderr_log": codex_stderr_artifact,
         }

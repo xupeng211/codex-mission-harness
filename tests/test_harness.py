@@ -3627,6 +3627,92 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
                 self.assertNotIn("fixture-secret", evidence_bytes.decode("utf-8"))
                 self.assertNotIn("access_token", evidence_bytes.decode("utf-8"))
 
+    def _deepseek_receiptless_wrapper_result(self, *, tamper_sidecar=False):
+        adapter, worktree, evidence_dir, _, stdout = self._review_fixture("deepseek")
+        attempt_id = "e" * 32
+        run_dir = evidence_dir / attempt_id
+        run_dir.mkdir(mode=0o700)
+        run_dir.chmod(0o700)
+        failure_path = run_dir / f"review-attempt-failure-aggregate-{attempt_id}.json"
+        failure = {
+            "schema_version": "cmh-review-attempt-failure/v1",
+            "repository": "ssh://github.com/owner/project.git",
+            "mission_id": "mission",
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+            "diff_sha256": "c" * 64,
+            "reviewer": "deepseek",
+            "provider": "deepseek",
+            "model": "deepseek-flash",
+            "reasoning_effort": None,
+            "attempt_id": attempt_id,
+            "stage": "aggregate",
+            "chunk_index": None,
+            "terminal_status": "EXITED",
+            "exit_code": 1,
+            "turn_completed": None,
+            "started_at": 10.0,
+            "completed_at": 11.0,
+            "failure_classification": "TRANSIENT_CAPACITY",
+            "retryable": True,
+            "reason_code": "provider_capacity",
+            "http_status": 429,
+            "provider_error_code": "rate_limit_error",
+            "sanitized_diagnostic": "provider capacity is temporarily unavailable",
+            "process_stdout_sha256": "d" * 64,
+            "process_stderr_sha256": "f" * 64,
+            "command_sha256": "1" * 64,
+            "completed_chunk_artifacts": [],
+            "receipt_written": False,
+        }
+        failure["integrity_sha256"] = hashlib.sha256(json.dumps(
+            failure, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode()).hexdigest()
+        raw = (json.dumps(failure, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
+        self._write_private_review_log(failure_path, raw)
+        expected_sha = hashlib.sha256(raw).hexdigest()
+        if tamper_sidecar:
+            failure_path.write_text("{}", encoding="utf-8")
+            failure_path.chmod(0o600)
+        self._write_private_review_log(stdout, json.dumps({
+            "status": "BLOCKED_EXTERNAL",
+            "error": "provider capacity is temporarily unavailable",
+            "failure_classification": "TRANSIENT_CAPACITY",
+            "retryable": True,
+            "failure_evidence_path": str(failure_path),
+            "failure_evidence_sha256": expected_sha,
+        }) + "\n")
+        with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
+                patch.object(adapter, "_repo_from_origin", return_value="owner/project"):
+            result = adapter.review_result(
+                "deepseek", worktree=str(worktree), base="a" * 40, head="b" * 40,
+                mission_id="mission", scope_file=str(worktree / "scope.json"),
+                stdout_path=str(stdout), evidence_dir=str(evidence_dir),
+                attempt_id="9" * 32, terminal_status="EXITED", exit_code=1,
+            )
+        return result
+
+    def test_deepseek_typed_failure_requires_valid_bound_artifact_and_drives_retry(self):
+        valid = self._deepseek_receiptless_wrapper_result()
+        self.assertEqual(valid.status, "BLOCKED_EXTERNAL")
+        self.assertEqual(valid.failure_classification, ReviewFailureClassification.TRANSIENT_CAPACITY)
+        self.assertTrue(valid.data["retryable"])
+        self.assertEqual(valid.data["wrapper_failure"]["stage"], "aggregate")
+        self.assertEqual(valid.data["wrapper_failure"]["diff_sha256"], "c" * 64)
+        self.assertTrue(Supervisor._review_retryable_failure(
+            JobResult("review", "EXITED", 1, "b" * 40), valid,
+        ))
+
+    def test_deepseek_invalid_failure_artifact_cannot_trigger_retry_from_error_text(self):
+        result = self._deepseek_receiptless_wrapper_result(tamper_sidecar=True)
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+        self.assertEqual(result.failure_classification,
+                         ReviewFailureClassification.UNKNOWN_EXTERNAL_FAILURE)
+        self.assertFalse(result.data["retryable"])
+        self.assertFalse(Supervisor._review_retryable_failure(
+            JobResult("review", "EXITED", 1, "b" * 40), result,
+        ))
+
     def test_receiptless_incomplete_or_completed_event_stream_never_approves(self):
         incomplete, _ = self._receiptless_codex_attempt(
             error="review process exited without a final result",

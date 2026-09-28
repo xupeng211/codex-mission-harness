@@ -52,6 +52,30 @@ def disposition_for(item, *, decision="DISPUTED", chunk_index=0, finding_index=0
         "rationale": rationale,
     }
 
+
+def run_fixture(root, *, large_diff=False):
+    repo = root / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Harness Test"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "harness-test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin",
+                    "git@github.com:fixture/repo.git"], check=True)
+    source = repo / "tracked.txt"
+    source.write_text("base\n")
+    subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    base = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    source.write_text(("x" * 74 + "\n") * 7000 if large_diff else "head\n")
+    subprocess.run(["git", "-C", str(repo), "commit", "-qam", "head"], check=True)
+    head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    token_file = root / "review-token"
+    token_file.write_text(TEST_SECRET)
+    token_file.chmod(0o600)
+    args = Namespace(repo=str(repo), base=base, head=head, mission_id="fixture",
+                     evidence=str(root / "evidence"), token_file=str(token_file), timeout=1)
+    return args, Path(args.evidence)
+
 class DeepSeekReceiptTest(unittest.TestCase):
     def test_chunk_and_aggregate_schemas_have_separate_disposition_contracts(self):
         self.assertNotIn("dispositions", review.CHUNK_SCHEMA["properties"])
@@ -568,56 +592,213 @@ class DeepSeekReceiptTest(unittest.TestCase):
                     )
             self.assertFalse(textconv_marker.exists())
 
-    def test_run_does_not_publish_receipt_when_aggregate_omits_dispositions(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            repo = root / "repo"
-            repo.mkdir()
-            subprocess.run(["git", "init", "-q", str(repo)], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Harness Test"], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.email", "harness-test@example.invalid"], check=True)
-            subprocess.run(["git", "-C", str(repo), "remote", "add", "origin",
-                            "git@github.com:fixture/repo.git"], check=True)
-            source = repo / "tracked.txt"
-            source.write_text("base\n")
-            subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
-            base = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
-            source.write_text("head\n")
-            subprocess.run(["git", "-C", str(repo), "commit", "-qam", "head"], check=True)
-            head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
-            token_file = root / "review-token"
-            token_file.write_text(TEST_SECRET)
-            token_file.chmod(0o600)
-            evidence = root / "evidence"
-            args = Namespace(repo=str(repo), base=base, head=head, mission_id="fixture",
-                             evidence=str(evidence), token_file=str(token_file), timeout=1)
+    def _execute_review(self, args, responder):
+        with patch.object(review, "resolve_claude_launcher",
+                          return_value=("/trusted/bin/claude", "/trusted/bin:/usr/bin")), \
+                patch.object(review, "invoke_reviewer", side_effect=responder):
+            review.run(args)
 
-            def echo_credential_on_stderr(command, prompt_text, env, timeout):
+    def _successful_chunk(self):
+        return subprocess.CompletedProcess(
+            ["claude"], 0, json.dumps({"review_result": "PASS", "findings": []}), "",
+        )
+
+    @staticmethod
+    def _aggregate_prompt(prompt_text):
+        return prompt_text.startswith("You are the final independent reviewer")
+
+    def _failure_record(self, caught):
+        self.assertIsNotNone(caught.exception.evidence_path)
+        path = Path(caught.exception.evidence_path)
+        self.assertTrue(path.is_file())
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        raw = path.read_bytes()
+        self.assertEqual(review.digest(raw), caught.exception.evidence_sha256)
+        record = json.loads(raw)
+        unsigned = {key: value for key, value in record.items() if key != "integrity_sha256"}
+        self.assertEqual(record["integrity_sha256"], review.digest(review.canon(unsigned)))
+        self.assertEqual(record["schema_version"], "cmh-review-attempt-failure/v1")
+        self.assertEqual(record["repository"], "ssh://github.com/fixture/repo.git")
+        self.assertEqual(record["mission_id"], "fixture")
+        self.assertRegex(record["base_sha"], r"^[0-9a-f]{40}$")
+        self.assertRegex(record["head_sha"], r"^[0-9a-f]{40}$")
+        self.assertEqual(record["model"], review.MODEL)
+        self.assertFalse(record["receipt_written"])
+        self.assertEqual(record["retryable"], caught.exception.retryable)
+        return record, raw
+
+    def test_aggregate_failures_get_typed_bound_private_diagnostics(self):
+        cases = (
+            ("capacity", "Selected model is at capacity", "",
+             "TRANSIENT_CAPACITY", True),
+            ("request_timeout", "", "request timed out",
+             "TRANSIENT_TRANSPORT", True),
+            ("connection_reset", "", "ECONNRESET: connection reset by peer",
+             "TRANSIENT_TRANSPORT", True),
+            ("authentication", '{"status":401,"type":"token_revoked"}', "",
+             "AUTHENTICATION_FAILURE", False),
+            ("payment", '{"status":402,"type":"payment_required"}', "",
+             "PAYMENT_OR_BILLING_FAILURE", False),
+            ("unsupported_model", '{"error":{"type":"unsupported_model"}}', "",
+             "MODEL_UNAVAILABLE_OR_UNSUPPORTED", False),
+            ("unknown", "unrecognized provider failure marker", "",
+             "UNKNOWN_EXTERNAL_FAILURE", False),
+        )
+        for name, stdout, stderr, expected_class, retryable in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                args, evidence = run_fixture(root)
+
+                def responder(command, prompt_text, env, timeout):
+                    if not self._aggregate_prompt(prompt_text):
+                        return self._successful_chunk()
+                    return subprocess.CompletedProcess(["claude"], 1, stdout, stderr)
+
+                with self.assertRaises(review.ReviewAttemptFailure) as caught:
+                    self._execute_review(args, responder)
+                record, raw = self._failure_record(caught)
+                self.assertEqual(caught.exception.classification.value, expected_class)
+                self.assertEqual(record["failure_classification"], expected_class)
+                self.assertEqual(record["retryable"], retryable)
+                self.assertEqual(record["stage"], "aggregate")
+                self.assertEqual(record["base_sha"], args.base)
+                self.assertEqual(record["head_sha"], args.head)
+                self.assertEqual(record["diff_sha256"], review.digest(
+                    subprocess.check_output(["git", "-C", str(args.repo), "diff", "--no-ext-diff",
+                                             "--no-textconv", "--binary", f"{args.base}..{args.head}"])))
+                self.assertEqual(len(record["completed_chunk_artifacts"]), 1)
+                self.assertEqual(record["process_stdout_sha256"], review.digest(stdout.encode()))
+                self.assertEqual(record["process_stderr_sha256"], review.digest(stderr.encode()))
+                self.assertFalse(list(evidence.rglob("deepseek-receipt-*.json")))
+                self.assertFalse(list(evidence.rglob("aggregate.json")))
+                self.assertTrue(list(evidence.rglob("chunk-000.json")))
+                self.assertNotIn(b"diff --git", raw)
+                payload = caught.exception.as_payload()
+                self.assertEqual(payload["failure_classification"], expected_class)
+                self.assertEqual(payload["retryable"], retryable)
+                self.assertEqual(payload["failure_evidence_path"], caught.exception.evidence_path)
+
+    def test_aggregate_timeout_exception_is_typed_transport_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, _ = run_fixture(Path(tmp))
+
+            def responder(command, prompt_text, env, timeout):
+                if not self._aggregate_prompt(prompt_text):
+                    return self._successful_chunk()
+                raise subprocess.TimeoutExpired(command, timeout, output=b"request timed out")
+
+            with self.assertRaises(review.ReviewAttemptFailure) as caught:
+                self._execute_review(args, responder)
+            record, _ = self._failure_record(caught)
+            self.assertEqual(record["stage"], "aggregate")
+            self.assertEqual(record["terminal_status"], "TIMED_OUT")
+            self.assertEqual(record["failure_classification"], "TRANSIENT_TRANSPORT")
+            self.assertTrue(record["retryable"])
+
+    def test_all_seventeen_chunks_pass_but_aggregate_failure_has_no_approval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, evidence = run_fixture(Path(tmp), large_diff=True)
+            diff = subprocess.check_output([
+                "git", "-C", str(args.repo), "diff", "--no-ext-diff", "--no-textconv",
+                "--binary", f"{args.base}..{args.head}",
+            ])
+            self.assertEqual(len(review.chunks(diff)), 17)
+            completed = []
+
+            def responder(command, prompt_text, env, timeout):
+                if not self._aggregate_prompt(prompt_text):
+                    completed.append(prompt_text)
+                    return self._successful_chunk()
+                return subprocess.CompletedProcess(
+                    ["claude"], 1, "Selected model is at capacity", "",
+                )
+
+            with self.assertRaises(review.ReviewAttemptFailure) as caught:
+                self._execute_review(args, responder)
+            record, _ = self._failure_record(caught)
+            self.assertEqual(len(completed), 17)
+            self.assertEqual(record["stage"], "aggregate")
+            self.assertEqual(record["failure_classification"], "TRANSIENT_CAPACITY")
+            self.assertEqual(len(record["completed_chunk_artifacts"]), 17)
+            failure_dir = Path(caught.exception.evidence_path).parent
+            self.assertTrue(all((failure_dir / item["path"]).is_file()
+                                for item in record["completed_chunk_artifacts"]))
+            self.assertEqual(len(list(evidence.rglob("chunk-*.json"))), 17)
+            self.assertFalse(list(evidence.rglob("aggregate.json")))
+            self.assertFalse(list(evidence.rglob("deepseek-receipt-*.json")))
+
+    def test_malformed_aggregate_output_is_nonretryable_and_not_receipted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, evidence = run_fixture(Path(tmp))
+
+            def responder(command, prompt_text, env, timeout):
+                if not self._aggregate_prompt(prompt_text):
+                    return self._successful_chunk()
+                return subprocess.CompletedProcess(["claude"], 0, "not-json", "")
+
+            with self.assertRaises(review.ReviewAttemptFailure) as caught:
+                self._execute_review(args, responder)
+            record, _ = self._failure_record(caught)
+            self.assertEqual(record["failure_classification"], "INVALID_REVIEWER_OUTPUT")
+            self.assertFalse(record["retryable"])
+            self.assertFalse(list(evidence.rglob("aggregate.json")))
+            self.assertFalse(list(evidence.rglob("deepseek-receipt-*.json")))
+
+    def test_chunk_failure_uses_same_typed_sanitized_evidence_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, evidence = run_fixture(Path(tmp))
+
+            def responder(command, prompt_text, env, timeout):
+                return subprocess.CompletedProcess(["claude"], 1, "", "request timeout")
+
+            with self.assertRaises(review.ReviewAttemptFailure) as caught:
+                self._execute_review(args, responder)
+            record, _ = self._failure_record(caught)
+            self.assertEqual(record["stage"], "chunk")
+            self.assertEqual(record["chunk_index"], 0)
+            self.assertEqual(record["failure_classification"], "TRANSIENT_TRANSPORT")
+            self.assertTrue(record["retryable"])
+            self.assertFalse(record["completed_chunk_artifacts"])
+            self.assertFalse(list(evidence.rglob("deepseek-receipt-*.json")))
+
+    def test_credential_echo_is_discarded_and_only_hashes_are_persisted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, evidence = run_fixture(Path(tmp))
+
+            def responder(command, prompt_text, env, timeout):
+                if not self._aggregate_prompt(prompt_text):
+                    return self._successful_chunk()
                 return subprocess.CompletedProcess(["claude"], 1, "", TEST_SECRET)
 
-            with patch.object(review, "resolve_claude_launcher",
-                              return_value=("/trusted/bin/claude", "/trusted/bin:/usr/bin")), \
-                    patch.object(review, "invoke_reviewer", side_effect=echo_credential_on_stderr), \
-                    self.assertRaisesRegex(ValueError, "output contained review credential") as caught:
-                review.run(args)
+            with self.assertRaises(review.ReviewAttemptFailure) as caught:
+                self._execute_review(args, responder)
+            record, raw = self._failure_record(caught)
+            self.assertEqual(record["reason_code"], "credential_echo_detected")
+            self.assertEqual(record["failure_classification"], "POLICY_OR_CONTRACT_FAILURE")
+            self.assertFalse(record["retryable"])
+            self.assertNotIn(TEST_SECRET.encode(), raw)
             self.assertNotIn(TEST_SECRET, str(caught.exception))
-            self.assertEqual(list(evidence.rglob("deepseek-receipt-*.json")), [])
-            for artifact in evidence.rglob("*"):
-                if artifact.is_file():
-                    self.assertNotIn(TEST_SECRET.encode(), artifact.read_bytes())
+            self.assertNotIn(TEST_SECRET, json.dumps(caught.exception.as_payload()))
+            self.assertFalse(list(evidence.rglob("aggregate.json")))
+            self.assertFalse(list(evidence.rglob("deepseek-receipt-*.json")))
 
-            def omit_aggregate_dispositions(command, prompt_text, env, timeout):
+    def test_aggregate_contract_failure_is_durable_and_nonretryable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, evidence = run_fixture(Path(tmp))
+
+            def responder(command, prompt_text, env, timeout):
+                if not self._aggregate_prompt(prompt_text):
+                    return self._successful_chunk()
                 return subprocess.CompletedProcess(
                     ["claude"], 0,
                     json.dumps({"review_result": "PASS", "findings": []}), "",
                 )
 
-            with patch.object(review, "resolve_claude_launcher",
-                              return_value=("/trusted/bin/claude", "/trusted/bin:/usr/bin")), \
-                    patch.object(review, "invoke_reviewer", side_effect=omit_aggregate_dispositions), \
-                    self.assertRaisesRegex(ValueError, "omitted blocker dispositions"):
-                review.run(args)
-
-            self.assertEqual(list(evidence.rglob("deepseek-receipt-*.json")), [])
-            self.assertEqual(len(list(evidence.rglob("aggregate.json"))), 1)
+            with self.assertRaises(review.ReviewAttemptFailure) as caught:
+                self._execute_review(args, responder)
+            record, _ = self._failure_record(caught)
+            self.assertEqual(record["reason_code"], "review_contract_rejected")
+            self.assertEqual(record["failure_classification"], "POLICY_OR_CONTRACT_FAILURE")
+            self.assertFalse(record["retryable"])
+            self.assertFalse(list(evidence.rglob("aggregate.json")))
+            self.assertFalse(list(evidence.rglob("deepseek-receipt-*.json")))
