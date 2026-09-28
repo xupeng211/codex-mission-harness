@@ -1155,6 +1155,43 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
                 RuntimeError, "inside the mission worktree"):
             AppServerCodex(worktree=str(repo))
 
+    def test_app_server_executes_the_same_relative_launcher_it_validated(self):
+        with tempfile.TemporaryDirectory(prefix="cmh-relative-launcher-", dir=Path.home()) as temp:
+            root = Path(temp)
+            controller = root / "controller"
+            worktree = root / "worktree"
+            trusted_launcher = controller / "bin" / "codex"
+            candidate_launcher = worktree / "bin" / "codex"
+            trusted_launcher.parent.mkdir(parents=True)
+            worktree.mkdir()
+            subprocess.run(["git", "init", "-q", str(worktree)], check=True)
+            for launcher in (trusted_launcher, candidate_launcher):
+                launcher.parent.mkdir(parents=True, exist_ok=True)
+                launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                launcher.chmod(0o755)
+            codex_home = root / "codex-home"
+            codex_home.mkdir(mode=0o700)
+            process = type("Process", (), {
+                "stdin": StringIO(), "stdout": StringIO(), "stderr": None,
+                "poll": lambda self: 0,
+            })()
+            previous_cwd = Path.cwd()
+            os.chdir(controller)
+            try:
+                with patch.dict(os.environ, {
+                        "PATH": "/usr/bin:/bin", "CODEX_HOME": str(codex_home),
+                        }, clear=True), \
+                        patch("harness.codex.subprocess.Popen", return_value=process) as launch, \
+                        patch.object(AppServerCodex, "_canonical_worktree", return_value=str(worktree)), \
+                        patch.object(AppServerCodex, "_request", return_value={}):
+                    adapter = AppServerCodex(executable="bin/codex", worktree=str(worktree))
+            finally:
+                os.chdir(previous_cwd)
+
+            self.assertEqual(launch.call_args.args[0][0], str(trusted_launcher.resolve()))
+            self.assertNotEqual(launch.call_args.args[0][0], str(candidate_launcher.resolve()))
+            adapter.close()
+
     def test_codex_thread_receives_explicit_sensitive_action_boundary(self):
         adapter = AppServerCodex.__new__(AppServerCodex)
         adapter._forbidden_actions = adapter._effective_policy(("merge",))
@@ -2624,6 +2661,41 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         )
         self.journal.update(self.spec.mission_id, current_head="a" * 40, current_state=State.CI)
         self.assertEqual(supervisor.step(self.spec.mission_id, self.spec), State.MERGE)
+
+    def test_ci_preserves_nonretryable_external_failure_evidence_without_pr_identity(self):
+        head = "a" * 40
+        failure_evidence = "GitHub CI query failed because the credential scope is unavailable"
+
+        class CanonicalBlockedCI(FootballPredictionAdapter):
+            def exact_head(self, worktree):
+                return head
+
+            def ci(self, worktree, reviewed_head, pr_number=None, pr_repo=None,
+                   base_sha=None, pr_base_sha=None):
+                return GateResult(
+                    "BLOCKED_EXTERNAL", failure_evidence,
+                    data={"retryable": False, "classification": "configuration"},
+                )
+
+        supervisor = Supervisor(
+            self.journal,
+            ProcessSupervisor(self.journal, Path(self.tmp.name) / "blocked-ci-evidence"),
+            self.codex,
+            CanonicalBlockedCI(),
+        )
+        self.journal.update(
+            self.spec.mission_id, current_head=head, current_state=State.CI,
+        )
+
+        self.assertEqual(
+            supervisor.step(self.spec.mission_id, self.spec), State.BLOCKED_EXTERNAL,
+        )
+        event = self.journal.db.execute(
+            "SELECT payload_json FROM events WHERE mission_id=? AND kind='state_transition' "
+            "ORDER BY seq DESC LIMIT 1",
+            (self.spec.mission_id,),
+        ).fetchone()
+        self.assertEqual(json.loads(event[0])["reason"], failure_evidence)
 
     def test_live_unknown_merge_claim_is_not_stolen(self):
         head = "a" * 40

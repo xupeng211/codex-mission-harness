@@ -674,6 +674,7 @@ class Supervisor:
                 advance(State.BLOCKED_EXTERNAL, "canonical CI returned malformed PR identity evidence")
                 return State.BLOCKED_EXTERNAL
             if (not isinstance(self.adapter, SimulatedAdapter)
+                    and result.status != "BLOCKED_EXTERNAL"
                     and ("pr_number" not in facts or "pr_repo" not in facts)):
                 advance(State.BLOCKED_EXTERNAL, "canonical CI omitted durable PR identity evidence")
                 return State.BLOCKED_EXTERNAL

@@ -47,7 +47,8 @@ class AppServerCodex:
         self._policy_cwd = self._canonical_worktree(worktree)
         self._permissions_profile = f"cmh_delegated_{uuid.uuid4().hex}"
         codex_home = self._codex_home()
-        app_server_argv = [executable, "-c", f'model="{self.MODEL}"',
+        trusted_executable = self._trusted_executable(executable, self._policy_cwd)
+        app_server_argv = [str(trusted_executable), "-c", f'model="{self.MODEL}"',
                            "-c", f'model_reasoning_effort="{self.REASONING_EFFORT}"',
                            "-c", 'default_permissions=":workspace"',
                            *self._permissions_profile_overrides(codex_home, self._permissions_profile),
@@ -56,7 +57,8 @@ class AppServerCodex:
                                      stdout=subprocess.PIPE, text=True, bufsize=1,
                                      cwd=self._policy_cwd,
                                      env=self._app_server_environment(
-                                         executable, self._policy_cwd, codex_home=codex_home,
+                                         str(trusted_executable), self._policy_cwd,
+                                         codex_home=codex_home,
                                      ))
         self.seq = 0
         self._pending_messages: list[dict] = []
