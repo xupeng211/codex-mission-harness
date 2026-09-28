@@ -3351,7 +3351,8 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
             "HTTPS_PROXY": "http://proxy.example.invalid:8080",
         }
         with patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
-                patch.object(adapter, "_trusted_python_interpreter", return_value=sys.executable), \
+                patch.object(adapter, "_trusted_python_interpreter",
+                             return_value=str(Path("/usr/bin/python3").resolve(strict=True))), \
                 patch.object(adapter, "_trusted_review_path", return_value="/usr/bin"), \
                 patch.object(adapter, "_call", wraps=adapter._call) as policy_call, \
                 patch.dict(os.environ, hostile, clear=True):
@@ -3388,7 +3389,8 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         trusted = self._trusted_codex_policy_fixture(Path(self.tmp.name), missing_home)
         hostile = {"CODEX_HOME": str(Path(self.tmp.name) / "builder-home")}
         with patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
-                patch.object(adapter, "_trusted_python_interpreter", return_value=sys.executable), \
+                patch.object(adapter, "_trusted_python_interpreter",
+                             return_value=str(Path("/usr/bin/python3").resolve(strict=True))), \
                 patch.object(adapter, "_trusted_review_path", return_value="/usr/bin"), \
                 patch.dict(os.environ, hostile, clear=True):
             with self.assertRaisesRegex(RuntimeError, "CODEX_HOME or auth metadata is unavailable"):
@@ -3402,7 +3404,8 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         auth.chmod(0o600)
         trusted = self._trusted_codex_policy_fixture(Path(self.tmp.name), invalid_home)
         with patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
-                patch.object(adapter, "_trusted_python_interpreter", return_value=sys.executable), \
+                patch.object(adapter, "_trusted_python_interpreter",
+                             return_value=str(Path("/usr/bin/python3").resolve(strict=True))), \
                 patch.object(adapter, "_trusted_review_path", return_value="/usr/bin"), \
                 patch.dict(os.environ, hostile, clear=True):
             with self.assertRaisesRegex(RuntimeError, "CODEX_HOME must be owner-only"):
