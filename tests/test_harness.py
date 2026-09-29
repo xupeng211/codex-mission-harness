@@ -3411,6 +3411,33 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
             with self.assertRaisesRegex(RuntimeError, "CODEX_HOME must be owner-only"):
                 adapter.review_environment("codex", worktree=str(worktree), base="a" * 40)
 
+    def test_codex_home_must_not_overlap_reviewed_worktree(self):
+        root = Path(self.tmp.name)
+
+        def make_home(path: Path) -> Path:
+            path.mkdir(mode=0o700, parents=True)
+            path.chmod(0o700)
+            auth = path / "auth.json"
+            auth.write_text("fixture", encoding="utf-8")
+            auth.chmod(0o600)
+            return path
+
+        worktree = root / "review-target"
+        worktree.mkdir()
+        nested_home = make_home(worktree / ".codex")
+        with self.assertRaisesRegex(RuntimeError, "must remain outside"):
+            FootballPredictionAdapter._validate_canonical_codex_home(
+                str(nested_home), worktree=str(worktree),
+            )
+
+        containing_home = make_home(root / "codex-home")
+        nested_worktree = containing_home / "review-target"
+        nested_worktree.mkdir()
+        with self.assertRaisesRegex(RuntimeError, "must remain outside"):
+            FootballPredictionAdapter._validate_canonical_codex_home(
+                str(containing_home), worktree=str(nested_worktree),
+            )
+
     def test_authority_call_ignores_ambient_path_and_execution_overrides(self):
         adapter = FootballPredictionAdapter()
         attacker_bin = Path(self.tmp.name) / "attacker-bin"

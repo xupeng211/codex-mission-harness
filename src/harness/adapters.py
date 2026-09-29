@@ -675,7 +675,11 @@ class FootballPredictionAdapter:
                 or (hasattr(os, "getuid") and auth_info.st_uid != os.getuid())
                 or stat.S_IMODE(auth_info.st_mode) != 0o600):
             raise RuntimeError("trusted reviewer authentication file must be owner-only")
-        if home == repo or home in repo.parents:
+        # Keep the credential directory disjoint from the reviewed worktree in
+        # both directions.  A CODEX_HOME nested in the worktree could be
+        # supplied by reviewed source, while a worktree nested in CODEX_HOME
+        # would let delegated commands walk from the checkout to auth.json.
+        if home == repo or home in repo.parents or repo in home.parents:
             raise RuntimeError("trusted reviewer CODEX_HOME must remain outside the reviewed repository")
         return str(home)
 
