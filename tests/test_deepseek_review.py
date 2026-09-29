@@ -919,6 +919,124 @@ class DeepSeekReceiptTest(unittest.TestCase):
             self.assertFalse(list(evidence.rglob("aggregate.json")))
             self.assertFalse(list(evidence.rglob("deepseek-receipt-*.json")))
 
+    def test_group_output_diagnostics_identify_safe_structural_reasons(self):
+        valid = {
+            "review_result": "PASS", "findings": [], "dispositions": [],
+            "summary": "The bounded group preserves the reviewed interfaces and state flows.",
+        }
+        cases = (
+            ("not-json", "JSON_PARSE_FAILED"),
+            (json.dumps({"review_result": "PASS", "findings": [], "dispositions": []}),
+             "MISSING_REQUIRED_FIELD"),
+            (json.dumps({"review_result": "PASS", "findings": []}),
+             "MISSING_REQUIRED_FIELD"),
+            (json.dumps({**valid, "summary": "short"}), "SUMMARY_TOO_SHORT"),
+            (json.dumps({**valid, "summary": "x" * 4001}), "SUMMARY_TOO_LONG"),
+            (json.dumps({**valid, "dispositions": {}}), "INVALID_DISPOSITIONS_TYPE"),
+            (json.dumps({**valid, "dispositions": [{}]}), "INVALID_DISPOSITION_SHAPE"),
+            (json.dumps({**valid, "findings": [{"severity": "P1"}],
+                         "review_result": "FAIL"}), "INVALID_FINDING_SHAPE"),
+            (json.dumps({**valid, "extra": "SENSITIVE_SOURCE_MARKER"}), "UNEXPECTED_FIELDS"),
+            (json.dumps({**valid, "review_result": "PASS",
+                         "findings": [{"severity": "P1", "title": "blocker",
+                                       "evidence": "bounded evidence"}]}),
+             "VERDICT_MISMATCH"),
+        )
+        for raw, expected in cases:
+            with self.subTest(expected=expected):
+                diagnostic = review.reviewer_output_diagnostics(
+                    raw, require_dispositions=True, allow_summary=True,
+                    require_summary=True,
+                )
+                self.assertEqual(diagnostic["reason_code"], expected)
+                self.assertNotIn("SENSITIVE_SOURCE_MARKER", json.dumps(diagnostic))
+
+        wrapped = review.reviewer_output_diagnostics(
+            json.dumps({"structured_output": valid}),
+            require_dispositions=True, allow_summary=True, require_summary=True,
+        )
+        self.assertEqual(wrapped["selected_wrapper"], "structured_output")
+        self.assertEqual(wrapped["reason_code"], "VALID")
+        self.assertTrue(wrapped["summary_present"])
+        self.assertEqual(wrapped["summary_character_length"], len(valid["summary"]))
+
+    def test_group_format_retry_accepts_one_malformed_response_without_weakening_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, evidence = run_fixture(Path(tmp))
+            calls = {"group": 0}
+            malformed = json.dumps({
+                "review_result": "PASS", "findings": [], "dispositions": [],
+                "summary": "The bounded group preserves the reviewed interfaces and state flows.",
+                "extra": "SENSITIVE_SOURCE_MARKER",
+            })
+            valid = self._successful_group().stdout
+
+            def responder(command, prompt_text, env, timeout):
+                if self._group_prompt(prompt_text):
+                    calls["group"] += 1
+                    return subprocess.CompletedProcess(
+                        ["claude"], 0, malformed if calls["group"] == 1 else valid, "",
+                    )
+                if self._aggregate_prompt(prompt_text):
+                    return subprocess.CompletedProcess(
+                        ["claude"], 0,
+                        json.dumps({"review_result": "PASS", "findings": [],
+                                    "dispositions": []}), "",
+                    )
+                return self._successful_chunk()
+
+            with contextlib.redirect_stdout(io.StringIO()) as captured:
+                self._execute_review(args, responder)
+            payload = json.loads(captured.getvalue())
+            self.assertEqual(payload["status"], "PASS")
+            self.assertEqual(calls["group"], 2)
+            attempts = list(evidence.rglob("group-000-output-attempt-*.json"))
+            self.assertEqual(len(attempts), 1)
+            attempt = json.loads(attempts[0].read_text())
+            self.assertEqual(attempt["reason_code"], "UNEXPECTED_FIELDS")
+            self.assertEqual(
+                attempt["failure_classification"],
+                "TRANSIENT_STRUCTURED_OUTPUT_FORMAT_FAILURE",
+            )
+            self.assertTrue(attempt["retryable"])
+            self.assertTrue(attempt["retry_scheduled"])
+            self.assertNotIn(b"SENSITIVE_SOURCE_MARKER", attempts[0].read_bytes())
+            self.assertTrue(list(evidence.rglob("deepseek-receipt-*.json")))
+
+    def test_group_format_retry_cap_fails_closed_and_preserves_attempt_refs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, evidence = run_fixture(Path(tmp))
+            calls = {"group": 0}
+            malformed = json.dumps({
+                "review_result": "PASS", "findings": [], "dispositions": [],
+                "summary": "The bounded group preserves the reviewed interfaces and state flows.",
+                "extra": "SENSITIVE_SOURCE_MARKER",
+            })
+
+            def responder(command, prompt_text, env, timeout):
+                if self._group_prompt(prompt_text):
+                    calls["group"] += 1
+                    return subprocess.CompletedProcess(["claude"], 0, malformed, "")
+                if self._aggregate_prompt(prompt_text):
+                    self.fail("final synthesis must not run after bounded retries fail")
+                return self._successful_chunk()
+
+            with self.assertRaises(review.ReviewAttemptFailure) as caught:
+                self._execute_review(args, responder)
+            record, raw = self._failure_record(caught)
+            self.assertEqual(calls["group"], 2)
+            self.assertEqual(record["failure_classification"], "INVALID_REVIEWER_OUTPUT")
+            self.assertFalse(record["retryable"])
+            self.assertEqual(record["reason_code"], "structured_output_retry_exhausted")
+            self.assertEqual(len(record["group_output_attempt_artifacts"]), 2)
+            self.assertNotIn(b"SENSITIVE_SOURCE_MARKER", raw)
+            failure_dir = Path(caught.exception.evidence_path).parent
+            for ref in record["group_output_attempt_artifacts"]:
+                artifact = failure_dir / ref["path"]
+                self.assertTrue(artifact.is_file())
+                self.assertNotIn(b"SENSITIVE_SOURCE_MARKER", artifact.read_bytes())
+            self.assertFalse(list(evidence.rglob("deepseek-receipt-*.json")))
+
     def test_chunk_failure_uses_same_typed_sanitized_evidence_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             args, evidence = run_fixture(Path(tmp))

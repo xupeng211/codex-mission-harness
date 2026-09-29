@@ -27,6 +27,7 @@ ENDPOINT = "https://api.deepseek.com/anthropic"
 CHUNK_BYTES = 32000
 AGGREGATE_GROUP_BYTES = 96000
 MAX_REVIEW_PROMPT_BYTES = 400000
+GROUP_OUTPUT_FORMAT_RETRY_LIMIT = 1
 _GIT_ENV = {
     "PATH": os.defpath,
     "HOME": "/nonexistent",
@@ -373,7 +374,12 @@ def reviewer_result(raw, *, require_dispositions=False, forbid_dispositions=Fals
         raise ValueError("invalid reviewer output") from None
     if not isinstance(value, dict):
         raise ValueError("invalid reviewer output")
-    result = value.get("structured_output") or value.get("result") or value
+    if "structured_output" in value:
+        result = value["structured_output"]
+    elif "result" in value:
+        result = value["result"]
+    else:
+        result = value
     if not isinstance(result, dict):
         raise ValueError("invalid reviewer output")
     required = {"review_result", "findings"}
@@ -415,6 +421,192 @@ def reviewer_result(raw, *, require_dispositions=False, forbid_dispositions=Fals
     if (result["review_result"] == "PASS") != (not blocking):
         raise ValueError("reviewer verdict mismatch")
     return result
+
+
+def _json_type(value):
+    if value is None: return "null"
+    if isinstance(value, bool): return "boolean"
+    if isinstance(value, int): return "integer"
+    if isinstance(value, float): return "number"
+    if isinstance(value, str): return "string"
+    if isinstance(value, list): return "array"
+    if isinstance(value, dict): return "object"
+    return "unknown"
+
+
+def _safe_json_field_name(value):
+    rendered = str(value)
+    return rendered if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", rendered) else "<non_identifier_field>"
+
+
+def _safe_json_field_names(value):
+    """Bound untrusted JSON keys to safe identifier metadata."""
+    if not isinstance(value, dict):
+        return []
+    names = sorted({_safe_json_field_name(key) for key in value})
+    if len(names) > 64:
+        return names[:64] + ["<additional_fields_omitted>"]
+    return names
+
+
+def reviewer_output_diagnostics(raw, *, require_dispositions=False,
+                                forbid_dispositions=False, allow_summary=False,
+                                require_summary=False,
+                                disposition_index_field="chunk_index"):
+    """Return bounded structural facts without retaining reviewer content."""
+    diagnostic = {
+        "parser_stage": "json_parse",
+        "json_parse_failed": False,
+        "wrapper_type": "unknown",
+        "selected_wrapper": "none",
+        "top_level_field_names": [],
+        "structured_output_type": "unknown",
+        "observed_field_names": [],
+        "missing_required_fields": [],
+        "unexpected_fields": [],
+        "field_types": {},
+        "findings_count": None,
+        "invalid_finding_indexes": [],
+        "dispositions_count": None,
+        "invalid_disposition_indexes": [],
+        "summary_present": False,
+        "summary_character_length": None,
+        "review_result": None,
+        "reason_code": "UNKNOWN_OUTPUT_SHAPE",
+    }
+    try:
+        value = json.loads(raw)
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        diagnostic.update(json_parse_failed=True, reason_code="JSON_PARSE_FAILED")
+        return diagnostic
+
+    diagnostic["parser_stage"] = "wrapper_selection"
+    diagnostic["wrapper_type"] = _json_type(value)
+    diagnostic["top_level_field_names"] = _safe_json_field_names(value)
+    if not isinstance(value, dict):
+        diagnostic.update(structured_output_type=_json_type(value),
+                           reason_code="INVALID_TOP_LEVEL_TYPE")
+        return diagnostic
+    if "structured_output" in value:
+        result = value["structured_output"]
+        diagnostic["selected_wrapper"] = "structured_output"
+    elif "result" in value:
+        result = value["result"]
+        diagnostic["selected_wrapper"] = "result"
+    else:
+        result = value
+        diagnostic["selected_wrapper"] = "top_level"
+    diagnostic["structured_output_type"] = _json_type(result)
+    if not isinstance(result, dict):
+        diagnostic["reason_code"] = "INVALID_STRUCTURED_OUTPUT_TYPE"
+        return diagnostic
+
+    diagnostic["parser_stage"] = "field_validation"
+    names = _safe_json_field_names(result)
+    diagnostic["observed_field_names"] = names
+    required = {"review_result", "findings"}
+    allowed = required | {"dispositions"}
+    if require_dispositions:
+        required.add("dispositions")
+    if allow_summary:
+        allowed.add("summary")
+    if require_summary:
+        required.add("summary")
+        allowed.add("summary")
+    diagnostic["missing_required_fields"] = sorted(required - set(result))
+    unexpected = sorted({_safe_json_field_name(key) for key in result if key not in allowed})
+    diagnostic["unexpected_fields"] = (
+        unexpected[:64] + ["<additional_fields_omitted>"]
+        if len(unexpected) > 64 else unexpected
+    )
+    for key in result:
+        safe_key = _safe_json_field_name(key)
+        if safe_key not in diagnostic["field_types"] and len(diagnostic["field_types"]) < 64:
+            diagnostic["field_types"][safe_key] = _json_type(result[key])
+    if len(result) > len(diagnostic["field_types"]):
+        diagnostic["field_types"]["<additional_fields_omitted>"] = "unknown"
+    if diagnostic["missing_required_fields"]:
+        diagnostic["reason_code"] = "MISSING_REQUIRED_FIELD"
+        return diagnostic
+    if diagnostic["unexpected_fields"]:
+        diagnostic["reason_code"] = "UNEXPECTED_FIELDS"
+        return diagnostic
+
+    verdict = result.get("review_result")
+    diagnostic["review_result"] = verdict if verdict in {"PASS", "FAIL"} else (
+        "INVALID" if verdict is not None else None
+    )
+    if verdict not in {"PASS", "FAIL"}:
+        diagnostic["reason_code"] = "INVALID_REVIEW_RESULT"
+        return diagnostic
+    findings = result.get("findings")
+    if not isinstance(findings, list):
+        diagnostic["reason_code"] = "INVALID_FINDINGS_TYPE"
+        return diagnostic
+    diagnostic["findings_count"] = len(findings)
+    invalid_findings = [index for index, item in enumerate(findings) if not finding(item)]
+    diagnostic["invalid_finding_indexes"] = invalid_findings[:64]
+    if invalid_findings:
+        diagnostic["reason_code"] = "INVALID_FINDING_SHAPE"
+        diagnostic["parser_stage"] = "finding_validation"
+        return diagnostic
+    if forbid_dispositions and "dispositions" in result:
+        diagnostic["reason_code"] = "UNEXPECTED_DISPOSITIONS"
+        return diagnostic
+
+    dispositions = result.get("dispositions")
+    if "dispositions" in result:
+        if not isinstance(dispositions, list):
+            diagnostic["reason_code"] = "INVALID_DISPOSITIONS_TYPE"
+            return diagnostic
+        diagnostic["dispositions_count"] = len(dispositions)
+        expected_fields = {
+            disposition_index_field, "finding_index", "source_severity",
+            "finding_sha256", "decision", "rationale",
+        }
+        invalid = []
+        for index, item in enumerate(dispositions):
+            if (not isinstance(item, dict) or set(item) != expected_fields
+                    or type(item.get(disposition_index_field)) is not int
+                    or item[disposition_index_field] < 0
+                    or type(item.get("finding_index")) is not int
+                    or item["finding_index"] < 0
+                    or item.get("source_severity") not in {"P0", "P1", "P2"}
+                    or not isinstance(item.get("finding_sha256"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", item["finding_sha256"]) is None
+                    or item.get("decision") not in {"UPHELD", "DISPUTED"}
+                    or not isinstance(item.get("rationale"), str)
+                    or len(item["rationale"].strip()) < 24):
+                invalid.append(index)
+        diagnostic["invalid_disposition_indexes"] = invalid[:64]
+        if invalid:
+            diagnostic["reason_code"] = "INVALID_DISPOSITION_SHAPE"
+            diagnostic["parser_stage"] = "disposition_validation"
+            return diagnostic
+    if require_dispositions and not isinstance(dispositions, list):
+        diagnostic["reason_code"] = "INVALID_DISPOSITIONS_TYPE"
+        return diagnostic
+
+    summary = result.get("summary")
+    diagnostic["summary_present"] = "summary" in result
+    if "summary" in result:
+        if not allow_summary or not isinstance(summary, str):
+            diagnostic["reason_code"] = "INVALID_SUMMARY_TYPE"
+            return diagnostic
+        diagnostic["summary_character_length"] = len(summary)
+        if len(summary) > 4000:
+            diagnostic["reason_code"] = "SUMMARY_TOO_LONG"
+            return diagnostic
+        if len(summary.strip()) < 32:
+            diagnostic["reason_code"] = "SUMMARY_TOO_SHORT"
+            return diagnostic
+    blocking = any(item["severity"] in {"P0", "P1", "P2"} for item in findings)
+    if (verdict == "PASS") != (not blocking):
+        diagnostic["reason_code"] = "VERDICT_MISMATCH"
+        return diagnostic
+    diagnostic["parser_stage"] = "complete"
+    diagnostic["reason_code"] = "VALID"
+    return diagnostic
 
 
 def validate_blocker_dispositions(chunks_, aggregate_result, *, allow_disputes=True,
@@ -704,7 +896,9 @@ def aggregate_group_prompt(base, head, diff_hash, manifest_hash, group_manifest_
             "Copy each chunk_index, finding_index, source_severity, and finding_sha256 exactly from RequiredDispositions; "
             "do not calculate, modify, omit, or duplicate these values. Use UPHELD when valid and include the exact finding; "
             "use DISPUTED only when this group's complete source disproves it, with a specific rationale. "
-            "Write a concise summary (32 to 4000 characters) of edited files, changed interfaces/data/control flows, "
+            "Always emit all four required top-level fields: review_result, findings, dispositions, and summary. "
+            "If RequiredDispositions is empty, dispositions must still be present as an empty array []. "
+            "summary is mandatory and must be 32 to 4000 characters. Write a concise summary of edited files, changed interfaces/data/control flows, "
             "state transitions, and relevant dependencies so a later cross-group reviewer can compare interactions.\n"
             f"Base={base}\nHead={head}\nDiffSHA256={diff_hash}\nChunkManifestSHA256={manifest_hash}\n"
             f"GroupManifestSHA256={group_manifest_hash}\nGroupIndex={group['index']} "
@@ -818,11 +1012,91 @@ def _output_failure_details(error):
     )
 
 
+_RETRYABLE_GROUP_OUTPUT_FORMAT_CODES = {
+    "JSON_PARSE_FAILED", "INVALID_TOP_LEVEL_TYPE", "INVALID_STRUCTURED_OUTPUT_TYPE",
+    "MISSING_REQUIRED_FIELD", "UNEXPECTED_FIELDS", "INVALID_REVIEW_RESULT",
+    "INVALID_FINDINGS_TYPE", "INVALID_FINDING_SHAPE", "INVALID_DISPOSITIONS_TYPE",
+    "INVALID_DISPOSITION_SHAPE", "INVALID_SUMMARY_TYPE", "SUMMARY_TOO_SHORT",
+    "SUMMARY_TOO_LONG",
+}
+
+
+def _group_output_failure_details(diagnostic, *, retry_exhausted=False):
+    """Classify one successful-process group response from safe shape facts."""
+    reason = diagnostic.get("reason_code") if isinstance(diagnostic, dict) else None
+    if reason in _RETRYABLE_GROUP_OUTPUT_FORMAT_CODES:
+        if retry_exhausted:
+            return ReviewFailureDetails(
+                ReviewFailureClassification.INVALID_REVIEWER_OUTPUT,
+                "structured_output_retry_exhausted",
+                "group reviewer output remained structurally invalid after the bounded format retry",
+            )
+        return ReviewFailureDetails(
+            ReviewFailureClassification.TRANSIENT_STRUCTURED_OUTPUT_FORMAT_FAILURE,
+            f"structured_output_{reason.casefold()}",
+            f"group reviewer output format was invalid ({reason})",
+        )
+    if reason == "VERDICT_MISMATCH":
+        return ReviewFailureDetails(
+            ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE,
+            "review_contract_rejected",
+            "reviewer output verdict conflicts with its findings",
+        )
+    if reason in {"VALID", None}:
+        return ReviewFailureDetails(
+            ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE,
+            "review_contract_rejected",
+            "reviewer output violated blocker disposition requirements",
+        )
+    return ReviewFailureDetails(
+        ReviewFailureClassification.INVALID_REVIEWER_OUTPUT,
+        f"structured_output_{str(reason).casefold()}",
+        f"group reviewer output failed validation ({reason})",
+    )
+
+
+def _publish_group_output_attempt(
+        *, evidence_fd, run_id, repository, mission_id, base, head, diff_hash,
+        group, prompt_text, command, diagnostic, attempt_index, retry_scheduled,
+        stdout, stderr, details):
+    """Persist structural metadata only; raw model output is never written."""
+    record = {
+        "schema_version": "cmh-deepseek-group-output-attempt/v1",
+        "repository": repository,
+        "mission_id": mission_id,
+        "base_sha": base,
+        "head_sha": head,
+        "diff_sha256": diff_hash,
+        "stage": "aggregate_group",
+        "group_index": group["index"],
+        "group_source_sha256": group["sha256"],
+        "attempt_index": attempt_index,
+        "failure_classification": details.classification.value,
+        "retryable": details.retryable,
+        "sanitized_diagnostic": details.sanitized_diagnostic,
+        "retry_scheduled": retry_scheduled,
+        "retry_limit": GROUP_OUTPUT_FORMAT_RETRY_LIMIT,
+        "reason_code": diagnostic.get("reason_code"),
+        "structural_diagnostics": diagnostic,
+        "prompt_bytes": len(prompt_text.encode("utf-8")),
+        "prompt_sha256": digest(prompt_text.encode("utf-8")),
+        "command_sha256": digest(canon(command)),
+        "process_stdout_sha256": digest(_captured_bytes(stdout)),
+        "process_stderr_sha256": digest(_captured_bytes(stderr)),
+        "receipt_written": False,
+    }
+    record["integrity_sha256"] = digest(canon(record))
+    rendered = canon(record) + b"\n"
+    name = f"group-{group['index']:03d}-output-attempt-{attempt_index}.json"
+    write_private_artifact(evidence_fd, name, rendered, run_id)
+    return name, digest(rendered)
+
+
 def _publish_attempt_failure(
         *, evidence_fd, evidence_dir, run_id, repository, mission_id, base, head, diff_hash,
         stage, chunk_index, started_at, completed_at, terminal_status, exit_code,
         command, stdout, stderr, token, details=None, completed_chunks=(),
-        group_index=None, completed_groups=()):
+        group_index=None, completed_groups=(), group_output_attempts=()):
     """Commit one sanitized typed failure artifact; never persist raw streams."""
     stdout_bytes = _captured_bytes(stdout)
     stderr_bytes = _captured_bytes(stderr)
@@ -886,6 +1160,7 @@ def _publish_attempt_failure(
         "command_sha256": digest(canon(command)) if command else None,
         "completed_chunk_artifacts": completed_artifacts,
         "completed_group_artifacts": completed_group_artifacts,
+        "group_output_attempt_artifacts": list(group_output_attempts),
         "receipt_written": False,
     }
     record["integrity_sha256"] = digest(canon(record))
@@ -1045,7 +1320,8 @@ def run(args):
         )
 
         def fail(stage, chunk_index, command, started_at, terminal_status, exit_code,
-                 stdout="", stderr="", details=None, group_index=None):
+                 stdout="", stderr="", details=None, group_index=None,
+                 group_output_attempts=()):
             _raise_attempt_failure(
                 evidence_fd=evidence_fd, evidence_dir=evidence, run_id=run_id,
                 repository=repository, mission_id=args.mission_id, base=base, head=head,
@@ -1055,6 +1331,7 @@ def run(args):
                 stdout=stdout, stderr=stderr, token=token, details=details,
                 completed_chunks=plan, group_index=group_index,
                 completed_groups=groups,
+                group_output_attempts=group_output_attempts,
             )
 
         for chunk in plan:
@@ -1121,39 +1398,105 @@ def run(args):
                          "bounded_group_prompt_rejected",
                          "aggregate group request exceeded the safe prompt size limit",
                      ),group_index=group["index"])
-            call_started_at=time.time()
-            try:
-                group_call=invoke_reviewer(group_command,group_text,env,args.timeout)
-            except subprocess.TimeoutExpired as exc:
-                fail("aggregate_group",None,group_command,call_started_at,
-                     "TIMED_OUT",None,exc.stdout,exc.stderr,
-                     ReviewFailureDetails(
-                         ReviewFailureClassification.TRANSIENT_TRANSPORT,
-                         "reviewer_request_timeout",
-                         "reviewer subprocess exceeded the configured request timeout",
-                     ),group_index=group["index"])
-            except OSError:
-                fail("aggregate_group",None,group_command,call_started_at,
-                     "NOT_STARTED",None,details=ReviewFailureDetails(
-                         ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE,
-                         "reviewer_process_start_failed",
-                         "trusted reviewer process could not be started",
-                     ),group_index=group["index"])
-            if _credential_echoed(group_call.stdout,group_call.stderr,token):
-                fail("aggregate_group",None,group_command,call_started_at,
-                     "OUTPUT_REJECTED",group_call.returncode,group_call.stdout,
-                     group_call.stderr,group_index=group["index"])
-            if group_call.returncode:
-                fail("aggregate_group",None,group_command,call_started_at,
-                     "EXITED",group_call.returncode,group_call.stdout,group_call.stderr,
-                     group_index=group["index"])
-            try:
-                group_result=reviewer_group_result(group_call.stdout)
-                validate_blocker_dispositions(group_chunks,group_result)
-            except (ValueError,TypeError) as exc:
-                fail("aggregate_group",None,group_command,call_started_at,
-                     "OUTPUT_REJECTED",group_call.returncode,group_call.stdout,
-                     group_call.stderr,_output_failure_details(exc),group_index=group["index"])
+            group_output_attempts = []
+            format_retry_count = 0
+            while True:
+                call_started_at=time.time()
+                try:
+                    group_call=invoke_reviewer(group_command,group_text,env,args.timeout)
+                except subprocess.TimeoutExpired as exc:
+                    fail("aggregate_group",None,group_command,call_started_at,
+                         "TIMED_OUT",None,exc.stdout,exc.stderr,
+                         ReviewFailureDetails(
+                             ReviewFailureClassification.TRANSIENT_TRANSPORT,
+                             "reviewer_request_timeout",
+                             "reviewer subprocess exceeded the configured request timeout",
+                         ),group_index=group["index"],
+                         group_output_attempts=group_output_attempts)
+                except OSError:
+                    fail("aggregate_group",None,group_command,call_started_at,
+                         "NOT_STARTED",None,details=ReviewFailureDetails(
+                             ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE,
+                             "reviewer_process_start_failed",
+                             "trusted reviewer process could not be started",
+                         ),group_index=group["index"],
+                         group_output_attempts=group_output_attempts)
+                if _credential_echoed(group_call.stdout,group_call.stderr,token):
+                    fail("aggregate_group",None,group_command,call_started_at,
+                         "OUTPUT_REJECTED",group_call.returncode,group_call.stdout,
+                         group_call.stderr,group_index=group["index"],
+                         group_output_attempts=group_output_attempts)
+                if group_call.returncode:
+                    fail("aggregate_group",None,group_command,call_started_at,
+                         "EXITED",group_call.returncode,group_call.stdout,group_call.stderr,
+                         group_index=group["index"],
+                         group_output_attempts=group_output_attempts)
+
+                diagnostic = reviewer_output_diagnostics(
+                    group_call.stdout, require_dispositions=True,
+                    allow_summary=True, require_summary=True,
+                )
+                if diagnostic["reason_code"] != "VALID":
+                    initial_details = _group_output_failure_details(diagnostic)
+                    retry_scheduled = (
+                        initial_details.classification
+                        == ReviewFailureClassification.TRANSIENT_STRUCTURED_OUTPUT_FORMAT_FAILURE
+                        and format_retry_count < GROUP_OUTPUT_FORMAT_RETRY_LIMIT
+                    )
+                    details = _group_output_failure_details(
+                        diagnostic, retry_exhausted=not retry_scheduled,
+                    )
+                    attempt_name, attempt_sha256 = _publish_group_output_attempt(
+                        evidence_fd=evidence_fd, run_id=run_id,
+                        repository=repository, mission_id=args.mission_id,
+                        base=base, head=head, diff_hash=diff_hash, group=group,
+                        prompt_text=group_text, command=group_command,
+                        diagnostic=diagnostic, attempt_index=format_retry_count,
+                        retry_scheduled=retry_scheduled,
+                        stdout=group_call.stdout, stderr=group_call.stderr,
+                        details=initial_details if retry_scheduled else details,
+                    )
+                    group_output_attempts.append({
+                        "group_index": group["index"],
+                        "attempt_index": format_retry_count,
+                        "path": attempt_name,
+                        "sha256": attempt_sha256,
+                        "reason_code": diagnostic["reason_code"],
+                    })
+                    if retry_scheduled:
+                        format_retry_count += 1
+                        continue
+                    fail("aggregate_group",None,group_command,call_started_at,
+                         "OUTPUT_REJECTED",group_call.returncode,group_call.stdout,
+                         group_call.stderr,details,group_index=group["index"],
+                         group_output_attempts=group_output_attempts)
+
+                try:
+                    group_result=reviewer_group_result(group_call.stdout)
+                    validate_blocker_dispositions(group_chunks,group_result)
+                except (ValueError,TypeError) as exc:
+                    details = _output_failure_details(exc)
+                    attempt_name, attempt_sha256 = _publish_group_output_attempt(
+                        evidence_fd=evidence_fd, run_id=run_id,
+                        repository=repository, mission_id=args.mission_id,
+                        base=base, head=head, diff_hash=diff_hash, group=group,
+                        prompt_text=group_text, command=group_command,
+                        diagnostic=diagnostic, attempt_index=format_retry_count,
+                        retry_scheduled=False, stdout=group_call.stdout,
+                        stderr=group_call.stderr, details=details,
+                    )
+                    group_output_attempts.append({
+                        "group_index": group["index"],
+                        "attempt_index": format_retry_count,
+                        "path": attempt_name,
+                        "sha256": attempt_sha256,
+                        "reason_code": details.reason_code,
+                    })
+                    fail("aggregate_group",None,group_command,call_started_at,
+                         "OUTPUT_REJECTED",group_call.returncode,group_call.stdout,
+                         group_call.stderr,details,group_index=group["index"],
+                         group_output_attempts=group_output_attempts)
+                break
             group_raw=_captured_bytes(group_call.stdout)
             write_private_artifact(evidence_fd,f"group-{group['index']:03d}.json",group_raw,run_id)
             group["result"]=group_result
