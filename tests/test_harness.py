@@ -3738,6 +3738,24 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         self.assertNotIn(b"bearer", evidence_bytes.lower())
         self.assertNotIn(b"access_token", evidence_bytes.lower())
 
+    def test_codex_nonzero_generic_schema_text_is_unknown_process_failure(self):
+        secret = "sk-fixture-process-secret"
+        result, _ = self._receiptless_codex_attempt(
+            error=f"structured output schema validation failed; {secret}",
+            events=[{"type": "error", "message": "invalid JSON"}],
+            attempt_id="e" * 32,
+        )
+        self.assertEqual(result.failure_classification,
+                         ReviewFailureClassification.UNKNOWN_EXTERNAL_FAILURE)
+        self.assertFalse(result.data["retryable"])
+        raw = Path(result.data["failure_evidence_path"]).read_bytes()
+        record = json.loads(raw)
+        self.assertEqual(record["failure_phase"], "PROCESS_OR_PROVIDER")
+        self.assertFalse(record["process_succeeded"])
+        self.assertEqual(record["exit_code"], 1)
+        self.assertNotIn(secret.encode(), raw)
+        self.assertNotIn(b"structured output schema", raw)
+
     def _deepseek_receiptless_wrapper_result(self, *, tamper_sidecar=False):
         adapter, worktree, evidence_dir, _, stdout = self._review_fixture("deepseek")
         attempt_id = "e" * 32

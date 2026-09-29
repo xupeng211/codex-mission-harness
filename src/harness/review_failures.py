@@ -74,12 +74,13 @@ def _provider_code(text: str) -> str | None:
     return None
 
 
-def classify_review_failure(values: Iterable[str]) -> ReviewFailureDetails:
-    """Classify only known signals and emit a bounded, non-echoing diagnostic.
+def classify_process_failure(values: Iterable[str]) -> ReviewFailureDetails:
+    """Classify a failed reviewer process from known provider/launcher signals.
 
     The input may contain untrusted provider output. It is inspected in memory,
-    but none of it is returned. Diagnostics and provider codes are normalized
-    from allowlisted categories.
+    but none of it is returned. A process exit does not establish that a
+    successful reviewer response reached structural validation, so generic
+    schema or JSON wording cannot classify it as malformed model output.
     """
     text = "\n".join(value for value in values if isinstance(value, str))
     folded = text.casefold()
@@ -136,11 +137,6 @@ def classify_review_failure(values: Iterable[str]) -> ReviewFailureDetails:
             "unknown configuration key", "invalid configuration")):
         classification = ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE
         reason, diagnostic = "review_contract_rejected", "review request or receipt contract was rejected"
-    elif any(marker in folded for marker in (
-            "invalid reviewer output", "invalid json", "malformed json", "output schema",
-            "schema validation", "structured output")):
-        classification = ReviewFailureClassification.INVALID_REVIEWER_OUTPUT
-        reason, diagnostic = "invalid_reviewer_output", "reviewer response did not match the required output schema"
     else:
         classification = ReviewFailureClassification.UNKNOWN_EXTERNAL_FAILURE
         reason, diagnostic = "unclassified_external_failure", "reviewer failure did not match a known safe diagnostic"

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
 
-from .review_failures import ReviewFailureClassification, classify_review_failure
+from .review_failures import ReviewFailureClassification, classify_process_failure
 
 
 @dataclass(frozen=True)
@@ -1237,7 +1237,7 @@ class FootballPredictionAdapter:
             classification = ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE
             reason_code = ("invalid_receipt_binding" if contract_failure
                            else "completed_turn_without_valid_receipt")
-            failure_details = classify_review_failure(["review contract rejected"])
+            failure_details = classify_process_failure(["review contract rejected"])
         elif typed_wrapper_failure is not None:
             classification = ReviewFailureClassification(
                 typed_wrapper_failure["failure_classification"],
@@ -1246,7 +1246,7 @@ class FootballPredictionAdapter:
         else:
             classification = ReviewFailureClassification.UNKNOWN_EXTERNAL_FAILURE
             reason_code = "unclassified_external_failure"
-            failure_details = classify_review_failure([])
+            failure_details = classify_process_failure([])
             # Prefer non-retryable categories if conflicting diagnostics were
             # captured; only clean capacity/transport evidence may retry.
             for category in (
@@ -1254,12 +1254,11 @@ class FootballPredictionAdapter:
                 ReviewFailureClassification.PAYMENT_OR_BILLING_FAILURE,
                 ReviewFailureClassification.MODEL_UNAVAILABLE_OR_UNSUPPORTED,
                 ReviewFailureClassification.POLICY_OR_CONTRACT_FAILURE,
-                ReviewFailureClassification.INVALID_REVIEWER_OUTPUT,
                 ReviewFailureClassification.TRANSIENT_CAPACITY,
                 ReviewFailureClassification.TRANSIENT_TRANSPORT,
             ):
                 match = next((details for signal in signals
-                              if (details := classify_review_failure([signal])).classification == category), None)
+                              if (details := classify_process_failure([signal])).classification == category), None)
                 if match is not None:
                     classification, reason_code = match.classification, match.reason_code
                     failure_details = match
@@ -1286,6 +1285,11 @@ class FootballPredictionAdapter:
             "attempt_id": attempt_id,
             "terminal_status": terminal_status or "UNKNOWN",
             "exit_code": exit_code,
+            "process_succeeded": exit_code == 0,
+            "failure_phase": (
+                "REVIEW_CONTRACT_VALIDATION" if contract_failure or turn_completed
+                else "PROCESS_OR_PROVIDER"
+            ),
             "turn_completed": turn_completed,
             "wrapper_failure": wrapper_failure,
             "failure_classification": classification.value,

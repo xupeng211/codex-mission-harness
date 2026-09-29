@@ -18,7 +18,7 @@ if str(_SRC) not in sys.path:
 from harness.review_failures import (  # noqa: E402
     ReviewFailureClassification,
     ReviewFailureDetails,
-    classify_review_failure,
+    classify_process_failure,
 )
 
 VERSION = "cmh-deepseek-review/v5"
@@ -1114,7 +1114,7 @@ def _publish_attempt_failure(
             "reviewer output contained the configured credential; raw output discarded",
         )
     elif details is None:
-        details = classify_review_failure((
+        details = classify_process_failure((
             _captured_text(stdout), _captured_text(stderr),
         ))
 
@@ -1153,6 +1153,14 @@ def _publish_attempt_failure(
         "group_index": group_index,
         "terminal_status": terminal_status,
         "exit_code": exit_code,
+        "process_succeeded": exit_code == 0,
+        "failure_phase": (
+            "PROCESS_OR_PROVIDER" if terminal_status != "OUTPUT_REJECTED" or exit_code != 0
+            else "STRUCTURED_OUTPUT_VALIDATION" if details.classification in {
+                ReviewFailureClassification.INVALID_REVIEWER_OUTPUT,
+                ReviewFailureClassification.TRANSIENT_STRUCTURED_OUTPUT_FORMAT_FAILURE,
+            } else "REVIEW_CONTRACT_VALIDATION"
+        ),
         "turn_completed": None,
         "started_at": started_at,
         "completed_at": completed_at,

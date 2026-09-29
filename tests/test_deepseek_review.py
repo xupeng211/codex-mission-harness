@@ -734,6 +734,8 @@ class DeepSeekReceiptTest(unittest.TestCase):
             self.assertEqual(record["stage"],"aggregate_group")
             self.assertEqual(record["group_index"],0)
             self.assertEqual(record["failure_classification"],"POLICY_OR_CONTRACT_FAILURE")
+            self.assertEqual(record["failure_phase"],"REVIEW_CONTRACT_VALIDATION")
+            self.assertTrue(record["process_succeeded"])
             self.assertEqual(len(record["completed_chunk_artifacts"]),1)
             self.assertFalse(record["completed_group_artifacts"])
             self.assertTrue(list(evidence.rglob("chunk-000.json")))
@@ -812,6 +814,12 @@ class DeepSeekReceiptTest(unittest.TestCase):
              "PAYMENT_OR_BILLING_FAILURE", False),
             ("unsupported_model", '{"error":{"type":"unsupported_model"}}', "",
              "MODEL_UNAVAILABLE_OR_UNSUPPORTED", False),
+            ("cli_configuration", "", "error: unexpected argument --invalid-option",
+             "POLICY_OR_CONTRACT_FAILURE", False),
+            ("generic_schema", "structured output schema validation failed", "",
+             "UNKNOWN_EXTERNAL_FAILURE", False),
+            ("generic_json", "invalid JSON in reviewer response", "",
+             "UNKNOWN_EXTERNAL_FAILURE", False),
             ("unknown", "unrecognized provider failure marker", "",
              "UNKNOWN_EXTERNAL_FAILURE", False),
         )
@@ -831,6 +839,8 @@ class DeepSeekReceiptTest(unittest.TestCase):
                 self.assertEqual(caught.exception.classification.value, expected_class)
                 self.assertEqual(record["failure_classification"], expected_class)
                 self.assertEqual(record["retryable"], retryable)
+                self.assertEqual(record["failure_phase"], "PROCESS_OR_PROVIDER")
+                self.assertFalse(record["process_succeeded"])
                 self.assertEqual(record["stage"], "aggregate")
                 self.assertEqual(record["base_sha"], args.base)
                 self.assertEqual(record["head_sha"], args.head)
@@ -848,6 +858,52 @@ class DeepSeekReceiptTest(unittest.TestCase):
                 self.assertEqual(payload["failure_classification"], expected_class)
                 self.assertEqual(payload["retryable"], retryable)
                 self.assertEqual(payload["failure_evidence_path"], caught.exception.evidence_path)
+
+    def test_process_failure_classifier_ignores_generic_output_shape_words(self):
+        cases = (
+            ("structured output schema validation failed", "UNKNOWN_EXTERNAL_FAILURE", False),
+            ("invalid JSON", "UNKNOWN_EXTERNAL_FAILURE", False),
+            ("Selected model is at capacity", "TRANSIENT_CAPACITY", True),
+            ("request timeout", "TRANSIENT_TRANSPORT", True),
+            ("HTTP 401 token_revoked", "AUTHENTICATION_FAILURE", False),
+            ("HTTP 402 billing_error", "PAYMENT_OR_BILLING_FAILURE", False),
+            ("unsupported model", "MODEL_UNAVAILABLE_OR_UNSUPPORTED", False),
+            ("unexpected argument", "POLICY_OR_CONTRACT_FAILURE", False),
+        )
+        for signal, expected, retryable in cases:
+            with self.subTest(signal=signal):
+                details = review.classify_process_failure([signal])
+                self.assertEqual(details.classification.value, expected)
+                self.assertEqual(details.retryable, retryable)
+
+    def test_nonzero_group_exit_never_uses_format_retry_or_echoes_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, evidence = run_fixture(Path(tmp))
+            calls = {"group": 0}
+            opaque = "structured output failed; invalid JSON; SECRET_SOURCE_MARKER"
+
+            def responder(command, prompt_text, env, timeout):
+                if self._group_prompt(prompt_text):
+                    calls["group"] += 1
+                    return subprocess.CompletedProcess(["claude"], 1, opaque, "")
+                if self._aggregate_prompt(prompt_text):
+                    self.fail("final synthesis cannot run after a failed group process")
+                return self._successful_chunk()
+
+            with self.assertRaises(review.ReviewAttemptFailure) as caught:
+                self._execute_review(args, responder)
+            record, raw = self._failure_record(caught)
+            self.assertEqual(calls["group"], 1)
+            self.assertEqual(record["stage"], "aggregate_group")
+            self.assertEqual(record["exit_code"], 1)
+            self.assertEqual(record["failure_phase"], "PROCESS_OR_PROVIDER")
+            self.assertFalse(record["process_succeeded"])
+            self.assertEqual(record["failure_classification"], "UNKNOWN_EXTERNAL_FAILURE")
+            self.assertFalse(record["retryable"])
+            self.assertEqual(record["group_output_attempt_artifacts"], [])
+            self.assertFalse(list(evidence.rglob("group-*-output-attempt-*.json")))
+            self.assertNotIn(b"SECRET_SOURCE_MARKER", raw)
+            self.assertNotIn(b"structured output failed", raw)
 
     def test_aggregate_timeout_exception_is_typed_transport_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -915,6 +971,8 @@ class DeepSeekReceiptTest(unittest.TestCase):
                 self._execute_review(args, responder)
             record, _ = self._failure_record(caught)
             self.assertEqual(record["failure_classification"], "INVALID_REVIEWER_OUTPUT")
+            self.assertEqual(record["failure_phase"], "STRUCTURED_OUTPUT_VALIDATION")
+            self.assertTrue(record["process_succeeded"])
             self.assertFalse(record["retryable"])
             self.assertFalse(list(evidence.rglob("aggregate.json")))
             self.assertFalse(list(evidence.rglob("deepseek-receipt-*.json")))
@@ -1015,8 +1073,44 @@ class DeepSeekReceiptTest(unittest.TestCase):
             )
             self.assertTrue(attempt["retryable"])
             self.assertTrue(attempt["retry_scheduled"])
+            self.assertEqual(attempt["reason_code"], "UNEXPECTED_FIELDS")
             self.assertNotIn(b"SENSITIVE_SOURCE_MARKER", attempts[0].read_bytes())
             self.assertTrue(list(evidence.rglob("deepseek-receipt-*.json")))
+
+    def test_group_missing_summary_uses_only_exit_zero_format_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args, evidence = run_fixture(Path(tmp))
+            group_calls = 0
+
+            def responder(command, prompt_text, env, timeout):
+                nonlocal group_calls
+                if self._group_prompt(prompt_text):
+                    group_calls += 1
+                    if group_calls == 1:
+                        return subprocess.CompletedProcess(
+                            ["claude"], 0,
+                            json.dumps({"review_result":"PASS","findings":[],
+                                        "dispositions":[]}), "",
+                        )
+                    return self._successful_group()
+                if self._aggregate_prompt(prompt_text):
+                    return subprocess.CompletedProcess(
+                        ["claude"], 0,
+                        json.dumps({"review_result":"PASS","findings":[],
+                                    "dispositions":[]}), "",
+                    )
+                return self._successful_chunk()
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                self._execute_review(args, responder)
+            attempts = list(evidence.rglob("group-000-output-attempt-*.json"))
+            self.assertEqual(group_calls, 2)
+            self.assertEqual(len(attempts), 1)
+            attempt = json.loads(attempts[0].read_text())
+            self.assertEqual(attempt["reason_code"], "MISSING_REQUIRED_FIELD")
+            self.assertEqual(attempt["failure_classification"],
+                             "TRANSIENT_STRUCTURED_OUTPUT_FORMAT_FAILURE")
+            self.assertTrue(attempt["retry_scheduled"])
 
     def test_group_format_retry_cap_fails_closed_and_preserves_attempt_refs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1043,6 +1137,8 @@ class DeepSeekReceiptTest(unittest.TestCase):
             self.assertEqual(record["failure_classification"], "INVALID_REVIEWER_OUTPUT")
             self.assertFalse(record["retryable"])
             self.assertEqual(record["reason_code"], "structured_output_retry_exhausted")
+            self.assertEqual(record["failure_phase"], "STRUCTURED_OUTPUT_VALIDATION")
+            self.assertTrue(record["process_succeeded"])
             self.assertEqual(len(record["group_output_attempt_artifacts"]), 2)
             self.assertNotIn(b"SENSITIVE_SOURCE_MARKER", raw)
             failure_dir = Path(caught.exception.evidence_path).parent
@@ -1083,6 +1179,8 @@ class DeepSeekReceiptTest(unittest.TestCase):
             record, raw = self._failure_record(caught)
             self.assertEqual(record["reason_code"], "credential_echo_detected")
             self.assertEqual(record["failure_classification"], "POLICY_OR_CONTRACT_FAILURE")
+            self.assertEqual(record["failure_phase"], "PROCESS_OR_PROVIDER")
+            self.assertFalse(record["process_succeeded"])
             self.assertFalse(record["retryable"])
             self.assertNotIn(TEST_SECRET.encode(), raw)
             self.assertNotIn(TEST_SECRET, str(caught.exception))
@@ -1107,6 +1205,8 @@ class DeepSeekReceiptTest(unittest.TestCase):
             record, _ = self._failure_record(caught)
             self.assertEqual(record["reason_code"], "review_contract_rejected")
             self.assertEqual(record["failure_classification"], "POLICY_OR_CONTRACT_FAILURE")
+            self.assertEqual(record["failure_phase"], "REVIEW_CONTRACT_VALIDATION")
+            self.assertTrue(record["process_succeeded"])
             self.assertFalse(record["retryable"])
             self.assertFalse(list(evidence.rglob("aggregate.json")))
             self.assertFalse(list(evidence.rglob("deepseek-receipt-*.json")))
