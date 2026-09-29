@@ -362,6 +362,7 @@ def auth_digest(value, secret):
 def sha(path): return digest(Path(path).read_bytes())
 def finding(value):
     return (isinstance(value,dict) and set(value)=={"severity","title","evidence"}
+            and isinstance(value.get("severity"), str)
             and value.get("severity") in {"P0","P1","P2","P3"}
             and isinstance(value.get("title"),str) and bool(value["title"])
             and isinstance(value.get("evidence"),str) and bool(value["evidence"]))
@@ -533,10 +534,12 @@ def reviewer_output_diagnostics(raw, *, require_dispositions=False,
         return diagnostic
 
     verdict = result.get("review_result")
-    diagnostic["review_result"] = verdict if verdict in {"PASS", "FAIL"} else (
+    diagnostic["review_result"] = verdict if (
+        isinstance(verdict, str) and verdict in {"PASS", "FAIL"}
+    ) else (
         "INVALID" if verdict is not None else None
     )
-    if verdict not in {"PASS", "FAIL"}:
+    if not isinstance(verdict, str) or verdict not in {"PASS", "FAIL"}:
         diagnostic["reason_code"] = "INVALID_REVIEW_RESULT"
         return diagnostic
     findings = result.get("findings")
@@ -566,15 +569,19 @@ def reviewer_output_diagnostics(raw, *, require_dispositions=False,
         }
         invalid = []
         for index, item in enumerate(dispositions):
+            source_severity = item.get("source_severity") if isinstance(item, dict) else None
+            decision = item.get("decision") if isinstance(item, dict) else None
             if (not isinstance(item, dict) or set(item) != expected_fields
                     or type(item.get(disposition_index_field)) is not int
                     or item[disposition_index_field] < 0
                     or type(item.get("finding_index")) is not int
                     or item["finding_index"] < 0
-                    or item.get("source_severity") not in {"P0", "P1", "P2"}
+                    or not isinstance(source_severity, str)
+                    or source_severity not in {"P0", "P1", "P2"}
                     or not isinstance(item.get("finding_sha256"), str)
                     or re.fullmatch(r"[0-9a-f]{64}", item["finding_sha256"]) is None
-                    or item.get("decision") not in {"UPHELD", "DISPUTED"}
+                    or not isinstance(decision, str)
+                    or decision not in {"UPHELD", "DISPUTED"}
                     or not isinstance(item.get("rationale"), str)
                     or len(item["rationale"].strip()) < 24):
                 invalid.append(index)

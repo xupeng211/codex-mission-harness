@@ -941,6 +941,21 @@ class DeepSeekReceiptTest(unittest.TestCase):
                          "findings": [{"severity": "P1", "title": "blocker",
                                        "evidence": "bounded evidence"}]}),
              "VERDICT_MISMATCH"),
+            (json.dumps({**valid, "review_result": []}), "INVALID_REVIEW_RESULT"),
+            (json.dumps({**valid, "review_result": "FAIL",
+                         "findings": [{"severity": [], "title": "blocker",
+                                       "evidence": "bounded evidence"}]}),
+             "INVALID_FINDING_SHAPE"),
+            (json.dumps({**valid, "dispositions": [{
+                "chunk_index": 0, "finding_index": 0, "source_severity": [],
+                "finding_sha256": "0" * 64, "decision": "UPHELD",
+                "rationale": "A bounded rationale with enough detail.",
+            }]}), "INVALID_DISPOSITION_SHAPE"),
+            (json.dumps({**valid, "dispositions": [{
+                "chunk_index": 0, "finding_index": 0, "source_severity": "P1",
+                "finding_sha256": "0" * 64, "decision": {},
+                "rationale": "A bounded rationale with enough detail.",
+            }]}), "INVALID_DISPOSITION_SHAPE"),
         )
         for raw, expected in cases:
             with self.subTest(expected=expected):
