@@ -28,9 +28,10 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import deepseek_review as secure  # noqa: E402
 from harness.model_registry import ModelSpec, load_registry, preflight  # noqa: E402
 from harness.openai_invocation import InvocationFailure, invoke_openai  # noqa: E402
+import harness.openai_invocation as invocation_module  # noqa: E402
 from harness.reviewer_v2_contract import bind_findings  # noqa: E402
 
-VERSION = "cmh-reviewer-v2-openai/v1"
+VERSION = "cmh-reviewer-v2-openai/v2"
 BLOCKING = frozenset({"P0", "P1", "P2"})
 CHUNK_BYTES = 32000
 GROUP_BYTES = 96000
@@ -269,12 +270,23 @@ def _assemble(diff: bytes, base: str, head: str, call, persist=None) -> tuple[di
 
 
 def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec,
-             auth_key: str, receipt_path: Path | None = None) -> dict:
+             auth_key: str, receipt_path: Path | None = None,
+             mission_id: str = "codex-mission-harness",
+             registry_path: str | Path | None = None) -> dict:
     if spec.provider != "openai" or not auth_key:
         raise ValueError("invalid OpenAI identity or receipt key")
+    repository = secure.repository_identity(
+        secure.git(root, "config", "--get", "remote.origin.url").decode().strip())
+    registry = load_registry(registry_path)
     if (receipt.get("version") != VERSION or receipt.get("provider") != "openai"
+            or spec != registry.role("final_reviewer")
             or receipt.get("model") != spec.model
             or receipt.get("reasoning_effort") != spec.reasoning_effort
+            or receipt.get("mission_id") != mission_id
+            or receipt.get("repository") != repository
+            or receipt.get("registry_sha256") != _sha(registry.path.read_bytes())
+            or receipt.get("runner_sha256") != _sha(Path(__file__).read_bytes())
+            or receipt.get("invocation_sha256") != _sha(Path(invocation_module.__file__).read_bytes())
             or receipt.get("base_sha") != base or receipt.get("head_sha") != head):
         raise ValueError("OpenAI receipt model or exact HEAD mismatch")
     unsigned = dict(receipt)
@@ -370,7 +382,9 @@ def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec
 
 
 def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
-        spec: ModelSpec, *, timeout: int = 900, call=None) -> Path:
+        spec: ModelSpec, *, timeout: int = 900, call=None,
+        mission_id: str = "codex-mission-harness",
+        registry_path: str | Path | None = None) -> Path:
     root = Path(root).resolve(strict=True)
     base, head = secure.full_sha(base), secure.full_sha(head)
     if secure.git(root, "rev-parse", "HEAD").decode().strip() != head:
@@ -378,6 +392,11 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
     if secure.git(root, "status", "--porcelain"):
         raise ValueError("review checkout has uncommitted changes")
     diff = secure.git(root, "diff", "--no-ext-diff", "--no-textconv", "--binary", f"{base}..{head}")
+    repository = secure.repository_identity(
+        secure.git(root, "config", "--get", "remote.origin.url").decode().strip())
+    registry = load_registry(registry_path)
+    if spec != registry.role("final_reviewer"):
+        raise ValueError("review model differs from selected registry")
     live = call is None
     if live:
         call = lambda prompt, group: invoke_codex(
@@ -398,17 +417,24 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
         if live:
             preflight(spec, probe=True, timeout=min(timeout, 120))
         receipt, _ = _assemble(diff, base, head, call, persist=persist)
-        receipt.update({"model": spec.model, "reasoning_effort": spec.reasoning_effort})
+        receipt.update({"model": spec.model, "reasoning_effort": spec.reasoning_effort,
+                        "mission_id": mission_id, "repository": repository,
+                        "registry_sha256": _sha(registry.path.read_bytes()),
+                        "runner_sha256": _sha(Path(__file__).read_bytes()),
+                        "invocation_sha256": _sha(Path(invocation_module.__file__).read_bytes())})
         receipt["auth_hmac_sha256"] = hmac.new(auth_key.encode(), _canon(receipt), hashlib.sha256).hexdigest()
-        validate(receipt, root=root, base=base, head=head, spec=spec, auth_key=auth_key)
+        validate(receipt, root=root, base=base, head=head, spec=spec, auth_key=auth_key,
+                 mission_id=mission_id, registry_path=registry_path)
         validate(receipt, root=root, base=base, head=head, spec=spec,
-                 auth_key=auth_key, receipt_path=path)
+                 auth_key=auth_key, receipt_path=path, mission_id=mission_id,
+                 registry_path=registry_path)
         # Publish the approval-shaped receipt only after all stage artifacts
         # and semantic checks are durable and complete.
         secure.write_private_artifact(child_fd, path.name, _canon(receipt), run_id)
         return path
     except Exception as exc:
         failure = {"status": "BLOCKED", "base_sha": base, "head_sha": head,
+                   "mission_id": mission_id, "repository": repository,
                    "diff_sha256": _sha(diff), "provider": spec.provider,
                    "model": spec.model, "reasoning_effort": spec.reasoning_effort,
                    "failure_category": exc.category if isinstance(exc, InvocationFailure)
@@ -437,6 +463,7 @@ def main() -> int:
     parser.add_argument("--receipt")
     parser.add_argument("--auth-key-file", required=True)
     parser.add_argument("--registry")
+    parser.add_argument("--mission-id", default="codex-mission-harness")
     args = parser.parse_args()
     try:
         root = Path(args.repo).resolve(strict=True)
@@ -445,7 +472,8 @@ def main() -> int:
         if args.command == "run":
             if not args.evidence:
                 raise ValueError("evidence directory required")
-            path = run(root, args.base, args.head, Path(args.evidence), key, spec)
+            path = run(root, args.base, args.head, Path(args.evidence), key, spec,
+                       mission_id=args.mission_id, registry_path=args.registry)
             value = json.loads(path.read_bytes())
             print(json.dumps({"status": value["review_result"], "receipt": str(path)}))
         else:
@@ -458,7 +486,8 @@ def main() -> int:
             finally:
                 os.close(fd)
             validate(value, root=root, base=args.base, head=args.head, spec=spec,
-                     auth_key=key, receipt_path=path)
+                     auth_key=key, receipt_path=path, mission_id=args.mission_id,
+                     registry_path=args.registry)
             print(json.dumps({"status": value["review_result"], "receipt": str(path)}))
     except InvocationFailure as exc:
         print(json.dumps({"status": "BLOCKED_EXTERNAL", "category": exc.category,

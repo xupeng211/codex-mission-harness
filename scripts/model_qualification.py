@@ -24,8 +24,9 @@ def main() -> int:
     parser.add_argument("--auth-key-file")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--registry")
     args = parser.parse_args()
-    spec = load_registry().role(args.role)
+    spec = load_registry(args.registry).role(args.role)
     if args.timeout < 1 or args.timeout > 900:
         parser.error("timeout must be between 1 and 900 seconds")
     if not args.output.is_absolute() or args.output.exists():
@@ -46,7 +47,7 @@ def main() -> int:
         print(json.dumps({"status": "FAIL", "identity": result.identity,
                           "cases_failed": result.cases_failed}), file=sys.stderr)
         return 1
-    receipt = qualification_receipt(result, auth_key=auth_key)
+    receipt = qualification_receipt(result, auth_key=auth_key, registry_path=args.registry)
     payload = (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode()
     fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
@@ -54,7 +55,8 @@ def main() -> int:
         os.fsync(fd)
     finally:
         os.close(fd)
-    validate_qualification_receipt(args.output, spec, auth_key=auth_key)
+    validate_qualification_receipt(args.output, spec, auth_key=auth_key,
+                                   registry_path=args.registry)
     print(json.dumps({"status": "PASS", "identity": result.identity,
                       "receipt": str(args.output)}))
     return 0

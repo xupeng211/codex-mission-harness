@@ -73,10 +73,23 @@ def canonical_environment(source: dict[str, str] | None = None,
         if name not in source:
             continue
         paths = source[name].split(os.pathsep) if name == "SSL_CERT_DIR" else [source[name]]
-        if all(Path(value).is_absolute() and Path(value).exists() and
-               not Path(value).is_symlink() for value in paths):
+        if all(_trusted_ca_path(Path(value), directory=name == "SSL_CERT_DIR") for value in paths):
             env[name] = source[name]
     return env
+
+
+def _trusted_ca_path(path: Path, *, directory: bool) -> bool:
+    """Only inherit system-owned, non-writable CA roots."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return (path.is_absolute() and not path.is_symlink() and info.st_uid == 0
+            and not stat.S_IMODE(info.st_mode) & 0o022
+            and (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))
+            and all(parent.is_dir() and parent.stat().st_uid == 0
+                    and not stat.S_IMODE(parent.stat().st_mode) & 0o022
+                    for parent in path.parents))
 
 
 def parse_events(raw: bytes) -> dict:

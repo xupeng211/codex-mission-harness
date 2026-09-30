@@ -53,6 +53,17 @@ class OpenAIInvocationTests(unittest.TestCase):
             self.assertNotIn("ANTHROPIC_BASE_URL", env)
             self.assertNotIn("OPENAI_BASE_URL", env)
 
+    def test_untrusted_ca_root_is_not_inherited(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"; home.mkdir(mode=0o700)
+            (home / "auth.json").write_text("{}")
+            (home / "auth.json").chmod(0o600)
+            ca = Path(tmp) / "attacker-ca.pem"
+            ca.write_text("untrusted")
+            env = canonical_environment({"SSL_CERT_FILE": str(ca)},
+                binary=Path("/usr/lib/chatgpt/resources/codex"), codex_home=home)
+            self.assertNotIn("SSL_CERT_FILE", env)
+
     def test_model_identity_is_required(self):
         from harness.openai_invocation import invoke_openai
         with self.assertRaises(ValueError):

@@ -9,7 +9,7 @@ from harness.model_qualification import (CASES, QualificationResult, expected_fi
                                          evaluate_cases, qualification_receipt,
                                          validate_qualification_receipt)
 from harness.openai_invocation import InvocationFailure
-from harness.model_registry import load_registry, preflight
+from harness.model_registry import load_registry, preflight, trusted_claude_launcher
 from harness.review_failures import ReviewFailureClassification, classify_process_failure
 from harness.reviewer_v2_contract import parse_synthesis
 
@@ -29,6 +29,18 @@ class RegistryTests(unittest.TestCase):
         registry = load_registry()
         self.assertEqual(registry.role("independent_reviewer").provider, "deepseek")
         self.assertEqual(registry.role("final_reviewer").model, "gpt-5.6-sol")
+
+    def test_deepseek_qualification_rejects_untrusted_path_launcher(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "bin"
+            directory.mkdir(mode=0o777)
+            directory.chmod(0o777)
+            launcher = directory / "claude"
+            launcher.write_text("#!/bin/sh\nexit 0\n")
+            launcher.chmod(0o755)
+            with patch.dict("os.environ", {"PATH": str(directory)}):
+                with self.assertRaises(RuntimeError):
+                    trusted_claude_launcher()
 
     def test_rejects_same_provider_and_extra_fields(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -133,6 +145,25 @@ class QualificationContractTests(unittest.TestCase):
             path = Path(temporary) / "receipt.json"
             path.write_text(json.dumps(receipt))
             self.assertEqual(validate_qualification_receipt(path, spec, auth_key="owner-test-key"), receipt)
+            self.assertIn("cli_runner_sha256", receipt)
+            self.assertIn("invocation_sha256", receipt)
+            original_read = Path.read_bytes
+            for changed_name, changed_parent in (("model_qualification.py", "scripts"),
+                                                 ("openai_invocation.py", "harness")):
+                with self.subTest(changed_name=changed_name):
+                    def changed_file(source):
+                        if source.name == changed_name and source.parent.name == changed_parent:
+                            return b"changed implementation"
+                        return original_read(source)
+                    with patch.object(Path, "read_bytes", changed_file):
+                        with self.assertRaises(ValueError):
+                            validate_qualification_receipt(path, spec, auth_key="owner-test-key")
+            with tempfile.TemporaryDirectory() as custom_dir:
+                alternate = Path(custom_dir) / "models.json"
+                alternate.write_bytes(load_registry().path.read_bytes() + b" ")
+                with self.assertRaises(ValueError):
+                    validate_qualification_receipt(path, spec, auth_key="owner-test-key",
+                                                   registry_path=alternate)
             with self.assertRaises(ValueError):
                 validate_qualification_receipt(path,
                     load_registry().role("independent_reviewer"), auth_key="owner-test-key")

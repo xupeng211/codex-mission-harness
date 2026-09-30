@@ -43,6 +43,7 @@ class OpenAIContractTests(unittest.TestCase):
         git(self.root, "init", "-q")
         git(self.root, "config", "user.email", "test@example.invalid")
         git(self.root, "config", "user.name", "Test")
+        git(self.root, "remote", "add", "origin", "git@github.com:example/harness.git")
         (self.root / "x.py").write_text("def f():\n    return 1\n")
         git(self.root, "add", ".")
         git(self.root, "commit", "-qm", "base")
@@ -56,7 +57,12 @@ class OpenAIContractTests(unittest.TestCase):
                                       "--binary", f"{self.base}..{self.head}")
 
     def _signed(self, receipt):
-        receipt.update(model=self.spec.model, reasoning_effort=self.spec.reasoning_effort)
+        receipt.update(model=self.spec.model, reasoning_effort=self.spec.reasoning_effort,
+                       mission_id="codex-mission-harness",
+                       repository="ssh://github.com/example/harness.git",
+                       registry_sha256=review._sha(review.load_registry().path.read_bytes()),
+                       runner_sha256=review._sha(Path(review.__file__).read_bytes()),
+                       invocation_sha256=review._sha(Path(review.invocation_module.__file__).read_bytes()))
         receipt["auth_hmac_sha256"] = hmac.new(b"test-key", review._canon(receipt), hashlib.sha256).hexdigest()
         return receipt
 
@@ -75,6 +81,21 @@ class OpenAIContractTests(unittest.TestCase):
         self.assertIn(self.head, calls[0][0])
         review.validate(receipt, root=self.root, base=self.base, head=self.head,
                         spec=self.spec, auth_key="test-key")
+        original_read = Path.read_bytes
+        def changed_runner(path):
+            return b"changed runner" if path == Path(review.__file__) else original_read(path)
+        with patch.object(Path, "read_bytes", changed_runner):
+            with self.assertRaises(ValueError):
+                review.validate(receipt, root=self.root, base=self.base,
+                                head=self.head, spec=self.spec, auth_key="test-key")
+        changed_mission = dict(receipt, mission_id="another-mission")
+        with self.assertRaises(ValueError):
+            review.validate(changed_mission, root=self.root, base=self.base,
+                            head=self.head, spec=self.spec, auth_key="test-key")
+        changed_repository = dict(receipt, repository="ssh://github.com/other/repo.git")
+        with self.assertRaises(ValueError):
+            review.validate(changed_repository, root=self.root, base=self.base,
+                            head=self.head, spec=self.spec, auth_key="test-key")
         with self.assertRaises(ValueError):
             review.validate(receipt, root=self.root, base=self.base, head="0" * 40,
                             spec=self.spec, auth_key="test-key")
@@ -175,19 +196,40 @@ class OpenAIContractTests(unittest.TestCase):
     def test_gate_requires_two_valid_independent_exact_lanes(self):
         diff_hash = hashlib.sha256(self.diff).hexdigest()
         deepseek = {"provider": "deepseek", "model": "deepseek-flash", "base_sha": self.base,
-                    "head_sha": self.head, "diff_sha256": diff_hash, "review_result": "PASS", "findings": []}
+                    "head_sha": self.head, "diff_sha256": diff_hash, "review_result": "PASS", "findings": [],
+                    "mission_id": "codex-mission-harness", "repository": "ssh://github.com/example/harness.git"}
         openai = {**deepseek, "provider": "openai", "model": "gpt-5.6-sol",
                   "reasoning_effort": "high"}
         validate = lambda value: value
         proof = gate.validate_gate(root=self.root, base=self.base, head=self.head,
                     deepseek_receipt=deepseek, openai_receipt=openai,
-                    deepseek_validator=validate, openai_validator=validate)
+                    deepseek_validator=validate, openai_validator=validate,
+                    mission_id="codex-mission-harness", repository="ssh://github.com/example/harness.git")
         self.assertEqual(proof["status"], "PASS")
         openai["findings"] = [{"severity": "P1"}]
         with self.assertRaises(ValueError):
             gate.validate_gate(root=self.root, base=self.base, head=self.head,
                 deepseek_receipt=deepseek, openai_receipt=openai,
-                deepseek_validator=validate, openai_validator=validate)
+                deepseek_validator=validate, openai_validator=validate,
+                mission_id="codex-mission-harness", repository="ssh://github.com/example/harness.git")
+
+    def test_gate_rechecks_checkout_after_lane_validation(self):
+        diff_hash = hashlib.sha256(self.diff).hexdigest()
+        identity = {"base_sha": self.base, "head_sha": self.head,
+                    "diff_sha256": diff_hash, "review_result": "PASS", "findings": [],
+                    "mission_id": "codex-mission-harness",
+                    "repository": "ssh://github.com/example/harness.git"}
+        deepseek = dict(identity, provider="deepseek", model="deepseek-flash")
+        openai = dict(identity, provider="openai", model="gpt-5.6-sol",
+                      reasoning_effort="high")
+        def mutate(value):
+            (self.root / "x.py").write_text("uncommitted mutation\n")
+            return value
+        with self.assertRaisesRegex(ValueError, "changed during validation"):
+            gate.validate_gate(root=self.root, base=self.base, head=self.head,
+                deepseek_receipt=deepseek, openai_receipt=openai,
+                deepseek_validator=lambda value: value, openai_validator=mutate,
+                mission_id="codex-mission-harness", repository=identity["repository"])
 
 
 if __name__ == "__main__":

@@ -96,6 +96,42 @@ def read_private_token(path: Path) -> str:
         os.close(fd)
 
 
+def trusted_claude_launcher() -> tuple[str, str]:
+    """Resolve a fixed absolute executable from trusted PATH directories."""
+    safe = []
+    repository = DEFAULT_REGISTRY_PATH.parents[1].resolve()
+    for entry in os.environ.get("PATH", os.defpath).split(os.pathsep):
+        path = Path(entry)
+        if not path.is_absolute():
+            continue
+        try:
+            directory = path.resolve(strict=True)
+            if directory == repository or repository in directory.parents:
+                continue
+            chain = (directory, *directory.parents)
+            if all(item.is_dir() and item.stat().st_uid in {0, os.getuid()}
+                   and not stat.S_IMODE(item.stat().st_mode) & 0o022 for item in chain):
+                safe.append(str(directory))
+        except OSError:
+            continue
+    if not safe:
+        raise RuntimeError("trusted DeepSeek launcher unavailable")
+    executable = shutil.which("claude", path=os.pathsep.join(safe))
+    if not executable:
+        raise RuntimeError("trusted DeepSeek launcher unavailable")
+    target = Path(executable).resolve(strict=True)
+    if target == repository or repository in target.parents:
+        raise RuntimeError("trusted DeepSeek launcher unavailable")
+    info = target.stat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid not in {0, os.getuid()}
+            or stat.S_IMODE(info.st_mode) & 0o022 or not os.access(target, os.X_OK)
+            or any(not ancestor.is_dir() or ancestor.stat().st_uid not in {0, os.getuid()}
+                   or stat.S_IMODE(ancestor.stat().st_mode) & 0o022
+                   for ancestor in (target.parent, *target.parents))):
+        raise RuntimeError("trusted DeepSeek launcher unavailable")
+    return str(target), os.pathsep.join(safe)
+
+
 def preflight(spec: ModelSpec, *, token_file: str | Path | None = None,
               probe: bool = False, timeout: int = 30) -> PreflightResult:
     """Check local auth; optional probe confirms actual model availability.
@@ -108,8 +144,7 @@ def preflight(spec: ModelSpec, *, token_file: str | Path | None = None,
         if token_file is None:
             raise ValueError("DeepSeek requires an explicit token file")
         token = read_private_token(Path(token_file))
-        if not shutil.which("claude"):
-            raise RuntimeError("trusted DeepSeek launcher unavailable")
+        trusted_claude_launcher()
         if probe:
             from .model_qualification import _actual_provider_invoke
             _actual_provider_invoke(spec, 'Return only {"decisions":[]}.', token=token,

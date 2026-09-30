@@ -31,8 +31,14 @@ class CodexAdapter(Protocol):
 
 class AppServerCodex:
     """Thin JSON-RPC adapter for the locally installed App Server; protocol stays here."""
-    MODEL = load_registry().role("builder").model
-    REASONING_EFFORT = load_registry().role("builder").reasoning_effort
+    @property
+    def MODEL(self) -> str:
+        return getattr(self, "_builder_model", None) or load_registry().role("builder").model
+
+    @property
+    def REASONING_EFFORT(self) -> str | None:
+        return getattr(self, "_builder_effort", None) or load_registry().role("builder").reasoning_effort
+
     RESPONSE_TIMEOUT_SECONDS = 300.0
     MAX_PENDING_MESSAGES = 256
 
@@ -43,6 +49,9 @@ class AppServerCodex:
         # either authority boundary from turn-supplied data.
         if worktree is None:
             raise ValueError("Codex mission worktree must be constructor-bound")
+        builder = load_registry().role("builder")
+        self._builder_model = builder.model
+        self._builder_effort = builder.reasoning_effort
         self._forbidden_actions = self._effective_policy(forbidden_actions)
         self._configured_forbidden_actions = self._effective_policy(forbidden_actions)
         self._policy_cwd = self._canonical_worktree(worktree)

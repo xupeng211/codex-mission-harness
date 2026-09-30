@@ -25,10 +25,22 @@ def _diff(root: Path, base: str, head: str) -> bytes:
     )
 
 
+def _source_stable(root: Path, base: str, head: str, diff_hash: str) -> bool:
+    def git(*args: str) -> bytes:
+        return subprocess.check_output(
+            ["git", "--no-replace-objects", "-C", str(root), *args],
+            env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LANG": "C.UTF-8",
+                 "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+                 "GIT_NO_REPLACE_OBJECTS": "1", "GIT_ATTR_NOSYSTEM": "1"})
+    return (git("rev-parse", "HEAD").decode().strip() == head
+            and not git("status", "--porcelain")
+            and hashlib.sha256(_diff(root, base, head)).hexdigest() == diff_hash)
+
+
 def validate_gate(
     *, root: Path, base: str, head: str, deepseek_receipt: dict,
     openai_receipt: dict, deepseek_validator: Callable[[dict], dict],
-    openai_validator: Callable[[dict], dict],
+    openai_validator: Callable[[dict], dict], mission_id: str, repository: str,
 ) -> dict:
     """Return an evidence digest only when both independently validated lanes pass.
 
@@ -40,6 +52,8 @@ def validate_gate(
         raise ValueError("full exact Git SHAs are required")
     root = Path(root).resolve(strict=True)
     diff_hash = hashlib.sha256(_diff(root, base, head)).hexdigest()
+    if not mission_id or not repository or not _source_stable(root, base, head, diff_hash):
+        raise ValueError("review source or mission identity is unstable")
     if not deepseek_receipt or not openai_receipt:
         raise ValueError("both lane receipts are required")
     lanes = []
@@ -53,6 +67,8 @@ def validate_gate(
         if (verified.get("provider") != expected_provider
                 or verified.get("base_sha") != base
                 or verified.get("head_sha") != head
+                or verified.get("mission_id") != mission_id
+                or verified.get("repository") != repository
                 or verified.get("diff_sha256") != diff_hash):
             raise ValueError("lane identity or exact source binding mismatch")
         if verified.get("review_result") != "PASS":
@@ -70,6 +86,8 @@ def validate_gate(
                       "reasoning_effort": verified.get("reasoning_effort"),
                       "receipt_sha256": hashlib.sha256(json.dumps(raw, sort_keys=True,
                            separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()})
+    if not _source_stable(root, base, head, diff_hash):
+        raise ValueError("review source changed during validation")
     return {"status": "PASS", "base_sha": base, "head_sha": head,
             "diff_sha256": diff_hash, "lanes": lanes}
 
@@ -96,6 +114,7 @@ def main() -> int:
     parser.add_argument("--deepseek-receipt", required=True)
     parser.add_argument("--openai-receipt", required=True)
     parser.add_argument("--deepseek-token-file", required=True)
+    parser.add_argument("--deepseek-auth-key-file")
     parser.add_argument("--openai-auth-key-file", required=True)
     parser.add_argument("--deepseek-qualification", required=True)
     parser.add_argument("--openai-qualification", required=True)
@@ -113,11 +132,13 @@ def main() -> int:
         independent = registry.role("independent_reviewer")
         final = registry.role("final_reviewer")
         deepseek_key = secure.read_token_file(args.deepseek_token_file, root)
+        deepseek_auth_key = secure.read_token_file(
+            args.deepseek_auth_key_file or args.deepseek_token_file, root)
         openai_key = secure.read_token_file(args.openai_auth_key_file, root)
         validate_qualification_receipt(Path(args.deepseek_qualification), independent,
-                                       auth_key=deepseek_key)
+                                       auth_key=deepseek_auth_key, registry_path=args.registry)
         validate_qualification_receipt(Path(args.openai_qualification), final,
-                                       auth_key=openai_key)
+                                       auth_key=openai_key, registry_path=args.registry)
         deepseek_path = Path(args.deepseek_receipt)
         openai_path = Path(args.openai_receipt)
         receipts = []
@@ -131,12 +152,14 @@ def main() -> int:
             secure.git(root, "config", "--get", "remote.origin.url").decode().strip())
         proof = validate_gate(
             root=root, base=base, head=head, deepseek_receipt=receipts[0],
-            openai_receipt=receipts[1],
+            openai_receipt=receipts[1], mission_id=args.mission_id, repository=repository,
             deepseek_validator=lambda value: deepseek.validate(
-                value, base, head, root, deepseek_path, args.mission_id, repository, deepseek_key),
+                value, base, head, root, deepseek_path, args.mission_id, repository, deepseek_key,
+                registry_path=args.registry),
             openai_validator=lambda value: openai.validate(
                 value, root=root, base=base, head=head, spec=final,
-                auth_key=openai_key, receipt_path=openai_path))
+                auth_key=openai_key, receipt_path=openai_path, mission_id=args.mission_id,
+                registry_path=args.registry))
         print(json.dumps(proof, sort_keys=True))
     except Exception:
         print(json.dumps({"status": "BLOCKED_EXTERNAL",

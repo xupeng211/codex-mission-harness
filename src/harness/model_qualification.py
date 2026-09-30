@@ -19,7 +19,7 @@ from .model_registry import ModelSpec
 from .openai_invocation import invoke_openai, InvocationFailure, InvocationResult
 from .reviewer_v2_contract import bind_findings, parse_synthesis
 
-QUALIFICATION_VERSION = "cmh-model-qualification/v1"
+QUALIFICATION_VERSION = "cmh-model-qualification/v2"
 
 
 @dataclass(frozen=True)
@@ -149,11 +149,13 @@ def _actual_provider_invoke(spec: ModelSpec, prompt: str, *, token: str | None,
             settings = root / "settings.json"
             settings.write_text('{"permissions":{"allow":[],"deny":["Bash","Edit",'
                                 '"Write","Read","Glob","Grep","WebFetch","WebSearch"]}}')
-            command = ["claude", "--bare", "--restricted", "--print", "--model", spec.model,
+            from .model_registry import trusted_claude_launcher
+            executable, safe_path = trusted_claude_launcher()
+            command = [executable, "--bare", "--restricted", "--print", "--model", spec.model,
                        "--settings", str(settings), "--tools", "", "--disallowed-tools",
                        "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch", "--output-format", "json",
                        "--json-schema", json.dumps(_SCHEMA, separators=(",", ":"))]
-            env = {"HOME": "/nonexistent", "PATH": os.environ.get("PATH", os.defpath),
+            env = {"HOME": "/nonexistent", "PATH": safe_path,
                    "LANG": "C.UTF-8", "ANTHROPIC_API_KEY": token,
                    "ANTHROPIC_AUTH_TOKEN": token,
                    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
@@ -185,34 +187,46 @@ def qualify_live(spec: ModelSpec, *, token_file: str | Path | None = None,
                            mode="real_provider")
 
 
-def qualification_receipt(result: QualificationResult, *, auth_key: str) -> dict:
+def qualification_receipt(result: QualificationResult, *, auth_key: str,
+                          registry_path: str | Path | None = None) -> dict:
     """Build an integrity-bound record without storing model responses."""
-    from .model_registry import DEFAULT_REGISTRY_PATH
-    from . import reviewer_v2_contract
+    from .model_registry import load_registry
+    from . import reviewer_v2_contract, openai_invocation, model_registry
 
     if not result.passed or not isinstance(auth_key, str) or not auth_key:
         raise ValueError("only a complete real-provider qualification can produce a receipt")
     code = Path(__file__).resolve()
+    registry = load_registry(registry_path)
+    if result.identity not in (registry.role("builder").identity(),
+                               registry.role("independent_reviewer").identity(),
+                               registry.role("final_reviewer").identity()):
+        raise ValueError("qualification identity is absent from selected registry")
+    cli = code.parents[2] / "scripts" / "model_qualification.py"
     receipt = {"version": QUALIFICATION_VERSION,
                "mode": result.mode, "identity": result.identity,
                "cases_passed": list(result.cases_passed),
                "response_sha256": list(result.response_sha256),
-               "registry_sha256": hashlib.sha256(DEFAULT_REGISTRY_PATH.read_bytes()).hexdigest(),
+               "registry_sha256": hashlib.sha256(registry.path.read_bytes()).hexdigest(),
                "contract_sha256": hashlib.sha256(Path(reviewer_v2_contract.__file__).read_bytes()).hexdigest(),
-               "runner_sha256": hashlib.sha256(code.read_bytes()).hexdigest()}
+               "runner_sha256": hashlib.sha256(code.read_bytes()).hexdigest(),
+               "cli_runner_sha256": hashlib.sha256(cli.read_bytes()).hexdigest(),
+               "invocation_sha256": hashlib.sha256(Path(openai_invocation.__file__).read_bytes()).hexdigest(),
+               "registry_code_sha256": hashlib.sha256(Path(model_registry.__file__).read_bytes()).hexdigest()}
     receipt["integrity_sha256"] = hmac.new(auth_key.encode(),
         json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode(), hashlib.sha256).hexdigest()
     return receipt
 
 
-def validate_qualification_receipt(path: str | Path, spec: ModelSpec, *, auth_key: str) -> dict:
+def validate_qualification_receipt(path: str | Path, spec: ModelSpec, *, auth_key: str,
+                                   registry_path: str | Path | None = None) -> dict:
     """Reject stale, incomplete, altered, or different-model qualification."""
-    from .model_registry import DEFAULT_REGISTRY_PATH
-    from . import reviewer_v2_contract
+    from .model_registry import load_registry
+    from . import reviewer_v2_contract, openai_invocation, model_registry
 
     receipt = json.loads(Path(path).read_text(encoding="utf-8"))
     expected_keys = {"version", "mode", "identity", "cases_passed", "response_sha256",
-                     "registry_sha256", "contract_sha256", "runner_sha256", "integrity_sha256"}
+                     "registry_sha256", "contract_sha256", "runner_sha256", "cli_runner_sha256",
+                     "invocation_sha256", "registry_code_sha256", "integrity_sha256"}
     if not isinstance(receipt, dict) or set(receipt) != expected_keys \
             or receipt["version"] != QUALIFICATION_VERSION \
             or receipt["mode"] != "real_provider" or receipt["identity"] != spec.identity() \
@@ -223,9 +237,17 @@ def validate_qualification_receipt(path: str | Path, spec: ModelSpec, *, auth_ke
                    or any(char not in "0123456789abcdef" for char in item)
                    for item in receipt["response_sha256"]):
         raise ValueError("invalid or mismatched model qualification receipt")
-    hashes = {"registry_sha256": DEFAULT_REGISTRY_PATH,
+    registry = load_registry(registry_path)
+    if spec.identity() not in (registry.role("builder").identity(),
+                              registry.role("independent_reviewer").identity(),
+                              registry.role("final_reviewer").identity()):
+        raise ValueError("qualification model is absent from selected registry")
+    hashes = {"registry_sha256": registry.path,
               "contract_sha256": Path(reviewer_v2_contract.__file__),
-              "runner_sha256": Path(__file__)}
+              "runner_sha256": Path(__file__),
+              "cli_runner_sha256": Path(__file__).resolve().parents[2] / "scripts" / "model_qualification.py",
+              "invocation_sha256": Path(openai_invocation.__file__),
+              "registry_code_sha256": Path(model_registry.__file__)}
     if any(receipt[key] != hashlib.sha256(file.read_bytes()).hexdigest()
            for key, file in hashes.items()):
         raise ValueError("model qualification code or registry changed")
