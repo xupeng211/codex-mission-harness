@@ -106,7 +106,7 @@ def _evaluate_cases(spec: ModelSpec, invoke: Callable[[ModelSpec, str], str], *,
             # every remaining fixture.
             failed.extend(item.name for item in CASES[index:])
             break
-        except (ValueError, RuntimeError, TimeoutError):
+        except (ValueError, RuntimeError, TimeoutError, subprocess.TimeoutExpired):
             failed.append(case.name)
         else:
             passed.append(case.name)

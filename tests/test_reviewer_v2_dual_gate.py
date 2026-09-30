@@ -96,6 +96,28 @@ class OpenAIContractTests(unittest.TestCase):
         self.assertEqual(record["failure_category"], "TURN_TIMEOUT_UNDIAGNOSED")
         self.assertEqual(list(failure_path.parent.iterdir()), [failure_path])
 
+    def test_invalid_group_result_preserves_raw_stage_and_never_publishes_receipt(self):
+        evidence = Path(self.temp.name) / "evidence"
+        evidence.mkdir(mode=0o700)
+        blocker = {"severity": "P1", "title": "Concrete issue", "evidence": "x.py:2"}
+        raw_group = json.dumps({"findings": [], "decisions": [{
+            "finding_id": "C000F000", "decision": "DISPUTED",
+            "rationale": "This rationale claims the blocker does not apply.",
+            "source_quote": "a quotation absent from the diff"}],
+            "summary": "The group was reviewed but its dispute lacks source evidence."}).encode()
+        def call(_prompt, group):
+            return raw_group if group else json.dumps({"findings": [blocker]}).encode()
+        with self.assertRaisesRegex(ValueError, "verifiable source quote"):
+            review.run(self.root, self.base, self.head, evidence, "test-key", self.spec,
+                       call=call)
+        run_dir, = evidence.iterdir()
+        self.assertEqual((run_dir / "group-000.json").read_bytes(), raw_group)
+        failure = json.loads((run_dir / "failure.json").read_text())
+        self.assertEqual(failure["status"], "BLOCKED")
+        self.assertEqual(failure["failure_category"], "REVIEW_RESULT_INVALID")
+        self.assertEqual(failure["artifact_sha256"]["group-000.json"], hashlib.sha256(raw_group).hexdigest())
+        self.assertFalse((run_dir / "receipt.json").exists())
+
     def test_preflight_provider_failure_publishes_no_approval_receipt(self):
         evidence = Path(self.temp.name) / "evidence"
         evidence.mkdir(mode=0o700)

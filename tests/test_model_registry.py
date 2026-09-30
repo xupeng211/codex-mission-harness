@@ -1,4 +1,5 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -107,6 +108,13 @@ class QualificationContractTests(unittest.TestCase):
             raise InvocationFailure("AUTHENTICATION_FAILURE", "auth failed", {})
         result = evaluate_cases(load_registry().role("final_reviewer"), fail_once)
         self.assertEqual(len(calls), 1)
+        self.assertEqual(result.cases_failed, tuple(case.name for case in CASES))
+
+    def test_provider_timeout_is_a_failed_qualification_case(self):
+        def timeout(_spec, _prompt):
+            raise subprocess.TimeoutExpired("deepseek", 1)
+        result = evaluate_cases(load_registry().role("independent_reviewer"), timeout)
+        self.assertFalse(result.passed)
         self.assertEqual(result.cases_failed, tuple(case.name for case in CASES))
 
     def test_provider_errors_are_not_format_retries(self):

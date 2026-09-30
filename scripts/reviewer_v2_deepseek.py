@@ -227,7 +227,7 @@ def validate(receipt: dict, base: str, head: str, root: Path | None = None,
     unsigned.pop("auth_hmac_sha256")
     if not hmac.compare_digest(sha256(canonical(unsigned)), observed):
         raise ValueError("receipt integrity mismatch")
-    if secret is None or not hmac.compare_digest(_receipt_hmac(receipt, secret),
+    if not isinstance(secret, str) or not secret or not hmac.compare_digest(_receipt_hmac(receipt, secret),
                                                   receipt["auth_hmac_sha256"]):
         raise ValueError("receipt authentication mismatch")
     if root is None:

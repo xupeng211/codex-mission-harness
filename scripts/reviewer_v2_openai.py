@@ -171,7 +171,8 @@ def _prompt(kind: str, *, base: str, head: str, diff: bytes, ids: list[dict] | N
     else:
         introduction += ("For every listed blocker ID return exactly one UPHELD or DISPUTED decision. "
                          "A DISPUTED decision needs specific reasoning and a verbatim source quote "
-                         "from this supplied diff. UPHELD can use an empty source_quote. "
+                         "from this supplied diff. If no exact quote supports a dispute, choose UPHELD. "
+                         "UPHELD must use an empty source_quote. "
                          "Also report any additional problems and summarize cross-file impact. "
                          f"Blockers: {json.dumps(ids, ensure_ascii=False)}. ")
     try:
@@ -199,12 +200,14 @@ def _decide(blockers: list[dict], result: dict, source: bytes) -> list[dict]:
             if item["decision"] == "UPHELD"]
 
 
-def _assemble(diff: bytes, base: str, head: str, call) -> tuple[dict, list[tuple[str, bytes]]]:
+def _assemble(diff: bytes, base: str, head: str, call, persist=None) -> tuple[dict, list[tuple[str, bytes]]]:
     chunks, groups = _plan(diff)
     artifacts = []
     for item in chunks:
         source = diff[item["start"]:item["end"]]
         raw = call(_prompt("CHUNK REVIEW", base=base, head=head, diff=source), False)
+        if persist is not None:
+            persist(f"chunk-{item['index']:03d}.json", raw)
         item["result"] = _result(raw)
         item["output_sha256"] = _sha(raw)
         artifacts.append((f"chunk-{item['index']:03d}.json", raw))
@@ -221,6 +224,8 @@ def _assemble(diff: bytes, base: str, head: str, call) -> tuple[dict, list[tuple
                 if record["severity"] in BLOCKING)
         source = diff[group["start"]:group["end"]]
         raw = call(_prompt("GROUP REVIEW", base=base, head=head, diff=source, ids=blockers), True)
+        if persist is not None:
+            persist(f"group-{group['index']:03d}.json", raw)
         result = _result(raw, group=True)
         upheld = _decide(blockers, result, source)
         group["result"] = result
@@ -243,6 +248,8 @@ def _assemble(diff: bytes, base: str, head: str, call) -> tuple[dict, list[tuple
                 batch = level[offset:offset + 8]
                 prompt = _synthesis_prompt([item["summary"] for item in batch], base, head)
                 raw = call(prompt, "synthesis")
+                if persist is not None:
+                    persist(f"synthesis-{len(synthesis):03d}.json", raw)
                 result = _synthesis_result(raw)
                 source_groups = [index for item in batch for index in item["source_groups"]]
                 record = {"index": len(synthesis), "source_groups": source_groups,
@@ -376,47 +383,45 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
         call = lambda prompt, group: invoke_codex(
             prompt, spec, stage="synthesis" if group == "synthesis" else
             "group" if group else "chunk", timeout=timeout)
-    try:
-        if live:
-            preflight(spec, probe=True, timeout=min(timeout, 120))
-        receipt, artifacts = _assemble(diff, base, head, call)
-    except InvocationFailure as exc:
-        failure = {"status": "BLOCKED", "base_sha": base, "head_sha": head,
-                   "diff_sha256": _sha(diff), "provider": spec.provider,
-                   "model": spec.model, "reasoning_effort": spec.reasoning_effort,
-                   "failure_category": exc.category, "invocation_evidence": dict(exc.evidence),
-                   "recorded_at": int(time.time())}
-        failure["auth_hmac_sha256"] = hmac.new(auth_key.encode(), _canon(failure),
-                                               hashlib.sha256).hexdigest()
-        _, parent_fd = secure.open_private_directory(evidence, root)
-        run_id = uuid.uuid4().hex
-        child_name = f"openai-failure-{head[:12]}-{run_id}"
-        try:
-            child_fd = secure.create_private_child_directory(parent_fd, child_name)
-            try:
-                secure.write_private_artifact(child_fd, "failure.json", _canon(failure), run_id)
-            finally:
-                os.close(child_fd)
-        finally:
-            os.close(parent_fd)
-        exc.evidence["failure_record"] = str(Path(evidence).absolute() / child_name / "failure.json")
-        raise
-    receipt.update({"model": spec.model, "reasoning_effort": spec.reasoning_effort})
-    receipt["auth_hmac_sha256"] = hmac.new(auth_key.encode(), _canon(receipt), hashlib.sha256).hexdigest()
-    validate(receipt, root=root, base=base, head=head, spec=spec, auth_key=auth_key)
     _, parent_fd = secure.open_private_directory(evidence, root)
     run_id = uuid.uuid4().hex
     child_name = f"openai-{head[:12]}-{run_id}"
     child_fd = secure.create_private_child_directory(parent_fd, child_name)
+    path = Path(evidence).absolute() / child_name / "receipt.json"
+    artifact_hashes = {}
+    def persist(name: str, raw: bytes) -> None:
+        if len(raw) > MAX_OUTPUT_BYTES:
+            raise ValueError("review output exceeds bound")
+        secure.write_private_artifact(child_fd, name, raw, run_id)
+        artifact_hashes[name] = _sha(raw)
     try:
-        for name, raw in artifacts:
-            secure.write_private_artifact(child_fd, name, raw, run_id)
-        name = "receipt.json"
-        path = Path(evidence).absolute() / child_name / name
-        secure.write_private_artifact(child_fd, name, _canon(receipt), run_id)
+        if live:
+            preflight(spec, probe=True, timeout=min(timeout, 120))
+        receipt, _ = _assemble(diff, base, head, call, persist=persist)
+        receipt.update({"model": spec.model, "reasoning_effort": spec.reasoning_effort})
+        receipt["auth_hmac_sha256"] = hmac.new(auth_key.encode(), _canon(receipt), hashlib.sha256).hexdigest()
+        validate(receipt, root=root, base=base, head=head, spec=spec, auth_key=auth_key)
         validate(receipt, root=root, base=base, head=head, spec=spec,
                  auth_key=auth_key, receipt_path=path)
+        # Publish the approval-shaped receipt only after all stage artifacts
+        # and semantic checks are durable and complete.
+        secure.write_private_artifact(child_fd, path.name, _canon(receipt), run_id)
         return path
+    except Exception as exc:
+        failure = {"status": "BLOCKED", "base_sha": base, "head_sha": head,
+                   "diff_sha256": _sha(diff), "provider": spec.provider,
+                   "model": spec.model, "reasoning_effort": spec.reasoning_effort,
+                   "failure_category": exc.category if isinstance(exc, InvocationFailure)
+                   else "REVIEW_RESULT_INVALID", "error_type": type(exc).__name__,
+                   "artifact_sha256": artifact_hashes,
+                   "invocation_evidence": dict(exc.evidence) if isinstance(exc, InvocationFailure) else {},
+                   "recorded_at": int(time.time())}
+        failure["auth_hmac_sha256"] = hmac.new(auth_key.encode(), _canon(failure),
+                                               hashlib.sha256).hexdigest()
+        secure.write_private_artifact(child_fd, "failure.json", _canon(failure), run_id)
+        if isinstance(exc, InvocationFailure):
+            exc.evidence["failure_record"] = str(path.parent / "failure.json")
+        raise
     finally:
         os.close(child_fd)
         os.close(parent_fd)

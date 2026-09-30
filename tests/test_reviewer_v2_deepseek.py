@@ -51,6 +51,9 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
             receipt = json.loads(receipt_path.read_text())
             reviewer.validate(receipt, base, head, root, receipt_path, "test",
                               "ssh://github.com/example/harness.git", "fixture-token")
+            with self.assertRaises(ValueError):
+                reviewer.validate(receipt, base, head, root, receipt_path, "test",
+                                  "ssh://github.com/example/harness.git", "")
             receipt["chunks"][0]["sha256"] = "0" * 64
             with self.assertRaises(ValueError):
                 reviewer.validate(receipt, base, head, root, receipt_path, "test",
