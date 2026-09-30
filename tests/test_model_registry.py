@@ -2,16 +2,27 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from harness.model_qualification import (CASES, QualificationResult, expected_findings,
                                          evaluate_cases, qualification_receipt,
                                          validate_qualification_receipt)
-from harness.model_registry import load_registry
+from harness.model_registry import load_registry, preflight
 from harness.review_failures import ReviewFailureClassification, classify_process_failure
 from harness.reviewer_v2_contract import parse_synthesis
 
 
 class RegistryTests(unittest.TestCase):
+    def test_openai_preflight_checks_canonical_binary_and_home(self):
+        with patch("harness.model_registry.subprocess.run") as run:
+            run.return_value.returncode = 0
+            result = preflight(load_registry().role("final_reviewer"))
+        self.assertTrue(result.authenticated)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:3], ["/usr/lib/chatgpt/resources/codex", "login", "status"])
+        self.assertEqual(run.call_args.kwargs["env"]["CODEX_HOME"],
+                         "/home/xupeng/.footballprediction/canonical-codex-reviewer")
+
     def test_default_registry_uses_two_providers(self):
         registry = load_registry()
         self.assertEqual(registry.role("independent_reviewer").provider, "deepseek")

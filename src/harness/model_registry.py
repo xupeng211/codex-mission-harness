@@ -117,10 +117,12 @@ def preflight(spec: ModelSpec, *, token_file: str | Path | None = None,
         return PreflightResult(spec.identity(), True, True if probe else None,
                                "actual_model_probe" if probe else "local_auth_only")
     if spec.provider == "openai":
-        if not shutil.which("codex"):
-            raise RuntimeError("Codex executable unavailable")
-        result = subprocess.run(["codex", "login", "status"], capture_output=True,
-                                text=True, timeout=timeout, check=False)
+        from .openai_invocation import CANONICAL_BINARY, canonical_environment
+
+        env = canonical_environment()
+        result = subprocess.run([str(CANONICAL_BINARY), "login", "status"],
+                                capture_output=True, text=True, env=env,
+                                timeout=timeout, check=False)
         if result.returncode:
             raise RuntimeError("Codex noninteractive authentication check failed")
         if probe:

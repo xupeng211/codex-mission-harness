@@ -106,7 +106,7 @@ def parse_events(raw: bytes) -> dict:
 
 def _failure_category(stderr: bytes, stdout: bytes, *, timed_out: bool) -> str:
     if timed_out:
-        return "TRANSIENT_TRANSPORT"
+        return "TURN_TIMEOUT_UNDIAGNOSED"
     content = (stderr + b"\n" + stdout).decode("utf-8", "replace").casefold()
     if re.search(r"unauthori|authentication|invalid.token|login required", content):
         return "AUTHENTICATION_FAILURE"
@@ -117,6 +117,23 @@ def _failure_category(stderr: bytes, stdout: bytes, *, timed_out: bool) -> str:
     if re.search(r"connection|network|timeout|stream|proxy|disconnect", content):
         return "TRANSIENT_TRANSPORT"
     return "CLI_OR_CONFIG_FAILURE"
+
+
+def _observed_events(raw: bytes) -> dict:
+    """Summarize an incomplete stream without treating it as completion."""
+    types = []
+    for line in raw.splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, UnicodeError):
+            break
+        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+            break
+        types.append(event["type"])
+    return {"observed_event_types": types[:1000],
+            "turn_started_observed": "turn.started" in types,
+            "terminal_observed": any(item in types for item in
+                                     ("turn.completed", "turn.failed"))}
 
 
 def invoke_openai(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 120,
@@ -159,7 +176,9 @@ def invoke_openai(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 
                     "environment_keys": sorted(env),
                     "exit_code": process.returncode, "timed_out": timed_out,
                     "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
-                    "stderr_sha256": hashlib.sha256(stderr).hexdigest()}
+                    "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+                    "stdout_bytes": len(stdout), "stderr_bytes": len(stderr),
+                    **_observed_events(stdout)}
         if timed_out or process.returncode != 0:
             raise InvocationFailure(_failure_category(stderr, stdout, timed_out=timed_out),
                                     "canonical Codex invocation did not complete", evidence)
