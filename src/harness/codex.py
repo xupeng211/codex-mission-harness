@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .policy import SENSITIVE
+from .model_registry import load_registry
 
 
 @dataclass(frozen=True)
@@ -30,8 +31,8 @@ class CodexAdapter(Protocol):
 
 class AppServerCodex:
     """Thin JSON-RPC adapter for the locally installed App Server; protocol stays here."""
-    MODEL = "gpt-5.6-sol"
-    REASONING_EFFORT = "high"
+    MODEL = load_registry().role("builder").model
+    REASONING_EFFORT = load_registry().role("builder").reasoning_effort
     RESPONSE_TIMEOUT_SECONDS = 300.0
     MAX_PENDING_MESSAGES = 256
 
