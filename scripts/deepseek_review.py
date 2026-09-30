@@ -7,7 +7,7 @@ commit-last: an incomplete run has no receipt and is never an approval.
 """
 from __future__ import annotations
 
-import argparse, base64, hashlib, hmac, json, os, pwd, re, shutil, stat, subprocess, sys, tempfile, time, uuid
+import argparse, base64, hashlib, hmac, json, os, pwd, re, shutil, signal, stat, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -951,8 +951,26 @@ def invoke_reviewer(command, prompt_text, env, timeout):
     # Keep source and synthesis prompts on stdin, not argv. The bounded request
     # limit is enforced before this call, independently of the operating system's
     # argv limit. Claude Code print mode supports prompts on stdin.
-    return subprocess.run(command, input=prompt_text.encode("utf-8"), env=env,
-                          capture_output=True, timeout=timeout)
+    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, env=env, start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(prompt_text.encode("utf-8"), timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        pgid = os.getpgid(process.pid)
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            stdout, stderr = process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(command, timeout, output=stdout, stderr=stderr) from exc
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 class ReviewAttemptFailure(RuntimeError):

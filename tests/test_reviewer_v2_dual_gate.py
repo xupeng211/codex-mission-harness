@@ -62,7 +62,8 @@ class OpenAIContractTests(unittest.TestCase):
                        repository="ssh://github.com/example/harness.git",
                        registry_sha256=review._sha(review.load_registry().path.read_bytes()),
                        runner_sha256=review._sha(Path(review.__file__).read_bytes()),
-                       invocation_sha256=review._sha(Path(review.invocation_module.__file__).read_bytes()))
+                       invocation_sha256=review._sha(Path(review.invocation_module.__file__).read_bytes()),
+                       schema_manifest_sha256=review._schema_manifest_sha())
         receipt["auth_hmac_sha256"] = hmac.new(b"test-key", review._canon(receipt), hashlib.sha256).hexdigest()
         return receipt
 

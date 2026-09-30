@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).parents[1]
 spec = importlib.util.spec_from_file_location("deepseek_review", ROOT / "scripts" / "deepseek_review.py")
@@ -117,6 +117,22 @@ def run_fixture(root, *, large_diff=False):
     return args, Path(args.evidence)
 
 class DeepSeekReceiptTest(unittest.TestCase):
+    def test_invoke_reviewer_timeout_terminates_process_group(self):
+        process = Mock(pid=4321, returncode=-9)
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired(["claude"], 1, output=b"partial", stderr=b"err"),
+            subprocess.TimeoutExpired(["claude"], 2, output=b"partial", stderr=b"err"),
+            (b"", b"err"),
+        ]
+        with patch.object(review.subprocess, "Popen", return_value=process), \
+             patch.object(review.os, "getpgid", return_value=4321), \
+             patch.object(review.os, "killpg") as killpg:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                review.invoke_reviewer(["claude"], "prompt", {}, 1)
+        self.assertEqual(killpg.call_count, 2)
+        self.assertEqual([call.args for call in killpg.call_args_list],
+                         [(4321, review.signal.SIGTERM), (4321, review.signal.SIGKILL)])
+        self.assertGreaterEqual(process.communicate.call_count, 3)
     def test_chunk_and_aggregate_schemas_have_separate_disposition_contracts(self):
         self.assertNotIn("dispositions", review.CHUNK_SCHEMA["properties"])
         self.assertIn("dispositions", review.GROUP_SCHEMA["properties"])

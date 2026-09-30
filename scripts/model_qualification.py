@@ -27,6 +27,8 @@ def main() -> int:
     parser.add_argument("--registry")
     args = parser.parse_args()
     spec = load_registry(args.registry).role(args.role)
+    if spec.provider == "deepseek" and not args.token_file:
+        parser.error("--token-file is required for DeepSeek provider execution")
     if args.timeout < 1 or args.timeout > 900:
         parser.error("timeout must be between 1 and 900 seconds")
     if not args.output.is_absolute() or args.output.exists():

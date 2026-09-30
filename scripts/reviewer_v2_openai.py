@@ -46,6 +46,11 @@ def _sha(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _schema_manifest_sha() -> str:
+    return _sha(_canon({stage: _schema(stage == "group", stage == "synthesis")
+                        for stage in ("chunk", "group", "synthesis")}))
+
+
 def _result(raw: bytes, *, group: bool = False) -> dict:
     if len(raw) > MAX_OUTPUT_BYTES:
         raise ValueError("review output exceeds bound")
@@ -172,7 +177,8 @@ def _prompt(kind: str, *, base: str, head: str, diff: bytes, ids: list[dict] | N
     else:
         introduction += ("For every listed blocker ID return exactly one UPHELD or DISPUTED decision. "
                          "A DISPUTED decision needs specific reasoning and a verbatim source quote "
-                         "from this supplied diff. If no exact quote supports a dispute, choose UPHELD. "
+                         "from this supplied group diff only. If no exact quote in this group source "
+                         "supports a dispute, choose UPHELD. Never quote another group or chunk. "
                          "UPHELD must use an empty source_quote. "
                          "Also report any additional problems and summarize cross-file impact. "
                          f"Blockers: {json.dumps(ids, ensure_ascii=False)}. ")
@@ -287,6 +293,7 @@ def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec
             or receipt.get("registry_sha256") != _sha(registry.path.read_bytes())
             or receipt.get("runner_sha256") != _sha(Path(__file__).read_bytes())
             or receipt.get("invocation_sha256") != _sha(Path(invocation_module.__file__).read_bytes())
+            or receipt.get("schema_manifest_sha256") != _schema_manifest_sha()
             or receipt.get("base_sha") != base or receipt.get("head_sha") != head):
         raise ValueError("OpenAI receipt model or exact HEAD mismatch")
     unsigned = dict(receipt)
@@ -415,13 +422,20 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
         artifact_hashes[name] = _sha(raw)
     try:
         if live:
-            preflight(spec, probe=True, timeout=min(timeout, 120))
+            # Authenticate first, then exercise the same Codex structured
+            # invocation path and chunk schema used by the review lane.
+            preflight(spec, probe=False, timeout=min(timeout, 120))
+            invoke_codex(
+                'Return JSON with an empty findings array. Use the exact chunk schema.',
+                spec, stage="chunk", timeout=min(timeout, 120),
+            )
         receipt, _ = _assemble(diff, base, head, call, persist=persist)
         receipt.update({"model": spec.model, "reasoning_effort": spec.reasoning_effort,
                         "mission_id": mission_id, "repository": repository,
                         "registry_sha256": _sha(registry.path.read_bytes()),
                         "runner_sha256": _sha(Path(__file__).read_bytes()),
-                        "invocation_sha256": _sha(Path(invocation_module.__file__).read_bytes())})
+                        "invocation_sha256": _sha(Path(invocation_module.__file__).read_bytes()),
+                        "schema_manifest_sha256": _schema_manifest_sha()})
         receipt["auth_hmac_sha256"] = hmac.new(auth_key.encode(), _canon(receipt), hashlib.sha256).hexdigest()
         validate(receipt, root=root, base=base, head=head, spec=spec, auth_key=auth_key,
                  mission_id=mission_id, registry_path=registry_path)
