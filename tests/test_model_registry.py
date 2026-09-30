@@ -178,8 +178,20 @@ class QualificationContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "receipt.json"
             path.write_text(json.dumps(receipt))
+            path.chmod(0o600)
             self.assertEqual(validate_qualification_receipt(path, spec, auth_key="owner-test-key",
                                                              role="final_reviewer"), receipt)
+            alias = Path(temporary) / "receipt-alias.json"
+            alias.symlink_to(path)
+            with self.assertRaises(OSError):
+                validate_qualification_receipt(alias, spec, auth_key="owner-test-key",
+                                               role="final_reviewer")
+            oversized = Path(temporary) / "oversized.json"
+            oversized.write_bytes(b"x" * 65_537)
+            oversized.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "bounded"):
+                validate_qualification_receipt(oversized, spec, auth_key="owner-test-key",
+                                               role="final_reviewer")
             with self.assertRaises(ValueError):
                 validate_qualification_receipt(path, spec, auth_key="owner-test-key", role="builder")
             self.assertIn("cli_runner_sha256", receipt)

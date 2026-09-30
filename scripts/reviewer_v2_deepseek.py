@@ -263,7 +263,16 @@ def run(args: argparse.Namespace) -> dict:
                                                                       structured_evidence=True),
                                   stage_state)
             group["result"] = result
-            group["bound_findings"] = bind_findings(result["findings"], "G", group["index"])
+            # Preserve original C identities for carried P3 and UPHELD blockers;
+            # only genuinely new findings receive a G identity.
+            carried_ids = {item["finding_id"] for item in expected
+                           if item["severity"] == "P3" or
+                           (item["finding_id"] in {d["finding_id"] for d in result["decisions"]}
+                            and next(d for d in result["decisions"]
+                                     if d["finding_id"] == item["finding_id"])["decision"] == "UPHELD")}
+            carried = [item for item in expected if item["finding_id"] in carried_ids]
+            new_bound = bind_findings(result["new_findings"], "G", group["index"])
+            group["bound_findings"] = carried + new_bound
             group["output_sha256"] = output_hash
         expected = _expected(groups)
         required = [item for item in expected if item["severity"] in {"P0", "P1", "P2"}]
@@ -410,7 +419,11 @@ def validate(receipt: dict, base: str, head: str, root: Path | None = None,
         selected = [chunks[i] for i in group["chunk_indexes"]]
         validate_bound_result(group["result"], _expected(selected), source,
                               structured_evidence=True)
-        if bind_findings(group["result"]["findings"], "G", group["index"]) != group["bound_findings"]:
+        carried = [item for item in _expected(selected)
+                   if item["severity"] == "P3" or item["finding_id"] in {
+                       d["finding_id"] for d in group["result"]["decisions"]
+                       if d["decision"] == "UPHELD"}]
+        if carried + bind_findings(group["result"]["new_findings"], "G", group["index"]) != group["bound_findings"]:
             raise ValueError("group finding binding mismatch")
     validate_bound_result(receipt["aggregate_result"], _expected(groups), None,
                           structured_evidence=True)

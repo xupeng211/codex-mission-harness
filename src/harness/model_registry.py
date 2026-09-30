@@ -44,24 +44,31 @@ class ModelRegistry:
 
 def load_registry(path: str | Path | None = None) -> ModelRegistry:
     source = Path(path) if path is not None else DEFAULT_REGISTRY_PATH
-    if path is not None:
-        if not source.is_absolute():
-            raise ValueError("custom model registry must use an absolute private path")
-        info = source.lstat()
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() \
-                or stat.S_IMODE(info.st_mode) != 0o600:
-            raise ValueError("custom model registry must be owner-owned mode 0600")
-        for parent in source.parents:
-            ancestor = parent.lstat()
-            # A root-owned sticky temporary root is safe when the registry is
-            # inside a private directory; no other writable ancestor is.
-            sticky_root = (ancestor.st_uid == 0 and
-                           stat.S_IMODE(ancestor.st_mode) & 0o1000 and
-                           stat.S_IMODE(ancestor.st_mode) & 0o002)
-            if (not stat.S_ISDIR(ancestor.st_mode) or
-                    ancestor.st_uid not in {0, os.getuid()} or
-                    (stat.S_IMODE(ancestor.st_mode) & 0o022 and not sticky_root)):
-                raise ValueError("custom model registry has an unsafe ancestor")
+    if not source.is_absolute():
+        raise ValueError("model registry must use an absolute owner-controlled path")
+    info = source.lstat()
+    required_mode = 0o600 if path is not None else None
+    private_group_write = info.st_gid == info.st_uid and not stat.S_IMODE(info.st_mode) & 0o002
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() \
+            or (required_mode is not None and stat.S_IMODE(info.st_mode) != required_mode) \
+            or (required_mode is None and (stat.S_IMODE(info.st_mode) & 0o002 or
+                stat.S_IMODE(info.st_mode) & 0o020 and not private_group_write)):
+        raise ValueError("model registry must be owner-owned and mode 0600 for custom paths")
+    for parent in source.parents:
+        ancestor = parent.lstat()
+        # A root-owned sticky temporary root is safe when the registry is
+        # inside a private directory; no other writable ancestor is.
+        sticky_root = (ancestor.st_uid == 0 and
+                       stat.S_IMODE(ancestor.st_mode) & 0o1000 and
+                       stat.S_IMODE(ancestor.st_mode) & 0o002)
+        private_group_write = (ancestor.st_gid == ancestor.st_uid and
+                               not stat.S_IMODE(ancestor.st_mode) & 0o002)
+        if (not stat.S_ISDIR(ancestor.st_mode) or
+                ancestor.st_uid not in {0, os.getuid()} or
+                (stat.S_IMODE(ancestor.st_mode) & 0o002 and not sticky_root) or
+                (stat.S_IMODE(ancestor.st_mode) & 0o020 and
+                 not private_group_write and not sticky_root)):
+            raise ValueError("model registry has an unsafe ancestor")
     raw = json.loads(source.read_text(encoding="utf-8"))
     if not isinstance(raw, dict) or set(raw) != {"version", "roles"} or raw["version"] != 1:
         raise ValueError("invalid model registry version or fields")
@@ -75,13 +82,14 @@ def load_registry(path: str | Path | None = None) -> ModelRegistry:
             raise ValueError(f"invalid model configuration for {role}")
         provider, model = value["provider"], value["model"]
         effort = value.get("reasoning_effort")
-        if provider not in PROVIDERS or not isinstance(model, str) or not model.strip() \
+        if not isinstance(provider, str) or provider not in PROVIDERS \
+                or not isinstance(model, str) or not model.strip() \
                 or model != model.strip() or any(char.isspace() for char in model) \
                 or any(char in model for char in ('"', "'", "\\", "/")):
             raise ValueError(f"invalid provider or model for {role}")
         if provider == "deepseek" and effort is not None:
             raise ValueError("DeepSeek role cannot specify Codex reasoning effort")
-        if provider == "openai" and effort not in EFFORTS:
+        if provider == "openai" and (not isinstance(effort, str) or effort not in EFFORTS):
             raise ValueError("OpenAI role requires supported reasoning effort")
         parsed[role] = ModelSpec(provider, model, effort)
     if parsed["independent_reviewer"].provider == parsed["final_reviewer"].provider:

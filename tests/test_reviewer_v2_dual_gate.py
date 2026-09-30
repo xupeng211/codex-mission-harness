@@ -107,9 +107,12 @@ class OpenAIContractTests(unittest.TestCase):
         def fail(_prompt, _group):
             raise InvocationFailure("TURN_TIMEOUT_UNDIAGNOSED", "no terminal event",
                                     {"observed_event_types": ["turn.started"]})
-        with self.assertRaises(InvocationFailure) as caught:
+        with patch.object(review, "validate_qualification_receipt"), \
+             patch.object(review, "preflight"), \
+             patch.object(review, "invoke_codex", side_effect=lambda *_args, **_kwargs: fail(None, None)), \
+             self.assertRaises(InvocationFailure) as caught:
             review.run(self.root, self.base, self.head, evidence, "test-key", self.spec,
-                       call=fail)
+                       qualification_path="fixture-qualification")
         failure_path = Path(caught.exception.evidence["failure_record"])
         record = json.loads(failure_path.read_text())
         self.assertEqual(record["status"], "BLOCKED")
@@ -128,11 +131,19 @@ class OpenAIContractTests(unittest.TestCase):
             "source_quote": "a quotation absent from the diff", "source_id": review._sha(self.diff),
             "quote_start": 0, "quote_end": 32}],
             "summary": "The group was reviewed but its dispute lacks source evidence."}).encode()
-        def call(_prompt, group):
-            return raw_group if group else json.dumps({"findings": [blocker]}).encode()
-        with self.assertRaisesRegex(ValueError, "bound source reference"):
+        calls = 0
+        def invoke(_prompt, _spec, *, stage, timeout):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return b'{"findings":[]}'  # preflight
+            return raw_group if stage == "group" else json.dumps({"findings": [blocker]}).encode()
+        with patch.object(review, "validate_qualification_receipt"), \
+             patch.object(review, "preflight"), \
+             patch.object(review, "invoke_codex", side_effect=invoke), \
+             self.assertRaisesRegex(ValueError, "bound source reference"):
             review.run(self.root, self.base, self.head, evidence, "test-key", self.spec,
-                       call=call)
+                       qualification_path="fixture-qualification")
         run_dir, = evidence.iterdir()
         self.assertEqual((run_dir / "group-000.json").read_bytes(), raw_group)
         failure = json.loads((run_dir / "failure.json").read_text())

@@ -234,7 +234,7 @@ def _assemble(diff: bytes, base: str, head: str, call, persist=None) -> tuple[di
         artifacts.append((f"chunk-{item['index']:03d}.json", raw))
         item["blocker_ids"] = [record["finding_id"] for record in
                                 bind_findings(item["result"]["findings"], "C", item["index"])
-                                if record["severity"] in BLOCKING]
+                                if record["finding"]["severity"] in BLOCKING]
     final_findings = []
     for group in groups:
         selected = [chunks[index] for index in group["chunk_indexes"]]
@@ -242,7 +242,7 @@ def _assemble(diff: bytes, base: str, head: str, call, persist=None) -> tuple[di
         for chunk in selected:
             blockers.extend(record for record in bind_findings(
                 chunk["result"]["findings"], "C", chunk["index"])
-                if record["severity"] in BLOCKING)
+                if record["finding"]["severity"] in BLOCKING)
         source = diff[group["start"]:group["end"]]
         raw = call(_prompt("GROUP REVIEW", base=base, head=head, diff=source, ids=blockers), True)
         if persist is not None:
@@ -342,7 +342,7 @@ def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec
             chunk = receipt["chunks"][index]
             expected_ids = []
             for record in bind_findings(chunk["result"]["findings"], "C", index):
-                if record["severity"] in BLOCKING:
+                if record["finding"]["severity"] in BLOCKING:
                     expected_ids.append(record["finding_id"])
                     expected_blockers.append(record)
             if chunk.get("blocker_ids", []) != expected_ids:
@@ -402,7 +402,7 @@ def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec
 
 
 def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
-        spec: ModelSpec, *, timeout: int = 900, call=None,
+        spec: ModelSpec, *, timeout: int = 900,
         mission_id: str = "codex-mission-harness",
         registry_path: str | Path | None = None,
         qualification_path: str | Path | None = None) -> Path:
@@ -418,11 +418,9 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
     registry = load_registry(registry_path)
     if spec != registry.role("final_reviewer"):
         raise ValueError("review model differs from selected registry")
-    live = call is None
-    if live:
-        call = lambda prompt, group: invoke_codex(
-            prompt, spec, stage="synthesis" if group == "synthesis" else
-            "group" if group else "chunk", timeout=timeout)
+    call = lambda prompt, group: invoke_codex(
+        prompt, spec, stage="synthesis" if group == "synthesis" else
+        "group" if group else "chunk", timeout=timeout)
     _, parent_fd = secure.open_private_directory(evidence, root)
     run_id = uuid.uuid4().hex
     child_name = f"openai-{head[:12]}-{run_id}"
@@ -435,18 +433,17 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
         secure.write_private_artifact(child_fd, name, raw, run_id)
         artifact_hashes[name] = _sha(raw)
     try:
-        if live:
-            if qualification_path is None:
-                raise ValueError("live OpenAI review requires a final reviewer qualification receipt")
-            validate_qualification_receipt(qualification_path, spec, auth_key=auth_key,
-                                           role="final_reviewer", registry_path=registry_path)
-            # Authenticate first, then exercise the same Codex structured
-            # invocation path and chunk schema used by the review lane.
-            preflight(spec, probe=False, timeout=min(timeout, 120))
-            invoke_codex(
-                'Return JSON with an empty findings array. Use the exact chunk schema.',
-                spec, stage="chunk", timeout=min(timeout, 120),
-            )
+        if qualification_path is None:
+            raise ValueError("live OpenAI review requires a final reviewer qualification receipt")
+        validate_qualification_receipt(qualification_path, spec, auth_key=auth_key,
+                                       role="final_reviewer", registry_path=registry_path)
+        # Authenticate first, then exercise the same Codex structured
+        # invocation path and chunk schema used by the review lane.
+        preflight(spec, probe=False, timeout=min(timeout, 120))
+        invoke_codex(
+            'Return JSON with an empty findings array. Use the exact chunk schema.',
+            spec, stage="chunk", timeout=min(timeout, 120),
+        )
         receipt, _ = _assemble(diff, base, head, call, persist=persist)
         receipt.update({"model": spec.model, "reasoning_effort": spec.reasoning_effort,
                         "mission_id": mission_id, "repository": repository,

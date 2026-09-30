@@ -152,6 +152,19 @@ class OpenAIInvocationTests(unittest.TestCase):
                               {"type": "object"}, timeout=1)
         self.assertEqual(caught.exception.category, "TURN_TIMEOUT_UNDIAGNOSED")
 
+    def test_broken_provider_pipe_is_classified_and_cleanup_attempted(self):
+        from harness.openai_invocation import invoke_openai
+        process = Mock(pid=1234)
+        process.communicate.side_effect = [BrokenPipeError(), (b"", b"")]
+        with patch("harness.openai_invocation.canonical_environment", return_value={}), \
+             patch("harness.openai_invocation.subprocess.Popen", return_value=process), \
+             patch("harness.openai_invocation.os.killpg") as killpg:
+            with self.assertRaises(InvocationFailure) as caught:
+                invoke_openai("review", ModelSpec("openai", "gpt-5.6-sol", "high"),
+                              {"type": "object"}, timeout=1)
+        self.assertEqual(caught.exception.evidence["io_error_class"], "BrokenPipeError")
+        killpg.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

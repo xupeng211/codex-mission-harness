@@ -10,6 +10,9 @@ import hmac
 import json
 import os
 import subprocess
+import signal
+import stat
+import time
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -160,12 +163,40 @@ def _actual_provider_invoke(spec: ModelSpec, prompt: str, *, token: str | None,
                    "ANTHROPIC_AUTH_TOKEN": token,
                    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
                    "CLAUDE_CODE_SIMPLE": "1"}
-            result = subprocess.run(command, input=prompt, capture_output=True, text=True, env=env,
-                                    cwd=root, timeout=timeout, check=False)
-            if result.returncode:
+            with tempfile.TemporaryFile() as input_file, tempfile.TemporaryFile() as output_file, \
+                    tempfile.TemporaryFile() as error_file:
+                input_file.write(prompt.encode("utf-8"))
+                input_file.seek(0)
+                process = subprocess.Popen(command, stdin=input_file, stdout=output_file,
+                                           stderr=error_file, env=env, cwd=root,
+                                           start_new_session=True)
+                deadline = time.monotonic() + timeout
+                try:
+                    while process.poll() is None:
+                        if (output_file.tell() > 128_000 or error_file.tell() > 128_000 or
+                                os.fstat(output_file.fileno()).st_size > 128_000 or
+                                os.fstat(error_file.fileno()).st_size > 128_000):
+                            raise ValueError("DeepSeek qualification output exceeds bound")
+                        if time.monotonic() >= deadline:
+                            raise subprocess.TimeoutExpired(command, timeout)
+                        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+                    if (os.fstat(output_file.fileno()).st_size > 128_000 or
+                            os.fstat(error_file.fileno()).st_size > 128_000):
+                        raise ValueError("DeepSeek qualification output exceeds bound")
+                except (ValueError, subprocess.TimeoutExpired):
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+                    raise
+                output_file.seek(0)
+                output = output_file.read(128_001)
+                returncode = process.returncode
+            if returncode:
                 raise RuntimeError("DeepSeek model qualification provider call failed")
             try:
-                envelope = json.loads(result.stdout)
+                envelope = json.loads(output)
                 if envelope.get("is_error") or not isinstance(envelope.get("structured_output"), dict):
                     raise ValueError("provider returned no structured output")
                 return json.dumps(envelope["structured_output"])
@@ -224,7 +255,21 @@ def validate_qualification_receipt(path: str | Path, spec: ModelSpec, *, auth_ke
     from .model_registry import load_registry
     from . import reviewer_v2_contract, openai_invocation, model_registry, codex
 
-    receipt = json.loads(Path(path).read_text(encoding="utf-8"))
+    receipt_path = Path(path)
+    if not receipt_path.is_absolute():
+        raise ValueError("qualification receipt must use an absolute private path")
+    descriptor = os.open(receipt_path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    try:
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or not 0 < info.st_size <= 65_536):
+            raise ValueError("qualification receipt must be private and bounded")
+        payload = os.read(descriptor, info.st_size + 1)
+        if len(payload) != info.st_size:
+            raise ValueError("qualification receipt changed while reading")
+    finally:
+        os.close(descriptor)
+    receipt = json.loads(payload)
     expected_keys = {"version", "role", "mode", "identity", "cases_passed", "response_sha256",
                      "registry_sha256", "contract_sha256", "runner_sha256", "cli_runner_sha256",
                      "invocation_sha256", "builder_runtime_sha256",

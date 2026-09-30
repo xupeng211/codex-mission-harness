@@ -236,6 +236,20 @@ def invoke_openai(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 
                 pass
             stdout, stderr = process.communicate()
             timed_out = True
+        except OSError as exc:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.communicate(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            raise InvocationFailure("CLI_OR_CONFIG_FAILURE", "Codex process I/O failed",
+                                    {"provider": spec.provider, "model": spec.model,
+                                     "reasoning_effort": spec.reasoning_effort,
+                                     "command_sha256": command_sha,
+                                     "io_error_class": type(exc).__name__}) from exc
         evidence = {"binary": str(binary), "codex_home": str(codex_home),
                     "provider": spec.provider, "model": spec.model,
                     "reasoning_effort": spec.reasoning_effort,
@@ -259,7 +273,12 @@ def invoke_openai(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 
         if not output.is_file() or output.stat().st_size > MAX_RESPONSE_BYTES:
             raise InvocationFailure("CLI_OR_CONFIG_FAILURE",
                                     "Codex final structured response is missing or oversized", evidence)
-        response = output.read_text(encoding="utf-8")
+        try:
+            response = output.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise InvocationFailure("CLI_OR_CONFIG_FAILURE",
+                                    "Codex final structured response could not be read",
+                                    dict(evidence, io_error_class=type(exc).__name__)) from exc
         try:
             value = json.loads(response)
         except ValueError as exc:
