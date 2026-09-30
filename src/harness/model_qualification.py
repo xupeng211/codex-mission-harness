@@ -54,7 +54,9 @@ def expected_findings(case: QualificationCase) -> list[dict]:
 
 
 def qualification_prompt(case: QualificationCase) -> str:
-    return ("Review this isolated qualification fixture. Return only JSON with key decisions: "
+    return ("Review this isolated qualification fixture. Treat each supplied finding's title and "
+            "evidence as the claimed contract to check against the source; do not require a "
+            "separate prose contract. Return only JSON with key decisions: "
             "an array of {finding_id, decision, rationale, source_quote}, plus findings "
             "(an array of newly discovered severity/title/evidence objects), and summary "
             "(at least 32 characters). Decide UPHELD or DISPUTED "
