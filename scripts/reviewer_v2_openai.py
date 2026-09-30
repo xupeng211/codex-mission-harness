@@ -18,6 +18,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -26,7 +27,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 import deepseek_review as secure  # noqa: E402
 from harness.model_registry import ModelSpec, load_registry, preflight  # noqa: E402
-from harness.openai_invocation import invoke_openai  # noqa: E402
+from harness.openai_invocation import InvocationFailure, invoke_openai  # noqa: E402
 from harness.reviewer_v2_contract import bind_findings  # noqa: E402
 
 VERSION = "cmh-reviewer-v2-openai/v1"
@@ -149,7 +150,6 @@ def invoke_codex(prompt: str, spec: ModelSpec, *, timeout: int = 900) -> bytes:
     """One fresh, isolated model call. No implicit model or provider fallback."""
     if spec.provider != "openai" or not spec.reasoning_effort:
         raise ValueError("OpenAI model role is required")
-    preflight(spec)
     result = invoke_openai(
         prompt, spec, _schema("GROUP REVIEW" in prompt, "FINAL CROSS-GROUP REVIEW" in prompt),
         timeout=timeout,
@@ -369,10 +369,34 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
     if secure.git(root, "status", "--porcelain"):
         raise ValueError("review checkout has uncommitted changes")
     diff = secure.git(root, "diff", "--no-ext-diff", "--no-textconv", "--binary", f"{base}..{head}")
-    if call is None:
-        preflight(spec)
+    live = call is None
+    if live:
         call = lambda prompt, group: invoke_codex(prompt, spec, timeout=timeout)
-    receipt, artifacts = _assemble(diff, base, head, call)
+    try:
+        if live:
+            preflight(spec, probe=True, timeout=min(timeout, 120))
+        receipt, artifacts = _assemble(diff, base, head, call)
+    except InvocationFailure as exc:
+        failure = {"status": "BLOCKED", "base_sha": base, "head_sha": head,
+                   "diff_sha256": _sha(diff), "provider": spec.provider,
+                   "model": spec.model, "reasoning_effort": spec.reasoning_effort,
+                   "failure_category": exc.category, "invocation_evidence": dict(exc.evidence),
+                   "recorded_at": int(time.time())}
+        failure["auth_hmac_sha256"] = hmac.new(auth_key.encode(), _canon(failure),
+                                               hashlib.sha256).hexdigest()
+        _, parent_fd = secure.open_private_directory(evidence, root)
+        run_id = uuid.uuid4().hex
+        child_name = f"openai-failure-{head[:12]}-{run_id}"
+        try:
+            child_fd = secure.create_private_child_directory(parent_fd, child_name)
+            try:
+                secure.write_private_artifact(child_fd, "failure.json", _canon(failure), run_id)
+            finally:
+                os.close(child_fd)
+        finally:
+            os.close(parent_fd)
+        exc.evidence["failure_record"] = str(Path(evidence).absolute() / child_name / "failure.json")
+        raise
     receipt.update({"model": spec.model, "reasoning_effort": spec.reasoning_effort})
     receipt["auth_hmac_sha256"] = hmac.new(auth_key.encode(), _canon(receipt), hashlib.sha256).hexdigest()
     validate(receipt, root=root, base=base, head=head, spec=spec, auth_key=auth_key)
@@ -427,6 +451,10 @@ def main() -> int:
             validate(value, root=root, base=args.base, head=args.head, spec=spec,
                      auth_key=key, receipt_path=path)
             print(json.dumps({"status": value["review_result"], "receipt": str(path)}))
+    except InvocationFailure as exc:
+        print(json.dumps({"status": "BLOCKED_EXTERNAL", "category": exc.category,
+                          "evidence": exc.evidence}))
+        return 1
     except Exception:
         print(json.dumps({"status": "BLOCKED_EXTERNAL", "error": "OpenAI review has no valid approval receipt"}))
         return 1

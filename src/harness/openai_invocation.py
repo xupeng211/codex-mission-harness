@@ -14,13 +14,14 @@ import signal
 import stat
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from .model_registry import ModelSpec
 
 CANONICAL_BINARY = Path("/usr/lib/chatgpt/resources/codex")
-CANONICAL_HOME = Path("/home/xupeng/.footballprediction/canonical-codex-reviewer")
+CANONICAL_HOME = Path("/home/xupeng/.cmh-openai-reviewer-home")
 PROXY_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
                "http_proxy", "https_proxy", "all_proxy", "no_proxy")
 CA_NAMES = ("CODEX_CA_CERTIFICATE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO",
@@ -108,6 +109,8 @@ def _failure_category(stderr: bytes, stdout: bytes, *, timed_out: bool) -> str:
     if timed_out:
         return "TURN_TIMEOUT_UNDIAGNOSED"
     content = (stderr + b"\n" + stdout).decode("utf-8", "replace").casefold()
+    if re.search(r"\b(?:401|403)\b", content):
+        return "AUTHENTICATION_FAILURE"
     if re.search(r"unauthori|authentication|invalid.token|login required", content):
         return "AUTHENTICATION_FAILURE"
     if re.search(r"model.*(unsupported|not found|unavailable)|unsupported.*model", content):
@@ -117,6 +120,17 @@ def _failure_category(stderr: bytes, stdout: bytes, *, timed_out: bool) -> str:
     if re.search(r"connection|network|timeout|stream|proxy|disconnect", content):
         return "TRANSIENT_TRANSPORT"
     return "CLI_OR_CONFIG_FAILURE"
+
+
+def _failure_markers(stderr: bytes, stdout: bytes) -> dict:
+    """Keep only fixed diagnostic labels, never provider text or credentials."""
+    content = (stderr + b"\n" + stdout).decode("utf-8", "replace").casefold()
+    return {"http_401": bool(re.search(r"\b401\b", content)),
+            "http_403": bool(re.search(r"\b403\b", content)),
+            "http_429": bool(re.search(r"\b429\b", content)),
+            "auth_refresh_mentioned": "refresh" in content,
+            "connection_error_mentioned": any(marker in content for marker in
+                                              ("connection reset", "disconnect", "proxy error"))}
 
 
 def _observed_events(raw: bytes) -> dict:
@@ -130,7 +144,7 @@ def _observed_events(raw: bytes) -> dict:
         if not isinstance(event, dict) or not isinstance(event.get("type"), str):
             break
         types.append(event["type"])
-    return {"observed_event_types": types[:1000],
+    return {"observed_event_types": types[:1000], "observed_event_count": len(types),
             "turn_started_observed": "turn.started" in types,
             "terminal_observed": any(item in types for item in
                                      ("turn.completed", "turn.failed"))}
@@ -162,6 +176,7 @@ def invoke_openai(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, cwd=root, env=env,
                                    start_new_session=True)
+        started = time.monotonic()
         try:
             stdout, stderr = process.communicate(prompt.encode(), timeout=timeout)
             timed_out = False
@@ -178,6 +193,8 @@ def invoke_openai(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 
                     "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
                     "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
                     "stdout_bytes": len(stdout), "stderr_bytes": len(stderr),
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                    "failure_markers": _failure_markers(stderr, stdout),
                     **_observed_events(stdout)}
         if timed_out or process.returncode != 0:
             raise InvocationFailure(_failure_category(stderr, stdout, timed_out=timed_out),

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Callable
 
 from .model_registry import ModelSpec
-from .openai_invocation import invoke_openai, InvocationResult
+from .openai_invocation import invoke_openai, InvocationFailure, InvocationResult
 from .reviewer_v2_contract import bind_findings, parse_synthesis
 
 QUALIFICATION_VERSION = "cmh-model-qualification/v1"
@@ -89,7 +89,7 @@ def _evaluate_cases(spec: ModelSpec, invoke: Callable[[ModelSpec, str], str], *,
     missing/invalid response fails that case and preserves the model identity.
     """
     passed, failed, hashes = [], [], []
-    for case in CASES:
+    for index, case in enumerate(CASES):
         try:
             raw = invoke(spec, qualification_prompt(case))
             if isinstance(raw, InvocationResult):
@@ -100,6 +100,12 @@ def _evaluate_cases(spec: ModelSpec, invoke: Callable[[ModelSpec, str], str], *,
                         for key, value in case.expected.items()}
             if decisions != expected or bound["new_findings"]:
                 raise ValueError("semantic decision mismatch")
+        except InvocationFailure:
+            # One failed provider invocation already invalidates the whole
+            # certificate. Do not repeat an auth failure or stalled turn for
+            # every remaining fixture.
+            failed.extend(item.name for item in CASES[index:])
+            break
         except (ValueError, RuntimeError, TimeoutError):
             failed.append(case.name)
         else:

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -14,6 +15,7 @@ sys.path.insert(0, str(ROOT / "src"))
 import reviewer_v2_gate as gate  # noqa: E402
 import reviewer_v2_openai as review  # noqa: E402
 from harness.model_registry import ModelSpec  # noqa: E402
+from harness.openai_invocation import InvocationFailure  # noqa: E402
 
 
 def git(root, *args):
@@ -64,6 +66,38 @@ class OpenAIContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             review.validate(receipt, root=self.root, base=self.base, head="0" * 40,
                             spec=self.spec, auth_key="test-key")
+
+    def test_failed_invocation_publishes_failure_only_for_exact_head(self):
+        evidence = Path(self.temp.name) / "evidence"
+        evidence.mkdir(mode=0o700)
+        def fail(_prompt, _group):
+            raise InvocationFailure("TURN_TIMEOUT_UNDIAGNOSED", "no terminal event",
+                                    {"observed_event_types": ["turn.started"]})
+        with self.assertRaises(InvocationFailure) as caught:
+            review.run(self.root, self.base, self.head, evidence, "test-key", self.spec,
+                       call=fail)
+        failure_path = Path(caught.exception.evidence["failure_record"])
+        record = json.loads(failure_path.read_text())
+        self.assertEqual(record["status"], "BLOCKED")
+        self.assertEqual(record["head_sha"], self.head)
+        self.assertEqual(record["diff_sha256"], hashlib.sha256(self.diff).hexdigest())
+        self.assertEqual(record["failure_category"], "TURN_TIMEOUT_UNDIAGNOSED")
+        self.assertEqual(list(failure_path.parent.iterdir()), [failure_path])
+
+    def test_preflight_provider_failure_publishes_no_approval_receipt(self):
+        evidence = Path(self.temp.name) / "evidence"
+        evidence.mkdir(mode=0o700)
+        error = InvocationFailure("AUTHENTICATION_FAILURE", "provider rejected auth",
+                                  {"failure_markers": {"http_401": True}})
+        with patch.object(review, "preflight", side_effect=error) as preflight:
+            with self.assertRaises(InvocationFailure) as caught:
+                review.run(self.root, self.base, self.head, evidence, "test-key", self.spec)
+        preflight.assert_called_once()
+        path = Path(caught.exception.evidence["failure_record"])
+        record = json.loads(path.read_text())
+        self.assertEqual(record["failure_category"], "AUTHENTICATION_FAILURE")
+        self.assertEqual(record["head_sha"], self.head)
+        self.assertFalse(list(evidence.rglob("receipt.json")))
 
     def test_missing_unknown_and_duplicate_blocker_id_fail_closed(self):
         blocker = {"severity": "P1", "title": "Concrete issue", "evidence": "x.py:2"}

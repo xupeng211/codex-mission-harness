@@ -7,6 +7,7 @@ from unittest.mock import patch
 from harness.model_qualification import (CASES, QualificationResult, expected_findings,
                                          evaluate_cases, qualification_receipt,
                                          validate_qualification_receipt)
+from harness.openai_invocation import InvocationFailure
 from harness.model_registry import load_registry, preflight
 from harness.review_failures import ReviewFailureClassification, classify_process_failure
 from harness.reviewer_v2_contract import parse_synthesis
@@ -21,7 +22,7 @@ class RegistryTests(unittest.TestCase):
         argv = run.call_args.args[0]
         self.assertEqual(argv[:3], ["/usr/lib/chatgpt/resources/codex", "login", "status"])
         self.assertEqual(run.call_args.kwargs["env"]["CODEX_HOME"],
-                         "/home/xupeng/.footballprediction/canonical-codex-reviewer")
+                         "/home/xupeng/.cmh-openai-reviewer-home")
 
     def test_default_registry_uses_two_providers(self):
         registry = load_registry()
@@ -98,6 +99,15 @@ class QualificationContractTests(unittest.TestCase):
         result = evaluate_cases(spec, lambda _spec, _prompt: self.raw([]))
         self.assertFalse(result.passed)
         self.assertIn("single_blocker", result.cases_failed)
+
+    def test_provider_invocation_failure_stops_remaining_qualification_calls(self):
+        calls = []
+        def fail_once(_spec, _prompt):
+            calls.append(1)
+            raise InvocationFailure("AUTHENTICATION_FAILURE", "auth failed", {})
+        result = evaluate_cases(load_registry().role("final_reviewer"), fail_once)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result.cases_failed, tuple(case.name for case in CASES))
 
     def test_provider_errors_are_not_format_retries(self):
         for message, expected in (("HTTP 401", ReviewFailureClassification.AUTHENTICATION_FAILURE),
