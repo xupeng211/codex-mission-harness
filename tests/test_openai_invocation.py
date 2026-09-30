@@ -6,10 +6,21 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness.model_registry import ModelSpec
-from harness.openai_invocation import InvocationFailure, canonical_environment, parse_events
+from harness.openai_invocation import (InvocationFailure, _failure_category,
+                                       _observed_events, canonical_environment, parse_events)
 
 
 class OpenAIInvocationTests(unittest.TestCase):
+    def test_started_turn_without_terminal_is_unresolved_timeout(self):
+        stream = b'{"type":"thread.started"}\n{"type":"turn.started"}\n'
+        observed = _observed_events(stream)
+        self.assertTrue(observed["turn_started_observed"])
+        self.assertFalse(observed["terminal_observed"])
+        self.assertEqual(_failure_category(b"", stream, timed_out=True),
+                         "TURN_TIMEOUT_UNDIAGNOSED")
+        with self.assertRaises(ValueError):
+            parse_events(stream)
+
     def test_event_parser_requires_terminal_completion_and_message(self):
         good = b'{"type":"thread.started"}\n{"type":"turn.started"}\n{"type":"item.completed","item":{"type":"agent_message"}}\n{"type":"turn.completed"}\n'
         self.assertTrue(parse_events(good)["terminal_completion"])
