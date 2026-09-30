@@ -15,6 +15,7 @@ from typing import Protocol
 
 from .policy import SENSITIVE
 from .model_registry import load_registry
+from .model_qualification import require_builder_qualification
 
 
 @dataclass(frozen=True)
@@ -43,12 +44,15 @@ class AppServerCodex:
     MAX_PENDING_MESSAGES = 256
 
     def __init__(self, executable: str = "codex", *,
-                 forbidden_actions: tuple[str, ...] = (), worktree: str | None = None):
+                 forbidden_actions: tuple[str, ...] = (), worktree: str | None = None,
+                 builder_qualification: str | Path | None = None,
+                 builder_auth_key_file: str | Path | None = None):
         # Both the mission deny-list and its validated worktree are immutable
         # constructor inputs. A later caller may verify them, but may not bind
         # either authority boundary from turn-supplied data.
         if worktree is None:
             raise ValueError("Codex mission worktree must be constructor-bound")
+        require_builder_qualification(builder_qualification, builder_auth_key_file)
         builder = load_registry().role("builder")
         self._builder_model = builder.model
         self._builder_effort = builder.reasoning_effort

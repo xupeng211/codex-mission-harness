@@ -25,6 +25,7 @@ from harness.reviewer_v2_contract import (  # noqa: E402
     bind_findings, canonical, parse_chunk, parse_synthesis, sha256, validate_bound_result,
 )
 from harness.model_registry import load_registry  # noqa: E402
+from harness.model_qualification import validate_qualification_receipt  # noqa: E402
 
 VERSION = "cmh-reviewer-v2-deepseek/v2"
 FAILURE_CATEGORIES = frozenset({
@@ -68,6 +69,13 @@ def _parse_stage(raw: str, parser, state: dict):
             else:
                 category = "SCHEMA_VALIDATION_FAILED"
                 state["schema_validation_error_class"] = type(exc).__name__
+                safe_reasons = {
+                    "unknown disposition finding_id": "UNKNOWN_FINDING_ID",
+                    "duplicate disposition finding_id": "DUPLICATE_FINDING_ID",
+                    "missing blocker disposition": "MISSING_FINDING_ID",
+                    "dispute lacks an exact bound source reference": "INVALID_SOURCE_BINDING",
+                }
+                state["schema_validation_reason"] = safe_reasons.get(str(exc), "OTHER")
         raise ReviewStageFailure(category, state["stage"]) from exc
 FINDING_SCHEMA = {"type": "object", "additionalProperties": False,
                   "required": ["severity", "title", "evidence"], "properties": {
@@ -75,11 +83,15 @@ FINDING_SCHEMA = {"type": "object", "additionalProperties": False,
                       "title": {"type": "string", "minLength": 1},
                       "evidence": {"type": "string", "minLength": 1}}}
 DECISION_SCHEMA = {"type": "object", "additionalProperties": False,
-                   "required": ["finding_id", "decision", "rationale", "source_quote"],
+                   "required": ["finding_id", "decision", "rationale", "source_quote",
+                                "source_id", "quote_start", "quote_end"],
                    "properties": {"finding_id": {"type": "string"},
                                   "decision": {"enum": ["UPHELD", "DISPUTED"]},
                                   "rationale": {"type": "string", "minLength": 24},
-                                  "source_quote": {"type": "string"}}}
+                                  "source_quote": {"type": "string"},
+                                  "source_id": {"type": "string"},
+                                  "quote_start": {"type": "integer", "minimum": 0},
+                                  "quote_end": {"type": "integer", "minimum": 0}}}
 CHUNK_SCHEMA = {"type": "object", "additionalProperties": False,
                 "required": ["findings"], "properties": {
                     "findings": {"type": "array", "items": FINDING_SCHEMA}}}
@@ -112,7 +124,8 @@ def _invoke(command: list[str], prompt: str, env: dict, timeout: int, token: str
     state.update(stage=stage, stage_id=artifact, input_sha256=sha256(prompt.encode()),
                  started_at=int(time.time()), timeout_seconds=timeout,
                  stdout_present=False, exit_code=None, stderr_markers={},
-                 parser_error_class=None, schema_validation_error_class=None)
+                 parser_error_class=None, schema_validation_error_class=None,
+                 schema_validation_reason=None)
     try:
         completed = legacy.invoke_reviewer(command, _bounded(prompt), env, timeout)
     except subprocess.TimeoutExpired as exc:
@@ -166,10 +179,11 @@ def run(args: argparse.Namespace) -> dict:
         raise ValueError("review worktree is dirty")
     repository = legacy.repository_identity(
         legacy.git(root, "config", "--get", "remote.origin.url").decode().strip())
-    diff = legacy.git(root, "diff", "--no-ext-diff", "--no-textconv", "--binary",
-                      f"{base}..{head}")
+    diff = legacy.bounded_diff(root, base, head)
     chunks = legacy.chunks(diff)
     groups = legacy.aggregate_groups(diff, chunks)
+    if len(chunks) > 8 or len(groups) > 3:
+        raise ValueError("review workload exceeds bounded stage count")
     diff_hash = sha256(diff)
     registry_path = getattr(args, "registry", None)
     registry = load_registry(registry_path)
@@ -191,6 +205,11 @@ def run(args: argparse.Namespace) -> dict:
         token = legacy.read_token_file(args.token_file, root)
         if not token:
             raise ValueError("missing DeepSeek credential")
+        qualification = getattr(args, "qualification", None)
+        if not qualification:
+            raise ValueError("live DeepSeek review requires an independent reviewer qualification receipt")
+        validate_qualification_receipt(qualification, model, auth_key=token,
+                                       role="independent_reviewer", registry_path=registry_path)
         settings = tempfile.NamedTemporaryFile(mode="w", delete=False)
         settings.write('{"permissions":{"allow":[],"deny":["Bash","Edit","Write",'
                        '"Read","Glob","Grep","WebFetch","WebSearch"]}}')
@@ -218,37 +237,52 @@ def run(args: argparse.Namespace) -> dict:
         for group in groups:
             selected = [chunks[i] for i in group["chunk_indexes"]]
             expected = _expected(selected)
+            required = [item for item in expected if item["severity"] in {"P0", "P1", "P2"}]
             source = diff[group["start"]:group["end"]]
             prompt = (_prompt_head(base, head, diff_hash, f"group {group['index']}")
                       + "Review exact source and cross-chunk interactions. Every supplied "
-                      "P0/P1/P2 finding needs one decision keyed by finding_id. "
+                      "P0/P1/P2 finding needs exactly one decision keyed by finding_id. "
+                      "Output decisions for RequiredFindingIds only; never decide P3 findings. "
+                      "Do not invent, omit, or repeat finding_id values. "
                       "UPHELD preserves the original finding automatically. DISPUTED requires "
                       "a specific rationale and source_quote copied exactly from this source. "
-                      "Use empty source_quote for UPHELD. findings contains only NEW findings; "
+                      "For DISPUTED, source_id must equal GroupSourceId and quote_start/quote_end "
+                      "must delimit the exact UTF-8 bytes of source_quote in this group source. "
+                      "For UPHELD use empty source_quote/source_id and zero offsets. "
+                      "Each evidence reference belongs to its decision finding_id. "
+                      "findings contains only NEW findings; "
                       "never copy supplied findings into it. Summarize interactions for cross-group review.\n"
-                      + f"PriorFindings={json.dumps(expected, sort_keys=True)}\n"
+                      + f"RequiredFindingIds={json.dumps([item['finding_id'] for item in required])}\n"
+                      + f"GroupSourceId={sha256(source)}\n"
+                      + f"PriorBlockingFindings={json.dumps(required, sort_keys=True)}\n"
                       + _render_source(source))
             raw, output_hash = _invoke(synthesis_command, prompt, env, args.timeout, token,
                                        stage="group", evidence_fd=evidence_fd,
                                        artifact=f"group-{group['index']:03d}.json", state=stage_state)
-            result = _parse_stage(raw, lambda value: parse_synthesis(value, expected, source=source),
+            result = _parse_stage(raw, lambda value: parse_synthesis(value, expected, source=source,
+                                                                      structured_evidence=True),
                                   stage_state)
             group["result"] = result
             group["bound_findings"] = bind_findings(result["findings"], "G", group["index"])
             group["output_sha256"] = output_hash
         expected = _expected(groups)
+        required = [item for item in expected if item["severity"] in {"P0", "P1", "P2"}]
         summaries = [{"group_index": group["index"], "summary": group["result"]["summary"],
                       "findings": group["bound_findings"]} for group in groups]
         prompt = (_prompt_head(base, head, diff_hash, "cross-group")
                   + "Analyze cross-group interactions using bounded summaries. You have no exact "
                   "source at this stage and must UPHOLD every supplied P0/P1/P2 finding. "
-                  "Use empty source_quote. findings contains only NEW cross-group findings. "
+                  "Use empty source_quote/source_id and zero quote offsets. "
+                  "findings contains only NEW cross-group findings. "
                   "Every blocker needs one decision keyed by finding_id.\n"
+                  "Decide RequiredFindingIds exactly once; no P3 IDs, invented IDs, or repeats.\n"
+                  + f"RequiredFindingIds={json.dumps([item['finding_id'] for item in required])}\n"
                   + f"GroupSummaries={json.dumps(summaries, sort_keys=True)}")
         raw, output_hash = _invoke(synthesis_command, prompt, env, args.timeout, token,
                                    stage="cross-group", evidence_fd=evidence_fd,
                                    artifact="aggregate.json", state=stage_state)
-        result = _parse_stage(raw, lambda value: parse_synthesis(value, expected, source=None),
+        result = _parse_stage(raw, lambda value: parse_synthesis(value, expected, source=None,
+                                                                  structured_evidence=True),
                               stage_state)
         receipt = {"version": VERSION, "repository": repository,
                    "mission_id": args.mission_id, "base_sha": base, "head_sha": head,
@@ -296,6 +330,7 @@ def run(args: argparse.Namespace) -> dict:
                    "stdout_present": stage_state.get("stdout_present", False),
                    "parser_error_class": stage_state.get("parser_error_class"),
                    "schema_validation_error_class": stage_state.get("schema_validation_error_class"),
+                   "schema_validation_reason": stage_state.get("schema_validation_reason"),
                    "output_sha256": stage_state.get("output_sha256")}
         failure["integrity_sha256"] = sha256(canonical(failure))
         if token:
@@ -331,7 +366,8 @@ def validate(receipt: dict, base: str, head: str, root: Path | None = None,
         raise ValueError("receipt identity mismatch")
     registry = load_registry(registry_path)
     spec = registry.role("independent_reviewer")
-    if (receipt["model"] != spec.model or receipt["reasoning_effort"] != spec.reasoning_effort
+    if (spec.provider != "deepseek" or receipt["model"] != spec.model
+            or receipt["reasoning_effort"] != spec.reasoning_effort
             or receipt["registry_sha256"] != sha256(registry.path.read_bytes())
             or receipt["runner_sha256"] != sha256(Path(__file__).read_bytes())):
         raise ValueError("receipt model mismatch")
@@ -349,8 +385,7 @@ def validate(receipt: dict, base: str, head: str, root: Path | None = None,
         raise ValueError("receipt authentication mismatch")
     if root is None:
         raise ValueError("exact source required for validation")
-    diff = legacy.git(root, "diff", "--no-ext-diff", "--no-textconv", "--binary",
-                      f"{base}..{head}")
+    diff = legacy.bounded_diff(root, base, head)
     if sha256(diff) != receipt["diff_sha256"]:
         raise ValueError("receipt diff mismatch")
     expected_chunks = legacy.chunks(diff)
@@ -373,10 +408,12 @@ def validate(receipt: dict, base: str, head: str, root: Path | None = None,
             raise ValueError("group descriptor mismatch")
         source = diff[group["start"]:group["end"]]
         selected = [chunks[i] for i in group["chunk_indexes"]]
-        validate_bound_result(group["result"], _expected(selected), source)
+        validate_bound_result(group["result"], _expected(selected), source,
+                              structured_evidence=True)
         if bind_findings(group["result"]["findings"], "G", group["index"]) != group["bound_findings"]:
             raise ValueError("group finding binding mismatch")
-    validate_bound_result(receipt["aggregate_result"], _expected(groups), None)
+    validate_bound_result(receipt["aggregate_result"], _expected(groups), None,
+                          structured_evidence=True)
     if (receipt["findings"] != receipt["aggregate_result"]["findings"]
             or receipt["review_result"] != receipt["aggregate_result"]["review_result"]):
         raise ValueError("receipt verdict mismatch")
@@ -394,11 +431,13 @@ def validate(receipt: dict, base: str, head: str, root: Path | None = None,
                 else:
                     selected = [chunks[i] for i in record["chunk_indexes"]]
                     source = diff[record["start"]:record["end"]]
-                    if parse_synthesis(raw.decode(), _expected(selected), source=source) != record["result"]:
+                    if parse_synthesis(raw.decode(), _expected(selected), source=source,
+                                       structured_evidence=True) != record["result"]:
                         raise ValueError("group artifact differs from receipt")
             raw = legacy.read_private_artifact(fd, "aggregate.json")
             if (sha256(raw) != receipt["aggregate_output_sha256"]
-                    or parse_synthesis(raw.decode(), _expected(groups), source=None)
+                    or parse_synthesis(raw.decode(), _expected(groups), source=None,
+                                       structured_evidence=True)
                     != receipt["aggregate_result"]):
                 raise ValueError("aggregate artifact differs from receipt")
         finally:
@@ -416,6 +455,8 @@ def main() -> int:
         p.add_argument("--head", required=True)
         p.add_argument("--mission-id", default="codex-mission-harness")
         p.add_argument("--token-file", required=True)
+        if name == "run":
+            p.add_argument("--qualification", required=True)
         p.add_argument("--registry")
         if name == "run":
             p.add_argument("--evidence", required=True)

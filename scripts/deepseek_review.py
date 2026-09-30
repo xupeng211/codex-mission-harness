@@ -7,7 +7,7 @@ commit-last: an incomplete run has no receipt and is never an approval.
 """
 from __future__ import annotations
 
-import argparse, base64, hashlib, hmac, json, os, pwd, re, shutil, signal, stat, subprocess, sys, tempfile, time, uuid
+import argparse, base64, hashlib, hmac, json, os, pwd, re, select, shutil, signal, stat, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -27,6 +27,8 @@ ENDPOINT = "https://api.deepseek.com/anthropic"
 CHUNK_BYTES = 32000
 AGGREGATE_GROUP_BYTES = 96000
 MAX_REVIEW_PROMPT_BYTES = 400000
+MAX_V2_DIFF_BYTES = 256000
+MAX_REVIEW_OUTPUT_BYTES = 128000
 GROUP_OUTPUT_FORMAT_RETRY_LIMIT = 1
 _GIT_ENV = {
     "PATH": os.defpath,
@@ -951,26 +953,83 @@ def invoke_reviewer(command, prompt_text, env, timeout):
     # Keep source and synthesis prompts on stdin, not argv. The bounded request
     # limit is enforced before this call, independently of the operating system's
     # argv limit. Claude Code print mode supports prompts on stdin.
-    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, env=env, start_new_session=True)
-    try:
-        stdout, stderr = process.communicate(prompt_text.encode("utf-8"), timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        pgid = os.getpgid(process.pid)
+    with tempfile.TemporaryFile() as stdin, tempfile.TemporaryFile() as stdout_file, \
+            tempfile.TemporaryFile() as stderr_file:
+        stdin.write(prompt_text.encode("utf-8"))
+        stdin.seek(0)
+        process = subprocess.Popen(command, stdin=stdin, stdout=stdout_file,
+                                   stderr=stderr_file, env=env, start_new_session=True)
+        deadline = time.monotonic() + timeout
         try:
-            os.killpg(pgid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            stdout, stderr = process.communicate(timeout=2)
-        except subprocess.TimeoutExpired:
+            while process.poll() is None:
+                if (os.fstat(stdout_file.fileno()).st_size > MAX_REVIEW_OUTPUT_BYTES
+                        or os.fstat(stderr_file.fileno()).st_size > MAX_REVIEW_OUTPUT_BYTES):
+                    raise ValueError("reviewer output exceeds bound")
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+            if (os.fstat(stdout_file.fileno()).st_size > MAX_REVIEW_OUTPUT_BYTES
+                    or os.fstat(stderr_file.fileno()).st_size > MAX_REVIEW_OUTPUT_BYTES):
+                raise ValueError("reviewer output exceeds bound")
+        except (subprocess.TimeoutExpired, ValueError) as exc:
             try:
-                os.killpg(pgid, signal.SIGKILL)
+                os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-            stdout, stderr = process.communicate()
-        raise subprocess.TimeoutExpired(command, timeout, output=stdout, stderr=stderr) from exc
-    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+            if isinstance(exc, subprocess.TimeoutExpired):
+                stdout_file.seek(0); stderr_file.seek(0)
+                raise subprocess.TimeoutExpired(command, timeout,
+                    output=stdout_file.read(MAX_REVIEW_OUTPUT_BYTES),
+                    stderr=stderr_file.read(MAX_REVIEW_OUTPUT_BYTES)) from exc
+            raise
+        stdout_file.seek(0); stderr_file.seek(0)
+        return subprocess.CompletedProcess(command, process.returncode,
+                stdout_file.read(MAX_REVIEW_OUTPUT_BYTES), stderr_file.read(MAX_REVIEW_OUTPUT_BYTES))
+
+
+def bounded_diff(root, base, head, *, max_bytes=MAX_V2_DIFF_BYTES, timeout=30):
+    """Read an exact Git diff with byte and time ceilings before any model call."""
+    command = ["git", "--no-replace-objects", "-C", str(root), "diff", "--no-ext-diff",
+               "--no-textconv", "--binary", f"{base}..{head}"]
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               env=_GIT_ENV, start_new_session=True)
+    chunks, size = [], 0
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Git diff exceeded review deadline")
+            readable, _, _ = select.select([process.stdout], [], [], min(remaining, 1))
+            if not readable:
+                continue
+            block = os.read(process.stdout.fileno(), min(65536, max_bytes + 1 - size))
+            if not block:
+                break
+            chunks.append(block)
+            size += len(block)
+            if size > max_bytes:
+                raise ValueError("review diff exceeds bounded source size")
+        if process.wait(timeout=max(0.1, deadline - time.monotonic())):
+            raise ValueError("Git diff failed")
+        return b"".join(chunks)
+    except Exception:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+        raise
+    finally:
+        process.stdout.close()
 
 
 class ReviewAttemptFailure(RuntimeError):

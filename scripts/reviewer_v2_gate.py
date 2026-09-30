@@ -11,18 +11,13 @@ import hashlib
 import json
 import re
 import subprocess
+import deepseek_review as secure
 from pathlib import Path
 from typing import Callable
 
 
 def _diff(root: Path, base: str, head: str) -> bytes:
-    return subprocess.check_output(
-        ["git", "--no-replace-objects", "-C", str(root), "diff", "--no-ext-diff",
-         "--no-textconv", "--binary", f"{base}..{head}"],
-        env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LANG": "C.UTF-8",
-             "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
-             "GIT_NO_REPLACE_OBJECTS": "1", "GIT_ATTR_NOSYSTEM": "1"},
-    )
+    return secure.bounded_diff(root, base, head)
 
 
 def _source_stable(root: Path, base: str, head: str, diff_hash: str) -> bool:
@@ -136,9 +131,11 @@ def main() -> int:
             args.deepseek_auth_key_file or args.deepseek_token_file, root)
         openai_key = secure.read_token_file(args.openai_auth_key_file, root)
         validate_qualification_receipt(Path(args.deepseek_qualification), independent,
-                                       auth_key=deepseek_auth_key, registry_path=args.registry)
+                                       auth_key=deepseek_auth_key, role="independent_reviewer",
+                                       registry_path=args.registry)
         validate_qualification_receipt(Path(args.openai_qualification), final,
-                                       auth_key=openai_key, registry_path=args.registry)
+                                       auth_key=openai_key, role="final_reviewer",
+                                       registry_path=args.registry)
         deepseek_path = Path(args.deepseek_receipt)
         openai_path = Path(args.openai_receipt)
         receipts = []

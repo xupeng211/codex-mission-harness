@@ -13,6 +13,13 @@ from .process import ProcessSupervisor
 from .supervisor import Supervisor
 
 
+def validate_builder_qualification(receipt_path: Path | None,
+                                   auth_key_file: Path | None) -> None:
+    """Require a distinct live builder certificate before starting App Server."""
+    from .model_qualification import require_builder_qualification
+    require_builder_qualification(receipt_path, auth_key_file)
+
+
 def load_spec(path: Path) -> MissionSpec:
     return MissionSpec.from_mapping(json.loads(path.read_text()))
 
@@ -39,14 +46,21 @@ def approval_head(journal: Journal, spec: MissionSpec, row) -> str:
 
 
 def build(root: Path, adapter_name: str = "footballprediction", codex=None,
-          forbidden_actions: tuple[str, ...] = (), worktree: str | None = None) -> Supervisor:
+          forbidden_actions: tuple[str, ...] = (), worktree: str | None = None,
+          builder_qualification: Path | None = None,
+          builder_auth_key_file: Path | None = None) -> Supervisor:
     journal = Journal(root / "data" / "harness.sqlite")
     if adapter_name == "simulation":
         adapter, selected_codex = SimulatedAdapter(), (codex or FixtureCodex())
     elif adapter_name == "footballprediction":
+        if codex is None:
+            validate_builder_qualification(builder_qualification, builder_auth_key_file)
         codex_args = {"forbidden_actions": forbidden_actions}
         if worktree is not None:
             codex_args["worktree"] = worktree
+        if codex is None:
+            codex_args["builder_qualification"] = builder_qualification
+            codex_args["builder_auth_key_file"] = builder_auth_key_file
         adapter, selected_codex = FootballPredictionAdapter(), (codex or AppServerCodex(**codex_args))
     else:
         raise ValueError("adapter must be exactly footballprediction or simulation")
@@ -66,8 +80,12 @@ def main() -> None:
     parser.add_argument("--root", type=Path, default=Path.cwd())
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run"); run.add_argument("mission", type=Path)
+    run.add_argument("--builder-qualification", type=Path)
+    run.add_argument("--builder-auth-key-file", type=Path)
     status = sub.add_parser("status"); status.add_argument("mission_id")
     resume = sub.add_parser("resume"); resume.add_argument("mission", type=Path)
+    resume.add_argument("--builder-qualification", type=Path)
+    resume.add_argument("--builder-auth-key-file", type=Path)
     approve = sub.add_parser("approve"); approve.add_argument("mission_id"); approve.add_argument("--action", required=True); approve.add_argument("--reason", default="")
     args = parser.parse_args()
     if args.command == "status":
@@ -107,6 +125,8 @@ def main() -> None:
         )
     supervisor = build(
         args.root, spec.adapter, forbidden_actions=spec.forbidden_actions, worktree=tree.path,
+        builder_qualification=args.builder_qualification,
+        builder_auth_key_file=args.builder_auth_key_file,
     )
     try:
         if not exists:

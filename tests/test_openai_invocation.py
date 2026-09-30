@@ -3,16 +3,48 @@ import os
 import tempfile
 import unittest
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
 from harness.model_registry import ModelSpec
 from harness.openai_invocation import (InvocationFailure, _failure_category,
-                                       _failure_markers, _observed_events,
+                                       _failure_markers, _observed_events, _matches_schema,
                                        canonical_environment, parse_events)
 
 
 class OpenAIInvocationTests(unittest.TestCase):
+    def test_preflight_result_requires_exact_structured_schema(self):
+        from harness.openai_invocation import invoke_openai
+        from harness.model_registry import load_registry
+        from reviewer_v2_openai import _schema
+        schema = _schema(False)
+        self.assertTrue(_matches_schema({"findings": []}, schema))
+        self.assertFalse(_matches_schema({"decisions": []}, schema))
+        self.assertFalse(_matches_schema({"findings": [], "extra": True}, schema))
+        self.assertFalse(_matches_schema({}, schema))
+        complete = (b'{"type":"thread.started"}\n{"type":"turn.started"}\n'
+                    b'{"type":"item.completed","item":{"type":"agent_message"}}\n'
+                    b'{"type":"turn.completed"}\n')
+        for result in ('not json', '{"findings":1}', '{"findings":[]}'):
+            with self.subTest(result=result):
+                process = Mock(pid=1234, returncode=0)
+                process.communicate.return_value = (complete, b"")
+                def start(command, **_kwargs):
+                    Path(command[command.index("--output-last-message") + 1]).write_text(result)
+                    return process
+                with patch("harness.openai_invocation.canonical_environment", return_value={}), \
+                     patch("harness.openai_invocation.subprocess.Popen", side_effect=start):
+                    if result == '{"findings":[]}':
+                        self.assertTrue(invoke_openai("review", load_registry().role("final_reviewer"),
+                                                     schema, timeout=1).evidence["structured_result_present"])
+                    else:
+                        with self.assertRaises(InvocationFailure):
+                            invoke_openai("review", load_registry().role("final_reviewer"),
+                                          schema, timeout=1)
+
     def test_started_turn_without_terminal_is_unresolved_timeout(self):
         stream = b'{"type":"thread.started"}\n{"type":"turn.started"}\n'
         observed = _observed_events(stream)
@@ -64,6 +96,13 @@ class OpenAIInvocationTests(unittest.TestCase):
                 binary=Path("/usr/lib/chatgpt/resources/codex"), codex_home=home)
             self.assertNotIn("SSL_CERT_FILE", env)
 
+    def test_ca_path_rejects_symlink_ancestor(self):
+        from harness.openai_invocation import _trusted_ca_path
+        with tempfile.TemporaryDirectory() as tmp:
+            alias = Path(tmp) / "trusted"
+            alias.symlink_to("/etc/ssl/certs", target_is_directory=True)
+            self.assertFalse(_trusted_ca_path(alias / "ca-certificates.crt", directory=False))
+
     def test_model_identity_is_required(self):
         from harness.openai_invocation import invoke_openai
         with self.assertRaises(ValueError):
@@ -100,6 +139,18 @@ class OpenAIInvocationTests(unittest.TestCase):
         self.assertEqual(caught.exception.category, "TURN_TIMEOUT_UNDIAGNOSED")
         self.assertTrue(caught.exception.evidence["turn_started_observed"])
         self.assertFalse(caught.exception.evidence["terminal_observed"])
+
+    def test_timeout_process_group_exit_race_is_classified(self):
+        from harness.openai_invocation import invoke_openai
+        process = Mock(pid=1234, returncode=-9)
+        process.communicate.side_effect = [subprocess.TimeoutExpired("codex", 1), (b"", b"")]
+        with patch("harness.openai_invocation.canonical_environment", return_value={}), \
+             patch("harness.openai_invocation.subprocess.Popen", return_value=process), \
+             patch("harness.openai_invocation.os.killpg", side_effect=ProcessLookupError):
+            with self.assertRaises(InvocationFailure) as caught:
+                invoke_openai("review", ModelSpec("openai", "gpt-5.6-sol", "high"),
+                              {"type": "object"}, timeout=1)
+        self.assertEqual(caught.exception.category, "TURN_TIMEOUT_UNDIAGNOSED")
 
 
 if __name__ == "__main__":

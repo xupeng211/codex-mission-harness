@@ -82,14 +82,15 @@ def _trusted_ca_path(path: Path, *, directory: bool) -> bool:
     """Only inherit system-owned, non-writable CA roots."""
     try:
         info = path.lstat()
+        return (path.is_absolute() and not path.is_symlink() and info.st_uid == 0
+                and not stat.S_IMODE(info.st_mode) & 0o022
+                and (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))
+                and all(stat.S_ISDIR(parent.lstat().st_mode)
+                        and parent.lstat().st_uid == 0
+                        and not stat.S_IMODE(parent.lstat().st_mode) & 0o022
+                        for parent in path.parents))
     except OSError:
         return False
-    return (path.is_absolute() and not path.is_symlink() and info.st_uid == 0
-            and not stat.S_IMODE(info.st_mode) & 0o022
-            and (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))
-            and all(parent.is_dir() and parent.stat().st_uid == 0
-                    and not stat.S_IMODE(parent.stat().st_mode) & 0o022
-                    for parent in path.parents))
 
 
 def parse_events(raw: bytes) -> dict:
@@ -116,6 +117,41 @@ def parse_events(raw: bytes) -> dict:
         raise ValueError("Codex turn lacked a valid terminal completion")
     return {"event_types": types, "agent_messages": messages,
             "terminal_completion": True}
+
+
+def _matches_schema(value: object, schema: dict) -> bool:
+    """Validate the bounded JSON Schema subset emitted by Harness."""
+    allowed = {"type", "properties", "required", "additionalProperties", "items",
+               "enum", "minLength", "maxLength", "minimum", "pattern"}
+    if not isinstance(schema, dict) or set(schema) - allowed:
+        return False
+    kind = schema.get("type")
+    if kind == "object":
+        if not isinstance(value, dict):
+            return False
+        properties = schema.get("properties", {})
+        if not isinstance(properties, dict) or not set(schema.get("required", [])).issubset(value):
+            return False
+        if schema.get("additionalProperties") is False and set(value) - set(properties):
+            return False
+        return all(key not in properties or _matches_schema(item, properties[key])
+                   for key, item in value.items())
+    if kind == "array":
+        return isinstance(value, list) and all(_matches_schema(item, schema.get("items", {}))
+                                               for item in value)
+    if kind == "string":
+        if not isinstance(value, str):
+            return False
+        if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", 1_000_000):
+            return False
+        if "pattern" in schema and re.fullmatch(schema["pattern"], value) is None:
+            return False
+    elif kind == "integer":
+        if type(value) is not int or value < schema.get("minimum", -1_000_000_000):
+            return False
+    elif kind is not None:
+        return False
+    return "enum" not in schema or value in schema["enum"]
 
 
 def _failure_category(stderr: bytes, stdout: bytes, *, timed_out: bool) -> str:
@@ -194,7 +230,10 @@ def invoke_openai(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 
             stdout, stderr = process.communicate(prompt.encode(), timeout=timeout)
             timed_out = False
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             stdout, stderr = process.communicate()
             timed_out = True
         evidence = {"binary": str(binary), "codex_home": str(codex_home),
@@ -226,9 +265,9 @@ def invoke_openai(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 
         except ValueError as exc:
             raise InvocationFailure("CLI_OR_CONFIG_FAILURE",
                                     "Codex final response is not JSON", evidence) from exc
-        if not isinstance(value, dict):
+        if not _matches_schema(value, schema):
             raise InvocationFailure("CLI_OR_CONFIG_FAILURE",
-                                    "Codex final response has invalid structure", evidence)
+                                    "Codex final response does not match requested schema", evidence)
         evidence["response_sha256"] = hashlib.sha256(response.encode()).hexdigest()
         evidence["structured_result_present"] = True
         return InvocationResult(response, evidence)

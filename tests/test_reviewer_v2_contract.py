@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from harness.reviewer_v2_contract import bind_findings, parse_chunk, parse_synthesis
+from harness.reviewer_v2_contract import bind_findings, parse_chunk, parse_synthesis, sha256
 
 
 FINDING = {"severity": "P1", "title": "Missing check", "evidence": "path.py:14 accepts bad input"}
@@ -42,6 +42,27 @@ class ReviewerV2ContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "source quote"):
             parse_synthesis(self.response([decision]), self.expected, source=None)
 
+    def test_structured_dispute_binds_id_source_and_exact_byte_range(self):
+        quote = "if value is None: raise ValueError()"
+        start = SOURCE.index(quote.encode())
+        decision = {**self.decision(kind="DISPUTED", quote=quote),
+                    "source_id": sha256(SOURCE), "quote_start": start,
+                    "quote_end": start + len(quote.encode())}
+        self.assertEqual(parse_synthesis(self.response([decision]), self.expected,
+                                         source=SOURCE, structured_evidence=True)["review_result"], "PASS")
+        for changed in ({"finding_id": "C999F999"}, {"source_id": "0" * 64},
+                        {"quote_start": start + 1}, {"quote_end": start + 1}):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                parse_synthesis(self.response([{**decision, **changed}]), self.expected,
+                                source=SOURCE, structured_evidence=True)
+        with self.assertRaises(ValueError):
+            parse_synthesis(self.response([decision]), self.expected, source=b"different group source",
+                            structured_evidence=True)
+        with self.assertRaises(ValueError):
+            parse_synthesis(self.response([{key: value for key, value in decision.items()
+                                            if key != "source_id"}]), self.expected, source=SOURCE,
+                            structured_evidence=True)
+
     def test_multiple_blockers_complete(self):
         expected = bind_findings([FINDING, {**FINDING, "severity": "P2"}], "C", 2)
         decisions = [self.decision(item["finding_id"]) for item in expected]
@@ -51,6 +72,15 @@ class ReviewerV2ContractTests(unittest.TestCase):
                     [self.decision("C999F999"), decisions[1]]):
             with self.assertRaises(ValueError):
                 parse_synthesis(self.response(bad), expected, source=SOURCE)
+
+    def test_p3_disposition_is_rejected_while_p3_finding_is_preserved(self):
+        expected = bind_findings([FINDING, {**FINDING, "severity": "P3"}], "C", 2)
+        upheld = self.decision(expected[0]["finding_id"])
+        result = parse_synthesis(self.response([upheld]), expected, source=SOURCE)
+        self.assertEqual(result["findings"], [FINDING, expected[1]["finding"]])
+        with self.assertRaisesRegex(ValueError, "unknown disposition finding_id"):
+            parse_synthesis(self.response([upheld, self.decision(expected[1]["finding_id"])]),
+                            expected, source=SOURCE)
 
     def test_invalid_structure_and_chunk(self):
         for raw in ('not JSON', '{}', self.response([])[:-1]):

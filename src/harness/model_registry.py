@@ -44,6 +44,24 @@ class ModelRegistry:
 
 def load_registry(path: str | Path | None = None) -> ModelRegistry:
     source = Path(path) if path is not None else DEFAULT_REGISTRY_PATH
+    if path is not None:
+        if not source.is_absolute():
+            raise ValueError("custom model registry must use an absolute private path")
+        info = source.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() \
+                or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError("custom model registry must be owner-owned mode 0600")
+        for parent in source.parents:
+            ancestor = parent.lstat()
+            # A root-owned sticky temporary root is safe when the registry is
+            # inside a private directory; no other writable ancestor is.
+            sticky_root = (ancestor.st_uid == 0 and
+                           stat.S_IMODE(ancestor.st_mode) & 0o1000 and
+                           stat.S_IMODE(ancestor.st_mode) & 0o002)
+            if (not stat.S_ISDIR(ancestor.st_mode) or
+                    ancestor.st_uid not in {0, os.getuid()} or
+                    (stat.S_IMODE(ancestor.st_mode) & 0o022 and not sticky_root)):
+                raise ValueError("custom model registry has an unsafe ancestor")
     raw = json.loads(source.read_text(encoding="utf-8"))
     if not isinstance(raw, dict) or set(raw) != {"version", "roles"} or raw["version"] != 1:
         raise ValueError("invalid model registry version or fields")

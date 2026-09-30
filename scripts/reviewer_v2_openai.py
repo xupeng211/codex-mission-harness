@@ -27,9 +27,10 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 import deepseek_review as secure  # noqa: E402
 from harness.model_registry import ModelSpec, load_registry, preflight  # noqa: E402
+from harness.model_qualification import validate_qualification_receipt  # noqa: E402
 from harness.openai_invocation import InvocationFailure, invoke_openai  # noqa: E402
 import harness.openai_invocation as invocation_module  # noqa: E402
-from harness.reviewer_v2_contract import bind_findings  # noqa: E402
+from harness.reviewer_v2_contract import bind_findings, validate_source_binding  # noqa: E402
 
 VERSION = "cmh-reviewer-v2-openai/v2"
 BLOCKING = frozenset({"P0", "P1", "P2"})
@@ -78,13 +79,17 @@ def _result(raw: bytes, *, group: bool = False) -> dict:
             raise ValueError("missing blocker decisions")
         for decision in decisions:
             if (not isinstance(decision, dict)
-                    or set(decision) != {"finding_id", "decision", "rationale", "source_quote"}
+                    or set(decision) != {"finding_id", "decision", "rationale", "source_quote",
+                                         "source_id", "quote_start", "quote_end"}
                     or not isinstance(decision["finding_id"], str)
                     or not re.fullmatch(r"C[0-9]{3}F[0-9]{3}", decision["finding_id"])
                     or decision["decision"] not in {"UPHELD", "DISPUTED"}
                     or not isinstance(decision["rationale"], str)
                     or len(decision["rationale"].strip()) < 24
                     or not isinstance(decision["source_quote"], str)
+                    or not isinstance(decision["source_id"], str)
+                    or type(decision["quote_start"]) is not int
+                    or type(decision["quote_end"]) is not int
                     or (decision["decision"] == "UPHELD" and decision["source_quote"] != "")):
                 raise ValueError("invalid blocker decision")
     return value
@@ -93,6 +98,8 @@ def _result(raw: bytes, *, group: bool = False) -> dict:
 def _plan(diff: bytes) -> tuple[list[dict], list[dict]]:
     if not diff:
         raise ValueError("empty diff is not reviewable")
+    if len(diff) > secure.MAX_V2_DIFF_BYTES:
+        raise ValueError("review diff exceeds bounded source size")
     chunks = []
     for start in range(0, len(diff), CHUNK_BYTES):
         end = min(start + CHUNK_BYTES, len(diff))
@@ -105,6 +112,8 @@ def _plan(diff: bytes) -> tuple[list[dict], list[dict]]:
         groups.append({"index": len(groups), "start": first["start"], "end": last["end"],
                        "chunk_indexes": [item["index"] for item in selected],
                        "sha256": _sha(diff[first["start"]:last["end"]])})
+    if len(chunks) > 8 or len(groups) > 3:
+        raise ValueError("review workload exceeds bounded stage count")
     return chunks, groups
 
 
@@ -120,11 +129,15 @@ def _schema(group: bool, synthesis: bool = False) -> dict:
         properties.update({"summary": {"type": "string"},
                            "decisions": {"type": "array", "items": {
                                "type": "object", "additionalProperties": False,
-                               "required": ["finding_id", "decision", "rationale", "source_quote"],
+                               "required": ["finding_id", "decision", "rationale", "source_quote",
+                                            "source_id", "quote_start", "quote_end"],
                                "properties": {"finding_id": {"type": "string"},
                                               "decision": {"type": "string", "enum": ["UPHELD", "DISPUTED"]},
                                               "rationale": {"type": "string"},
-                                              "source_quote": {"type": "string"}}}}})
+                                              "source_quote": {"type": "string"},
+                                              "source_id": {"type": "string"},
+                                              "quote_start": {"type": "integer", "minimum": 0},
+                                              "quote_end": {"type": "integer", "minimum": 0}}}}})
     return {"type": "object", "additionalProperties": False,
             "required": list(properties), "properties": properties}
 
@@ -179,8 +192,12 @@ def _prompt(kind: str, *, base: str, head: str, diff: bytes, ids: list[dict] | N
                          "A DISPUTED decision needs specific reasoning and a verbatim source quote "
                          "from this supplied group diff only. If no exact quote in this group source "
                          "supports a dispute, choose UPHELD. Never quote another group or chunk. "
-                         "UPHELD must use an empty source_quote. "
+                         "For DISPUTED set source_id to GroupSourceId and quote_start/quote_end "
+                         "to UTF-8 byte offsets delimiting source_quote in this group source. "
+                         "For UPHELD use empty source_quote/source_id and zero offsets. "
+                         "Bind each evidence reference to its finding_id. "
                          "Also report any additional problems and summarize cross-file impact. "
+                         f"GroupSourceId: {_sha(diff)}. "
                          f"Blockers: {json.dumps(ids, ensure_ascii=False)}. ")
     try:
         source = "\nEXACT DIFF TEXT (UTF-8):\n" + diff.decode("utf-8")
@@ -197,10 +214,7 @@ def _decide(blockers: list[dict], result: dict, source: bytes) -> list[dict]:
         if identifier not in expected or identifier in seen:
             raise ValueError("unknown or repeated blocker ID")
         seen.add(identifier)
-        if item["decision"] == "DISPUTED":
-            quote = item["source_quote"]
-            if len(quote.strip()) < 12 or quote.encode() not in source:
-                raise ValueError("disputed finding lacks a verifiable source quote")
+        validate_source_binding(item, source)
     if seen != set(expected):
         raise ValueError("missing blocker disposition")
     return [expected[item["finding_id"]] for item in result["decisions"]
@@ -301,8 +315,7 @@ def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec
     expected_hmac = hmac.new(auth_key.encode(), _canon(unsigned), hashlib.sha256).hexdigest()
     if not isinstance(observed_hmac, str) or not hmac.compare_digest(observed_hmac, expected_hmac):
         raise ValueError("OpenAI receipt authentication mismatch")
-    diff = secure.git(Path(root).resolve(), "diff", "--no-ext-diff", "--no-textconv",
-                      "--binary", f"{base}..{head}")
+    diff = secure.bounded_diff(Path(root).resolve(), base, head)
     if receipt["diff_sha256"] != _sha(diff):
         raise ValueError("OpenAI receipt diff mismatch")
     expected_chunks, expected_groups = _plan(diff)
@@ -391,14 +404,15 @@ def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec
 def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
         spec: ModelSpec, *, timeout: int = 900, call=None,
         mission_id: str = "codex-mission-harness",
-        registry_path: str | Path | None = None) -> Path:
+        registry_path: str | Path | None = None,
+        qualification_path: str | Path | None = None) -> Path:
     root = Path(root).resolve(strict=True)
     base, head = secure.full_sha(base), secure.full_sha(head)
     if secure.git(root, "rev-parse", "HEAD").decode().strip() != head:
         raise ValueError("checkout HEAD differs from reviewed HEAD")
     if secure.git(root, "status", "--porcelain"):
         raise ValueError("review checkout has uncommitted changes")
-    diff = secure.git(root, "diff", "--no-ext-diff", "--no-textconv", "--binary", f"{base}..{head}")
+    diff = secure.bounded_diff(root, base, head)
     repository = secure.repository_identity(
         secure.git(root, "config", "--get", "remote.origin.url").decode().strip())
     registry = load_registry(registry_path)
@@ -422,6 +436,10 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
         artifact_hashes[name] = _sha(raw)
     try:
         if live:
+            if qualification_path is None:
+                raise ValueError("live OpenAI review requires a final reviewer qualification receipt")
+            validate_qualification_receipt(qualification_path, spec, auth_key=auth_key,
+                                           role="final_reviewer", registry_path=registry_path)
             # Authenticate first, then exercise the same Codex structured
             # invocation path and chunk schema used by the review lane.
             preflight(spec, probe=False, timeout=min(timeout, 120))
@@ -477,6 +495,7 @@ def main() -> int:
     parser.add_argument("--receipt")
     parser.add_argument("--auth-key-file", required=True)
     parser.add_argument("--registry")
+    parser.add_argument("--qualification")
     parser.add_argument("--mission-id", default="codex-mission-harness")
     args = parser.parse_args()
     try:
@@ -487,7 +506,8 @@ def main() -> int:
             if not args.evidence:
                 raise ValueError("evidence directory required")
             path = run(root, args.base, args.head, Path(args.evidence), key, spec,
-                       mission_id=args.mission_id, registry_path=args.registry)
+                       mission_id=args.mission_id, registry_path=args.registry,
+                       qualification_path=args.qualification)
             value = json.loads(path.read_bytes())
             print(json.dumps({"status": value["review_result"], "receipt": str(path)}))
         else:

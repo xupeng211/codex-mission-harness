@@ -125,11 +125,12 @@ class OpenAIContractTests(unittest.TestCase):
         raw_group = json.dumps({"findings": [], "decisions": [{
             "finding_id": "C000F000", "decision": "DISPUTED",
             "rationale": "This rationale claims the blocker does not apply.",
-            "source_quote": "a quotation absent from the diff"}],
+            "source_quote": "a quotation absent from the diff", "source_id": review._sha(self.diff),
+            "quote_start": 0, "quote_end": 32}],
             "summary": "The group was reviewed but its dispute lacks source evidence."}).encode()
         def call(_prompt, group):
             return raw_group if group else json.dumps({"findings": [blocker]}).encode()
-        with self.assertRaisesRegex(ValueError, "verifiable source quote"):
+        with self.assertRaisesRegex(ValueError, "bound source reference"):
             review.run(self.root, self.base, self.head, evidence, "test-key", self.spec,
                        call=call)
         run_dir, = evidence.iterdir()
@@ -145,14 +146,30 @@ class OpenAIContractTests(unittest.TestCase):
         evidence.mkdir(mode=0o700)
         error = InvocationFailure("AUTHENTICATION_FAILURE", "provider rejected auth",
                                   {"failure_markers": {"http_401": True}})
-        with patch.object(review, "preflight", side_effect=error) as preflight:
+        with patch.object(review, "validate_qualification_receipt"), \
+             patch.object(review, "preflight", side_effect=error) as preflight:
             with self.assertRaises(InvocationFailure) as caught:
-                review.run(self.root, self.base, self.head, evidence, "test-key", self.spec)
+                review.run(self.root, self.base, self.head, evidence, "test-key", self.spec,
+                           qualification_path="fixture-qualification")
         preflight.assert_called_once()
         path = Path(caught.exception.evidence["failure_record"])
         record = json.loads(path.read_text())
         self.assertEqual(record["failure_category"], "AUTHENTICATION_FAILURE")
         self.assertEqual(record["head_sha"], self.head)
+        self.assertFalse(list(evidence.rglob("receipt.json")))
+
+    def test_live_review_requires_matching_final_reviewer_qualification(self):
+        evidence = Path(self.temp.name) / "evidence"
+        with self.assertRaisesRegex(ValueError, "qualification receipt"):
+            review.run(self.root, self.base, self.head, evidence, "test-key", self.spec)
+        self.assertFalse(list(evidence.rglob("receipt.json")))
+        self.assertEqual(len(list(evidence.rglob("failure.json"))), 1)
+        with patch.object(review, "validate_qualification_receipt",
+                          side_effect=ValueError("role mismatch")) as validate:
+            with self.assertRaisesRegex(ValueError, "role mismatch"):
+                review.run(self.root, self.base, self.head, evidence, "test-key", self.spec,
+                           qualification_path="untrusted-receipt")
+        self.assertEqual(validate.call_args.kwargs["role"], "final_reviewer")
         self.assertFalse(list(evidence.rglob("receipt.json")))
 
     def test_missing_unknown_and_duplicate_blocker_id_fail_closed(self):
@@ -164,7 +181,8 @@ class OpenAIContractTests(unittest.TestCase):
                         return json.dumps({"findings": [blocker]}).encode()
                     decisions = [{"finding_id": identifier, "decision": "UPHELD",
                                   "rationale": "The changed source makes the issue persist.",
-                                  "source_quote": ""} for identifier in ids]
+                                  "source_quote": "", "source_id": "",
+                                  "quote_start": 0, "quote_end": 0} for identifier in ids]
                     return json.dumps({"findings": [], "decisions": decisions,
                                        "summary": "The source was reviewed with its original finding."}).encode()
                 with self.assertRaises(ValueError):
@@ -177,7 +195,8 @@ class OpenAIContractTests(unittest.TestCase):
                 return json.dumps({"findings": [blocker]}).encode()
             return json.dumps({"findings": [], "decisions": [{"finding_id": "C000F000",
                 "decision": "UPHELD", "rationale": "The changed source makes the issue persist.",
-                "source_quote": ""}], "summary": "The blocker remains in the reviewed source."}).encode()
+                "source_quote": "", "source_id": "", "quote_start": 0, "quote_end": 0}],
+                "summary": "The blocker remains in the reviewed source."}).encode()
         receipt, _ = review._assemble(self.diff, self.base, self.head, call)
         self.assertEqual(receipt["review_result"], "FAIL")
         self._signed(receipt)

@@ -5,11 +5,13 @@ import json
 import os
 import stat
 import subprocess
+import sys
+import time
 import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 ROOT = Path(__file__).parents[1]
 spec = importlib.util.spec_from_file_location("deepseek_review", ROOT / "scripts" / "deepseek_review.py")
@@ -117,22 +119,44 @@ def run_fixture(root, *, large_diff=False):
     return args, Path(args.evidence)
 
 class DeepSeekReceiptTest(unittest.TestCase):
+    def test_reviewer_output_is_bounded_before_read_or_receipt(self):
+        program = f"import sys;sys.stdout.write('x'*{review.MAX_REVIEW_OUTPUT_BYTES + 1})"
+        with self.assertRaisesRegex(ValueError, "output exceeds bound"):
+            review.invoke_reviewer([sys.executable, "-c", program], "prompt", os.environ.copy(), 5)
+
+    def test_exact_diff_has_byte_ceiling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            (repo / "source.txt").write_text("before\n")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+            base = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            (repo / "source.txt").write_text("after\n" * 100)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qam", "head"], check=True)
+            head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            with self.assertRaisesRegex(ValueError, "bounded source size"):
+                review.bounded_diff(repo, base, head, max_bytes=32)
+
     def test_invoke_reviewer_timeout_terminates_process_group(self):
-        process = Mock(pid=4321, returncode=-9)
-        process.communicate.side_effect = [
-            subprocess.TimeoutExpired(["claude"], 1, output=b"partial", stderr=b"err"),
-            subprocess.TimeoutExpired(["claude"], 2, output=b"partial", stderr=b"err"),
-            (b"", b"err"),
-        ]
-        with patch.object(review.subprocess, "Popen", return_value=process), \
-             patch.object(review.os, "getpgid", return_value=4321), \
-             patch.object(review.os, "killpg") as killpg:
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "child.pid"
+            program = ("import pathlib,signal,subprocess,sys,time;"
+                       "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                       "child=subprocess.Popen([sys.executable,'-c',"
+                       "'import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(30)']);"
+                       "pathlib.Path(sys.argv[1]).write_text(str(child.pid));time.sleep(30)")
             with self.assertRaises(subprocess.TimeoutExpired):
-                review.invoke_reviewer(["claude"], "prompt", {}, 1)
-        self.assertEqual(killpg.call_count, 2)
-        self.assertEqual([call.args for call in killpg.call_args_list],
-                         [(4321, review.signal.SIGTERM), (4321, review.signal.SIGKILL)])
-        self.assertGreaterEqual(process.communicate.call_count, 3)
+                review.invoke_reviewer([sys.executable, "-c", program, str(marker)],
+                                       "prompt", os.environ.copy(), 1)
+            child_pid = int(marker.read_text())
+            for _ in range(40):
+                if not Path(f"/proc/{child_pid}").exists():
+                    break
+                time.sleep(0.05)
+            self.assertFalse(Path(f"/proc/{child_pid}").exists())
     def test_chunk_and_aggregate_schemas_have_separate_disposition_contracts(self):
         self.assertNotIn("dispositions", review.CHUNK_SCHEMA["properties"])
         self.assertIn("dispositions", review.GROUP_SCHEMA["properties"])

@@ -49,7 +49,8 @@ def main() -> int:
         print(json.dumps({"status": "FAIL", "identity": result.identity,
                           "cases_failed": result.cases_failed}), file=sys.stderr)
         return 1
-    receipt = qualification_receipt(result, auth_key=auth_key, registry_path=args.registry)
+    receipt = qualification_receipt(result, auth_key=auth_key, role=args.role,
+                                    registry_path=args.registry)
     payload = (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode()
     fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
@@ -57,7 +58,7 @@ def main() -> int:
         os.fsync(fd)
     finally:
         os.close(fd)
-    validate_qualification_receipt(args.output, spec, auth_key=auth_key,
+    validate_qualification_receipt(args.output, spec, auth_key=auth_key, role=args.role,
                                    registry_path=args.registry)
     print(json.dumps({"status": "PASS", "identity": result.identity,
                       "receipt": str(args.output)}))

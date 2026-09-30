@@ -65,7 +65,24 @@ def _unwrap(raw: str) -> dict:
     return value
 
 
-def parse_synthesis(raw: str, expected: list[dict], *, source: bytes | None) -> dict:
+def validate_source_binding(decision: dict, source: bytes | None) -> None:
+    """Bind a disputed quote to exact bytes of this stage's immutable source."""
+    source_id = decision.get("source_id")
+    start, end = decision.get("quote_start"), decision.get("quote_end")
+    if decision["decision"] == "UPHELD":
+        if source_id != "" or start != 0 or end != 0 or decision["source_quote"]:
+            raise ValueError("upheld disposition has unexpected source reference")
+        return
+    quote = decision["source_quote"].encode("utf-8")
+    if (source is None or source_id != sha256(source)
+            or type(start) is not int or type(end) is not int
+            or start < 0 or end > len(source) or start >= end
+            or len(quote.strip()) < 12 or source[start:end] != quote):
+        raise ValueError("dispute lacks an exact bound source reference")
+
+
+def parse_synthesis(raw: str, expected: list[dict], *, source: bytes | None,
+                    structured_evidence: bool = False) -> dict:
     """Reject unknown, duplicate, or missing decisions without inventing any.
 
     A group may dispute with an exact source quote.  The final synthesis has
@@ -85,8 +102,16 @@ def parse_synthesis(raw: str, expected: list[dict], *, source: bytes | None) -> 
         raise ValueError("duplicate finding identity")
     observed = {}
     for decision in value["decisions"]:
+        if isinstance(decision, dict) and isinstance(decision.get("finding_id"), str):
+            if decision["finding_id"] not in required:
+                raise ValueError("unknown disposition finding_id")
+            if decision["finding_id"] in observed:
+                raise ValueError("duplicate disposition finding_id")
+        decision_fields = {"finding_id", "decision", "rationale", "source_quote"}
+        if structured_evidence:
+            decision_fields |= {"source_id", "quote_start", "quote_end"}
         if (not isinstance(decision, dict)
-                or set(decision) != {"finding_id", "decision", "rationale", "source_quote"}
+                or set(decision) != decision_fields
                 or not isinstance(decision.get("finding_id"), str)
                 or decision["finding_id"] not in required
                 or decision["finding_id"] in observed
@@ -95,7 +120,9 @@ def parse_synthesis(raw: str, expected: list[dict], *, source: bytes | None) -> 
                 or len(decision["rationale"].strip()) < 24
                 or not isinstance(decision.get("source_quote"), str)):
             raise ValueError("invalid or duplicate disposition")
-        if decision["decision"] == "DISPUTED":
+        if structured_evidence:
+            validate_source_binding(decision, source)
+        elif decision["decision"] == "DISPUTED":
             quote = decision["source_quote"].strip()
             if (source is None or len(quote) < 12
                     or quote.encode("utf-8") not in source):
@@ -116,12 +143,14 @@ def parse_synthesis(raw: str, expected: list[dict], *, source: bytes | None) -> 
                                        for item in findings) else "PASS"}
 
 
-def validate_bound_result(result: dict, expected: list[dict], source: bytes | None) -> None:
+def validate_bound_result(result: dict, expected: list[dict], source: bytes | None,
+                          *, structured_evidence: bool = False) -> None:
     """Recompute every derived field when validating a durable receipt."""
     if not isinstance(result, dict) or set(result) != {
             "decisions", "new_findings", "summary", "findings", "review_result"}:
         raise ValueError("invalid bound result")
     model_fields = {key: result[key] for key in ("decisions", "summary")}
     model_fields["findings"] = result["new_findings"]
-    if parse_synthesis(canonical(model_fields).decode(), expected, source=source) != result:
+    if parse_synthesis(canonical(model_fields).decode(), expected, source=source,
+                       structured_evidence=structured_evidence) != result:
         raise ValueError("bound result differs from model decisions")

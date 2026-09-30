@@ -7,7 +7,8 @@ from unittest.mock import patch
 
 from harness.model_qualification import (CASES, QualificationResult, expected_findings,
                                          evaluate_cases, qualification_receipt,
-                                         validate_qualification_receipt)
+                                         validate_qualification_receipt,
+                                         require_builder_qualification)
 from harness.openai_invocation import InvocationFailure
 from harness.model_registry import load_registry, preflight, trusted_claude_launcher
 from harness.review_failures import ReviewFailureClassification, classify_process_failure
@@ -58,8 +59,31 @@ class RegistryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_registry(path)
 
+    def test_custom_registry_requires_private_owner_controlled_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "models.json"
+            path.write_bytes(load_registry().path.read_bytes())
+            with self.assertRaisesRegex(ValueError, "mode 0600"):
+                load_registry(path)
+            path.chmod(0o600)
+            self.assertEqual(load_registry(path).role("builder"), load_registry().role("builder"))
+            alias = Path(temporary) / "alias.json"
+            alias.symlink_to(path)
+            with self.assertRaises(ValueError):
+                load_registry(alias)
+
 
 class QualificationContractTests(unittest.TestCase):
+    def test_builder_execution_gate_requires_builder_role(self):
+        with self.assertRaisesRegex(ValueError, "builder qualification"):
+            require_builder_qualification(None, None)
+        with patch("harness.model_registry.read_private_token", return_value="fixture-key"), \
+             patch("harness.model_qualification.validate_qualification_receipt",
+                   return_value={"role": "builder"}) as validate:
+            self.assertEqual(require_builder_qualification("builder-receipt", "key-file"),
+                             {"role": "builder"})
+        self.assertEqual(validate.call_args.kwargs["role"], "builder")
+
     def setUp(self):
         self.case = CASES[3]
         self.findings = expected_findings(self.case)
@@ -105,6 +129,15 @@ class QualificationContractTests(unittest.TestCase):
             source=disputed_case.source.encode())
         self.assertEqual(result["review_result"], "PASS")
 
+    def test_upheld_chunk_blocker_is_carried_into_group_findings(self):
+        case = CASES[3]
+        expected = expected_findings(case)
+        result = parse_synthesis(self.raw([
+            self.decision(item["finding_id"]) for item in expected
+        ]), expected, source=case.source.encode())
+        self.assertEqual(result["review_result"], "FAIL")
+        self.assertEqual(result["findings"], [item["finding"] for item in expected])
+
     def test_mock_invoker_cannot_be_reported_as_real_qualification(self):
         # A caller can use this function for fixtures, but certificates from a
         # mock are not accepted by the external qualification gate.
@@ -140,11 +173,14 @@ class QualificationContractTests(unittest.TestCase):
         spec = load_registry().role("final_reviewer")
         result = QualificationResult(spec.identity(), "real_provider",
                                      tuple(case.name for case in CASES), (), ("a" * 64,) * len(CASES))
-        receipt = qualification_receipt(result, auth_key="owner-test-key")
+        receipt = qualification_receipt(result, auth_key="owner-test-key", role="final_reviewer")
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "receipt.json"
             path.write_text(json.dumps(receipt))
-            self.assertEqual(validate_qualification_receipt(path, spec, auth_key="owner-test-key"), receipt)
+            self.assertEqual(validate_qualification_receipt(path, spec, auth_key="owner-test-key",
+                                                             role="final_reviewer"), receipt)
+            with self.assertRaises(ValueError):
+                validate_qualification_receipt(path, spec, auth_key="owner-test-key", role="builder")
             self.assertIn("cli_runner_sha256", receipt)
             self.assertIn("invocation_sha256", receipt)
             original_read = Path.read_bytes
@@ -157,20 +193,23 @@ class QualificationContractTests(unittest.TestCase):
                         return original_read(source)
                     with patch.object(Path, "read_bytes", changed_file):
                         with self.assertRaises(ValueError):
-                            validate_qualification_receipt(path, spec, auth_key="owner-test-key")
+                            validate_qualification_receipt(path, spec, auth_key="owner-test-key",
+                                                           role="final_reviewer")
             with tempfile.TemporaryDirectory() as custom_dir:
                 alternate = Path(custom_dir) / "models.json"
                 alternate.write_bytes(load_registry().path.read_bytes() + b" ")
                 with self.assertRaises(ValueError):
                     validate_qualification_receipt(path, spec, auth_key="owner-test-key",
-                                                   registry_path=alternate)
+                                                   role="final_reviewer", registry_path=alternate)
             with self.assertRaises(ValueError):
                 validate_qualification_receipt(path,
-                    load_registry().role("independent_reviewer"), auth_key="owner-test-key")
+                    load_registry().role("independent_reviewer"), auth_key="owner-test-key",
+                    role="final_reviewer")
             receipt["cases_passed"] = []
             path.write_text(json.dumps(receipt))
             with self.assertRaises(ValueError):
-                validate_qualification_receipt(path, spec, auth_key="owner-test-key")
+                validate_qualification_receipt(path, spec, auth_key="owner-test-key",
+                                               role="final_reviewer")
 
 
 if __name__ == "__main__":

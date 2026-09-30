@@ -1016,7 +1016,8 @@ class HarnessTest(unittest.TestCase):
             worktree = root / "worktree"
             worktree.mkdir()
             subprocess.run(["git", "init", "-q", str(worktree)], check=True)
-            with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=True):
+            with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=True), \
+                 patch("harness.codex.require_builder_qualification"):
                 adapter = AppServerCodex(executable=executable, worktree=str(worktree))
                 try:
                     thread_id = adapter.start_or_resume(None, str(worktree))
@@ -1116,6 +1117,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         codex_home.mkdir(mode=0o700)
         self.assertEqual(AppServerCodex._canonical_worktree(str(first)), str(first))
         with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}), \
+                patch("harness.codex.require_builder_qualification"), \
                 patch("harness.codex.subprocess.Popen", return_value=process) as launch, \
                 patch.object(AppServerCodex, "_canonical_worktree", return_value=str(first)), \
                 patch.object(AppServerCodex, "_request", return_value={}) as request:
@@ -1173,6 +1175,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
             "poll": lambda self: 0,
         })()
         with patch.dict(os.environ, hostile, clear=True), \
+                patch("harness.codex.require_builder_qualification"), \
                 patch("harness.codex.subprocess.Popen", return_value=process) as launch, \
                 patch.object(AppServerCodex, "_canonical_worktree", return_value=str(first)), \
                 patch.object(AppServerCodex, "_request", return_value={}):
@@ -1212,7 +1215,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         launcher.chmod(0o755)
         codex_home = Path(self.tmp.name) / "launcher-codex-home"
         codex_home.mkdir(mode=0o700)
-        with patch.dict(os.environ, {
+        with patch("harness.codex.require_builder_qualification"), patch.dict(os.environ, {
                 "PATH": f"{repo}:/usr/bin:/bin", "CODEX_HOME": str(codex_home),
         }, clear=True), self.assertRaisesRegex(
                 RuntimeError, "inside the mission worktree"):
@@ -1241,7 +1244,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
             previous_cwd = Path.cwd()
             os.chdir(controller)
             try:
-                with patch.dict(os.environ, {
+                with patch("harness.codex.require_builder_qualification"), patch.dict(os.environ, {
                         "PATH": "/usr/bin:/bin", "CODEX_HOME": str(codex_home),
                         }, clear=True), \
                         patch("harness.codex.subprocess.Popen", return_value=process) as launch, \
@@ -1284,17 +1287,26 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
     def test_production_build_injects_immutable_mission_codex_policy(self):
         denied = ("live_provider_request", "quota_consumption")
         fake = FakeCodex()
-        with patch("harness.cli.AppServerCodex", return_value=fake) as constructor:
+        with patch("harness.cli.AppServerCodex") as constructor, \
+             self.assertRaisesRegex(ValueError, "builder qualification"):
+            build(Path(self.tmp.name), "footballprediction", forbidden_actions=denied)
+        constructor.assert_not_called()
+        with patch("harness.cli.validate_builder_qualification"), \
+             patch("harness.cli.AppServerCodex", return_value=fake) as constructor:
             supervisor = build(Path(self.tmp.name), "footballprediction",
                                forbidden_actions=denied)
-        constructor.assert_called_once_with(forbidden_actions=denied)
+        constructor.assert_called_once_with(forbidden_actions=denied,
+                                            builder_qualification=None,
+                                            builder_auth_key_file=None)
         self.assertIs(supervisor.codex, fake)
 
-        with patch("harness.cli.AppServerCodex", return_value=fake) as constructor:
+        with patch("harness.cli.validate_builder_qualification"), \
+             patch("harness.cli.AppServerCodex", return_value=fake) as constructor:
             build(Path(self.tmp.name), "footballprediction", forbidden_actions=denied,
                   worktree="/validated/worktree")
         constructor.assert_called_once_with(
             forbidden_actions=denied, worktree="/validated/worktree",
+            builder_qualification=None, builder_auth_key_file=None,
         )
 
         adapter = AppServerCodex.__new__(AppServerCodex)

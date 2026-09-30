@@ -13,6 +13,20 @@ import reviewer_v2_deepseek as reviewer
 
 
 class DeepSeekV2ReceiptTests(unittest.TestCase):
+    def test_p3_disposition_failure_has_safe_reason_code(self):
+        finding = {"severity": "P3", "title": "Minor issue", "evidence": "source.py:2"}
+        expected = reviewer.bind_findings([finding], "C", 0)
+        raw = json.dumps({"findings": [], "decisions": [{
+            "finding_id": expected[0]["finding_id"], "decision": "UPHELD",
+            "rationale": "This source confirms the original minor issue.",
+            "source_quote": "", "source_id": "", "quote_start": 0, "quote_end": 0}],
+            "summary": "The change contains one nonblocking finding only."})
+        state = {"stage": "group"}
+        with self.assertRaises(reviewer.ReviewStageFailure):
+            reviewer._parse_stage(raw, lambda value: reviewer.parse_synthesis(
+                value, expected, source=b"source", structured_evidence=True), state)
+        self.assertEqual(state["schema_validation_reason"], "UNKNOWN_FINDING_ID")
+
     def test_group_failures_are_private_classified_and_never_publish_receipt(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "repo"
@@ -47,7 +61,7 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
                     evidence = Path(temporary) / category.lower()
                     args = SimpleNamespace(repo=str(root), base=base, head=head,
                         evidence=str(evidence), token_file=str(Path(temporary) / "token"),
-                        mission_id="test", timeout=1)
+                        mission_id="test", timeout=1, qualification="fixture-qualification")
                     def invoke(_command, prompt, _env, _timeout):
                         if "Scope=chunk" in prompt:
                             return good_chunk
@@ -57,6 +71,7 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
                     with (patch.object(reviewer.legacy, "resolve_claude_launcher",
                                        return_value=("/bin/true", "/usr/bin:/bin")),
                           patch.object(reviewer.legacy, "read_token_file", return_value="fixture-token"),
+                          patch.object(reviewer, "validate_qualification_receipt"),
                           patch.object(reviewer.legacy, "invoke_reviewer", side_effect=invoke)):
                         with self.assertRaises(reviewer.ReviewStageFailure) as caught:
                             reviewer.run(args)
@@ -91,7 +106,7 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
             evidence = Path(temporary) / "evidence"
             args = SimpleNamespace(repo=str(root), base=base, head=head,
                                    evidence=str(evidence), token_file=str(Path(temporary) / "token"),
-                                   mission_id="test", timeout=30)
+                                   mission_id="test", timeout=30, qualification="fixture-qualification")
             summary = "The source change preserves the relevant contract and control flow."
             def invoke(command, prompt, env, timeout):
                 result = ({"findings": []} if "Scope=chunk" in prompt else
@@ -101,6 +116,7 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
             with (patch.object(reviewer.legacy, "resolve_claude_launcher",
                                return_value=("/bin/true", "/usr/bin:/bin")),
                   patch.object(reviewer.legacy, "read_token_file", return_value="fixture-token"),
+                  patch.object(reviewer, "validate_qualification_receipt"),
                   patch.object(reviewer.legacy, "invoke_reviewer", side_effect=invoke)):
                 response = reviewer.run(args)
             receipt_path = Path(response["review_receipt"])
