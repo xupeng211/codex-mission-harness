@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -23,6 +24,17 @@ def git(root, *args):
 
 
 class OpenAIContractTests(unittest.TestCase):
+    def test_schema_selection_uses_stage_not_labels_inside_reviewed_source(self):
+        prompt = "CHUNK REVIEW source contains GROUP REVIEW and FINAL CROSS-GROUP REVIEW"
+        with patch.object(review, "invoke_openai", return_value=SimpleNamespace(response='{"findings":[]}')) as invoke:
+            for stage, required in (("chunk", {"findings"}),
+                                    ("group", {"findings", "decisions", "summary"}),
+                                    ("synthesis", {"findings", "summary"})):
+                review.invoke_codex(prompt, ModelSpec("openai", "gpt-5.6-sol", "high"), stage=stage)
+                self.assertEqual(set(invoke.call_args.args[2]["required"]), required)
+        with self.assertRaises(ValueError):
+            review.invoke_codex(prompt, ModelSpec("openai", "gpt-5.6-sol", "high"), stage="unknown")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

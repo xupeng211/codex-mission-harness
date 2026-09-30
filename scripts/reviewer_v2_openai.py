@@ -146,12 +146,14 @@ def _synthesis_prompt(summaries: list[str], base: str, head: str) -> str:
             f"Base {base}; head {head}. Group summaries: " + json.dumps(summaries, ensure_ascii=False))
 
 
-def invoke_codex(prompt: str, spec: ModelSpec, *, timeout: int = 900) -> bytes:
+def invoke_codex(prompt: str, spec: ModelSpec, *, stage: str, timeout: int = 900) -> bytes:
     """One fresh, isolated model call. No implicit model or provider fallback."""
     if spec.provider != "openai" or not spec.reasoning_effort:
         raise ValueError("OpenAI model role is required")
+    if stage not in {"chunk", "group", "synthesis"}:
+        raise ValueError("invalid OpenAI review stage")
     result = invoke_openai(
-        prompt, spec, _schema("GROUP REVIEW" in prompt, "FINAL CROSS-GROUP REVIEW" in prompt),
+        prompt, spec, _schema(stage == "group", stage == "synthesis"),
         timeout=timeout,
     )
     return result.response.encode()
@@ -371,7 +373,9 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
     diff = secure.git(root, "diff", "--no-ext-diff", "--no-textconv", "--binary", f"{base}..{head}")
     live = call is None
     if live:
-        call = lambda prompt, group: invoke_codex(prompt, spec, timeout=timeout)
+        call = lambda prompt, group: invoke_codex(
+            prompt, spec, stage="synthesis" if group == "synthesis" else
+            "group" if group else "chunk", timeout=timeout)
     try:
         if live:
             preflight(spec, probe=True, timeout=min(timeout, 120))
