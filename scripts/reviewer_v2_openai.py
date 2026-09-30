@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 import deepseek_review as secure  # noqa: E402
 from harness.model_registry import ModelSpec, load_registry, preflight  # noqa: E402
+from harness.openai_invocation import invoke_openai  # noqa: E402
 from harness.reviewer_v2_contract import bind_findings  # noqa: E402
 
 VERSION = "cmh-reviewer-v2-openai/v1"
@@ -149,21 +150,11 @@ def invoke_codex(prompt: str, spec: ModelSpec, *, timeout: int = 900) -> bytes:
     if spec.provider != "openai" or not spec.reasoning_effort:
         raise ValueError("OpenAI model role is required")
     preflight(spec)
-    with tempfile.TemporaryDirectory(prefix="cmh-openai-review-") as tmp:
-        directory = Path(tmp)
-        schema = directory / "schema.json"
-        output = directory / "result.json"
-        schema.write_bytes(_canon(_schema("GROUP REVIEW" in prompt,
-                                        "FINAL CROSS-GROUP REVIEW" in prompt)))
-        argv = ["codex", "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral",
-                "--skip-git-repo-check", "--sandbox", "read-only", "-C", str(directory),
-                "--model", spec.model, "-c", f'model_reasoning_effort="{spec.reasoning_effort}"',
-                "--output-schema", str(schema), "--output-last-message", str(output), "-"]
-        completed = subprocess.run(argv, input=prompt.encode(), stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, timeout=timeout, cwd=directory)
-        if completed.returncode != 0 or not output.is_file():
-            raise RuntimeError("OpenAI review invocation failed without a valid result")
-        return output.read_bytes()
+    result = invoke_openai(
+        prompt, spec, _schema("GROUP REVIEW" in prompt, "FINAL CROSS-GROUP REVIEW" in prompt),
+        timeout=timeout,
+    )
+    return result.response.encode()
 
 
 def _prompt(kind: str, *, base: str, head: str, diff: bytes, ids: list[dict] | None = None) -> str:

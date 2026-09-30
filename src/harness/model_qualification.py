@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable
 
 from .model_registry import ModelSpec
+from .openai_invocation import invoke_openai, InvocationResult
 from .reviewer_v2_contract import bind_findings, parse_synthesis
 
 QUALIFICATION_VERSION = "cmh-model-qualification/v1"
@@ -89,6 +90,8 @@ def _evaluate_cases(spec: ModelSpec, invoke: Callable[[ModelSpec, str], str], *,
     for case in CASES:
         try:
             raw = invoke(spec, qualification_prompt(case))
+            if isinstance(raw, InvocationResult):
+                raw = raw.response
             bound = parse_synthesis(raw, expected_findings(case), source=case.source.encode())
             decisions = {item["finding_id"]: item["decision"] for item in bound["decisions"]}
             expected = {expected_findings(case)[int(key[1:])-1]["finding_id"]: value
@@ -124,23 +127,14 @@ _SCHEMA = {"type": "object", "properties": {"decisions": {"type": "array", "item
 
 
 def _actual_provider_invoke(spec: ModelSpec, prompt: str, *, token: str | None,
-                            timeout: int) -> str:
+                            timeout: int) -> str | InvocationResult:
     """One bounded, noninteractive call to the exact configured model."""
     with tempfile.TemporaryDirectory(prefix="cmh-model-qualification-") as temporary:
         root = Path(temporary)
         schema = root / "schema.json"
         schema.write_text(json.dumps(_SCHEMA), encoding="utf-8")
         if spec.provider == "openai":
-            output = root / "response.json"
-            command = ["codex", "exec", "--ephemeral", "--ignore-user-config",
-                       "--skip-git-repo-check", "--sandbox", "read-only", "--model", spec.model,
-                       "-c", f'model_reasoning_effort="{spec.reasoning_effort}"',
-                       "--output-schema", str(schema), "--output-last-message", str(output), "-"]
-            result = subprocess.run(command, input=prompt, capture_output=True, text=True,
-                                    cwd=root, timeout=timeout, check=False)
-            if result.returncode or not output.is_file():
-                raise RuntimeError("OpenAI model qualification provider call failed")
-            return output.read_text(encoding="utf-8")
+            return invoke_openai(prompt, spec, _SCHEMA, timeout=timeout)
         if spec.provider == "deepseek":
             if token is None:
                 raise ValueError("DeepSeek qualification token missing")
