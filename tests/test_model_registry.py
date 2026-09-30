@@ -63,6 +63,7 @@ class RegistryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "models.json"
             path.write_bytes(load_registry().path.read_bytes())
+            path.chmod(0o644)
             with self.assertRaisesRegex(ValueError, "mode 0600"):
                 load_registry(path)
             path.chmod(0o600)
