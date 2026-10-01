@@ -467,12 +467,13 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
         # and semantic checks are durable and complete.
         secure.write_private_artifact(child_fd, path.name, _canon(receipt), run_id)
         return path
-    except Exception as exc:
+    except (Exception, KeyboardInterrupt) as exc:
         failure = {"status": "BLOCKED", "base_sha": base, "head_sha": head,
                    "mission_id": mission_id, "repository": repository,
                    "diff_sha256": _sha(diff), "provider": spec.provider,
                    "model": spec.model, "reasoning_effort": spec.reasoning_effort,
                    "failure_category": exc.category if isinstance(exc, InvocationFailure)
+                   else "CANCELLED" if isinstance(exc, KeyboardInterrupt)
                    else "REVIEW_RESULT_INVALID", "error_type": type(exc).__name__,
                    "artifact_sha256": artifact_hashes,
                    "invocation_evidence": dict(exc.evidence) if isinstance(exc, InvocationFailure) else {},

@@ -236,6 +236,13 @@ def invoke_openai(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 
                 pass
             stdout, stderr = process.communicate()
             timed_out = True
+        except KeyboardInterrupt:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+            raise
         except OSError as exc:
             try:
                 os.killpg(process.pid, signal.SIGKILL)

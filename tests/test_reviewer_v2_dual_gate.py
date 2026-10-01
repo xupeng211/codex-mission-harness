@@ -121,6 +121,36 @@ class OpenAIContractTests(unittest.TestCase):
         self.assertEqual(record["failure_category"], "TURN_TIMEOUT_UNDIAGNOSED")
         self.assertEqual(list(failure_path.parent.iterdir()), [failure_path])
 
+    def test_interrupt_after_first_chunk_records_failure_without_receipt(self):
+        evidence = Path(self.temp.name) / "interrupted"
+        evidence.mkdir(mode=0o700)
+        calls = 0
+        def invoke(_prompt, _spec, *, stage, timeout):
+            nonlocal calls
+            calls += 1
+            if calls == 1:  # structured preflight
+                return b'{"findings":[]}'
+            if calls == 2:
+                return b'{"findings":[]}'
+            raise KeyboardInterrupt()
+        with patch.object(review, "validate_qualification_receipt"), \
+             patch.object(review, "preflight"), \
+             patch.object(review, "_plan", return_value=(
+                 [{"index": i, "start": 0, "end": len(self.diff)} for i in range(3)],
+                 [{"index": 0, "chunk_indexes": [0, 1, 2],
+                   "start": 0, "end": len(self.diff)}])), \
+             patch.object(review, "invoke_codex", side_effect=invoke), \
+             self.assertRaises(KeyboardInterrupt):
+            review.run(self.root, self.base, self.head, evidence, "test-key", self.spec,
+                       qualification_path="fixture-qualification")
+        run_dir, = evidence.iterdir()
+        self.assertTrue((run_dir / "chunk-000.json").exists())
+        self.assertFalse((run_dir / "chunk-001.json").exists())
+        self.assertFalse((run_dir / "receipt.json").exists())
+        failure = json.loads((run_dir / "failure.json").read_text())
+        self.assertEqual(failure["failure_category"], "CANCELLED")
+        self.assertEqual(failure["head_sha"], self.head)
+
     def test_invalid_group_result_preserves_raw_stage_and_never_publishes_receipt(self):
         evidence = Path(self.temp.name) / "evidence"
         evidence.mkdir(mode=0o700)

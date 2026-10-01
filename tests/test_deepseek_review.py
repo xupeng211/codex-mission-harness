@@ -157,6 +157,28 @@ class DeepSeekReceiptTest(unittest.TestCase):
                     break
                 time.sleep(0.05)
             self.assertFalse(Path(f"/proc/{child_pid}").exists())
+
+    def test_invoke_reviewer_interrupt_terminates_process_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "child.pid"
+            program = "sleep 30 & echo $! > \"$1\"; wait"
+            original_sleep = review.time.sleep
+            calls = [0]
+            def interrupt_after_start(_seconds):
+                calls[0] += 1
+                if calls[0] == 1:
+                    return original_sleep(0.1)
+                raise KeyboardInterrupt()
+            with patch.object(review.time, "sleep", side_effect=interrupt_after_start):
+                with self.assertRaises(KeyboardInterrupt):
+                    review.invoke_reviewer(["/bin/sh", "-c", program, "sh", str(marker)],
+                                           "prompt", os.environ.copy(), 30)
+            child_pid = int(marker.read_text())
+            for _ in range(40):
+                if not Path(f"/proc/{child_pid}").exists():
+                    break
+                original_sleep(0.05)
+            self.assertFalse(Path(f"/proc/{child_pid}").exists())
     def test_chunk_and_aggregate_schemas_have_separate_disposition_contracts(self):
         self.assertNotIn("dispositions", review.CHUNK_SCHEMA["properties"])
         self.assertIn("dispositions", review.GROUP_SCHEMA["properties"])

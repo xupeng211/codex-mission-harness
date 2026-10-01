@@ -971,9 +971,10 @@ def invoke_reviewer(command, prompt_text, env, timeout):
             if (os.fstat(stdout_file.fileno()).st_size > MAX_REVIEW_OUTPUT_BYTES
                     or os.fstat(stderr_file.fileno()).st_size > MAX_REVIEW_OUTPUT_BYTES):
                 raise ValueError("reviewer output exceeds bound")
-        except (subprocess.TimeoutExpired, ValueError) as exc:
+        except (subprocess.TimeoutExpired, ValueError, KeyboardInterrupt) as exc:
             try:
-                os.killpg(process.pid, signal.SIGTERM)
+                os.killpg(process.pid, signal.SIGKILL if isinstance(exc, KeyboardInterrupt)
+                          else signal.SIGTERM)
             except ProcessLookupError:
                 pass
             try:
