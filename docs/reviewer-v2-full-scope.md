@@ -37,7 +37,10 @@ canonical JSON excluding the hash field; the saved JSON file has its own hash.
 Source is split into contiguous 32,000 byte chunks and groups of at most three
 chunks (96,000 bytes). The full source ceiling is 4,096,000 bytes, 128 chunks,
 and 64 groups. These are allocation bounds, not one enlarged model input. The
-legacy 256,000 byte API remains unchanged. Long files, hunks, lines and UTF-8
+bounded_diff compatibility API retains its 256,000 byte default. The separately
+bounded legacy run/validate entry points explicitly request a 4,096,000 byte
+ceiling and cap allocation at 128 chunks. Full-scope V2 runners use the manifest
+protocol, preserving the compatibility default. Long files, hunks, lines and UTF-8
 boundaries can span chunks; exact bytes are preserved, with base64 rendering
 where a fragment cannot decode. Separate location metadata supplies file/blob
 and enclosing hunk identities, including for fragments that begin inside a
