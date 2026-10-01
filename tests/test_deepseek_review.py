@@ -179,6 +179,58 @@ class DeepSeekReceiptTest(unittest.TestCase):
                     break
                 original_sleep(0.05)
             self.assertFalse(Path(f"/proc/{child_pid}").exists())
+
+    def test_legacy_oversized_scope_rejected_before_any_launcher_or_model_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args,_=run_fixture(Path(directory))
+            repo=Path(args.repo)
+            (repo/'tracked.txt').write_text('x' * (review.MAX_LEGACY_DIFF_BYTES+1))
+            subprocess.run(['git','-C',str(repo),'commit','-qam','oversized'],check=True)
+            args.head=subprocess.check_output(['git','-C',str(repo),'rev-parse','HEAD'],text=True).strip()
+            with patch.object(review,'resolve_claude_launcher') as launcher:
+                with self.assertRaisesRegex(ValueError,'bounded source size'):
+                    review.run(args)
+                launcher.assert_not_called()
+
+    def test_legacy_final_synthesis_receives_disputed_original_findings(self):
+        blocker={'severity':'P1','title':'cross-group risk','evidence':'original evidence'}
+        chunk={'index':0,'result':{'review_result':'FAIL','findings':[blocker]}}
+        disposition=disposition_for(blocker,decision='DISPUTED')
+        group={'index':0,'start':0,'end':1,'chunk_indexes':[0], 'sha256':'a'*64,
+               'output_sha256':'b'*64,'result':{'summary':'local dispute',
+               'review_result':'PASS','findings':[],'dispositions':[disposition]}}
+        prompt=review.aggregate_prompt(BASE,HEAD,'c'*64,'d'*64,'e'*64,[group],[],[],original_chunks=[chunk])
+        self.assertIn('original_chunk_findings',prompt)
+        self.assertIn('cross-group risk',prompt)
+        self.assertIn('original evidence',prompt)
+        self.assertIn('DISPUTED',prompt)
+        self.assertIn('Reevaluate every original disputed chunk finding',prompt)
+
+    def test_full_sha_is_checked_before_starting_diff_process(self):
+        with patch.object(review.subprocess,'Popen') as process:
+            with self.assertRaisesRegex(ValueError,'full SHA'):
+                review.bounded_diff(Path('/nonexistent'),'--output=/tmp/unwanted',HEAD)
+            process.assert_not_called()
+
+    def test_timeout_kills_descendant_even_if_leader_exits_on_term(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker=Path(directory)/'child.pid'
+            program=("import pathlib,subprocess,sys,time;"
+                     "child=subprocess.Popen([sys.executable,'-c',"
+                     "'import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(30)']);"
+                     "pathlib.Path(sys.argv[1]).write_text(str(child.pid));time.sleep(30)")
+            with self.assertRaises(subprocess.TimeoutExpired):
+                review.invoke_reviewer([sys.executable,'-c',program,str(marker)],'prompt',os.environ.copy(),1)
+            pid=int(marker.read_text())
+            for _ in range(40):
+                if not Path(f'/proc/{pid}').exists():break
+                time.sleep(0.05)
+            self.assertFalse(Path(f'/proc/{pid}').exists())
+
+    def test_v5_receipts_are_stale_after_resource_and_dispute_audit_policy(self):
+        with self.assertRaisesRegex(ValueError,'exact-head binding'):
+            review.validate(receipt(version='cmh-deepseek-review/v5'),BASE,HEAD)
+
     def test_chunk_and_aggregate_schemas_have_separate_disposition_contracts(self):
         self.assertNotIn("dispositions", review.CHUNK_SCHEMA["properties"])
         self.assertIn("dispositions", review.GROUP_SCHEMA["properties"])
@@ -453,7 +505,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
                        if key not in {"integrity_sha256", "auth_hmac_sha256"}}
             value["integrity_sha256"] = review.digest(review.canon(payload))
             value["auth_hmac_sha256"] = review.auth_digest(value, TEST_SECRET)
-            with patch.object(review, "git", return_value=source), \
+            with patch.object(review, "bounded_diff", return_value=source), \
                     self.assertRaisesRegex(ValueError, "chunk result does not match"):
                 review.validate(value, BASE, HEAD, root=repo,
                                 receipt_path=evidence / "receipt.json")
@@ -586,7 +638,8 @@ class DeepSeekReceiptTest(unittest.TestCase):
         self.assertIn('"chunk_index": 2', group_rendered)
         self.assertIn('"finding_sha256": "' + review.digest(review.canon(blocker)) + '"', group_rendered)
         self.assertIn("do not calculate, modify, omit, or duplicate these values", group_rendered)
-        group_result={"review_result":"FAIL","findings":[blocker],"summary":"A bounded group summary."}
+        group_result={"review_result":"FAIL","findings":[blocker],"summary":"A bounded group summary.",
+                      "dispositions":[disposition_for(blocker,chunk_index=2)]}
         groups=[{**group,"output_sha256":"0"*64,"result":group_result}]
         final_findings,final_required=review.indexed_chunk_findings(
             [{"index":0,"result":group_result}],source_index_field="group_index",
