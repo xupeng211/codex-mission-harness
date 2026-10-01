@@ -123,9 +123,9 @@ def digest(value): return hashlib.sha256(value).hexdigest()
 def open_private_directory(path, repo_root, *, create=True, secure=True):
     """Open an external owner-controlled directory without following links.
 
-    Evidence directories are tightened to 0700. Credential parent directories
-    are only checked for unsafe writes so reading an existing token never
-    changes its surrounding filesystem metadata.
+    Only the requested evidence target may be tightened to 0700 during creation.
+    Existing ancestors are checked for unsafe writes without changing their
+    metadata; validation and credential reads never chmod existing paths.
     """
     nofollow = getattr(os, "O_NOFOLLOW", None)
     directory_flag = getattr(os, "O_DIRECTORY", None)
@@ -208,12 +208,18 @@ def open_private_directory(path, repo_root, *, create=True, secure=True):
                 if uid is not None and info.st_uid != uid:
                     os.close(child_fd)
                     raise ValueError("private evidence directory is not owner-owned")
-                if secure:
+                if child_path != target and mode & 0o022:
+                    os.close(child_fd)
+                    raise ValueError("evidence ancestor is group- or world-writable")
+                if secure and child_path == target and mode != 0o700:
+                    if not create:
+                        os.close(child_fd)
+                        raise ValueError("evidence directory is not owner-only")
                     os.fchmod(child_fd, 0o700)
                     if stat.S_IMODE(os.fstat(child_fd).st_mode) != 0o700:
                         os.close(child_fd)
                         raise ValueError("private evidence directory could not be secured")
-                elif mode & 0o022:
+                elif not secure and mode & 0o022:
                     os.close(child_fd)
                     raise ValueError("credential directory is group- or world-writable")
             else:
