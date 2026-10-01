@@ -140,7 +140,8 @@ def validate_premerge_gate(*, root, base, head, plan, scope, repository, **kwarg
         raise ValueError('premerge exact scope mismatch')
     result = _validate_scope_evidence(root=root, base=base, head=head,
         target_main=verified_plan['actual_main_sha'], repository=repository, **kwargs)
-    validate_plan(root, plan, repository)
+    if validate_plan(root, plan, repository) != verified_plan:
+        raise ValueError("premerge plan changed during evidence validation")
     return {**result, 'status': 'SIMULATED_PREMERGE_PASS' if expected['simulated'] else 'PASS',
             'premerge_scope': scope, 'premerge_plan_sha256': verified_plan['plan_sha256'],
             'actual_main_sha': verified_plan['actual_main_sha'], 'simulated': expected['simulated'],

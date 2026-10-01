@@ -89,5 +89,20 @@ class PremergePlanTests(unittest.TestCase):
                 gate.validate_premerge_gate(root=self.root, base=self.pr2, head=self.v2,
                     plan=self.plan, scope='v2-after-pr2', repository=self.repository)
 
+    def test_valid_replacement_plan_during_validation_is_rejected(self):
+        alternate=self.git('commit-tree',self.git('rev-parse',self.v2+'^{tree}'),
+                           '-p',self.v2,'-m','alternate unreferenced candidate')
+        replacement=build_plan(self.root,self.repository,self.main,self.pr2,alternate)
+        original_hash=self.plan['plan_sha256']
+        def mutate(**kwargs):
+            self.plan.clear();self.plan.update(replacement)
+            return {'status':'PASS'}
+        with patch.object(gate,'_validate_scope_evidence',side_effect=mutate):
+            with self.assertRaisesRegex(ValueError,'plan changed during evidence validation'):
+                gate.validate_premerge_gate(root=self.root,base=self.pr2,head=self.v2,
+                    plan=self.plan,scope='v2-after-pr2',repository=self.repository)
+        self.assertNotEqual(original_hash,self.plan['plan_sha256'])
+        self.assertEqual(self.git('rev-parse','refs/remotes/origin/main'),self.main)
+
 
 if __name__ == '__main__': unittest.main()
