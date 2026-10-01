@@ -3231,6 +3231,26 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         self.assertEqual(result.status, "BLOCKED_EXTERNAL")
         self.assertEqual(victim.read_text(encoding="utf-8"), "untouched review body\n")
 
+    def test_preflight_rejects_hardlinked_body_without_chmod_or_truncation(self):
+        root=Path(self.tmp.name)
+        body_directory=self.worktree.parent/'.cmh-gate-evidence'/'safe-demo'/('a'*40)
+        body_directory.mkdir(parents=True,mode=0o700)
+        victim=root/'unrelated.txt';victim.write_text('untouched data\n');victim.chmod(0o640)
+        os.link(victim,body_directory/'pr-body.md')
+        result=self._prepare_agent_preflight(FootballPredictionAdapter(),self.worktree)
+        self.assertEqual(result.status,'BLOCKED_EXTERNAL')
+        self.assertEqual(victim.read_text(),'untouched data\n')
+        self.assertEqual(victim.stat().st_mode & 0o777,0o640)
+
+    def test_private_writer_rejects_hardlink_before_mutating_inode(self):
+        root=Path(self.tmp.name)
+        victim=root/'unrelated.txt';victim.write_text('untouched data\n');victim.chmod(0o640)
+        alias=root/'linked-evidence';os.link(victim,alias)
+        with self.assertRaisesRegex(RuntimeError,'single-link'):
+            FootballPredictionAdapter._write_private_file(alias,'replacement')
+        self.assertEqual(victim.read_text(),'untouched data\n')
+        self.assertEqual(victim.stat().st_mode & 0o777,0o640)
+
     def test_pr_discovery_without_open_pr_is_retryable(self):
         adapter = FootballPredictionAdapter()
         with patch.object(adapter, "_run", side_effect=[

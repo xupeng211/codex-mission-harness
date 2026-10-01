@@ -265,9 +265,9 @@ class FootballPredictionAdapter:
                 flags |= os.O_EXCL
             fd = os.open(path, flags, 0o600)
             info = os.fstat(fd)
-            if (not stat.S_ISREG(info.st_mode)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
                     or (hasattr(os, "getuid") and info.st_uid != os.getuid())):
-                raise RuntimeError("evidence file is not a regular current-user-owned file")
+                raise RuntimeError("evidence file is not a single-link regular current-user-owned file")
             os.fchmod(fd, 0o600)
             if not exclusive:
                 os.ftruncate(fd, 0)
