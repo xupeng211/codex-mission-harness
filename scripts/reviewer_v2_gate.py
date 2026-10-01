@@ -12,12 +12,13 @@ import json
 import re
 import subprocess
 import deepseek_review as secure
+from harness import full_diff_manifest as full
 from pathlib import Path
 from typing import Callable
 
 
 def _diff(root: Path, base: str, head: str) -> bytes:
-    return secure.bounded_diff(root, base, head)
+    return full.read_diff(root, base, head)
 
 
 def _source_stable(root: Path, base: str, head: str, diff_hash: str) -> bool:
@@ -36,6 +37,7 @@ def validate_gate(
     *, root: Path, base: str, head: str, deepseek_receipt: dict,
     openai_receipt: dict, deepseek_validator: Callable[[dict], dict],
     openai_validator: Callable[[dict], dict], mission_id: str, repository: str,
+    qualification_validators: dict[str, Callable[[], dict]],
 ) -> dict:
     """Return an evidence digest only when both independently validated lanes pass.
 
@@ -46,17 +48,49 @@ def validate_gate(
     if not all(re.fullmatch(r"[0-9a-f]{40}", value or "") for value in (base, head)):
         raise ValueError("full exact Git SHAs are required")
     root = Path(root).resolve(strict=True)
+    target_main = full.git(root, 'rev-parse', 'refs/remotes/origin/main').decode().strip()
+    if base != target_main or full.git(root, 'merge-base', base, head).decode().strip() != base:
+        raise ValueError('final gate requires the complete current target main scope')
     diff_hash = hashlib.sha256(_diff(root, base, head)).hexdigest()
     if not mission_id or not repository or not _source_stable(root, base, head, diff_hash):
         raise ValueError("review source or mission identity is unstable")
     if not deepseek_receipt or not openai_receipt:
         raise ValueError("both lane receipts are required")
+    _, manifest = full.build_manifest(root, base, head, repository)
+    full.validate_manifest(root, manifest, repository, base, head, review_ready=True)
     lanes = []
     for expected_provider, raw, validator in (
         ("deepseek", deepseek_receipt, deepseek_validator),
         ("openai", openai_receipt, openai_validator),
     ):
+        role = 'independent_reviewer' if expected_provider == 'deepseek' else 'final_reviewer'
+        qualified = qualification_validators[expected_provider]()
+        if (qualified.get('role') != role or qualified.get('mode') != 'real_provider'
+                or qualified.get('identity', {}).get('provider') != expected_provider):
+            raise ValueError('invalid qualification role/provider')
         verified = validator(raw)
+        execution = verified.get('execution_identity', {})
+        unsigned_execution = dict(execution)
+        execution_hash = unsigned_execution.pop('execution_sha256', None)
+        if execution_hash != full.sha256(full.canonical(unsigned_execution)):
+            raise ValueError('execution identity integrity mismatch')
+        if (verified.get('full_manifest') != manifest
+                or execution.get('manifest_sha256') != manifest['manifest_sha256']
+                or execution.get('qualification_receipt_identity') != full.sha256(full.canonical(qualified))
+                or execution.get('role') != role or execution.get('provider') != expected_provider
+                or execution.get('model_configuration') != qualified.get('identity')
+                or execution.get('model') != verified.get('model')
+                or execution.get('manifest_implementation_sha256') != full.sha256(Path(full.__file__).read_bytes())
+                or any(execution.get(key) != verified.get(key) for key in
+                       ('repository', 'mission_id', 'base_sha', 'head_sha', 'diff_sha256',
+                        'runner_sha256', 'registry_sha256'))):
+            raise ValueError('qualification/full scope identity chain mismatch')
+        full.validate_coverage(_diff(root, base, head), manifest, verified.get('chunks', []))
+        full.validate_tasks(_diff(root, base, head), manifest, verified.get('task_assignments'))
+        if (len(verified.get('groups', [])) != len(manifest['groups'])
+                or any({k: a.get(k) for k in e} != e
+                       for a, e in zip(verified['groups'], manifest['groups']))):
+            raise ValueError('required group coverage mismatch')
         if verified != raw:
             raise ValueError("review validator did not return the exact receipt")
         if (verified.get("provider") != expected_provider
@@ -81,10 +115,11 @@ def validate_gate(
                       "reasoning_effort": verified.get("reasoning_effort"),
                       "receipt_sha256": hashlib.sha256(json.dumps(raw, sort_keys=True,
                            separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()})
-    if not _source_stable(root, base, head, diff_hash):
+    if (not _source_stable(root, base, head, diff_hash)
+            or full.git(root, "rev-parse", "refs/remotes/origin/main").decode().strip() != base):
         raise ValueError("review source changed during validation")
     return {"status": "PASS", "base_sha": base, "head_sha": head,
-            "diff_sha256": diff_hash, "lanes": lanes}
+            "diff_sha256": diff_hash, "manifest_sha256": manifest["manifest_sha256"], "lanes": lanes}
 
 
 def main() -> int:
@@ -148,6 +183,11 @@ def main() -> int:
         repository = secure.repository_identity(
             secure.git(root, "config", "--get", "remote.origin.url").decode().strip())
         proof = validate_gate(
+            qualification_validators={
+                'deepseek': lambda: validate_qualification_receipt(Path(args.deepseek_qualification), independent,
+                    auth_key=deepseek_auth_key, role='independent_reviewer', registry_path=args.registry),
+                'openai': lambda: validate_qualification_receipt(Path(args.openai_qualification), final,
+                    auth_key=openai_key, role='final_reviewer', registry_path=args.registry)},
             root=root, base=base, head=head, deepseek_receipt=receipts[0],
             openai_receipt=receipts[1], mission_id=args.mission_id, repository=repository,
             deepseek_validator=lambda value: deepseek.validate(

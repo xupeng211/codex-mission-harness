@@ -32,6 +32,7 @@ from harness.model_qualification import validate_qualification_receipt  # noqa: 
 from harness.openai_invocation import InvocationFailure, invoke_openai  # noqa: E402
 import harness.openai_invocation as invocation_module  # noqa: E402
 from harness.reviewer_v2_contract import bind_findings, validate_source_binding  # noqa: E402
+from harness import full_diff_manifest as full
 from harness.review_resume import ReviewRun  # noqa: E402
 
 VERSION = "cmh-reviewer-v2-openai/v2"
@@ -98,25 +99,7 @@ def _result(raw: bytes, *, group: bool = False) -> dict:
 
 
 def _plan(diff: bytes) -> tuple[list[dict], list[dict]]:
-    if not diff:
-        raise ValueError("empty diff is not reviewable")
-    if len(diff) > secure.MAX_V2_DIFF_BYTES:
-        raise ValueError("review diff exceeds bounded source size")
-    chunks = []
-    for start in range(0, len(diff), CHUNK_BYTES):
-        end = min(start + CHUNK_BYTES, len(diff))
-        chunks.append({"index": len(chunks), "start": start, "end": end,
-                       "sha256": _sha(diff[start:end])})
-    groups = []
-    for start in range(0, len(chunks), GROUP_BYTES // CHUNK_BYTES):
-        selected = chunks[start:start + GROUP_BYTES // CHUNK_BYTES]
-        first, last = selected[0], selected[-1]
-        groups.append({"index": len(groups), "start": first["start"], "end": last["end"],
-                       "chunk_indexes": [item["index"] for item in selected],
-                       "sha256": _sha(diff[first["start"]:last["end"]])})
-    if len(chunks) > 8 or len(groups) > 3:
-        raise ValueError("review workload exceeds bounded stage count")
-    return chunks, groups
+    return full.plan(diff)
 
 
 def _schema(group: bool, synthesis: bool = False) -> dict:
@@ -160,7 +143,7 @@ def _synthesis_result(raw: bytes) -> dict:
 
 
 def _synthesis_prompt(summaries: list[str], base: str, head: str) -> str:
-    return ("FINAL CROSS-GROUP REVIEW. Independently inspect interactions between these "
+    return full.bounded_prompt("FINAL CROSS-GROUP REVIEW. Independently inspect interactions between these "
             "bounded source-review summaries. Report any additional cross-group problems. "
             "Existing group blockers are mechanically retained and cannot be removed here. "
             "Return JSON with findings and a concrete summary. "
@@ -205,7 +188,7 @@ def _prompt(kind: str, *, base: str, head: str, diff: bytes, ids: list[dict] | N
         source = "\nEXACT DIFF TEXT (UTF-8):\n" + diff.decode("utf-8")
     except UnicodeDecodeError:
         source = "\nEXACT DIFF BYTES (base64):\n" + base64.b64encode(diff).decode()
-    return introduction + source
+    return full.bounded_prompt(introduction + source)
 
 
 def _decide(blockers: list[dict], result: dict, source: bytes) -> list[dict]:
@@ -223,12 +206,32 @@ def _decide(blockers: list[dict], result: dict, source: bytes) -> list[dict]:
             if item["decision"] == "UPHELD"]
 
 
-def _assemble(diff: bytes, base: str, head: str, call, persist=None, stage_run=None) -> tuple[dict, list[tuple[str, bytes]]]:
+def synthesis_level(groups, chunks):
+    level = []
+    for group in groups:
+        upheld = {d['finding_id'] for d in group['result']['decisions'] if d['decision'] == 'UPHELD'}
+        retained = [f for f in group['source_blockers'] if f['finding_id'] in upheld]
+        retained += bind_findings(group['result']['findings'], 'G', group['index'])
+        retained += [f for i in group['chunk_indexes'] for f in bind_findings(
+            chunks[i]['result']['findings'], 'C', i) if f['severity'] == 'P3']
+        level.append({'summary': group['result']['summary'], 'source_groups': [group['index']],
+                      'source_findings': retained})
+    if len({f['finding_id'] for item in level for f in item['source_findings']}) != sum(
+            len(item['source_findings']) for item in level):
+        raise ValueError('duplicate cross-group finding identity')
+    return level
+
+
+def _assemble(diff: bytes, base: str, head: str, call, persist=None, stage_run=None, manifest=None) -> tuple[dict, list[tuple[str, bytes]]]:
     chunks, groups = _plan(diff)
     artifacts = []
     for item in chunks:
         source = diff[item["start"]:item["end"]]
         prompt = _prompt("CHUNK REVIEW", base=base, head=head, diff=source)
+        if manifest is not None:
+            prompt = full.bounded_prompt('Manifest=' + manifest['manifest_sha256'] +
+                '\nLocation metadata (not canonical coverage):' + full.chunk_context(
+                    manifest, item['start'], item['end']) + '\n' + prompt)
         name = f"chunk-{item['index']:03d}"
         if stage_run is None:
             raw = call(prompt, False)
@@ -252,6 +255,10 @@ def _assemble(diff: bytes, base: str, head: str, call, persist=None, stage_run=N
                 if record["finding"]["severity"] in BLOCKING)
         source = diff[group["start"]:group["end"]]
         prompt = _prompt("GROUP REVIEW", base=base, head=head, diff=source, ids=blockers)
+        if manifest is not None:
+            prompt = full.bounded_prompt('Manifest=' + manifest['manifest_sha256'] +
+                '\nLocation metadata (not canonical coverage):' + full.chunk_context(
+                    manifest, group['start'], group['end']) + '\n' + prompt)
         name = f"group-{group['index']:03d}"
         def validate_group(raw):
             parsed = _result(raw, group=True)
@@ -277,13 +284,12 @@ def _assemble(diff: bytes, base: str, head: str, call, persist=None, stage_run=N
     # Each pass consumes at most eight bounded summaries. A higher level
     # receives bounded outputs from the previous pass, never an unbounded diff.
     if len(groups) > 1:
-        level = [{"summary": item["result"]["summary"], "source_groups": [item["index"]]}
-                 for item in groups]
+        level = synthesis_level(groups, chunks)
         while len(level) > 1:
             next_level = []
             for offset in range(0, len(level), 8):
                 batch = level[offset:offset + 8]
-                prompt = _synthesis_prompt([item["summary"] for item in batch], base, head)
+                prompt = _synthesis_prompt(batch, base, head)
                 name = f"synthesis-{len(synthesis):03d}"
                 if stage_run is None:
                     raw = call(prompt, "synthesis")
@@ -295,12 +301,14 @@ def _assemble(diff: bytes, base: str, head: str, call, persist=None, stage_run=N
                                             lambda: call(prompt, "synthesis"), _synthesis_result)
                 source_groups = [index for item in batch for index in item["source_groups"]]
                 record = {"index": len(synthesis), "source_groups": source_groups,
-                          "input_summaries_sha256": _sha(_canon([item["summary"] for item in batch])),
+                          "input_summaries_sha256": _sha(_canon(batch)),
                           "output_sha256": _sha(raw), "result": result}
                 synthesis.append(record)
                 artifacts.append((f"synthesis-{record['index']:03d}.json", raw))
                 final_findings.extend(result["findings"])
-                next_level.append({"summary": result["summary"], "source_groups": source_groups})
+                next_level.append({"summary": result["summary"], "source_groups": source_groups,
+                                   "source_findings": [f for item in batch for f in item['source_findings']] +
+                                       bind_findings(result['findings'], 'F', record['index'])})
             level = next_level
     receipt = {"version": VERSION, "provider": "openai", "base_sha": base, "head_sha": head,
                "diff_sha256": _sha(diff), "chunks": chunks, "groups": groups,
@@ -308,6 +316,13 @@ def _assemble(diff: bytes, base: str, head: str, call, persist=None, stage_run=N
                "findings": final_findings,
                "review_result": "FAIL" if any(f["severity"] in BLOCKING for f in final_findings) else "PASS"}
     return receipt, artifacts
+
+
+def expected_execution(receipt, manifest, qualification_hash, spec):
+    return full.execution_identity(manifest, receipt['mission_id'], qualification_hash,
+        role='final_reviewer', provider=spec.provider, model=spec.model, configuration=spec.identity(),
+        registry_hash=receipt['registry_sha256'], runner_hash=receipt['runner_sha256'],
+        invocation_hash=receipt['invocation_sha256'], schema_hash=receipt['schema_manifest_sha256'])
 
 
 def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec,
@@ -336,9 +351,17 @@ def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec
     expected_hmac = hmac.new(auth_key.encode(), _canon(unsigned), hashlib.sha256).hexdigest()
     if not isinstance(observed_hmac, str) or not hmac.compare_digest(observed_hmac, expected_hmac):
         raise ValueError("OpenAI receipt authentication mismatch")
-    diff = secure.bounded_diff(Path(root).resolve(), base, head)
+    diff = full.read_diff(Path(root).resolve(), base, head)
     if receipt["diff_sha256"] != _sha(diff):
         raise ValueError("OpenAI receipt diff mismatch")
+    _, manifest = full.build_manifest(root, base, head, repository)
+    full.validate_manifest(root, receipt.get('full_manifest'), repository, base, head, review_ready=True)
+    full.validate_tasks(diff, manifest, receipt.get('task_assignments'))
+    execution = receipt.get('execution_identity', {})
+    qualification_hash = execution.get('qualification_receipt_identity')
+    if not isinstance(qualification_hash, str) or not re.fullmatch('[0-9a-f]{64}', qualification_hash):
+        raise ValueError('qualification binding missing')
+    full.validate_execution(execution, expected_execution(receipt, manifest, qualification_hash, spec))
     expected_chunks, expected_groups = _plan(diff)
     if len(receipt.get("chunks", [])) != len(expected_chunks) or len(receipt.get("groups", [])) != len(expected_groups):
         raise ValueError("OpenAI review coverage mismatch")
@@ -382,8 +405,7 @@ def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec
     if len(receipt["groups"]) <= 1 and synthesis:
         raise ValueError("unexpected cross-group synthesis")
     if len(receipt["groups"]) > 1:
-        level = [{"summary": item["result"]["summary"], "source_groups": [item["index"]]}
-                 for item in receipt["groups"]]
+        level = synthesis_level(receipt["groups"], receipt["chunks"])
         consumed = 0
         while len(level) > 1:
             next_level = []
@@ -395,11 +417,13 @@ def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec
                 source_groups = [index for item in batch for index in item["source_groups"]]
                 if (record.get("index") != consumed
                         or record.get("source_groups") != source_groups
-                        or record.get("input_summaries_sha256") != _sha(_canon([item["summary"] for item in batch]))):
+                        or record.get("input_summaries_sha256") != _sha(_canon(batch))):
                     raise ValueError("cross-group source binding mismatch")
                 result = _synthesis_result(_canon(record.get("result")))
                 findings.extend(result["findings"])
-                next_level.append({"summary": result["summary"], "source_groups": source_groups})
+                next_level.append({"summary": result["summary"], "source_groups": source_groups,
+                                   "source_findings": [f for item in batch for f in item['source_findings']] +
+                                       bind_findings(result['findings'], 'F', record['index'])})
                 consumed += 1
             level = next_level
         if consumed != len(synthesis):
@@ -433,7 +457,7 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
         raise ValueError("checkout HEAD differs from reviewed HEAD")
     if secure.git(root, "status", "--porcelain"):
         raise ValueError("review checkout has uncommitted changes")
-    diff = secure.bounded_diff(root, base, head)
+    diff = full.read_diff(root, base, head)
     repository = secure.repository_identity(
         secure.git(root, "config", "--get", "remote.origin.url").decode().strip())
     registry = load_registry(registry_path)
@@ -445,8 +469,9 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
     chunks, groups = _plan(diff)
     stage_plan = [(f"chunk-{i:03d}", "chunk") for i in range(len(chunks))] + [
         (f"group-{i:03d}", "group") for i in range(len(groups))]
-    if len(groups) > 1:
-        stage_plan.append(("synthesis-000", "cross-group"))
+    stage_plan.extend(full.synthesis_stage_names(len(groups)))
+    _, manifest = full.build_manifest(root, base, head, repository)
+    full.validate_manifest(root, manifest, repository, base, head, review_ready=True)
     qualification_identity = (_sha(Path(qualification_path).read_bytes())
                               if qualification_path and Path(qualification_path).exists()
                               else _sha(str(qualification_path).encode()))
@@ -458,7 +483,11 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
                 "invocation_hash": _sha(Path(invocation_module.__file__).read_bytes()),
                 "schema_manifest_hash": _schema_manifest_sha(),
                 "qualification_receipt_identity": qualification_identity,
-                "input_manifest_identity": _sha(_canon({"chunks": chunks, "groups": groups}))}
+                "input_manifest_identity": _sha(_canon({"chunks": chunks, "groups": groups})),
+                "full_manifest_sha256": manifest["manifest_sha256"],
+                "chunking_policy": full.CHUNKING,
+                "manifest_implementation_sha256": _sha(Path(full.__file__).read_bytes())}
+    identity["review_execution_identity"] = _sha(_canon(identity))
     run_state = ReviewRun(evidence, root, identity, stage_plan, secure,
                           prefix="openai-v2-")
     run_id, child_fd = run_state.state["review_run_id"], run_state.fd
@@ -476,7 +505,7 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
     try:
         if qualification_path is None:
             raise ValueError("live OpenAI review requires a final reviewer qualification receipt")
-        validate_qualification_receipt(qualification_path, spec, auth_key=auth_key,
+        qualified = validate_qualification_receipt(qualification_path, spec, auth_key=auth_key,
                                        role="final_reviewer", registry_path=registry_path)
         # Authenticate first, then exercise the same Codex structured
         # invocation path and chunk schema used by the review lane.
@@ -485,13 +514,16 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
             'Return JSON with an empty findings array. Use the exact chunk schema.',
             spec, stage="chunk", timeout=min(timeout, 120),
         )
-        receipt, _ = _assemble(diff, base, head, call, stage_run=stage_run)
+        receipt, _ = _assemble(diff, base, head, call, stage_run=stage_run, manifest=manifest)
         receipt.update({"model": spec.model, "reasoning_effort": spec.reasoning_effort,
                         "mission_id": mission_id, "repository": repository,
                         "registry_sha256": _sha(registry.path.read_bytes()),
                         "runner_sha256": _sha(Path(__file__).read_bytes()),
                         "invocation_sha256": _sha(Path(invocation_module.__file__).read_bytes()),
                         "schema_manifest_sha256": _schema_manifest_sha()})
+        receipt['task_assignments'] = full.review_tasks(diff, manifest)
+        receipt['full_manifest'] = manifest
+        receipt['execution_identity'] = expected_execution(receipt, manifest, _sha(_canon(qualified)), spec)
         receipt["auth_hmac_sha256"] = hmac.new(auth_key.encode(), _canon(receipt), hashlib.sha256).hexdigest()
         validate(receipt, root=root, base=base, head=head, spec=spec, auth_key=auth_key,
                  mission_id=mission_id, registry_path=registry_path)

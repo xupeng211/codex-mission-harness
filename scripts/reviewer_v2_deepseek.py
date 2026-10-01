@@ -28,6 +28,7 @@ from harness.reviewer_v2_contract import (  # noqa: E402
 )
 from harness.model_registry import load_registry  # noqa: E402
 from harness.model_qualification import validate_qualification_receipt  # noqa: E402
+from harness import full_diff_manifest as full
 from harness.review_resume import ReviewRun  # noqa: E402
 from harness.review_failure_diagnostics import (  # noqa: E402
     classify_nonzero, cli_wrapper_summary, command_identity, environment_identity, stream_metadata,
@@ -137,7 +138,7 @@ def _render_source(source: bytes) -> str:
 
 
 def _bounded(prompt: str) -> str:
-    if len(prompt.encode()) > legacy.MAX_REVIEW_PROMPT_BYTES:
+    if len(prompt.encode()) > full.MAX_PROMPT_BYTES:
         raise ValueError("review prompt exceeds bounded size")
     return prompt
 
@@ -235,11 +236,10 @@ def run(args: argparse.Namespace) -> dict:
         raise ValueError("review worktree is dirty")
     repository = legacy.repository_identity(
         legacy.git(root, "config", "--get", "remote.origin.url").decode().strip())
-    diff = legacy.bounded_diff(root, base, head)
-    chunks = legacy.chunks(diff)
-    groups = legacy.aggregate_groups(diff, chunks)
-    if len(chunks) > 8 or len(groups) > 3:
-        raise ValueError("review workload exceeds bounded stage count")
+    diff = full.read_diff(root, base, head)
+    chunks, groups = full.plan(diff)
+    _, manifest = full.build_manifest(root, base, head, repository)
+    full.validate_manifest(root, manifest, repository, base, head, review_ready=True)
     diff_hash = sha256(diff)
     registry_path = getattr(args, "registry", None)
     registry = load_registry(registry_path)
@@ -266,7 +266,7 @@ def run(args: argparse.Namespace) -> dict:
         qualification = getattr(args, "qualification", None)
         if not qualification:
             raise ValueError("live DeepSeek review requires an independent reviewer qualification receipt")
-        validate_qualification_receipt(qualification, model, auth_key=token,
+        qualified = validate_qualification_receipt(qualification, model, auth_key=token,
                                        role="independent_reviewer", registry_path=registry_path)
         identity = {"provider": model.provider, "role": "independent_reviewer",
                     "model": model.model, "model_configuration": model.identity(),
@@ -279,7 +279,11 @@ def run(args: argparse.Namespace) -> dict:
                                                              "synthesis": SYNTHESIS_SCHEMA})),
                     "qualification_receipt_identity": sha256(Path(qualification).read_bytes())
                     if Path(qualification).exists() else sha256(str(qualification).encode()),
-                    "input_manifest_identity": sha256(canonical({"chunks": chunks, "groups": groups}))}
+                    "input_manifest_identity": sha256(canonical({"chunks": chunks, "groups": groups})),
+                    "full_manifest_sha256": manifest["manifest_sha256"],
+                    "chunking_policy": full.CHUNKING,
+                "manifest_implementation_sha256": sha256(Path(full.__file__).read_bytes())}
+        identity["review_execution_identity"] = sha256(canonical(identity))
         stages = [(f"chunk-{i:03d}", "chunk") for i in range(len(chunks))] + [
             (f"group-{i:03d}", "group") for i in range(len(groups))] + [("aggregate", "cross-group")]
         run = ReviewRun(Path(args.evidence), root, identity, stages, legacy, prefix="deepseek-v2-")
@@ -301,6 +305,8 @@ def run(args: argparse.Namespace) -> dict:
         for chunk in chunks:
             source = diff[chunk["start"]:chunk["end"]]
             prompt = (_prompt_head(base, head, diff_hash, f"chunk {chunk['index']}")
+                      + "Manifest=" + manifest["manifest_sha256"] + "\nLocation metadata (not canonical coverage):"
+                      + full.chunk_context(manifest, chunk["start"], chunk["end"]) + "\n"
                       + _render_source(source))
             name = f"chunk-{chunk['index']:03d}"
             raw_bytes, findings = run.stage(name, "chunk", prompt.encode(),
@@ -317,6 +323,8 @@ def run(args: argparse.Namespace) -> dict:
             required = [item for item in expected if item["severity"] in {"P0", "P1", "P2"}]
             source = diff[group["start"]:group["end"]]
             prompt = (_prompt_head(base, head, diff_hash, f"group {group['index']}")
+                      + "Manifest=" + manifest["manifest_sha256"] + "\nLocation metadata (not canonical coverage):"
+                      + full.chunk_context(manifest, group["start"], group["end"]) + "\n"
                       + "Review exact source and cross-chunk interactions. Every supplied "
                       "P0/P1/P2 finding needs exactly one decision keyed by finding_id. "
                       "Output decisions for RequiredFindingIds only; never decide P3 findings. "
@@ -381,9 +389,12 @@ def run(args: argparse.Namespace) -> dict:
                    "reasoning_effort": model.reasoning_effort, "chunks": chunks, "groups": groups,
                    "aggregate_result": result, "aggregate_output_sha256": output_hash,
                    "review_result": result["review_result"], "findings": result["findings"],
-                   "command_sha256": sha256(canonical({"chunk": chunk_command,
-                                                      "synthesis": synthesis_command})),
+                   "command_sha256": sha256(canonical({"chunk": command_identity(chunk_command),
+                                                      "synthesis": command_identity(synthesis_command)})),
                    "completed_at": run.state["created_at"] // 1_000_000_000}
+        receipt['task_assignments'] = full.review_tasks(diff, manifest)
+        receipt['full_manifest'] = manifest
+        receipt['execution_identity'] = expected_execution(receipt, manifest, sha256(canonical(qualified)), model)
         receipt["integrity_sha256"] = sha256(canonical(receipt))
         receipt["auth_hmac_sha256"] = _receipt_hmac(receipt, token)
         path = evidence / f"deepseek-v2-receipt-{head[:12]}-{run_id}.json"
@@ -467,6 +478,14 @@ def run(args: argparse.Namespace) -> dict:
             run.close()
 
 
+def expected_execution(receipt, manifest, qualification_hash, spec):
+    return full.execution_identity(manifest, receipt['mission_id'], qualification_hash,
+        role='independent_reviewer', provider=spec.provider, model=spec.model, configuration=spec.identity(),
+        registry_hash=receipt['registry_sha256'], runner_hash=receipt['runner_sha256'],
+        invocation_hash=sha256(Path(legacy.__file__).read_bytes()),
+        schema_hash=sha256(canonical({'chunk': CHUNK_SCHEMA, 'synthesis': SYNTHESIS_SCHEMA})))
+
+
 def validate(receipt: dict, base: str, head: str, root: Path | None = None,
              receipt_path: Path | None = None, mission_id: str | None = None,
              repository: str | None = None, secret: str | None = None,
@@ -475,7 +494,7 @@ def validate(receipt: dict, base: str, head: str, root: Path | None = None,
                 "registry_sha256", "runner_sha256",
                 "provider", "model", "reasoning_effort", "chunks", "groups", "aggregate_result",
                 "aggregate_output_sha256", "review_result", "findings", "command_sha256",
-                "completed_at", "integrity_sha256", "auth_hmac_sha256"}
+                "completed_at", "integrity_sha256", "auth_hmac_sha256", "full_manifest", "execution_identity", "task_assignments"}
     if not isinstance(receipt, dict) or set(receipt) != required:
         raise ValueError("invalid V2 receipt shape")
     if (receipt["version"] != VERSION or receipt["base_sha"] != base
@@ -502,10 +521,18 @@ def validate(receipt: dict, base: str, head: str, root: Path | None = None,
         raise ValueError("receipt authentication mismatch")
     if root is None:
         raise ValueError("exact source required for validation")
-    diff = legacy.bounded_diff(root, base, head)
+    diff = full.read_diff(root, base, head)
     if sha256(diff) != receipt["diff_sha256"]:
         raise ValueError("receipt diff mismatch")
-    expected_chunks = legacy.chunks(diff)
+    _, manifest = full.build_manifest(root, base, head, receipt['repository'])
+    full.validate_manifest(root, receipt['full_manifest'], receipt['repository'], base, head, review_ready=True)
+    full.validate_tasks(diff, manifest, receipt['task_assignments'])
+    execution = receipt['execution_identity']
+    qualification_hash = execution.get('qualification_receipt_identity')
+    if not isinstance(qualification_hash, str) or not re.fullmatch('[0-9a-f]{64}', qualification_hash):
+        raise ValueError('qualification binding missing')
+    full.validate_execution(execution, expected_execution(receipt, manifest, qualification_hash, spec))
+    expected_chunks, expected_groups = full.plan(diff)
     chunks = receipt["chunks"]
     if len(chunks) != len(expected_chunks):
         raise ValueError("chunk coverage mismatch")
@@ -516,7 +543,6 @@ def validate(receipt: dict, base: str, head: str, root: Path | None = None,
                                  "C", descriptor["index"])
         if expected != chunk["bound_findings"]:
             raise ValueError("chunk finding binding mismatch")
-    expected_groups = legacy.aggregate_groups(diff, expected_chunks)
     groups = receipt["groups"]
     if len(groups) != len(expected_groups):
         raise ValueError("group coverage mismatch")

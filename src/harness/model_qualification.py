@@ -22,7 +22,7 @@ from .model_registry import ModelSpec
 from .openai_invocation import invoke_openai, InvocationFailure, InvocationResult
 from .reviewer_v2_contract import bind_findings, parse_synthesis
 
-QUALIFICATION_VERSION = "cmh-model-qualification/v4"
+QUALIFICATION_VERSION = "cmh-model-qualification/v5"
 
 
 @dataclass(frozen=True)
@@ -222,7 +222,7 @@ def qualification_receipt(result: QualificationResult, *, auth_key: str,
                           role: str, registry_path: str | Path | None = None) -> dict:
     """Build an integrity-bound record without storing model responses."""
     from .model_registry import load_registry
-    from . import reviewer_v2_contract, openai_invocation, model_registry, codex
+    from . import reviewer_v2_contract, openai_invocation, model_registry, codex, full_diff_manifest
 
     if not result.passed or not isinstance(auth_key, str) or not auth_key:
         raise ValueError("only a complete real-provider qualification can produce a receipt")
@@ -231,6 +231,9 @@ def qualification_receipt(result: QualificationResult, *, auth_key: str,
     if result.identity != registry.role(role).identity():
         raise ValueError("qualification identity is absent from selected registry")
     cli = code.parents[2] / "scripts" / "model_qualification.py"
+    review_runner = code.parents[2] / 'scripts' / (
+        'reviewer_v2_deepseek.py' if role == 'independent_reviewer' else
+        'reviewer_v2_openai.py' if role == 'final_reviewer' else 'model_qualification.py')
     receipt = {"version": QUALIFICATION_VERSION, "role": role,
                "mode": result.mode, "identity": result.identity,
                "cases_passed": list(result.cases_passed),
@@ -243,7 +246,13 @@ def qualification_receipt(result: QualificationResult, *, auth_key: str,
                "builder_runtime_sha256": hashlib.sha256(Path(codex.__file__).read_bytes()).hexdigest(),
                "qualification_schema_sha256": hashlib.sha256(json.dumps(
                    _SCHEMA, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
-               "registry_code_sha256": hashlib.sha256(Path(model_registry.__file__).read_bytes()).hexdigest()}
+               "registry_code_sha256": hashlib.sha256(Path(model_registry.__file__).read_bytes()).hexdigest(),
+               "review_runner_sha256": hashlib.sha256(review_runner.read_bytes()).hexdigest(),
+               "full_scope_contract_sha256": hashlib.sha256(Path(full_diff_manifest.__file__).read_bytes()).hexdigest(),
+               "case_manifest_sha256": hashlib.sha256(json.dumps([
+                   {'name': c.name, 'source': c.source, 'findings': c.findings, 'expected': c.expected}
+                   for c in CASES], sort_keys=True, separators=(',', ':')).encode()).hexdigest(),
+               "authentication_identity": hmac.new(auth_key.encode(), b'cmh-qualification-auth/v1', hashlib.sha256).hexdigest()}
     receipt["integrity_sha256"] = hmac.new(auth_key.encode(),
         json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode(), hashlib.sha256).hexdigest()
     return receipt
@@ -253,7 +262,7 @@ def validate_qualification_receipt(path: str | Path, spec: ModelSpec, *, auth_ke
                                    role: str, registry_path: str | Path | None = None) -> dict:
     """Reject stale, incomplete, altered, or different-model qualification."""
     from .model_registry import load_registry
-    from . import reviewer_v2_contract, openai_invocation, model_registry, codex
+    from . import reviewer_v2_contract, openai_invocation, model_registry, codex, full_diff_manifest
 
     receipt_path = Path(path)
     if not receipt_path.is_absolute():
@@ -273,7 +282,7 @@ def validate_qualification_receipt(path: str | Path, spec: ModelSpec, *, auth_ke
     expected_keys = {"version", "role", "mode", "identity", "cases_passed", "response_sha256",
                      "registry_sha256", "contract_sha256", "runner_sha256", "cli_runner_sha256",
                      "invocation_sha256", "builder_runtime_sha256",
-                     "qualification_schema_sha256", "registry_code_sha256", "integrity_sha256"}
+                     "qualification_schema_sha256", "registry_code_sha256", "full_scope_contract_sha256", "review_runner_sha256", "case_manifest_sha256", "authentication_identity", "integrity_sha256"}
     if not isinstance(receipt, dict) or set(receipt) != expected_keys \
             or receipt["version"] != QUALIFICATION_VERSION \
             or receipt["role"] != role \
@@ -288,7 +297,10 @@ def validate_qualification_receipt(path: str | Path, spec: ModelSpec, *, auth_ke
     registry = load_registry(registry_path)
     if spec.identity() != registry.role(role).identity():
         raise ValueError("qualification model is absent from selected registry")
-    hashes = {"registry_sha256": registry.path,
+    review_runner = Path(__file__).resolve().parents[2] / 'scripts' / (
+        'reviewer_v2_deepseek.py' if role == 'independent_reviewer' else
+        'reviewer_v2_openai.py' if role == 'final_reviewer' else 'model_qualification.py')
+    hashes = {"full_scope_contract_sha256": Path(full_diff_manifest.__file__), "review_runner_sha256": review_runner, "registry_sha256": registry.path,
               "contract_sha256": Path(reviewer_v2_contract.__file__),
               "runner_sha256": Path(__file__),
               "cli_runner_sha256": Path(__file__).resolve().parents[2] / "scripts" / "model_qualification.py",
@@ -301,6 +313,12 @@ def validate_qualification_receipt(path: str | Path, spec: ModelSpec, *, auth_ke
     if receipt["qualification_schema_sha256"] != hashlib.sha256(json.dumps(
             _SCHEMA, sort_keys=True, separators=(",", ":")).encode()).hexdigest():
         raise ValueError("model qualification schema changed")
+    expected_cases = hashlib.sha256(json.dumps([
+        {'name': c.name, 'source': c.source, 'findings': c.findings, 'expected': c.expected}
+        for c in CASES], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    if (receipt['case_manifest_sha256'] != expected_cases or receipt['authentication_identity'] !=
+            hmac.new(auth_key.encode(), b'cmh-qualification-auth/v1', hashlib.sha256).hexdigest()):
+        raise ValueError('qualification cases or authentication identity changed')
     unsigned = {key: value for key, value in receipt.items() if key != "integrity_sha256"}
     if not isinstance(auth_key, str) or not auth_key or not hmac.compare_digest(
             receipt["integrity_sha256"], hmac.new(auth_key.encode(),

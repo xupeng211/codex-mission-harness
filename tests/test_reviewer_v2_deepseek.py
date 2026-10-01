@@ -77,7 +77,7 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
                     with (patch.object(reviewer.legacy, "resolve_claude_launcher",
                                        return_value=("/bin/true", "/usr/bin:/bin")),
                           patch.object(reviewer.legacy, "read_token_file", return_value="fixture-token"),
-                          patch.object(reviewer, "validate_qualification_receipt"),
+                          patch.object(reviewer, "validate_qualification_receipt", return_value={}),
                           patch.object(reviewer.legacy, "invoke_reviewer", side_effect=invoke)):
                         with self.assertRaises(reviewer.ReviewStageFailure) as caught:
                             reviewer.run(args)
@@ -140,7 +140,7 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
             with (patch.object(reviewer.legacy, "resolve_claude_launcher",
                                return_value=("/bin/true", "/usr/bin:/bin")),
                   patch.object(reviewer.legacy, "read_token_file", return_value="fixture-token"),
-                  patch.object(reviewer, "validate_qualification_receipt"),
+                  patch.object(reviewer, "validate_qualification_receipt", return_value={}),
                   patch.object(reviewer.legacy, "invoke_reviewer", side_effect=invoke)):
                 response = reviewer.run(args)
             receipt_path = Path(response["review_receipt"])

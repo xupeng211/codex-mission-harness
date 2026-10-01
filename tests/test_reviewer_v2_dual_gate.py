@@ -48,13 +48,14 @@ class OpenAIContractTests(unittest.TestCase):
         git(self.root, "add", ".")
         git(self.root, "commit", "-qm", "base")
         self.base = git(self.root, "rev-parse", "HEAD")
+        git(self.root, "update-ref", "refs/remotes/origin/main", self.base)
         (self.root / "x.py").write_text("def f():\n    return 2\n")
         git(self.root, "add", ".")
         git(self.root, "commit", "-qm", "change")
         self.head = git(self.root, "rev-parse", "HEAD")
         self.spec = ModelSpec("openai", "gpt-5.6-sol", "high")
-        self.diff = review.secure.git(self.root, "diff", "--no-ext-diff", "--no-textconv",
-                                      "--binary", f"{self.base}..{self.head}")
+        self.diff = review.full.read_diff(self.root, self.base, self.head)
+
 
     def _signed(self, receipt):
         receipt.update(model=self.spec.model, reasoning_effort=self.spec.reasoning_effort,
@@ -64,6 +65,10 @@ class OpenAIContractTests(unittest.TestCase):
                        runner_sha256=review._sha(Path(review.__file__).read_bytes()),
                        invocation_sha256=review._sha(Path(review.invocation_module.__file__).read_bytes()),
                        schema_manifest_sha256=review._schema_manifest_sha())
+        _, manifest = review.full.build_manifest(self.root, self.base, self.head, receipt['repository'])
+        receipt['task_assignments'] = review.full.review_tasks(self.diff, manifest)
+        receipt['full_manifest'] = manifest
+        receipt['execution_identity'] = review.expected_execution(receipt, manifest, 'a' * 64, self.spec)
         receipt["auth_hmac_sha256"] = hmac.new(b"test-key", review._canon(receipt), hashlib.sha256).hexdigest()
         return receipt
 
@@ -107,7 +112,7 @@ class OpenAIContractTests(unittest.TestCase):
         def fail(_prompt, _group):
             raise InvocationFailure("TURN_TIMEOUT_UNDIAGNOSED", "no terminal event",
                                     {"observed_event_types": ["turn.started"]})
-        with patch.object(review, "validate_qualification_receipt"), \
+        with patch.object(review, "validate_qualification_receipt", return_value={}), \
              patch.object(review, "preflight"), \
              patch.object(review, "invoke_codex", side_effect=lambda *_args, **_kwargs: fail(None, None)), \
              self.assertRaises(InvocationFailure) as caught:
@@ -134,7 +139,7 @@ class OpenAIContractTests(unittest.TestCase):
             if calls == 2:
                 return b'{"findings":[]}'
             raise KeyboardInterrupt()
-        with patch.object(review, "validate_qualification_receipt"), \
+        with patch.object(review, "validate_qualification_receipt", return_value={}), \
              patch.object(review, "preflight"), \
              patch.object(review, "_plan", return_value=(
                  [{"index": i, "start": 0, "end": len(self.diff)} for i in range(3)],
@@ -172,7 +177,7 @@ class OpenAIContractTests(unittest.TestCase):
             if calls == 1:
                 return b'{"findings":[]}'  # preflight
             return raw_group if stage == "group" else json.dumps({"findings": [blocker]}).encode()
-        with patch.object(review, "validate_qualification_receipt"), \
+        with patch.object(review, "validate_qualification_receipt", return_value={}), \
              patch.object(review, "preflight"), \
              patch.object(review, "invoke_codex", side_effect=invoke), \
              self.assertRaisesRegex(ValueError, "bound source reference"):
@@ -191,7 +196,7 @@ class OpenAIContractTests(unittest.TestCase):
         evidence.mkdir(mode=0o700)
         error = InvocationFailure("AUTHENTICATION_FAILURE", "provider rejected auth",
                                   {"failure_markers": {"http_401": True}})
-        with patch.object(review, "validate_qualification_receipt"), \
+        with patch.object(review, "validate_qualification_receipt", return_value={}), \
              patch.object(review, "preflight", side_effect=error) as preflight:
             with self.assertRaises(InvocationFailure) as caught:
                 review.run(self.root, self.base, self.head, evidence, "test-key", self.spec,
@@ -258,6 +263,23 @@ class OpenAIContractTests(unittest.TestCase):
         receipt.pop("auth_hmac_sha256")
         receipt["auth_hmac_sha256"] = hmac.new(b"test-key", review._canon(receipt), hashlib.sha256).hexdigest()
 
+    def _gate_bind(self, deepseek, openai):
+        _, manifest = review.full.build_manifest(self.root, self.base, self.head, deepseek['repository'])
+        validators = {}
+        for provider, receipt in [('deepseek', deepseek), ('openai', openai)]:
+            role = 'independent_reviewer' if provider == 'deepseek' else 'final_reviewer'
+            configuration = {'provider': provider, 'model': receipt['model'],
+                             'reasoning_effort': receipt.get('reasoning_effort')}
+            qualified = {'role': role, 'mode': 'real_provider', 'identity': configuration}
+            validators[provider] = lambda q=qualified: q
+            receipt.update(task_assignments=review.full.review_tasks(self.diff, manifest), full_manifest=manifest, chunks=manifest['chunks'], groups=manifest['groups'],
+                           registry_sha256='b' * 64, runner_sha256='c' * 64)
+            receipt['execution_identity'] = review.full.execution_identity(manifest, receipt['mission_id'],
+                review._sha(review._canon(qualified)), role=role, provider=provider,
+                model=receipt['model'], configuration=configuration, registry_hash='b' * 64,
+                runner_hash='c' * 64, invocation_hash='d' * 64, schema_hash='e' * 64)
+        return validators
+
     def test_gate_requires_two_valid_independent_exact_lanes(self):
         diff_hash = hashlib.sha256(self.diff).hexdigest()
         deepseek = {"provider": "deepseek", "model": "deepseek-flash", "base_sha": self.base,
@@ -265,15 +287,16 @@ class OpenAIContractTests(unittest.TestCase):
                     "mission_id": "codex-mission-harness", "repository": "ssh://github.com/example/harness.git"}
         openai = {**deepseek, "provider": "openai", "model": "gpt-5.6-sol",
                   "reasoning_effort": "high"}
+        qualifications = self._gate_bind(deepseek, openai)
         validate = lambda value: value
-        proof = gate.validate_gate(root=self.root, base=self.base, head=self.head,
+        proof = gate.validate_gate(qualification_validators=qualifications, root=self.root, base=self.base, head=self.head,
                     deepseek_receipt=deepseek, openai_receipt=openai,
                     deepseek_validator=validate, openai_validator=validate,
                     mission_id="codex-mission-harness", repository="ssh://github.com/example/harness.git")
         self.assertEqual(proof["status"], "PASS")
         openai["findings"] = [{"severity": "P1"}]
         with self.assertRaises(ValueError):
-            gate.validate_gate(root=self.root, base=self.base, head=self.head,
+            gate.validate_gate(qualification_validators=qualifications, root=self.root, base=self.base, head=self.head,
                 deepseek_receipt=deepseek, openai_receipt=openai,
                 deepseek_validator=validate, openai_validator=validate,
                 mission_id="codex-mission-harness", repository="ssh://github.com/example/harness.git")
@@ -287,11 +310,12 @@ class OpenAIContractTests(unittest.TestCase):
         deepseek = dict(identity, provider="deepseek", model="deepseek-flash")
         openai = dict(identity, provider="openai", model="gpt-5.6-sol",
                       reasoning_effort="high")
+        qualifications = self._gate_bind(deepseek, openai)
         def mutate(value):
             (self.root / "x.py").write_text("uncommitted mutation\n")
             return value
         with self.assertRaisesRegex(ValueError, "changed during validation"):
-            gate.validate_gate(root=self.root, base=self.base, head=self.head,
+            gate.validate_gate(qualification_validators=qualifications, root=self.root, base=self.base, head=self.head,
                 deepseek_receipt=deepseek, openai_receipt=openai,
                 deepseek_validator=lambda value: value, openai_validator=mutate,
                 mission_id="codex-mission-harness", repository=identity["repository"])
