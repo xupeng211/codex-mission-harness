@@ -113,6 +113,15 @@ class ReviewRun:
                 finally:
                     os.close(fd)
                 break
+            if state.get("last_failure") and not state["last_failure"].get("resume_allowed"):
+                fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.parent_fd)
+                try:
+                    state["invalidated"] = True
+                    state["invalidation_reason"] = "terminal review failure"
+                    _atomic_state(fd, state)
+                finally:
+                    os.close(fd)
+                break
             if state.get("state_version") != STATE_VERSION or state.get("stages") != [list(item) for item in self.stages]:
                 raise ValueError("matching review state has invalid version or plan")
             self.fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.parent_fd)
@@ -134,6 +143,7 @@ class ReviewRun:
                       "completed_chunk_ids": [], "completed_group_ids": [],
                       "cross_group_completed": False, "final_completed": False,
                       "receipt_written": False, "created_at": time.time_ns(),
+                      "failure_count": 0, "last_failure": None,
                       "lease": {"pid": os.getpid(), "start_ticks": _start_ticks(), "run_id": run_id}}
         _atomic_state(self.fd, self.state)
 
@@ -194,6 +204,8 @@ class ReviewRun:
             "input_hash": input_hash, "output_hash": sha256(raw),
             "completed_at": int(time.time()), "validator_result": "PASS"}
         self.state["completed_order"].append(name)
+        self.state["failure_count"] = 0
+        self.state["last_failure"] = None
         next_index = index + 1
         self.state["current_stage"] = name
         self.state["next_stage"] = self.stages[next_index][0] if next_index < len(self.stages) else "receipt"
@@ -229,11 +241,19 @@ class ReviewRun:
     def failure(self, failure: dict, auth_key: str | None = None) -> Path:
         failure.pop("integrity_sha256", None)
         failure.pop("auth_hmac_sha256", None)
+        attempt = self.state.get("failure_count", 0) + 1
+        inferred = failure.get("failure_category") in {
+            "CANCELLED", "CHILD_PROCESS_TIMEOUT", "MODEL_TIMEOUT", "TRANSPORT_ERROR",
+            "TURN_TIMEOUT_UNDIAGNOSED", "TRANSIENT_CAPACITY", "TRANSIENT_TRANSPORT",
+            "RATE_LIMIT", "PROVIDER_ERROR"}
+        allowed = bool(failure.get("resume_allowed", inferred)) and attempt <= 1
+        reason = failure.get("resume_policy_reason", "category policy")
+        if not allowed and attempt > 1:
+            reason = "bounded stage retry exhausted"
         failure.update(stage=self.state["next_stage"],
                        durable_completed_stages=list(self.state["completed_order"]),
-                       resume_allowed=failure.get("failure_category") in {
-                           "CANCELLED", "CHILD_PROCESS_TIMEOUT", "MODEL_TIMEOUT", "TRANSPORT_ERROR",
-                           "TURN_TIMEOUT_UNDIAGNOSED", "TRANSIENT_CAPACITY", "TRANSIENT_TRANSPORT"},
+                       resume_allowed=allowed, resume_policy_reason=reason,
+                       stage_failure_attempt=attempt, max_resumable_failures=1,
                        next_stage=self.state["next_stage"], identity_snapshot=self.identity)
         if "runner_sha256" in failure and "stage_id" in failure:
             failure["integrity_sha256"] = sha256(canonical(failure))
@@ -248,6 +268,10 @@ class ReviewRun:
         else:
             name = f"failure-{uuid.uuid4().hex}.json"
         self.storage.write_private_artifact(self.fd, name, canonical(failure), uuid.uuid4().hex)
+        self.state["failure_count"] = attempt
+        self.state["last_failure"] = {"artifact_path": name, "resume_allowed": allowed,
+                                      "stage": self.state["next_stage"]}
+        _atomic_state(self.fd, self.state)
         return self.path / name
 
     def close(self) -> None:

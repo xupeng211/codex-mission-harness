@@ -28,11 +28,17 @@ from harness.reviewer_v2_contract import (  # noqa: E402
 from harness.model_registry import load_registry  # noqa: E402
 from harness.model_qualification import validate_qualification_receipt  # noqa: E402
 from harness.review_resume import ReviewRun  # noqa: E402
+from harness.review_failure_diagnostics import (  # noqa: E402
+    classify_nonzero, cli_wrapper_summary, command_identity, environment_identity, stream_metadata,
+)
 
 VERSION = "cmh-reviewer-v2-deepseek/v2"
 FAILURE_CATEGORIES = frozenset({
     "CHILD_PROCESS_TIMEOUT", "MODEL_TIMEOUT", "TRANSPORT_ERROR", "AUTH_ERROR",
-    "NONZERO_EXIT", "MALFORMED_JSON", "SCHEMA_VALIDATION_FAILED", "EMPTY_OUTPUT",
+    "CLI_USAGE_ERROR", "INVALID_ARGUMENT", "RATE_LIMIT", "QUOTA_ERROR",
+    "PROVIDER_ERROR", "CONTEXT_LIMIT", "SCHEMA_INVOCATION_ERROR",
+    "LOCAL_LAUNCHER_ERROR", "SIGNALLED", "UNKNOWN_NONZERO_EXIT",
+    "MALFORMED_JSON", "SCHEMA_VALIDATION_FAILED", "EMPTY_OUTPUT",
     "PARTIAL_OUTPUT", "RECEIPT_WRITE_FAILED", "INTERNAL_EXCEPTION", "CANCELLED", "UNKNOWN",
 })
 
@@ -57,8 +63,20 @@ def _stderr_markers(stderr: bytes | str | None) -> dict[str, bool]:
 
 
 def _parse_stage(raw: str, parser, state: dict):
+    state["parser_entered"] = True
+    state["parser_result"] = "FAIL"
     try:
-        return parser(raw)
+        json.loads(raw)
+    except (ValueError, UnicodeError):
+        pass
+    else:
+        state["schema_validation_entered"] = True
+        state["schema_validation_result"] = "FAIL"
+    try:
+        result = parser(raw)
+        state["parser_result"] = "PASS"
+        state["schema_validation_result"] = "PASS"
+        return result
     except (ValueError, UnicodeError, TypeError) as exc:
         state["parser_error_class"] = type(exc).__name__
         if not raw.strip():
@@ -123,30 +141,58 @@ def _invoke(command: list[str], prompt: str, env: dict, timeout: int, token: str
     state = {} if state is None else state
     state.pop("timeout_at", None)
     state.pop("output_sha256", None)
+    started_monotonic = time.monotonic()
     state.update(stage=stage, stage_id=artifact, input_sha256=sha256(prompt.encode()),
                  started_at=int(time.time()), timeout_seconds=timeout,
-                 stdout_present=False, exit_code=None, stderr_markers={},
+                 command_identity_hash=command_identity(command),
+                 environment_identity_hash=environment_identity(env),
+                 stdout_present=False, stdout_size=0, stdout_sha256=None,
+                 stderr_present=False, stderr_size=0, stderr_sha256=None,
+                 stdout_truncated=False, stderr_truncated=False,
+                 cli_wrapper={"is_error": None, "api_error_status": None, "subtype": None},
+                 exit_code=None, signal_if_any=None, stderr_markers={},
+                 sanitized_error_class=None, sanitized_error_markers={},
+                 resume_allowed=False, resume_policy_reason="stage not completed",
+                 parser_entered=False, parser_result="NOT_ENTERED",
+                 schema_validation_entered=False, schema_validation_result="NOT_ENTERED",
                  parser_error_class=None, schema_validation_error_class=None,
                  schema_validation_reason=None)
     try:
         completed = legacy.invoke_reviewer(command, _bounded(prompt), env, timeout)
     except subprocess.TimeoutExpired as exc:
         state.update(timeout_at=int(time.time()), finished_at=int(time.time()),
-                     stdout_present=bool(exc.output), stderr_markers=_stderr_markers(exc.stderr))
+                     duration_seconds=round(time.monotonic() - started_monotonic, 3),
+                     stderr_markers=_stderr_markers(exc.stderr),
+                     sanitized_error_class="CHILD_PROCESS_TIMEOUT",
+                     resume_allowed=True, resume_policy_reason="bounded child timeout",
+                     **stream_metadata(exc.output, exc.stderr))
         raise ReviewStageFailure("CHILD_PROCESS_TIMEOUT", stage) from exc
     except OSError as exc:
-        state["finished_at"] = int(time.time())
-        raise ReviewStageFailure("TRANSPORT_ERROR", stage) from exc
+        state.update(finished_at=int(time.time()),
+                     duration_seconds=round(time.monotonic() - started_monotonic, 3),
+                     sanitized_error_class="LOCAL_LAUNCHER_ERROR",
+                     resume_policy_reason="local launcher failure")
+        raise ReviewStageFailure("LOCAL_LAUNCHER_ERROR", stage) from exc
+    except KeyboardInterrupt:
+        state.update(finished_at=int(time.time()),
+                     duration_seconds=round(time.monotonic() - started_monotonic, 3),
+                     sanitized_error_class="CANCELLED", resume_allowed=True,
+                     resume_policy_reason="runner cancellation")
+        raise
     state.update(finished_at=int(time.time()), exit_code=completed.returncode,
-                 stdout_present=bool(completed.stdout),
+                 duration_seconds=round(time.monotonic() - started_monotonic, 3),
+                 signal_if_any=-completed.returncode if completed.returncode < 0 else None,
+                 **stream_metadata(completed.stdout, completed.stderr),
+                 cli_wrapper=cli_wrapper_summary(completed.stdout),
                  stderr_markers=_stderr_markers(completed.stderr))
     if legacy._credential_echoed(completed.stdout, completed.stderr, token):
+        state.update(sanitized_error_class="AUTH_ERROR", resume_policy_reason="credential echoed")
         raise ReviewStageFailure("AUTH_ERROR", stage)
     if completed.returncode:
-        markers = state["stderr_markers"]
-        category = ("AUTH_ERROR" if markers["auth"] else
-                    "MODEL_TIMEOUT" if markers["timeout"] else
-                    "TRANSPORT_ERROR" if markers["transport"] else "NONZERO_EXIT")
+        category, markers, allowed, reason = classify_nonzero(
+            completed.stdout, completed.stderr, completed.returncode)
+        state.update(sanitized_error_class=category, sanitized_error_markers=markers,
+                     resume_allowed=allowed, resume_policy_reason=reason)
         raise ReviewStageFailure(category, stage)
     raw = legacy._captured_bytes(completed.stdout)
     if not raw.strip():
@@ -353,7 +399,12 @@ def run(args: argparse.Namespace) -> dict:
         failure = {"status": "BLOCKED", "failure_category": category,
                    "base_sha": base, "head_sha": head, "diff_sha256": diff_hash,
                    "runner_sha256": sha256(Path(__file__).read_bytes()),
+                   "registry_sha256": identity["registry_hash"] if run is not None else sha256(registry.path.read_bytes()),
+                   "invocation_sha256": identity["invocation_hash"] if run is not None else sha256(Path(legacy.__file__).read_bytes()),
+                   "schema_manifest_sha256": identity["schema_manifest_hash"] if run is not None else sha256(canonical({"chunk": CHUNK_SCHEMA, "synthesis": SYNTHESIS_SCHEMA})),
+                   "qualification_receipt_identity": identity["qualification_receipt_identity"] if run is not None else None,
                    "provider": model.provider, "model": model.model,
+                   "role": "independent_reviewer",
                    "reasoning_effort": model.reasoning_effort,
                    "repository": repository, "mission_id": args.mission_id,
                    "stage": stage_state["stage"], "stage_id": stage_state["stage_id"],
@@ -362,6 +413,26 @@ def run(args: argparse.Namespace) -> dict:
                    "finished_at": int(time.time()),
                    "timeout_at": stage_state.get("timeout_at"),
                    "exit_code": stage_state.get("exit_code"),
+                   "signal_if_any": stage_state.get("signal_if_any"),
+                   "duration_seconds": stage_state.get("duration_seconds"),
+                   "command_identity_hash": stage_state.get("command_identity_hash"),
+                   "environment_identity_hash": stage_state.get("environment_identity_hash"),
+                   "stdout_size": stage_state.get("stdout_size", 0),
+                   "stdout_sha256": stage_state.get("stdout_sha256"),
+                   "stdout_truncated": stage_state.get("stdout_truncated", False),
+                   "stderr_present": stage_state.get("stderr_present", False),
+                   "stderr_size": stage_state.get("stderr_size", 0),
+                   "stderr_sha256": stage_state.get("stderr_sha256"),
+                   "stderr_truncated": stage_state.get("stderr_truncated", False),
+                   "cli_wrapper": stage_state.get("cli_wrapper"),
+                   "sanitized_error_class": stage_state.get("sanitized_error_class"),
+                   "sanitized_error_markers": stage_state.get("sanitized_error_markers", {}),
+                   "parser_entered": stage_state.get("parser_entered", False),
+                   "parser_result": stage_state.get("parser_result", "NOT_ENTERED"),
+                   "schema_validation_entered": stage_state.get("schema_validation_entered", False),
+                   "schema_validation_result": stage_state.get("schema_validation_result", "NOT_ENTERED"),
+                   "resume_allowed": stage_state.get("resume_allowed", False),
+                   "resume_policy_reason": stage_state.get("resume_policy_reason", "not classified"),
                    "stderr_summary": stage_state.get("stderr_markers", {}),
                    "stdout_present": stage_state.get("stdout_present", False),
                    "parser_error_class": stage_state.get("parser_error_class"),

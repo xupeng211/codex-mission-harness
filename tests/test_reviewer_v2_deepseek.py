@@ -50,7 +50,7 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
             cases = {
                 "CHILD_PROCESS_TIMEOUT": subprocess.TimeoutExpired("claude", 1,
                     output=b"partial output", stderr=b"fixture-token should stay private"),
-                "NONZERO_EXIT": subprocess.CompletedProcess([], 1, b"", b"unknown failure"),
+                "UNKNOWN_NONZERO_EXIT": subprocess.CompletedProcess([], 1, b"partial result", b"unknown failure"),
                 "MALFORMED_JSON": subprocess.CompletedProcess([], 0, b"not json", b""),
                 "EMPTY_OUTPUT": subprocess.CompletedProcess([], 0, b"", b""),
                 "SCHEMA_VALIDATION_FAILED": subprocess.CompletedProcess([], 0,
@@ -82,6 +82,17 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
                     self.assertEqual(failure["head_sha"], head)
                     self.assertEqual(failure["failure_category"], category)
                     self.assertEqual(len(failure["runner_sha256"]), 64)
+                    self.assertEqual(failure["role"], "independent_reviewer")
+                    self.assertEqual(len(failure["command_identity_hash"]), 64)
+                    self.assertEqual(len(failure["environment_identity_hash"]), 64)
+                    if category == "UNKNOWN_NONZERO_EXIT":
+                        self.assertFalse(failure["parser_entered"])
+                        self.assertFalse(failure["schema_validation_entered"])
+                        self.assertFalse(failure["resume_allowed"])
+                        self.assertTrue(failure["stdout_present"])
+                        self.assertEqual(failure["stdout_sha256"], reviewer.sha256(b"partial result"))
+                        self.assertEqual(failure["stderr_sha256"], reviewer.sha256(b"unknown failure"))
+                        self.assertEqual(failure["sanitized_error_class"], category)
                     self.assertNotIn("fixture-token", failure_path.read_text())
                     self.assertFalse(list(evidence.rglob("deepseek-v2-receipt-*.json")))
 
