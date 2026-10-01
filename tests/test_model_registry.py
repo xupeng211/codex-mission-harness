@@ -9,7 +9,8 @@ from harness.model_qualification import (CASES, QualificationResult, expected_fi
                                          evaluate_cases, qualification_receipt,
                                          validate_qualification_receipt,
                                          require_builder_qualification)
-from harness.openai_invocation import InvocationFailure
+from harness.openai_invocation import InvocationFailure, canonical_environment
+from trusted_invocation_fixture import canonical_fixture
 from harness.model_registry import load_registry, preflight, trusted_claude_launcher
 from harness.review_failures import ReviewFailureClassification, classify_process_failure
 from harness.reviewer_v2_contract import parse_synthesis
@@ -17,14 +18,18 @@ from harness.reviewer_v2_contract import parse_synthesis
 
 class RegistryTests(unittest.TestCase):
     def test_openai_preflight_checks_canonical_binary_and_home(self):
-        with patch("harness.model_registry.subprocess.run") as run:
+        with canonical_fixture() as (binary, home), \
+             patch("harness.openai_invocation.canonical_environment", side_effect=lambda:
+                   canonical_environment({}, binary=binary, codex_home=home)) as environment, \
+             patch("harness.model_registry.subprocess.run") as run:
             run.return_value.returncode = 0
             result = preflight(load_registry().role("final_reviewer"))
         self.assertTrue(result.authenticated)
+        environment.assert_called_once_with()
         argv = run.call_args.args[0]
         self.assertEqual(argv[:3], ["/usr/lib/chatgpt/resources/codex", "login", "status"])
         self.assertEqual(run.call_args.kwargs["env"]["CODEX_HOME"],
-                         "/home/xupeng/.cmh-openai-reviewer-home")
+                         str(home))
 
     def test_default_registry_uses_two_providers(self):
         registry = load_registry()

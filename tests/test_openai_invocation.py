@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
+from trusted_invocation_fixture import canonical_fixture
 from harness.model_registry import ModelSpec
 from harness.openai_invocation import (InvocationFailure, _failure_category,
                                        _failure_markers, _observed_events, _matches_schema,
@@ -72,11 +73,7 @@ class OpenAIInvocationTests(unittest.TestCase):
                 parse_events(bad)
 
     def test_environment_does_not_inherit_provider_routing(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp) / "home"; home.mkdir(mode=0o700)
-            (home / "auth.json").write_text("{}")
-            (home / "auth.json").chmod(0o600)
-            binary = Path("/usr/lib/chatgpt/resources/codex")
+        with canonical_fixture() as (binary, home):
             env = canonical_environment({"HTTP_PROXY":"http://proxy.invalid",
                                          "ANTHROPIC_BASE_URL":"https://bad.invalid",
                                          "OPENAI_BASE_URL":"https://bad.invalid"},
@@ -86,15 +83,22 @@ class OpenAIInvocationTests(unittest.TestCase):
             self.assertNotIn("OPENAI_BASE_URL", env)
 
     def test_untrusted_ca_root_is_not_inherited(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp) / "home"; home.mkdir(mode=0o700)
-            (home / "auth.json").write_text("{}")
-            (home / "auth.json").chmod(0o600)
-            ca = Path(tmp) / "attacker-ca.pem"
+        with canonical_fixture() as (binary, home):
+            ca = home.parent / "attacker-ca.pem"
             ca.write_text("untrusted")
-            env = canonical_environment({"SSL_CERT_FILE": str(ca)},
-                binary=Path("/usr/lib/chatgpt/resources/codex"), codex_home=home)
+            env = canonical_environment({"SSL_CERT_FILE": str(ca)}, binary=binary, codex_home=home)
             self.assertNotIn("SSL_CERT_FILE", env)
+
+    def test_canonical_metadata_fixture_preserves_fail_closed_checks(self):
+        with canonical_fixture() as (binary, home):
+            binary.chmod(0o777)
+            with self.assertRaises(ValueError): canonical_environment({}, binary=binary, codex_home=home)
+            binary.chmod(0o755)
+            (home / 'auth.json').chmod(0o644)
+            with self.assertRaises(ValueError): canonical_environment({}, binary=binary, codex_home=home)
+            (home / 'auth.json').chmod(0o600)
+            home.chmod(0o755)
+            with self.assertRaises(ValueError): canonical_environment({}, binary=binary, codex_home=home)
 
     def test_ca_path_rejects_symlink_ancestor(self):
         from harness.openai_invocation import _trusted_ca_path
