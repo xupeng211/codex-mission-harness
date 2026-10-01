@@ -9,6 +9,7 @@ import hmac
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -200,6 +201,11 @@ def run(args: argparse.Namespace) -> dict:
                          "started_at": int(time.time()), "stdout_present": False,
                          "exit_code": None, "stderr_markers": {},
                          "parser_error_class": None, "schema_validation_error_class": None}
+    previous_signals = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT))
+    def interrupt(_signum, _frame):
+        raise KeyboardInterrupt()
+    signal.signal(signal.SIGTERM, interrupt)
+    signal.signal(signal.SIGINT, interrupt)
     try:
         executable, safe_path = legacy.resolve_claude_launcher(root, os.environ.get("PATH", ""))
         token = legacy.read_token_file(args.token_file, root)
@@ -352,6 +358,8 @@ def run(args: argparse.Namespace) -> dict:
         wrapped.failure_artifact = str(evidence / "failure.json")
         raise wrapped from exc
     finally:
+        signal.signal(signal.SIGTERM, previous_signals[0])
+        signal.signal(signal.SIGINT, previous_signals[1])
         if settings is not None:
             Path(settings.name).unlink(missing_ok=True)
         token = ""

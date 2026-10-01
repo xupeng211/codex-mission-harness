@@ -15,6 +15,7 @@ import hmac
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -432,6 +433,11 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
             raise ValueError("review output exceeds bound")
         secure.write_private_artifact(child_fd, name, raw, run_id)
         artifact_hashes[name] = _sha(raw)
+    previous_signals = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT))
+    def interrupt(_signum, _frame):
+        raise KeyboardInterrupt()
+    signal.signal(signal.SIGTERM, interrupt)
+    signal.signal(signal.SIGINT, interrupt)
     try:
         if qualification_path is None:
             raise ValueError("live OpenAI review requires a final reviewer qualification receipt")
@@ -478,6 +484,8 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
             exc.evidence["failure_record"] = str(path.parent / "failure.json")
         raise
     finally:
+        signal.signal(signal.SIGTERM, previous_signals[0])
+        signal.signal(signal.SIGINT, previous_signals[1])
         os.close(child_fd)
         os.close(parent_fd)
 
