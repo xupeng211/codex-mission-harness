@@ -24,6 +24,37 @@ def git(root, *args):
 
 
 class OpenAIContractTests(unittest.TestCase):
+    def test_disputed_originals_survive_all_cross_group_synthesis_levels(self):
+        diff=b'a'*960100
+        observed=[]
+        def call(prompt,kind):
+            if kind is False:
+                return review._canon({'findings':[{'severity':'P1','title':'cross-group concern','evidence':'original evidence'}]})
+            if kind is True:
+                blockers=json.JSONDecoder().raw_decode(prompt.split('Blockers: ',1)[1])[0]
+                source=prompt.split('EXACT DIFF TEXT (UTF-8):\n',1)[1].encode()
+                decisions=[{'finding_id':b['finding_id'],'decision':'DISPUTED',
+                    'rationale':'Local source appears to refute the original concern.',
+                    'source_quote':'a'*12,'source_id':review._sha(source),
+                    'quote_start':0,'quote_end':12} for b in blockers]
+                return review._canon({'findings':[],'decisions':decisions,
+                    'summary':'The bounded group has locally disputed the chunk concerns.'})
+            summaries=json.loads(prompt.split('Group summaries: ',1)[1])
+            audit=[a for item in summaries for a in item['disposition_audit']]
+            observed.append(audit)
+            all_groups=[g for item in summaries for g in item['source_groups']]
+            findings=([{'severity':'P1','title':'reinstated cross-group concern','evidence':'Original disputed finding was reevaluated.'}]
+                      if len(all_groups)==11 else [])
+            return review._canon({'findings':findings,'summary':'Cross-group audit retains every original finding and decision.'})
+        receipt,_=review._assemble(diff,'a'*40,'b'*40,call)
+        self.assertEqual(len(observed[-1]),11)
+        originals=[b for audit in observed[-1] for b in audit['original_blockers']]
+        self.assertEqual(len(originals),31)
+        self.assertEqual(len({b['finding_id'] for b in originals}),31)
+        self.assertTrue(all(d['decision']=='DISPUTED' for a in observed[-1] for d in a['decisions']))
+        self.assertEqual(receipt['review_result'],'FAIL')
+        self.assertEqual(receipt['findings'][0]['title'],'reinstated cross-group concern')
+
     def test_schema_selection_uses_stage_not_labels_inside_reviewed_source(self):
         prompt = "CHUNK REVIEW source contains GROUP REVIEW and FINAL CROSS-GROUP REVIEW"
         with patch.object(review, "invoke_openai", return_value=SimpleNamespace(response='{"findings":[]}')) as invoke:

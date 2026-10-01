@@ -146,6 +146,7 @@ def _synthesis_prompt(summaries: list[str], base: str, head: str) -> str:
     return full.bounded_prompt("FINAL CROSS-GROUP REVIEW. Independently inspect interactions between these "
             "bounded source-review summaries. Report any additional cross-group problems. "
             "Existing group blockers are mechanically retained and cannot be removed here. "
+            "Reevaluate original disputed findings in disposition_audit for cross-group risks; report a NEW finding if a local dispute is unsound. "
             "Return JSON with findings and a concrete summary. "
             f"Base {base}; head {head}. Group summaries: " + json.dumps(summaries, ensure_ascii=False))
 
@@ -215,7 +216,10 @@ def synthesis_level(groups, chunks):
         retained += [f for i in group['chunk_indexes'] for f in bind_findings(
             chunks[i]['result']['findings'], 'C', i) if f['severity'] == 'P3']
         level.append({'summary': group['result']['summary'], 'source_groups': [group['index']],
-                      'source_findings': retained})
+                      'source_findings': retained,
+                      'disposition_audit': [{'group_index': group['index'],
+                          'original_blockers': group['source_blockers'],
+                          'decisions': group['result']['decisions']}]})
     if len({f['finding_id'] for item in level for f in item['source_findings']}) != sum(
             len(item['source_findings']) for item in level):
         raise ValueError('duplicate cross-group finding identity')
@@ -308,7 +312,8 @@ def _assemble(diff: bytes, base: str, head: str, call, persist=None, stage_run=N
                 final_findings.extend(result["findings"])
                 next_level.append({"summary": result["summary"], "source_groups": source_groups,
                                    "source_findings": [f for item in batch for f in item['source_findings']] +
-                                       bind_findings(result['findings'], 'F', record['index'])})
+                                       bind_findings(result['findings'], 'F', record['index']),
+                                   'disposition_audit': [audit for item in batch for audit in item['disposition_audit']]})
             level = next_level
     receipt = {"version": VERSION, "provider": "openai", "base_sha": base, "head_sha": head,
                "diff_sha256": _sha(diff), "chunks": chunks, "groups": groups,
@@ -423,7 +428,8 @@ def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec
                 findings.extend(result["findings"])
                 next_level.append({"summary": result["summary"], "source_groups": source_groups,
                                    "source_findings": [f for item in batch for f in item['source_findings']] +
-                                       bind_findings(result['findings'], 'F', record['index'])})
+                                       bind_findings(result['findings'], 'F', record['index']),
+                                   'disposition_audit': [audit for item in batch for audit in item['disposition_audit']]})
                 consumed += 1
             level = next_level
         if consumed != len(synthesis):

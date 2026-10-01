@@ -133,6 +133,10 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
                                    mission_id="test", timeout=30, qualification="fixture-qualification")
             summary = "The source change preserves the relevant contract and control flow."
             def invoke(command, prompt, env, timeout):
+                if "Scope=cross-group" in prompt:
+                    self.assertIn("original_chunk_findings",prompt)
+                    self.assertIn("chunk_dispositions",prompt)
+                    self.assertIn("Reevaluate all original disputed findings",prompt)
                 result = ({"findings": []} if "Scope=chunk" in prompt else
                           {"findings": [], "decisions": [], "summary": summary})
                 return subprocess.CompletedProcess(command, 0, json.dumps({

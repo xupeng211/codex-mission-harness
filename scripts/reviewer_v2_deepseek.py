@@ -364,9 +364,12 @@ def run(args: argparse.Namespace) -> dict:
         expected = _expected(groups)
         required = [item for item in expected if item["severity"] in {"P0", "P1", "P2"}]
         summaries = [{"group_index": group["index"], "summary": group["result"]["summary"],
-                      "findings": group["bound_findings"]} for group in groups]
+                      "findings": group["bound_findings"],
+                      "original_chunk_findings": _expected([chunks[i] for i in group["chunk_indexes"]]),
+                      "chunk_dispositions": group["result"]["decisions"]} for group in groups]
         prompt = (_prompt_head(base, head, diff_hash, "cross-group")
-                  + "Analyze cross-group interactions using bounded summaries. You have no exact "
+                  + "Reevaluate all original disputed findings and their group decisions for cross-group risks; add NEW findings if local disputes are unsound. "
+                  "Analyze cross-group interactions using bounded summaries. You have no exact "
                   "source at this stage and must UPHOLD every supplied P0/P1/P2 finding. "
                   "Use empty source_quote/source_id and zero quote offsets. "
                   "findings contains only NEW cross-group findings. "
