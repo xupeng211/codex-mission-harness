@@ -23,7 +23,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import deepseek_review as legacy  # noqa: E402
 from harness.reviewer_v2_contract import (  # noqa: E402
-    bind_findings, canonical, parse_chunk, parse_synthesis, sha256, validate_bound_result,
+    SourceBindingError, bind_findings, canonical, parse_chunk, parse_synthesis, sha256,
+    validate_bound_result,
 )
 from harness.model_registry import load_registry  # noqa: E402
 from harness.model_qualification import validate_qualification_receipt  # noqa: E402
@@ -79,6 +80,12 @@ def _parse_stage(raw: str, parser, state: dict):
         return result
     except (ValueError, UnicodeError, TypeError) as exc:
         state["parser_error_class"] = type(exc).__name__
+        if isinstance(exc, SourceBindingError):
+            state["source_binding_diagnostic"] = {
+                **exc.details, "stage_id": state.get("stage_id"),
+                "parser_entered": state["parser_entered"],
+                "schema_validation_entered": state["schema_validation_entered"],
+                "validation_result": "FAIL"}
         if not raw.strip():
             category = "EMPTY_OUTPUT"
         else:
@@ -156,7 +163,7 @@ def _invoke(command: list[str], prompt: str, env: dict, timeout: int, token: str
                  parser_entered=False, parser_result="NOT_ENTERED",
                  schema_validation_entered=False, schema_validation_result="NOT_ENTERED",
                  parser_error_class=None, schema_validation_error_class=None,
-                 schema_validation_reason=None)
+                 schema_validation_reason=None, source_binding_diagnostic=None)
     try:
         completed = legacy.invoke_reviewer(command, _bounded(prompt), env, timeout)
     except subprocess.TimeoutExpired as exc:
@@ -438,6 +445,7 @@ def run(args: argparse.Namespace) -> dict:
                    "parser_error_class": stage_state.get("parser_error_class"),
                    "schema_validation_error_class": stage_state.get("schema_validation_error_class"),
                    "schema_validation_reason": stage_state.get("schema_validation_reason"),
+                   "source_binding_diagnostic": stage_state.get("source_binding_diagnostic"),
                    "output_sha256": stage_state.get("output_sha256")}
         failure["integrity_sha256"] = sha256(canonical(failure))
         if token:

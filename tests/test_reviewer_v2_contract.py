@@ -1,7 +1,8 @@
 import json
 import unittest
 
-from harness.reviewer_v2_contract import bind_findings, parse_chunk, parse_synthesis, sha256
+from harness.reviewer_v2_contract import (SourceBindingError, bind_findings,
+                                          parse_chunk, parse_synthesis, sha256)
 
 
 FINDING = {"severity": "P1", "title": "Missing check", "evidence": "path.py:14 accepts bad input"}
@@ -89,6 +90,24 @@ class ReviewerV2ContractTests(unittest.TestCase):
         self.assertEqual(parse_chunk(json.dumps({"findings": [FINDING]})), [FINDING])
         with self.assertRaises(ValueError):
             parse_chunk(json.dumps({"findings": [FINDING], "review_result": "PASS"}))
+
+    def test_utf8_group_quote_and_field_level_failure(self):
+        source = "diff --git a/甲.py b/甲.py\n+clé = '正常'\n".encode()
+        quote = "clé = '正常'"
+        start = source.index(quote.encode())
+        decision = {**self.decision(kind="DISPUTED", quote=quote), "source_id": sha256(source),
+                    "quote_start": start, "quote_end": start + len(quote.encode())}
+        self.assertEqual(parse_synthesis(self.response([decision]), self.expected, source=source,
+                                         structured_evidence=True)["review_result"], "PASS")
+        for change, subclass in (({"source_id": "0" * 64}, "SOURCE_ID_MISMATCH"),
+                                 ({"quote_start": start - 1}, "QUOTE_RANGE_MISMATCH"),
+                                 ({"quote_end": start + len(quote)}, "QUOTE_RANGE_MISMATCH"),
+                                 ({"quote_end": len(source) + 1}, "RANGE_OUT_OF_BOUNDS")):
+            with self.subTest(change=change), self.assertRaises(SourceBindingError) as caught:
+                parse_synthesis(self.response([{**decision, **change}]), self.expected,
+                                source=source, structured_evidence=True)
+            self.assertEqual(caught.exception.details["error_subclass"], subclass)
+            self.assertEqual(caught.exception.details["finding_id"], self.identity)
 
 
 if __name__ == "__main__":

@@ -46,7 +46,8 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
             git("commit", "-qm", "head")
             head = git("rev-parse", "HEAD")
             good_chunk = subprocess.CompletedProcess([], 0,
-                json.dumps({"structured_output": {"findings": []}}).encode(), b"")
+                json.dumps({"structured_output": {"findings": [{"severity": "P1",
+                    "title": "Synthetic blocker", "evidence": "source.py changed"}]}}).encode(), b"")
             cases = {
                 "CHILD_PROCESS_TIMEOUT": subprocess.TimeoutExpired("claude", 1,
                     output=b"partial output", stderr=b"fixture-token should stay private"),
@@ -54,7 +55,12 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
                 "MALFORMED_JSON": subprocess.CompletedProcess([], 0, b"not json", b""),
                 "EMPTY_OUTPUT": subprocess.CompletedProcess([], 0, b"", b""),
                 "SCHEMA_VALIDATION_FAILED": subprocess.CompletedProcess([], 0,
-                    json.dumps({"structured_output": {"findings": []}}).encode(), b""),
+                    json.dumps({"structured_output": {"findings": [], "decisions": [{
+                        "finding_id": "C000F000", "decision": "DISPUTED",
+                        "rationale": "Synthetic rationale with enough length for this decision.",
+                        "source_quote": "diff --git a/source.py", "source_id": "0" * 64,
+                        "quote_start": 0, "quote_end": 22}],
+                        "summary": "This synthetic group response has an invalid source identity."}}).encode(), b""),
             }
             for category, group_response in cases.items():
                 with self.subTest(category=category):
@@ -93,6 +99,13 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
                         self.assertEqual(failure["stdout_sha256"], reviewer.sha256(b"partial result"))
                         self.assertEqual(failure["stderr_sha256"], reviewer.sha256(b"unknown failure"))
                         self.assertEqual(failure["sanitized_error_class"], category)
+                    if category == "SCHEMA_VALIDATION_FAILED":
+                        detail = failure["source_binding_diagnostic"]
+                        self.assertEqual(detail["error_subclass"], "SOURCE_ID_MISMATCH")
+                        self.assertEqual(detail["finding_id"], "C000F000")
+                        self.assertEqual(detail["stage_id"], "group-000.json")
+                        self.assertEqual(detail["validation_rule"], "GROUP_SOURCE_HASH_MATCH")
+                        self.assertEqual(detail["validation_result"], "FAIL")
                     self.assertNotIn("fixture-token", failure_path.read_text())
                     self.assertFalse(list(evidence.rglob("deepseek-v2-receipt-*.json")))
 

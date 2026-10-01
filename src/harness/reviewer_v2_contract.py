@@ -13,6 +13,44 @@ import re
 BLOCKING = frozenset({"P0", "P1", "P2"})
 
 
+class SourceBindingError(ValueError):
+    """A source rejection with bounded, non-secret diagnostic fields."""
+
+    def __init__(self, subclass: str, field: str, rule: str, decision: dict,
+                 source: bytes | None):
+        source_id = decision.get("source_id")
+        actual_source = source_id if isinstance(source_id, str) and re.fullmatch(r"[0-9a-f]{64}", source_id) else None
+        quote = decision.get("source_quote")
+        quote_bytes = quote.encode("utf-8") if isinstance(quote, str) else None
+        start, end = decision.get("quote_start"), decision.get("quote_end")
+        actual_range = ([start, end] if type(start) is int and type(end) is int else None)
+        ranged_bytes = (source[start:end] if source is not None and actual_range is not None
+                        and 0 <= start < end <= len(source) else None)
+        occurrences = []
+        if source is not None and quote_bytes:
+            cursor = source.find(quote_bytes)
+            while cursor >= 0 and len(occurrences) < 2:
+                occurrences.append([cursor, cursor + len(quote_bytes)])
+                cursor = source.find(quote_bytes, cursor + 1)
+        finding_id = decision.get("finding_id")
+        safe_finding = (finding_id if isinstance(finding_id, str)
+                        and re.fullmatch(r"[CGF][0-9]{3}F[0-9]{3}", finding_id) else None)
+        self.details = {
+            "error_class": "INVALID_SOURCE_BINDING", "error_subclass": subclass,
+            "stage_id": None, "finding_id": safe_finding, "disposition_id": safe_finding,
+            "source_id": actual_source, "source_path": None,
+            "expected_source_hash": sha256(source) if source is not None else None,
+            "actual_source_hash": actual_source,
+            "expected_range": occurrences[0] if len(occurrences) == 1 else None,
+            "actual_range": actual_range,
+            "expected_quote_hash": sha256(ranged_bytes) if ranged_bytes is not None else None,
+            "actual_quote_hash": sha256(quote_bytes) if quote_bytes is not None else None,
+            "validation_rule": rule, "failure_field": field,
+            "quote_occurrence_count": len(occurrences),
+        }
+        super().__init__("dispute lacks an exact bound source reference")
+
+
 def canonical(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
@@ -71,14 +109,28 @@ def validate_source_binding(decision: dict, source: bytes | None) -> None:
     start, end = decision.get("quote_start"), decision.get("quote_end")
     if decision["decision"] == "UPHELD":
         if source_id != "" or start != 0 or end != 0 or decision["source_quote"]:
-            raise ValueError("upheld disposition has unexpected source reference")
+            raise SourceBindingError("UPHELD_UNEXPECTED_SOURCE", "source_reference",
+                                     "UPHELD_REFERENCE_MUST_BE_EMPTY", decision, source)
         return
     quote = decision["source_quote"].encode("utf-8")
-    if (source is None or source_id != sha256(source)
-            or type(start) is not int or type(end) is not int
-            or start < 0 or end > len(source) or start >= end
-            or len(quote.strip()) < 12 or source[start:end] != quote):
-        raise ValueError("dispute lacks an exact bound source reference")
+    if source is None:
+        raise SourceBindingError("SOURCE_UNAVAILABLE", "source_id",
+                                 "DISPUTE_REQUIRES_GROUP_SOURCE", decision, source)
+    if source_id != sha256(source):
+        raise SourceBindingError("SOURCE_ID_MISMATCH", "source_id",
+                                 "GROUP_SOURCE_HASH_MATCH", decision, source)
+    if type(start) is not int or type(end) is not int:
+        raise SourceBindingError("RANGE_NOT_INTEGER", "quote_range",
+                                 "UTF8_BYTE_RANGE_INTEGER", decision, source)
+    if start < 0 or end > len(source) or start >= end:
+        raise SourceBindingError("RANGE_OUT_OF_BOUNDS", "quote_range",
+                                 "UTF8_BYTE_RANGE_IN_GROUP", decision, source)
+    if len(quote.strip()) < 12:
+        raise SourceBindingError("QUOTE_TOO_SHORT", "source_quote",
+                                 "MINIMUM_QUOTE_BYTES", decision, source)
+    if source[start:end] != quote:
+        raise SourceBindingError("QUOTE_RANGE_MISMATCH", "source_quote",
+                                 "EXACT_UTF8_BYTES_AT_RANGE", decision, source)
 
 
 def parse_synthesis(raw: str, expected: list[dict], *, source: bytes | None,
