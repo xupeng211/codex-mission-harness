@@ -171,6 +171,26 @@ def _failure_category(stderr: bytes, stdout: bytes, *, timed_out: bool) -> str:
     return "CLI_OR_CONFIG_FAILURE"
 
 
+def _event_error_bytes(raw: bytes) -> bytes:
+    """Classify native error events without scanning reviewed agent-message text."""
+    errors = []
+    for line in raw.splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
+        if isinstance(event, dict) and event.get('type') in {'error', 'turn.failed'}:
+            error = event.get('error')
+            if isinstance(error, dict):
+                errors.extend(str(error.get(key, '')) for key in ('code', 'message'))
+            elif isinstance(error, str):
+                errors.append(error)
+            for key in ('code', 'message'):
+                if isinstance(event.get(key), str):
+                    errors.append(event[key])
+    return '\n'.join(errors).encode('utf-8')
+
+
 def _failure_markers(stderr: bytes, stdout: bytes) -> dict:
     """Keep only fixed diagnostic labels, never provider text or credentials."""
     content = (stderr + b"\n" + stdout).decode("utf-8", "replace").casefold()
@@ -275,7 +295,8 @@ def invoke_openai(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 
         try:
             events = parse_events(stdout)
         except ValueError as exc:
-            raise InvocationFailure("CLI_OR_CONFIG_FAILURE", str(exc), evidence) from exc
+            category = _failure_category(stderr, _event_error_bytes(stdout), timed_out=False)
+            raise InvocationFailure(category, str(exc), evidence) from exc
         evidence.update(events)
         if not output.is_file() or output.stat().st_size > MAX_RESPONSE_BYTES:
             raise InvocationFailure("CLI_OR_CONFIG_FAILURE",

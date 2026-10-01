@@ -46,6 +46,37 @@ class OpenAIInvocationTests(unittest.TestCase):
                             invoke_openai("review", load_registry().role("final_reviewer"),
                                           schema, timeout=1)
 
+    def test_zero_exit_error_event_is_rejected_and_classified_for_bounded_resume(self):
+        from harness.openai_invocation import invoke_openai
+        for message, category in [('stream disconnected: connection reset', 'TRANSIENT_TRANSPORT'),
+                                  ('HTTP 401 unauthorized', 'AUTHENTICATION_FAILURE')]:
+            stream = (b'{"type":"thread.started"}\n{"type":"turn.started"}\n' +
+                      json.dumps({'type': 'error', 'message': message}).encode() + b'\n' +
+                      b'{"type":"item.completed","item":{"type":"agent_message"}}\n' +
+                      b'{"type":"turn.completed"}\n')
+            process = Mock(pid=1234, returncode=0); process.communicate.return_value=(stream,b'')
+            with self.subTest(category=category), \
+                 patch('harness.openai_invocation.canonical_environment', return_value={}), \
+                 patch('harness.openai_invocation.subprocess.Popen', return_value=process):
+                with self.assertRaises(InvocationFailure) as caught:
+                    invoke_openai('source', ModelSpec('openai','gpt-5.6-sol','high'), {}, timeout=1)
+            self.assertEqual(caught.exception.category, category)
+            self.assertTrue(caught.exception.evidence['terminal_observed'])
+            self.assertEqual(caught.exception.evidence['exit_code'], 0)
+            self.assertFalse(caught.exception.evidence.get('structured_result_present', False))
+
+    def test_agent_message_cannot_invent_retryable_transport_failure(self):
+        from harness.openai_invocation import invoke_openai
+        stream = (b'{"type":"thread.started"}\n{"type":"turn.started"}\n' +
+                  json.dumps({'type':'item.completed','item':{'type':'agent_message',
+                              'text':'connection reset 401 unauthorised'}}).encode()+b'\n')
+        process=Mock(pid=1234,returncode=0);process.communicate.return_value=(stream,b'')
+        with patch('harness.openai_invocation.canonical_environment',return_value={}), \
+             patch('harness.openai_invocation.subprocess.Popen',return_value=process):
+            with self.assertRaises(InvocationFailure) as caught:
+                invoke_openai('source',ModelSpec('openai','gpt-5.6-sol','high'),{},timeout=1)
+        self.assertEqual(caught.exception.category,'CLI_OR_CONFIG_FAILURE')
+
     def test_started_turn_without_terminal_is_unresolved_timeout(self):
         stream = b'{"type":"thread.started"}\n{"type":"turn.started"}\n'
         observed = _observed_events(stream)
