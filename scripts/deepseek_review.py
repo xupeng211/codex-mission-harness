@@ -7,7 +7,7 @@ commit-last: an incomplete run has no receipt and is never an approval.
 """
 from __future__ import annotations
 
-import argparse, base64, hashlib, hmac, json, os, pwd, re, shutil, stat, subprocess, sys, tempfile, time, uuid
+import argparse, base64, hashlib, hmac, json, os, pwd, re, resource, select, shutil, signal, stat, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -21,12 +21,15 @@ from harness.review_failures import (  # noqa: E402
     classify_process_failure,
 )
 
-VERSION = "cmh-deepseek-review/v5"
+VERSION = "cmh-deepseek-review/v6"
 MODEL = "deepseek-flash"
 ENDPOINT = "https://api.deepseek.com/anthropic"
 CHUNK_BYTES = 32000
 AGGREGATE_GROUP_BYTES = 96000
 MAX_REVIEW_PROMPT_BYTES = 400000
+MAX_LEGACY_DIFF_BYTES = 4096000
+MAX_LEGACY_CHUNKS = 128
+MAX_REVIEW_OUTPUT_BYTES = 128000
 GROUP_OUTPUT_FORMAT_RETRY_LIMIT = 1
 _GIT_ENV = {
     "PATH": os.defpath,
@@ -745,11 +748,13 @@ def trusted_executable(path):
 
 def chunks(diff):
     if not diff: raise ValueError("empty diff is not reviewable")
+    if len(diff) > MAX_LEGACY_DIFF_BYTES: raise ValueError("review diff exceeds bounded source size")
     out=[]; start=0
     while start < len(diff):
         end=min(len(diff),start+CHUNK_BYTES); cut=diff.rfind(b"\n",start+1,end+1)
         if cut > start: end=cut+1
         source=diff[start:end]; out.append({"index":len(out),"start":start,"end":end,"sha256":digest(source)}) ; start=end
+    if len(out) > MAX_LEGACY_CHUNKS: raise ValueError("review chunk count exceeds bound")
     return out
 
 def aggregate_group_layout(plan):
@@ -782,6 +787,7 @@ def aggregate_group_manifest_hash(base, head, diff_hash, manifest_hash, groups):
     return digest(canon(manifest))
 
 def validate(receipt, base, head, root=None, receipt_path=None, mission_id=None, repository=None, secret=None):
+    base, head = full_sha(base), full_sha(head)
     required={"version","repository","mission_id","base_sha","head_sha","diff_sha256","manifest_sha256","group_manifest_sha256","chunks","groups","chunk_findings","aggregate_result","aggregate_output_sha256","provider","model","command_sha256","review_result","findings","integrity_sha256","auth_hmac_sha256"}
     optional={"started_at","completed_at"}
     if not isinstance(receipt,dict) or not required <= set(receipt) or set(receipt)-required-optional: raise ValueError("incomplete or unknown receipt fields")
@@ -852,7 +858,7 @@ def validate(receipt, base, head, root=None, receipt_path=None, mission_id=None,
     if aggregate_result["findings"] != receipt["findings"]:
         raise ValueError("aggregate findings mismatch")
     if root is not None:
-        diff=git(Path(root).resolve(),"diff","--no-ext-diff","--no-textconv","--binary",f"{base}..{head}")
+        diff=bounded_diff(Path(root).resolve(),base,head)
         if position!=len(diff) or digest(diff)!=receipt["diff_sha256"]: raise ValueError("receipt diff coverage mismatch")
         if descriptors!=chunks(diff): raise ValueError("chunk manifest does not match exact diff")
         manifest={"version":"cmh-deepseek-chunks/v2","base_sha":base,"head_sha":head,"diff_sha256":digest(diff),"chunks":descriptors}
@@ -922,15 +928,18 @@ def aggregate_group_prompt(base, head, diff_hash, manifest_hash, group_manifest_
             f"RequiredDispositions={json.dumps(required_dispositions,sort_keys=True)}\n"+rendered)
 
 def aggregate_prompt(base, head, diff_hash, manifest_hash, group_manifest_hash,
-                     groups, group_findings, required_dispositions):
+                     groups, group_findings, required_dispositions, original_chunks=None):
     """Synthesize cross-group interactions without resending the unbounded diff."""
     summaries=[{"group_index":group["index"],"start":group["start"],"end":group["end"],
                 "chunk_indexes":group["chunk_indexes"],"group_sha256":group["sha256"],
                 "output_sha256":group["output_sha256"],"summary":group["result"]["summary"],
                 "review_result":group["result"]["review_result"],
-                "findings":group["result"]["findings"]} for group in groups]
+                "findings":group["result"]["findings"],
+                "chunk_dispositions":group["result"]["dispositions"],
+                "original_chunk_findings":indexed_chunk_findings([c for c in (original_chunks or []) if c["index"] in group["chunk_indexes"]])[0]} for group in groups]
     return ("You are the final cross-group independent reviewer for this exact diff. Do not use tools or filesystem. "
             "The diff was partitioned into non-overlapping source groups, each reviewed with its exact source by an independent pass. "
+            "Reevaluate every original disputed chunk finding for cross-group risks; add a NEW finding if the local dispute is unsound. "
             "Compare all group summaries for cross-file/cross-group interactions, including API/data contracts, state transitions, "
             "error handling, and security boundaries; add findings for risks visible only across groups. "
             "Return only JSON matching the schema. PASS only when P0/P1/P2 are absent. "
@@ -957,8 +966,92 @@ def invoke_reviewer(command, prompt_text, env, timeout):
     # Keep source and synthesis prompts on stdin, not argv. The bounded request
     # limit is enforced before this call, independently of the operating system's
     # argv limit. Claude Code print mode supports prompts on stdin.
-    return subprocess.run(command, input=prompt_text.encode("utf-8"), env=env,
-                          capture_output=True, timeout=timeout)
+    def output_file_limit():
+        resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_REVIEW_OUTPUT_BYTES + 1, MAX_REVIEW_OUTPUT_BYTES + 1))
+    with tempfile.TemporaryFile() as stdin, tempfile.TemporaryFile() as stdout_file, \
+            tempfile.TemporaryFile() as stderr_file:
+        stdin.write(prompt_text.encode("utf-8"))
+        stdin.seek(0)
+        process = subprocess.Popen(command, stdin=stdin, stdout=stdout_file,
+                                   stderr=stderr_file, env=env, start_new_session=True,
+                                   preexec_fn=output_file_limit)
+        deadline = time.monotonic() + timeout
+        try:
+            while process.poll() is None:
+                if (os.fstat(stdout_file.fileno()).st_size > MAX_REVIEW_OUTPUT_BYTES
+                        or os.fstat(stderr_file.fileno()).st_size > MAX_REVIEW_OUTPUT_BYTES):
+                    raise ValueError("reviewer output exceeds bound")
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+            if (os.fstat(stdout_file.fileno()).st_size > MAX_REVIEW_OUTPUT_BYTES
+                    or os.fstat(stderr_file.fileno()).st_size > MAX_REVIEW_OUTPUT_BYTES):
+                raise ValueError("reviewer output exceeds bound")
+        except (subprocess.TimeoutExpired, ValueError, KeyboardInterrupt) as exc:
+            try:
+                os.killpg(process.pid, signal.SIGKILL if isinstance(exc, KeyboardInterrupt)
+                          else signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            if isinstance(exc, subprocess.TimeoutExpired):
+                stdout_file.seek(0); stderr_file.seek(0)
+                raise subprocess.TimeoutExpired(command, timeout,
+                    output=stdout_file.read(MAX_REVIEW_OUTPUT_BYTES),
+                    stderr=stderr_file.read(MAX_REVIEW_OUTPUT_BYTES)) from exc
+            raise
+        stdout_file.seek(0); stderr_file.seek(0)
+        return subprocess.CompletedProcess(command, process.returncode,
+                stdout_file.read(MAX_REVIEW_OUTPUT_BYTES), stderr_file.read(MAX_REVIEW_OUTPUT_BYTES))
+
+
+def bounded_diff(root, base, head, *, max_bytes=MAX_LEGACY_DIFF_BYTES, timeout=30):
+    """Read an exact Git diff with byte and time ceilings before any model call."""
+    base, head = full_sha(base), full_sha(head)
+    command = ["git", "--no-replace-objects", "-C", str(root), "diff", "--no-ext-diff",
+               "--no-textconv", "--binary", f"{base}..{head}"]
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               env=_GIT_ENV, start_new_session=True)
+    chunks, size = [], 0
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Git diff exceeded review deadline")
+            readable, _, _ = select.select([process.stdout], [], [], min(remaining, 1))
+            if not readable:
+                continue
+            block = os.read(process.stdout.fileno(), min(65536, max_bytes + 1 - size))
+            if not block:
+                break
+            chunks.append(block)
+            size += len(block)
+            if size > max_bytes:
+                raise ValueError("review diff exceeds bounded source size")
+        if process.wait(timeout=max(0.1, deadline - time.monotonic())):
+            raise ValueError("Git diff failed")
+        return b"".join(chunks)
+    except Exception:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+        raise
+    finally:
+        process.stdout.close()
 
 
 class ReviewAttemptFailure(RuntimeError):
@@ -1257,7 +1350,7 @@ def run(args):
     if git(root, "rev-parse", "HEAD").decode().strip().lower() != head:
         raise ValueError("worktree HEAD differs from requested HEAD")
     repository = repository_identity(git(root, "config", "--get", "remote.origin.url").decode().strip())
-    diff = git(root, "diff", "--no-ext-diff", "--no-textconv", "--binary", f"{base}..{head}")
+    diff = bounded_diff(root, base, head)
     plan = chunks(diff)
     diff_hash = digest(diff)
     manifest = {
@@ -1528,7 +1621,7 @@ def run(args):
         )
         aggregate_text=aggregate_prompt(
             base,head,diff_hash,manifest_hash,group_manifest_hash,groups,
-            group_findings,required_dispositions,
+            group_findings,required_dispositions,original_chunks=plan,
         )
         try:
             bounded_prompt_bytes(aggregate_text)
