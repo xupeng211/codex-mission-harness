@@ -115,3 +115,27 @@ files and coverage proof. It creates no review PASS receipt. Regenerate these
 artifacts after committing; a precommit HEAD identity is not final evidence.
 Tests use disposable Git repositories, blocked socket connections and explicit
 mock invokers. Their qualification and review records are test fixtures only.
+
+## Independent premerge acceptance of the dependency sequence
+
+`harness.premerge_plan` freezes actual main, PR #2 HEAD and V2 HEAD, verifies
+both ancestry edges and both `merge-tree` results, and records two scopes:
+actual main..PR2 and prospective PR2..V2. It does not update any ref.
+The PR2 candidate can be reviewed by the V2 implementation running outside
+its source worktree: source identity and qualified tool identity are distinct,
+so this does not require importing unreviewed V2 changes into PR2's scope.
+
+`reviewer_v2_gate.py --premerge-plan PLAN --premerge-scope v2-after-pr2` uses a
+separate frozen-plan gate. It verifies the same actual qualification, source,
+result artifacts and receipt chain, but returns `SIMULATED_PREMERGE_PASS` with
+`production_main_gate_eligible=false`. The ordinary production gate still
+requires actual origin/main. PR2's premerge scope returns PASS only for its
+complete actual main range. A changed main, wrong scope, altered plan, missing
+receipt or incomplete review fails closed.
+
+This prospective V2 evidence cannot authorize merging V2 into current main.
+After the first human-authorized integration, fetch actual main and check its
+SHA. If it differs from the reviewed prospective base (as with a GitHub merge
+commit or squash), regenerate the manifest and necessary exact-base review
+evidence. Never edit or re-sign old receipts to change their base. Until then,
+premerge reports explicitly distinguish simulated scope from real main scope.

@@ -33,11 +33,11 @@ def _source_stable(root: Path, base: str, head: str, diff_hash: str) -> bool:
             and hashlib.sha256(_diff(root, base, head)).hexdigest() == diff_hash)
 
 
-def validate_gate(
+def _validate_scope_evidence(
     *, root: Path, base: str, head: str, deepseek_receipt: dict,
     openai_receipt: dict, deepseek_validator: Callable[[dict], dict],
     openai_validator: Callable[[dict], dict], mission_id: str, repository: str,
-    qualification_validators: dict[str, Callable[[], dict]],
+    qualification_validators: dict[str, Callable[[], dict]], target_main: str,
 ) -> dict:
     """Return an evidence digest only when both independently validated lanes pass.
 
@@ -48,9 +48,8 @@ def validate_gate(
     if not all(re.fullmatch(r"[0-9a-f]{40}", value or "") for value in (base, head)):
         raise ValueError("full exact Git SHAs are required")
     root = Path(root).resolve(strict=True)
-    target_main = full.git(root, 'rev-parse', 'refs/remotes/origin/main').decode().strip()
-    if base != target_main or full.git(root, 'merge-base', base, head).decode().strip() != base:
-        raise ValueError('final gate requires the complete current target main scope')
+    if full.git(root, 'rev-parse', 'refs/remotes/origin/main').decode().strip() != target_main:
+        raise ValueError('target main changed during validation')
     diff_hash = hashlib.sha256(_diff(root, base, head)).hexdigest()
     if not mission_id or not repository or not _source_stable(root, base, head, diff_hash):
         raise ValueError("review source or mission identity is unstable")
@@ -116,10 +115,36 @@ def validate_gate(
                       "receipt_sha256": hashlib.sha256(json.dumps(raw, sort_keys=True,
                            separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()})
     if (not _source_stable(root, base, head, diff_hash)
-            or full.git(root, "rev-parse", "refs/remotes/origin/main").decode().strip() != base):
+            or full.git(root, "rev-parse", "refs/remotes/origin/main").decode().strip() != target_main):
         raise ValueError("review source changed during validation")
     return {"status": "PASS", "base_sha": base, "head_sha": head,
             "diff_sha256": diff_hash, "manifest_sha256": manifest["manifest_sha256"], "lanes": lanes}
+
+
+def validate_gate(*, root, base, head, **kwargs):
+    """Production gate: only the complete current main candidate scope."""
+    target_main = full.git(root, 'rev-parse', 'refs/remotes/origin/main').decode().strip()
+    if base != target_main or full.git(root, 'merge-base', base, head).decode().strip() != base:
+        raise ValueError('final gate requires the complete current target main scope')
+    return _validate_scope_evidence(root=root, base=base, head=head, target_main=target_main, **kwargs)
+
+
+def validate_premerge_gate(*, root, base, head, plan, scope, repository, **kwargs):
+    """Separate simulated gate; it cannot authorize integration against real main."""
+    from harness.premerge_plan import validate_plan
+    verified_plan = validate_plan(root, plan, repository)
+    if scope not in verified_plan['scopes']:
+        raise ValueError('unknown premerge scope')
+    expected = verified_plan['scopes'][scope]
+    if base != expected['base_sha'] or head != expected['head_sha']:
+        raise ValueError('premerge exact scope mismatch')
+    result = _validate_scope_evidence(root=root, base=base, head=head,
+        target_main=verified_plan['actual_main_sha'], repository=repository, **kwargs)
+    validate_plan(root, plan, repository)
+    return {**result, 'status': 'SIMULATED_PREMERGE_PASS' if expected['simulated'] else 'PASS',
+            'premerge_scope': scope, 'premerge_plan_sha256': verified_plan['plan_sha256'],
+            'actual_main_sha': verified_plan['actual_main_sha'], 'simulated': expected['simulated'],
+            'actual_merge_performed': False, 'production_main_gate_eligible': not expected['simulated']}
 
 
 def main() -> int:
@@ -150,6 +175,8 @@ def main() -> int:
     parser.add_argument("--openai-qualification", required=True)
     parser.add_argument("--mission-id", default="codex-mission-harness")
     parser.add_argument("--registry")
+    parser.add_argument("--premerge-plan", type=Path)
+    parser.add_argument("--premerge-scope", choices=("pr2", "v2-after-pr2"))
     args = parser.parse_args()
     try:
         root = Path(args.repo).resolve(strict=True)
@@ -182,7 +209,12 @@ def main() -> int:
                 os.close(fd)
         repository = secure.repository_identity(
             secure.git(root, "config", "--get", "remote.origin.url").decode().strip())
-        proof = validate_gate(
+        if bool(args.premerge_plan) != bool(args.premerge_scope):
+            raise ValueError('premerge plan and scope must be supplied together')
+        gate_function = validate_premerge_gate if args.premerge_plan else validate_gate
+        gate_options = ({'plan': json.loads(args.premerge_plan.read_bytes()), 'scope': args.premerge_scope}
+                        if args.premerge_plan else {})
+        proof = gate_function(**gate_options,
             qualification_validators={
                 'deepseek': lambda: validate_qualification_receipt(Path(args.deepseek_qualification), independent,
                     auth_key=deepseek_auth_key, role='independent_reviewer', registry_path=args.registry),
