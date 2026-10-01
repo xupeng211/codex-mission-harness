@@ -249,6 +249,7 @@ def run(args: argparse.Namespace) -> dict:
     run = None
     settings = None
     token = ""
+    auth_key = ""
     stage_state: dict = {"stage": "setup", "stage_id": "setup", "input_sha256": diff_hash,
                          "started_at": int(time.time()), "stdout_present": False,
                          "exit_code": None, "stderr_markers": {},
@@ -263,10 +264,14 @@ def run(args: argparse.Namespace) -> dict:
         token = legacy.read_token_file(args.token_file, root)
         if not token:
             raise ValueError("missing DeepSeek credential")
+        auth_key_file = getattr(args, "auth_key_file", None)
+        auth_key = legacy.read_token_file(auth_key_file, root) if auth_key_file else token
+        if not auth_key:
+            raise ValueError("missing review authentication key")
         qualification = getattr(args, "qualification", None)
         if not qualification:
             raise ValueError("live DeepSeek review requires an independent reviewer qualification receipt")
-        qualified = validate_qualification_receipt(qualification, model, auth_key=token,
+        qualified = validate_qualification_receipt(qualification, model, auth_key=auth_key,
                                        role="independent_reviewer", registry_path=registry_path)
         identity = {"provider": model.provider, "role": "independent_reviewer",
                     "model": model.model, "model_configuration": model.identity(),
@@ -399,13 +404,13 @@ def run(args: argparse.Namespace) -> dict:
         receipt['full_manifest'] = manifest
         receipt['execution_identity'] = expected_execution(receipt, manifest, sha256(canonical(qualified)), model)
         receipt["integrity_sha256"] = sha256(canonical(receipt))
-        receipt["auth_hmac_sha256"] = _receipt_hmac(receipt, token)
+        receipt["auth_hmac_sha256"] = _receipt_hmac(receipt, auth_key)
         path = evidence / f"deepseek-v2-receipt-{head[:12]}-{run_id}.json"
         stage_state.update(stage="final receipt", stage_id=path.name,
                            input_sha256=sha256(canonical(receipt)), started_at=int(time.time()))
         # Validate the already durable model artifacts before publishing the
         # receipt. A failed run cannot leave an approval-looking receipt.
-        validate(receipt, base, head, root, path, args.mission_id, repository, token,
+        validate(receipt, base, head, root, path, args.mission_id, repository, auth_key,
                  registry_path=registry_path)
         try:
             run.receipt(path.name, canonical(receipt), lambda: None)
@@ -462,9 +467,9 @@ def run(args: argparse.Namespace) -> dict:
                    "source_binding_diagnostic": stage_state.get("source_binding_diagnostic"),
                    "output_sha256": stage_state.get("output_sha256")}
         failure["integrity_sha256"] = sha256(canonical(failure))
-        if token:
-            failure["auth_hmac_sha256"] = _receipt_hmac(failure, token)
-        failure_path = run.failure(failure, token) if run is not None else None
+        if auth_key:
+            failure["auth_hmac_sha256"] = _receipt_hmac(failure, auth_key)
+        failure_path = run.failure(failure, auth_key) if run is not None else None
         if isinstance(exc, ReviewStageFailure):
             exc.failure_artifact = str(failure_path) if failure_path else None
             raise
@@ -477,6 +482,7 @@ def run(args: argparse.Namespace) -> dict:
         if settings is not None:
             Path(settings.name).unlink(missing_ok=True)
         token = ""
+        auth_key = ""
         if run is not None:
             run.close()
 
@@ -605,6 +611,7 @@ def main() -> int:
         p.add_argument("--head", required=True)
         p.add_argument("--mission-id", default="codex-mission-harness")
         p.add_argument("--token-file", required=True)
+        p.add_argument("--auth-key-file")
         if name == "run":
             p.add_argument("--qualification", required=True)
         p.add_argument("--registry")
@@ -620,12 +627,12 @@ def main() -> int:
         else:
             root = Path(args.repo).resolve()
             path = Path(args.receipt).resolve()
-            token = legacy.read_token_file(args.token_file, root)
+            auth_key = legacy.read_token_file(args.auth_key_file or args.token_file, root)
             receipt = json.loads(path.read_text())
             repository = legacy.repository_identity(
                 legacy.git(root, "config", "--get", "remote.origin.url").decode().strip())
             validate(receipt, legacy.full_sha(args.base), legacy.full_sha(args.head), root,
-                     path, args.mission_id, repository, token, registry_path=args.registry)
+                     path, args.mission_id, repository, auth_key, registry_path=args.registry)
             print(json.dumps({"status": receipt["review_result"]}))
     except ReviewStageFailure as exc:
         print(json.dumps({"status": "BLOCKED", "category": exc.category,

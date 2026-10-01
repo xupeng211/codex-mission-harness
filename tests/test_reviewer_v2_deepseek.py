@@ -110,6 +110,12 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
                     self.assertFalse(list(evidence.rglob("deepseek-v2-receipt-*.json")))
 
     def test_commit_last_receipt_and_exact_source_validation(self):
+        self._exercise_receipt()
+
+    def test_separate_signing_key_never_replaces_provider_credential(self):
+        self._exercise_receipt(separate_auth=True)
+
+    def _exercise_receipt(self, separate_auth=False):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "repo"
             root.mkdir()
@@ -131,8 +137,13 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
             args = SimpleNamespace(repo=str(root), base=base, head=head,
                                    evidence=str(evidence), token_file=str(Path(temporary) / "token"),
                                    mission_id="test", timeout=30, qualification="fixture-qualification")
+            signing_file=Path(temporary)/"signing-key"
+            if separate_auth:args.auth_key_file=str(signing_file)
+            receipt_key="fixture-signing-key" if separate_auth else "fixture-token"
             summary = "The source change preserves the relevant contract and control flow."
             def invoke(command, prompt, env, timeout):
+                self.assertEqual(env["ANTHROPIC_API_KEY"],"fixture-token")
+                self.assertNotIn("fixture-signing-key",repr(env))
                 if "Scope=cross-group" in prompt:
                     self.assertIn("original_chunk_findings",prompt)
                     self.assertIn("chunk_dispositions",prompt)
@@ -143,10 +154,11 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
                     "structured_output": result}).encode(), b"")
             with (patch.object(reviewer.legacy, "resolve_claude_launcher",
                                return_value=("/bin/true", "/usr/bin:/bin")),
-                  patch.object(reviewer.legacy, "read_token_file", return_value="fixture-token"),
-                  patch.object(reviewer, "validate_qualification_receipt", return_value={}),
+                  patch.object(reviewer.legacy, "read_token_file", side_effect=lambda path,_root: "fixture-signing-key" if str(path)==str(signing_file) else "fixture-token"),
+                  patch.object(reviewer, "validate_qualification_receipt", return_value={}) as qualified,
                   patch.object(reviewer.legacy, "invoke_reviewer", side_effect=invoke)):
                 response = reviewer.run(args)
+            self.assertEqual(qualified.call_args.kwargs["auth_key"],receipt_key)
             receipt_path = Path(response["review_receipt"])
             self.assertEqual(response["status"], "PASS")
             state = json.loads((receipt_path.parent / "state.json").read_text())
@@ -160,14 +172,14 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
                             <= set(state["identity"]))
             receipt = json.loads(receipt_path.read_text())
             reviewer.validate(receipt, base, head, root, receipt_path, "test",
-                              "ssh://github.com/example/harness.git", "fixture-token")
+                              "ssh://github.com/example/harness.git", receipt_key)
             original_read = Path.read_bytes
             def changed_runner(path):
                 return b"changed runner" if path == Path(reviewer.__file__) else original_read(path)
             with patch.object(Path, "read_bytes", changed_runner):
                 with self.assertRaises(ValueError):
                     reviewer.validate(receipt, base, head, root, receipt_path, "test",
-                                      "ssh://github.com/example/harness.git", "fixture-token")
+                                      "ssh://github.com/example/harness.git", receipt_key)
             with tempfile.TemporaryDirectory() as custom_dir:
                 registry = Path(custom_dir) / "models.json"
                 registry.write_bytes(reviewer.load_registry().path.read_bytes() + b" ")
@@ -181,7 +193,7 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
             receipt["chunks"][0]["sha256"] = "0" * 64
             with self.assertRaises(ValueError):
                 reviewer.validate(receipt, base, head, root, receipt_path, "test",
-                                  "ssh://github.com/example/harness.git", "fixture-token")
+                                  "ssh://github.com/example/harness.git", receipt_key)
 
 
 if __name__ == "__main__":

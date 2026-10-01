@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -14,6 +15,38 @@ from harness.model_qualification import (  # noqa: E402
     qualify_live, qualification_receipt, validate_qualification_receipt,
 )
 from harness.model_registry import read_private_token  # noqa: E402
+
+
+def publish_receipt(output: Path, payload: bytes, validate) -> None:
+    """Validate pending bytes, publish exclusively, and sync the directory entry."""
+    import deepseek_review as secure
+    parent, directory_fd=secure.open_private_directory(output.parent,
+        Path(__file__).resolve().parents[1],create=False)
+    pending='qualification-pending-'+uuid.uuid4().hex
+    published=False
+    try:
+        fd=os.open(pending,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=directory_fd)
+        try:
+            offset=0
+            while offset<len(payload):
+                written=os.write(fd,payload[offset:])
+                if written<=0:raise OSError('qualification write made no progress')
+                offset+=written
+            os.fsync(fd)
+        finally:os.close(fd)
+        validate(parent/pending)
+        os.link(pending,output.name,src_dir_fd=directory_fd,dst_dir_fd=directory_fd,follow_symlinks=False)
+        published=True
+        validate(parent/output.name)
+        os.fsync(directory_fd)
+    except BaseException:
+        if published:os.unlink(output.name,dir_fd=directory_fd)
+        raise
+    finally:
+        try:os.unlink(pending,dir_fd=directory_fd)
+        except FileNotFoundError:pass
+        try:os.fsync(directory_fd)
+        finally:os.close(directory_fd)
 
 
 def main() -> int:
@@ -52,14 +85,12 @@ def main() -> int:
     receipt = qualification_receipt(result, auth_key=auth_key, role=args.role,
                                     registry_path=args.registry)
     payload = (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode()
-    fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
-        os.write(fd, payload)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    validate_qualification_receipt(args.output, spec, auth_key=auth_key, role=args.role,
-                                   registry_path=args.registry)
+        publish_receipt(args.output,payload,lambda path:validate_qualification_receipt(
+            path,spec,auth_key=auth_key,role=args.role,registry_path=args.registry))
+    except (OSError,ValueError):
+        print(json.dumps({'status':'FAIL','reason':'qualification receipt publication rejected'}),file=sys.stderr)
+        return 1
     print(json.dumps({"status": "PASS", "identity": result.identity,
                       "receipt": str(args.output)}))
     return 0
