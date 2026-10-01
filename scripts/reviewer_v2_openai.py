@@ -32,6 +32,7 @@ from harness.model_qualification import validate_qualification_receipt  # noqa: 
 from harness.openai_invocation import InvocationFailure, invoke_openai  # noqa: E402
 import harness.openai_invocation as invocation_module  # noqa: E402
 from harness.reviewer_v2_contract import bind_findings, validate_source_binding  # noqa: E402
+from harness.review_resume import ReviewRun  # noqa: E402
 
 VERSION = "cmh-reviewer-v2-openai/v2"
 BLOCKING = frozenset({"P0", "P1", "P2"})
@@ -222,15 +223,20 @@ def _decide(blockers: list[dict], result: dict, source: bytes) -> list[dict]:
             if item["decision"] == "UPHELD"]
 
 
-def _assemble(diff: bytes, base: str, head: str, call, persist=None) -> tuple[dict, list[tuple[str, bytes]]]:
+def _assemble(diff: bytes, base: str, head: str, call, persist=None, stage_run=None) -> tuple[dict, list[tuple[str, bytes]]]:
     chunks, groups = _plan(diff)
     artifacts = []
     for item in chunks:
         source = diff[item["start"]:item["end"]]
-        raw = call(_prompt("CHUNK REVIEW", base=base, head=head, diff=source), False)
-        if persist is not None:
-            persist(f"chunk-{item['index']:03d}.json", raw)
-        item["result"] = _result(raw)
+        prompt = _prompt("CHUNK REVIEW", base=base, head=head, diff=source)
+        name = f"chunk-{item['index']:03d}"
+        if stage_run is None:
+            raw = call(prompt, False)
+            item["result"] = _result(raw)
+            if persist is not None:
+                persist(name + ".json", raw)
+        else:
+            raw, item["result"] = stage_run(name, "chunk", prompt, lambda: call(prompt, False), _result)
         item["output_sha256"] = _sha(raw)
         artifacts.append((f"chunk-{item['index']:03d}.json", raw))
         item["blocker_ids"] = [record["finding_id"] for record in
@@ -245,10 +251,19 @@ def _assemble(diff: bytes, base: str, head: str, call, persist=None) -> tuple[di
                 chunk["result"]["findings"], "C", chunk["index"])
                 if record["finding"]["severity"] in BLOCKING)
         source = diff[group["start"]:group["end"]]
-        raw = call(_prompt("GROUP REVIEW", base=base, head=head, diff=source, ids=blockers), True)
-        if persist is not None:
-            persist(f"group-{group['index']:03d}.json", raw)
-        result = _result(raw, group=True)
+        prompt = _prompt("GROUP REVIEW", base=base, head=head, diff=source, ids=blockers)
+        name = f"group-{group['index']:03d}"
+        def validate_group(raw):
+            parsed = _result(raw, group=True)
+            _decide(blockers, parsed, source)
+            return parsed
+        if stage_run is None:
+            raw = call(prompt, True)
+            result = validate_group(raw)
+            if persist is not None:
+                persist(name + ".json", raw)
+        else:
+            raw, result = stage_run(name, "group", prompt, lambda: call(prompt, True), validate_group)
         upheld = _decide(blockers, result, source)
         group["result"] = result
         group["source_blockers"] = blockers
@@ -269,10 +284,15 @@ def _assemble(diff: bytes, base: str, head: str, call, persist=None) -> tuple[di
             for offset in range(0, len(level), 8):
                 batch = level[offset:offset + 8]
                 prompt = _synthesis_prompt([item["summary"] for item in batch], base, head)
-                raw = call(prompt, "synthesis")
-                if persist is not None:
-                    persist(f"synthesis-{len(synthesis):03d}.json", raw)
-                result = _synthesis_result(raw)
+                name = f"synthesis-{len(synthesis):03d}"
+                if stage_run is None:
+                    raw = call(prompt, "synthesis")
+                    result = _synthesis_result(raw)
+                    if persist is not None:
+                        persist(name + ".json", raw)
+                else:
+                    raw, result = stage_run(name, "cross-group", prompt,
+                                            lambda: call(prompt, "synthesis"), _synthesis_result)
                 source_groups = [index for item in batch for index in item["source_groups"]]
                 record = {"index": len(synthesis), "source_groups": source_groups,
                           "input_summaries_sha256": _sha(_canon([item["summary"] for item in batch])),
@@ -422,17 +442,32 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
     call = lambda prompt, group: invoke_codex(
         prompt, spec, stage="synthesis" if group == "synthesis" else
         "group" if group else "chunk", timeout=timeout)
-    _, parent_fd = secure.open_private_directory(evidence, root)
-    run_id = uuid.uuid4().hex
-    child_name = f"openai-{head[:12]}-{run_id}"
-    child_fd = secure.create_private_child_directory(parent_fd, child_name)
-    path = Path(evidence).absolute() / child_name / "receipt.json"
+    chunks, groups = _plan(diff)
+    stage_plan = [(f"chunk-{i:03d}", "chunk") for i in range(len(chunks))] + [
+        (f"group-{i:03d}", "group") for i in range(len(groups))]
+    if len(groups) > 1:
+        stage_plan.append(("synthesis-000", "cross-group"))
+    qualification_identity = (_sha(Path(qualification_path).read_bytes())
+                              if qualification_path and Path(qualification_path).exists()
+                              else _sha(str(qualification_path).encode()))
+    identity = {"provider": spec.provider, "role": "final_reviewer", "model": spec.model,
+                "model_configuration": spec.identity(), "repository": repository,
+                "mission_id": mission_id, "base_sha": base, "head_sha": head,
+                "diff_hash": _sha(diff), "registry_hash": _sha(registry.path.read_bytes()),
+                "runner_hash": _sha(Path(__file__).read_bytes()),
+                "invocation_hash": _sha(Path(invocation_module.__file__).read_bytes()),
+                "schema_manifest_hash": _schema_manifest_sha(),
+                "qualification_receipt_identity": qualification_identity,
+                "input_manifest_identity": _sha(_canon({"chunks": chunks, "groups": groups}))}
+    run_state = ReviewRun(evidence, root, identity, stage_plan, secure,
+                          prefix="openai-v2-")
+    run_id, child_fd = run_state.state["review_run_id"], run_state.fd
+    path = run_state.path / "receipt.json"
     artifact_hashes = {}
-    def persist(name: str, raw: bytes) -> None:
-        if len(raw) > MAX_OUTPUT_BYTES:
-            raise ValueError("review output exceeds bound")
-        secure.write_private_artifact(child_fd, name, raw, run_id)
-        artifact_hashes[name] = _sha(raw)
+    def stage_run(name, kind, prompt, execute, validate_result):
+        raw, result = run_state.stage(name, kind, prompt.encode(), execute, validate_result)
+        artifact_hashes[name + ".json"] = _sha(raw)
+        return raw, result
     previous_signals = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT))
     def interrupt(_signum, _frame):
         raise KeyboardInterrupt()
@@ -450,7 +485,7 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
             'Return JSON with an empty findings array. Use the exact chunk schema.',
             spec, stage="chunk", timeout=min(timeout, 120),
         )
-        receipt, _ = _assemble(diff, base, head, call, persist=persist)
+        receipt, _ = _assemble(diff, base, head, call, stage_run=stage_run)
         receipt.update({"model": spec.model, "reasoning_effort": spec.reasoning_effort,
                         "mission_id": mission_id, "repository": repository,
                         "registry_sha256": _sha(registry.path.read_bytes()),
@@ -465,7 +500,7 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
                  registry_path=registry_path)
         # Publish the approval-shaped receipt only after all stage artifacts
         # and semantic checks are durable and complete.
-        secure.write_private_artifact(child_fd, path.name, _canon(receipt), run_id)
+        run_state.receipt(path.name, _canon(receipt), lambda: None)
         return path
     except (Exception, KeyboardInterrupt) as exc:
         failure = {"status": "BLOCKED", "base_sha": base, "head_sha": head,
@@ -478,17 +513,14 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
                    "artifact_sha256": artifact_hashes,
                    "invocation_evidence": dict(exc.evidence) if isinstance(exc, InvocationFailure) else {},
                    "recorded_at": int(time.time())}
-        failure["auth_hmac_sha256"] = hmac.new(auth_key.encode(), _canon(failure),
-                                               hashlib.sha256).hexdigest()
-        secure.write_private_artifact(child_fd, "failure.json", _canon(failure), run_id)
+        failure_path = run_state.failure(failure, auth_key)
         if isinstance(exc, InvocationFailure):
-            exc.evidence["failure_record"] = str(path.parent / "failure.json")
+            exc.evidence["failure_record"] = str(failure_path)
         raise
     finally:
         signal.signal(signal.SIGTERM, previous_signals[0])
         signal.signal(signal.SIGINT, previous_signals[1])
-        os.close(child_fd)
-        os.close(parent_fd)
+        run_state.close()
 
 
 def main() -> int:

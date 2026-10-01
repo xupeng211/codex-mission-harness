@@ -27,6 +27,7 @@ from harness.reviewer_v2_contract import (  # noqa: E402
 )
 from harness.model_registry import load_registry  # noqa: E402
 from harness.model_qualification import validate_qualification_receipt  # noqa: E402
+from harness.review_resume import ReviewRun  # noqa: E402
 
 VERSION = "cmh-reviewer-v2-deepseek/v2"
 FAILURE_CATEGORIES = frozenset({
@@ -118,7 +119,7 @@ def _bounded(prompt: str) -> str:
 
 def _invoke(command: list[str], prompt: str, env: dict, timeout: int, token: str,
             *, stage: str, evidence_fd: int, artifact: str,
-            state: dict | None = None) -> tuple[str, str]:
+            state: dict | None = None, persist: bool = True) -> tuple[str, str]:
     state = {} if state is None else state
     state.pop("timeout_at", None)
     state.pop("output_sha256", None)
@@ -150,7 +151,8 @@ def _invoke(command: list[str], prompt: str, env: dict, timeout: int, token: str
     raw = legacy._captured_bytes(completed.stdout)
     if not raw.strip():
         raise ReviewStageFailure("EMPTY_OUTPUT", stage)
-    legacy.write_private_artifact(evidence_fd, artifact, raw, uuid.uuid4().hex)
+    if persist:
+        legacy.write_private_artifact(evidence_fd, artifact, raw, uuid.uuid4().hex)
     state["output_sha256"] = sha256(raw)
     return raw.decode("utf-8"), sha256(raw)
 
@@ -191,10 +193,7 @@ def run(args: argparse.Namespace) -> dict:
     model = registry.role("independent_reviewer")
     if model.provider != "deepseek":
         raise ValueError("independent reviewer provider is not DeepSeek")
-    evidence_root, root_fd = legacy.open_private_directory(args.evidence, root)
-    run_id = uuid.uuid4().hex
-    evidence = evidence_root / run_id
-    evidence_fd = legacy.create_private_child_directory(root_fd, run_id)
+    run = None
     settings = None
     token = ""
     stage_state: dict = {"stage": "setup", "stage_id": "setup", "input_sha256": diff_hash,
@@ -216,6 +215,22 @@ def run(args: argparse.Namespace) -> dict:
             raise ValueError("live DeepSeek review requires an independent reviewer qualification receipt")
         validate_qualification_receipt(qualification, model, auth_key=token,
                                        role="independent_reviewer", registry_path=registry_path)
+        identity = {"provider": model.provider, "role": "independent_reviewer",
+                    "model": model.model, "model_configuration": model.identity(),
+                    "repository": repository, "mission_id": args.mission_id,
+                    "base_sha": base, "head_sha": head, "diff_hash": diff_hash,
+                    "registry_hash": sha256(registry.path.read_bytes()),
+                    "runner_hash": sha256(Path(__file__).read_bytes()),
+                    "invocation_hash": sha256(Path(legacy.__file__).read_bytes()),
+                    "schema_manifest_hash": sha256(canonical({"chunk": CHUNK_SCHEMA,
+                                                             "synthesis": SYNTHESIS_SCHEMA})),
+                    "qualification_receipt_identity": sha256(Path(qualification).read_bytes())
+                    if Path(qualification).exists() else sha256(str(qualification).encode()),
+                    "input_manifest_identity": sha256(canonical({"chunks": chunks, "groups": groups}))}
+        stages = [(f"chunk-{i:03d}", "chunk") for i in range(len(chunks))] + [
+            (f"group-{i:03d}", "group") for i in range(len(groups))] + [("aggregate", "cross-group")]
+        run = ReviewRun(Path(args.evidence), root, identity, stages, legacy, prefix="deepseek-v2-")
+        run_id, evidence, evidence_fd = run.state["review_run_id"], run.path, run.fd
         settings = tempfile.NamedTemporaryFile(mode="w", delete=False)
         settings.write('{"permissions":{"allow":[],"deny":["Bash","Edit","Write",'
                        '"Read","Glob","Grep","WebFetch","WebSearch"]}}')
@@ -234,10 +249,13 @@ def run(args: argparse.Namespace) -> dict:
             source = diff[chunk["start"]:chunk["end"]]
             prompt = (_prompt_head(base, head, diff_hash, f"chunk {chunk['index']}")
                       + _render_source(source))
-            raw, output_hash = _invoke(chunk_command, prompt, env, args.timeout, token,
-                                       stage="chunk", evidence_fd=evidence_fd,
-                                       artifact=f"chunk-{chunk['index']:03d}.json", state=stage_state)
-            findings = _parse_stage(raw, parse_chunk, stage_state)
+            name = f"chunk-{chunk['index']:03d}"
+            raw_bytes, findings = run.stage(name, "chunk", prompt.encode(),
+                lambda: _invoke(chunk_command, prompt, env, args.timeout, token,
+                                stage="chunk", evidence_fd=evidence_fd,
+                                artifact=name + ".json", state=stage_state, persist=False)[0].encode(),
+                lambda data: _parse_stage(data.decode(), parse_chunk, stage_state))
+            output_hash = sha256(raw_bytes)
             chunk["bound_findings"] = bind_findings(findings, "C", chunk["index"])
             chunk["output_sha256"] = output_hash
         for group in groups:
@@ -262,12 +280,14 @@ def run(args: argparse.Namespace) -> dict:
                       + f"GroupSourceId={sha256(source)}\n"
                       + f"PriorBlockingFindings={json.dumps(required, sort_keys=True)}\n"
                       + _render_source(source))
-            raw, output_hash = _invoke(synthesis_command, prompt, env, args.timeout, token,
-                                       stage="group", evidence_fd=evidence_fd,
-                                       artifact=f"group-{group['index']:03d}.json", state=stage_state)
-            result = _parse_stage(raw, lambda value: parse_synthesis(value, expected, source=source,
-                                                                      structured_evidence=True),
-                                  stage_state)
+            name = f"group-{group['index']:03d}"
+            raw_bytes, result = run.stage(name, "group", prompt.encode(),
+                lambda: _invoke(synthesis_command, prompt, env, args.timeout, token,
+                                stage="group", evidence_fd=evidence_fd,
+                                artifact=name + ".json", state=stage_state, persist=False)[0].encode(),
+                lambda data: _parse_stage(data.decode(), lambda value: parse_synthesis(
+                    value, expected, source=source, structured_evidence=True), stage_state))
+            output_hash = sha256(raw_bytes)
             group["result"] = result
             # Preserve original C identities for carried P3 and UPHELD blockers;
             # only genuinely new findings receive a G identity.
@@ -293,12 +313,13 @@ def run(args: argparse.Namespace) -> dict:
                   "Decide RequiredFindingIds exactly once; no P3 IDs, invented IDs, or repeats.\n"
                   + f"RequiredFindingIds={json.dumps([item['finding_id'] for item in required])}\n"
                   + f"GroupSummaries={json.dumps(summaries, sort_keys=True)}")
-        raw, output_hash = _invoke(synthesis_command, prompt, env, args.timeout, token,
-                                   stage="cross-group", evidence_fd=evidence_fd,
-                                   artifact="aggregate.json", state=stage_state)
-        result = _parse_stage(raw, lambda value: parse_synthesis(value, expected, source=None,
-                                                                  structured_evidence=True),
-                              stage_state)
+        raw_bytes, result = run.stage("aggregate", "cross-group", prompt.encode(),
+            lambda: _invoke(synthesis_command, prompt, env, args.timeout, token,
+                            stage="cross-group", evidence_fd=evidence_fd,
+                            artifact="aggregate.json", state=stage_state, persist=False)[0].encode(),
+            lambda data: _parse_stage(data.decode(), lambda value: parse_synthesis(
+                value, expected, source=None, structured_evidence=True), stage_state))
+        output_hash = sha256(raw_bytes)
         receipt = {"version": VERSION, "repository": repository,
                    "mission_id": args.mission_id, "base_sha": base, "head_sha": head,
                    "registry_sha256": sha256(registry.path.read_bytes()),
@@ -309,7 +330,7 @@ def run(args: argparse.Namespace) -> dict:
                    "review_result": result["review_result"], "findings": result["findings"],
                    "command_sha256": sha256(canonical({"chunk": chunk_command,
                                                       "synthesis": synthesis_command})),
-                   "completed_at": int(time.time())}
+                   "completed_at": run.state["created_at"] // 1_000_000_000}
         receipt["integrity_sha256"] = sha256(canonical(receipt))
         receipt["auth_hmac_sha256"] = _receipt_hmac(receipt, token)
         path = evidence / f"deepseek-v2-receipt-{head[:12]}-{run_id}.json"
@@ -320,7 +341,7 @@ def run(args: argparse.Namespace) -> dict:
         validate(receipt, base, head, root, path, args.mission_id, repository, token,
                  registry_path=registry_path)
         try:
-            legacy.write_private_artifact(evidence_fd, path.name, canonical(receipt), run_id)
+            run.receipt(path.name, canonical(receipt), lambda: None)
         except Exception as exc:
             raise ReviewStageFailure("RECEIPT_WRITE_FAILED", "final receipt") from exc
         os.fsync(evidence_fd)
@@ -350,12 +371,12 @@ def run(args: argparse.Namespace) -> dict:
         failure["integrity_sha256"] = sha256(canonical(failure))
         if token:
             failure["auth_hmac_sha256"] = _receipt_hmac(failure, token)
-        legacy.write_private_artifact(evidence_fd, "failure.json", canonical(failure), run_id)
+        failure_path = run.failure(failure, token) if run is not None else None
         if isinstance(exc, ReviewStageFailure):
-            exc.failure_artifact = str(evidence / "failure.json")
+            exc.failure_artifact = str(failure_path) if failure_path else None
             raise
         wrapped = ReviewStageFailure(category, stage_state["stage"])
-        wrapped.failure_artifact = str(evidence / "failure.json")
+        wrapped.failure_artifact = str(failure_path) if failure_path else None
         raise wrapped from exc
     finally:
         signal.signal(signal.SIGTERM, previous_signals[0])
@@ -363,8 +384,8 @@ def run(args: argparse.Namespace) -> dict:
         if settings is not None:
             Path(settings.name).unlink(missing_ok=True)
         token = ""
-        os.close(evidence_fd)
-        os.close(root_fd)
+        if run is not None:
+            run.close()
 
 
 def validate(receipt: dict, base: str, head: str, root: Path | None = None,

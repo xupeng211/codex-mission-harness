@@ -78,7 +78,7 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
                     self.assertEqual(caught.exception.category, category)
                     failure_path = Path(caught.exception.failure_artifact)
                     failure = json.loads(failure_path.read_text())
-                    self.assertEqual(failure["stage"], "group")
+                    self.assertEqual(failure["stage"], "group-000")
                     self.assertEqual(failure["head_sha"], head)
                     self.assertEqual(failure["failure_category"], category)
                     self.assertEqual(len(failure["runner_sha256"]), 64)
@@ -121,6 +121,15 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
                 response = reviewer.run(args)
             receipt_path = Path(response["review_receipt"])
             self.assertEqual(response["status"], "PASS")
+            state = json.loads((receipt_path.parent / "state.json").read_text())
+            self.assertTrue(state["receipt_written"])
+            self.assertEqual(state["next_stage"], "complete")
+            self.assertEqual(state["completed_order"], ["chunk-000", "group-000", "aggregate"])
+            self.assertTrue({"provider", "role", "model", "model_configuration", "repository",
+                             "mission_id", "base_sha", "head_sha", "diff_hash", "registry_hash",
+                             "runner_hash", "invocation_hash", "schema_manifest_hash",
+                             "qualification_receipt_identity", "input_manifest_identity"}
+                            <= set(state["identity"]))
             receipt = json.loads(receipt_path.read_text())
             reviewer.validate(receipt, base, head, root, receipt_path, "test",
                               "ssh://github.com/example/harness.git", "fixture-token")
