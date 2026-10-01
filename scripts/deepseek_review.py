@@ -337,6 +337,21 @@ def read_token_file(path, repo_root):
     finally:
         os.close(parent_fd)
 
+def trusted_ca_path(path, *, directory=False):
+    """CA roots and every lexical ancestor must be immutable to non-root users."""
+    try:
+        info=path.lstat()
+        if (not path.is_absolute() or info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022
+                or not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))):
+            return False
+        for parent in path.parents:
+            info=parent.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
+                return False
+        return True
+    except OSError:
+        return False
+
 def reviewer_transport_environment(source=None):
     """Retain transport-only proxy and system-root CA settings, never auth/config."""
     source = os.environ if source is None else source
@@ -348,15 +363,7 @@ def reviewer_transport_environment(source=None):
         paths = value.split(os.pathsep) if name == "SSL_CERT_DIR" else [value]
         safe = True
         for raw_path in paths:
-            path = Path(raw_path)
-            try:
-                info = path.lstat()
-            except OSError:
-                safe = False
-                break
-            expected_type = stat.S_ISDIR(info.st_mode) if name == "SSL_CERT_DIR" else stat.S_ISREG(info.st_mode)
-            if (not path.is_absolute() or stat.S_ISLNK(info.st_mode) or not expected_type
-                    or info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022):
+            if not trusted_ca_path(Path(raw_path), directory=name == "SSL_CERT_DIR"):
                 safe = False
                 break
         if safe:
@@ -871,7 +878,7 @@ def validate(receipt, base, head, root=None, receipt_path=None, mission_id=None,
             evidence=Path(os.path.abspath(receipt_path)).parent
             evidence_fd=None
             try:
-                _, evidence_fd=open_private_directory(evidence, root)
+                _, evidence_fd=open_private_directory(evidence, root, create=False)
                 for chunk in chunks_:
                     artifact=read_private_artifact(evidence_fd,f"chunk-{chunk['index']:03d}.json")
                     if digest(artifact)!=chunk["output_sha256"]: raise ValueError("chunk artifact mismatch")
@@ -1718,7 +1725,7 @@ def main():
         if a.cmd=="run": run(a)
         else:
             root=Path(a.repo).resolve(); receipt_path=Path(a.receipt)
-            _,evidence_fd=open_private_directory(receipt_path.parent,root)
+            _,evidence_fd=open_private_directory(receipt_path.parent,root,create=False)
             token=""
             try:
                 receipt=json.loads(read_private_artifact(evidence_fd,receipt_path.name))

@@ -505,6 +505,12 @@ class DeepSeekReceiptTest(unittest.TestCase):
                        if key not in {"integrity_sha256", "auth_hmac_sha256"}}
             value["integrity_sha256"] = review.digest(review.canon(payload))
             value["auth_hmac_sha256"] = review.auth_digest(value, TEST_SECRET)
+            evidence.chmod(0o755)
+            with patch.object(review, "bounded_diff", return_value=source), \
+                    self.assertRaisesRegex(ValueError, "owner-only"):
+                review.validate(value, BASE, HEAD, root=repo,receipt_path=evidence / "receipt.json")
+            self.assertEqual(stat.S_IMODE(evidence.stat().st_mode),0o755)
+            evidence.chmod(0o700)
             with patch.object(review, "bounded_diff", return_value=source), \
                     self.assertRaisesRegex(ValueError, "chunk result does not match"):
                 review.validate(value, BASE, HEAD, root=repo,
