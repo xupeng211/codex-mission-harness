@@ -27,7 +27,8 @@ Each call debits its full approved input, output, reasoning, cache and cost
 reservation before launch. The debit remains after success, failure or
 missing usage. Reported usage and CLI USD metadata are stored separately;
 they are not confirmed bills. DeepSeek cost estimates use the signed peak
-price table and reported token counts; CLI USD metadata is never treated as a
+price table and reported token counts. Reasoning is added to output for this
+estimate even when the provider may include it in output already. CLI USD metadata is never treated as a
 bill or compared to the USD reserve. A token or price-based estimate above its
 reserve blocks later calls. Resume reads an already committed review stage
 without invoking the model, so it makes no new reservation.

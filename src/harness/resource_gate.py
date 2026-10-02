@@ -179,9 +179,9 @@ class Reservation:
                     record["usage_accounting"] = "OVER_RESERVATION_BLOCK_FUTURE_CALLS"
                 prices = record.get("price_microusd_per_million")
                 if prices and all(type(tokens.get(k)) is int and tokens[k] >= 0
-                                  for k in ("input", "output", "cache")):
+                                  for k in ("input", "output", "reasoning", "cache")):
                     numerator = (tokens["input"] * prices["input_cache_miss"] +
-                                 tokens["output"] * prices["output"] +
+                                 (tokens["output"] + tokens["reasoning"]) * prices["output"] +
                                  tokens["cache"] * prices["cache_hit"])
                     estimate = (numerator + 999_999) // 1_000_000
                     record["estimated_cost_microusd"] = estimate
