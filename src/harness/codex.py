@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Protocol
 
 from .policy import SENSITIVE
+from .model_registry import load_registry
+from .model_qualification import require_builder_qualification
 
 
 @dataclass(frozen=True)
@@ -32,16 +34,23 @@ class AppServerCodex:
     """Thin JSON-RPC adapter for the locally installed App Server; protocol stays here."""
     MODEL = "gpt-5.6-sol"
     REASONING_EFFORT = "high"
+
     RESPONSE_TIMEOUT_SECONDS = 300.0
     MAX_PENDING_MESSAGES = 256
 
     def __init__(self, executable: str = "codex", *,
-                 forbidden_actions: tuple[str, ...] = (), worktree: str | None = None):
+                 forbidden_actions: tuple[str, ...] = (), worktree: str | None = None,
+                 builder_qualification: str | Path | None = None,
+                 builder_auth_key_file: str | Path | None = None):
         # Both the mission deny-list and its validated worktree are immutable
         # constructor inputs. A later caller may verify them, but may not bind
         # either authority boundary from turn-supplied data.
         if worktree is None:
             raise ValueError("Codex mission worktree must be constructor-bound")
+        require_builder_qualification(builder_qualification, builder_auth_key_file)
+        builder = load_registry().role("builder")
+        self.MODEL = builder.model
+        self.REASONING_EFFORT = builder.reasoning_effort
         self._forbidden_actions = self._effective_policy(forbidden_actions)
         self._configured_forbidden_actions = self._effective_policy(forbidden_actions)
         self._policy_cwd = self._canonical_worktree(worktree)

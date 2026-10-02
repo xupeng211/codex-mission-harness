@@ -618,6 +618,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
             repo.mkdir()
             credential_dir = root / "credentials"
             credential_dir.mkdir(mode=0o750)
+            credential_dir.chmod(0o750)
             token_file = credential_dir / "token"
             token_file.write_text(TEST_SECRET)
             token_file.chmod(0o600)
