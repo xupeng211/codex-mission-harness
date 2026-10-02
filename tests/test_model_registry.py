@@ -1,4 +1,5 @@
 import json
+import hashlib
 import subprocess
 import tempfile
 import unittest
@@ -17,6 +18,47 @@ from harness.reviewer_v2_contract import parse_synthesis
 
 
 class RegistryTests(unittest.TestCase):
+    def test_candidate_registry_is_explicit_and_preserves_baseline(self):
+        baseline = load_registry()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "candidate.json"
+            binary = Path("/usr/bin/git")
+            value = json.loads(baseline.path.read_text())
+            value["roles"]["final_reviewer"] = {
+                "provider": "openai", "model": "gpt-6.1-sol", "reasoning_effort": "high",
+                "executable": str(binary),
+                "executable_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+            }
+            path.write_text(json.dumps(value))
+            path.chmod(0o600)
+            candidate = load_registry(path)
+            self.assertEqual(baseline.role("final_reviewer").model, "gpt-5.6-sol")
+            self.assertEqual(candidate.role("final_reviewer").model, "gpt-6.1-sol")
+            self.assertEqual(candidate.role("builder"), baseline.role("builder"))
+            self.assertEqual(candidate.role("independent_reviewer"), baseline.role("independent_reviewer"))
+            self.assertNotEqual(candidate.role("final_reviewer").identity(),
+                                baseline.role("final_reviewer").identity())
+            from harness.openai_invocation import selected_binary
+            self.assertEqual(selected_binary(candidate.role("final_reviewer")), binary)
+            with self.assertRaisesRegex(ValueError, "differs from selected"):
+                selected_binary(candidate.role("final_reviewer"), Path("/usr/bin/false"))
+            value["roles"]["final_reviewer"]["executable_sha256"] = "0" * 64
+            path.write_text(json.dumps(value))
+            with self.assertRaisesRegex(ValueError, "hash mismatch"):
+                selected_binary(load_registry(path).role("final_reviewer"))
+
+    def test_candidate_preflight_uses_only_its_pinned_binary(self):
+        from harness.model_registry import ModelSpec
+        spec = ModelSpec("openai", "gpt-6.1-sol", "high", "/usr/bin/git",
+                         hashlib.sha256(Path("/usr/bin/git").read_bytes()).hexdigest())
+        with patch("harness.openai_invocation.canonical_environment", return_value={}) as environment, \
+             patch("harness.model_registry.subprocess.run") as run:
+            run.return_value.returncode = 0
+            result = preflight(spec)
+        self.assertEqual(result.identity, spec.identity())
+        self.assertEqual(run.call_args.args[0], ["/usr/bin/git", "login", "status"])
+        environment.assert_called_once_with(binary=Path("/usr/bin/git"))
+
     def test_openai_preflight_checks_canonical_binary_and_home(self):
         with canonical_fixture() as (binary, home), \
              patch("harness.openai_invocation.canonical_environment", side_effect=lambda:
@@ -80,6 +122,43 @@ class RegistryTests(unittest.TestCase):
 
 
 class QualificationContractTests(unittest.TestCase):
+    def test_old_qualification_cannot_authorize_candidate_model(self):
+        baseline = load_registry().role("final_reviewer")
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            registry_path = directory / "candidate.json"
+            value = json.loads(load_registry().path.read_text())
+            binary = Path("/usr/bin/git")
+            value["roles"]["final_reviewer"] = {
+                "provider": "openai", "model": "gpt-6.1-sol", "reasoning_effort": "high",
+                "executable": str(binary),
+                "executable_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+            }
+            registry_path.write_text(json.dumps(value))
+            registry_path.chmod(0o600)
+            candidate = load_registry(registry_path).role("final_reviewer")
+            def signed(spec, registry=None):
+                result = QualificationResult(spec.identity(), "real_provider",
+                                             tuple(case.name for case in CASES), (),
+                                             ("a" * 64,) * len(CASES))
+                return qualification_receipt(result, auth_key="fixture-key",
+                                             role="final_reviewer", registry_path=registry)
+            old_path = directory / "old.json"
+            old_path.write_text(json.dumps(signed(baseline)))
+            old_path.chmod(0o600)
+            with self.assertRaises(ValueError):
+                validate_qualification_receipt(old_path, candidate, auth_key="fixture-key",
+                                               role="final_reviewer", registry_path=registry_path)
+            new_path = directory / "candidate-receipt.json"
+            new_path.write_text(json.dumps(signed(candidate, registry_path)))
+            new_path.chmod(0o600)
+            self.assertEqual(validate_qualification_receipt(
+                new_path, candidate, auth_key="fixture-key", role="final_reviewer",
+                registry_path=registry_path)["identity"], candidate.identity())
+            with self.assertRaises(ValueError):
+                validate_qualification_receipt(new_path, baseline, auth_key="fixture-key",
+                                               role="final_reviewer")
+
     def test_builder_execution_gate_requires_builder_role(self):
         with self.assertRaisesRegex(ValueError, "builder qualification"):
             require_builder_qualification(None, None)

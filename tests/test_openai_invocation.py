@@ -153,6 +153,14 @@ class OpenAIInvocationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             invoke_openai("x", ModelSpec("openai", "", "high"), {}, timeout=1)
 
+    def test_candidate_binary_mismatch_never_falls_back_or_starts_a_process(self):
+        from harness.openai_invocation import invoke_openai
+        spec = ModelSpec("openai", "gpt-6.1-sol", "high", "/usr/bin/git", "0" * 64)
+        with patch("harness.openai_invocation.subprocess.Popen") as start:
+            with self.assertRaisesRegex(ValueError, "hash mismatch"):
+                invoke_openai("review", spec, {"type": "object"}, timeout=1)
+        start.assert_not_called()
+
     def test_process_exit_and_missing_result_never_pass(self):
         from harness.openai_invocation import invoke_openai
         complete = (b'{"type":"thread.started"}\n{"type":"turn.started"}\n'

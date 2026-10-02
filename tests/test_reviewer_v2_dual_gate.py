@@ -137,6 +137,38 @@ class OpenAIContractTests(unittest.TestCase):
             review.validate(receipt, root=self.root, base=self.base, head="0" * 40,
                             spec=self.spec, auth_key="test-key")
 
+    def test_baseline_review_receipt_cannot_authorize_candidate_model(self):
+        def call(_prompt, group):
+            if group:
+                return review._canon({"findings": [], "decisions": [],
+                                      "summary": "The changed code has no blocking impact."})
+            return b'{"findings":[]}'
+        receipt, _ = review._assemble(self.diff, self.base, self.head, call)
+        self._signed(receipt)
+        with tempfile.TemporaryDirectory() as temporary:
+            registry_path = Path(temporary) / "candidate.json"
+            config = json.loads(review.load_registry().path.read_text())
+            binary = Path("/usr/bin/git")
+            config["roles"]["final_reviewer"] = {
+                "provider": "openai", "model": "gpt-6.1-sol", "reasoning_effort": "high",
+                "executable": str(binary),
+                "executable_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+            }
+            registry_path.write_text(json.dumps(config))
+            registry_path.chmod(0o600)
+            candidate = review.load_registry(registry_path).role("final_reviewer")
+            with self.assertRaisesRegex(ValueError, "model or exact HEAD mismatch"):
+                review.validate(receipt, root=self.root, base=self.base, head=self.head,
+                                spec=candidate, auth_key="test-key", registry_path=registry_path)
+            _, manifest = review.full.build_manifest(self.root, self.base, self.head,
+                                                     receipt["repository"])
+            old_execution = review.expected_execution(receipt, manifest, "a" * 64, self.spec)
+            new_execution = review.expected_execution(receipt, manifest, "a" * 64, candidate)
+            self.assertNotEqual(old_execution["execution_sha256"],
+                                new_execution["execution_sha256"])
+            with self.assertRaises(ValueError):
+                review.full.validate_execution(old_execution, new_execution)
+
     def test_failed_invocation_publishes_failure_only_for_exact_head(self):
         evidence = Path(self.temp.name) / "evidence"
         evidence.mkdir(mode=0o700)

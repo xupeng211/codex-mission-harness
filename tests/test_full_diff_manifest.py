@@ -240,6 +240,27 @@ class FullDiffTests(unittest.TestCase):
         with self.assertRaises(ValueError): run.receipt('receipt.json', b'{}', lambda: None)
         self.assertFalse((run.path / 'receipt.json').exists()); run.close()
 
+    def test_candidate_model_cannot_resume_baseline_chunks(self):
+        evidence = Path(self.tmp.name) / 'model-migration-resume'
+        stages = [('chunk-000', 'chunk'), ('group-000', 'group')]
+        baseline = {'model': 'gpt-5.6-sol', 'model_configuration': {
+            'model': 'gpt-5.6-sol', 'reasoning_effort': 'high'},
+            'review_execution_identity': 'a' * 64}
+        old = ReviewRun(evidence, self.root, baseline, stages, openai.secure,
+                        prefix='fixture-')
+        old.stage('chunk-000', 'chunk', b'input', lambda: b'{}', json.loads)
+        old_path = old.path
+        old.close()
+        candidate = {'model': 'gpt-6.1-sol', 'model_configuration': {
+            'model': 'gpt-6.1-sol', 'reasoning_effort': 'high'},
+            'review_execution_identity': 'b' * 64}
+        new = ReviewRun(evidence, self.root, candidate, stages, openai.secure,
+                        prefix='fixture-')
+        self.assertNotEqual(new.path, old_path)
+        self.assertEqual(new.state['completed_chunk_ids'], [])
+        self.assertTrue(json.loads((old_path / 'state.json').read_text())['invalidated'])
+        new.close()
+
     def test_group_count_tree_plan(self):
         self.assertEqual(full.synthesis_stage_names(10), [('synthesis-000', 'cross-group'),
                          ('synthesis-001', 'cross-group'), ('synthesis-002', 'cross-group')])

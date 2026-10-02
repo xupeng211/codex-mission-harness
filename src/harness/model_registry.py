@@ -6,6 +6,7 @@ must pass real provider qualification before it is enabled for a review gate.
 from __future__ import annotations
 
 import json
+import re
 import os
 import shutil
 import stat
@@ -25,10 +26,16 @@ class ModelSpec:
     provider: str
     model: str
     reasoning_effort: str | None = None
+    executable: str | None = None
+    executable_sha256: str | None = None
 
     def identity(self) -> dict[str, str | None]:
-        return {"provider": self.provider, "model": self.model,
-                "reasoning_effort": self.reasoning_effort}
+        identity = {"provider": self.provider, "model": self.model,
+                    "reasoning_effort": self.reasoning_effort}
+        if self.executable is not None:
+            identity.update(executable=self.executable,
+                            executable_sha256=self.executable_sha256)
+        return identity
 
 
 @dataclass(frozen=True)
@@ -78,7 +85,8 @@ def load_registry(path: str | Path | None = None) -> ModelRegistry:
     parsed = {}
     for role, value in roles.items():
         if not isinstance(value, dict) or set(value) not in (
-                {"provider", "model"}, {"provider", "model", "reasoning_effort"}):
+                {"provider", "model"}, {"provider", "model", "reasoning_effort"},
+                {"provider", "model", "reasoning_effort", "executable", "executable_sha256"}):
             raise ValueError(f"invalid model configuration for {role}")
         provider, model = value["provider"], value["model"]
         effort = value.get("reasoning_effort")
@@ -91,7 +99,12 @@ def load_registry(path: str | Path | None = None) -> ModelRegistry:
             raise ValueError("DeepSeek role cannot specify Codex reasoning effort")
         if provider == "openai" and (not isinstance(effort, str) or effort not in EFFORTS):
             raise ValueError("OpenAI role requires supported reasoning effort")
-        parsed[role] = ModelSpec(provider, model, effort)
+        executable, executable_sha256 = value.get("executable"), value.get("executable_sha256")
+        if executable is not None and (provider != "openai" or not isinstance(executable, str)
+                or not Path(executable).is_absolute() or not isinstance(executable_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", executable_sha256) is None):
+            raise ValueError("OpenAI executable requires an absolute path and SHA256")
+        parsed[role] = ModelSpec(provider, model, effort, executable, executable_sha256)
     if parsed["independent_reviewer"].provider == parsed["final_reviewer"].provider:
         raise ValueError("review lanes require different providers")
     return ModelRegistry(parsed, source.resolve())
@@ -178,10 +191,12 @@ def preflight(spec: ModelSpec, *, token_file: str | Path | None = None,
         return PreflightResult(spec.identity(), True, True if probe else None,
                                "actual_model_probe" if probe else "local_auth_only")
     if spec.provider == "openai":
-        from .openai_invocation import CANONICAL_BINARY, canonical_environment
+        from .openai_invocation import canonical_environment, selected_binary
 
-        env = canonical_environment()
-        result = subprocess.run([str(CANONICAL_BINARY), "login", "status"],
+        binary = selected_binary(spec)
+        env = (canonical_environment(binary=binary) if spec.executable is not None
+               else canonical_environment())
+        result = subprocess.run([str(binary), "login", "status"],
                                 capture_output=True, text=True, env=env,
                                 timeout=timeout, check=False)
         if result.returncode:

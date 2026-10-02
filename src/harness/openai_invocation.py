@@ -33,6 +33,28 @@ MAX_RESPONSE_BYTES = 128_000
 MAX_EVENT_STREAM_BYTES = 2_000_000
 
 
+def selected_binary(spec: ModelSpec, explicit: Path | None = None) -> Path:
+    """Select exactly the registry-pinned executable; never fall back on failure."""
+    if spec.executable is None:
+        if spec.executable_sha256 is not None:
+            raise ValueError("unpaired Codex executable digest")
+        return explicit if explicit is not None else CANONICAL_BINARY
+    binary = Path(spec.executable)
+    if explicit is not None and explicit != binary:
+        raise ValueError("Codex executable differs from selected model identity")
+    if (not binary.is_absolute() or binary.is_symlink()
+            or not isinstance(spec.executable_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", spec.executable_sha256)):
+        raise ValueError("invalid pinned Codex executable identity")
+    for parent in (binary.parent, *binary.parents):
+        info = parent.stat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
+            raise ValueError("pinned Codex executable has an unsafe ancestor")
+    if hashlib.sha256(binary.read_bytes()).hexdigest() != spec.executable_sha256:
+        raise ValueError("pinned Codex executable hash mismatch")
+    return binary
+
+
 class InvocationFailure(RuntimeError):
     def __init__(self, category: str, reason: str, evidence: dict):
         super().__init__(reason)
@@ -223,7 +245,7 @@ def _observed_events(raw: bytes) -> dict:
 
 
 def invoke_openai(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 120,
-                  binary: Path = CANONICAL_BINARY,
+                  binary: Path | None = None,
                   codex_home: Path = CANONICAL_HOME,
                   source_env: dict[str, str] | None = None) -> InvocationResult:
     if spec.provider != "openai" or not spec.model or not spec.reasoning_effort:
@@ -232,6 +254,7 @@ def invoke_openai(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 
         raise ValueError("Codex timeout must be bounded")
     if not isinstance(prompt, str) or len(prompt.encode()) > MAX_PROMPT_BYTES:
         raise ValueError("Codex prompt exceeds bound")
+    binary = selected_binary(spec, binary)
     env = canonical_environment(source_env, binary=binary, codex_home=codex_home)
     with tempfile.TemporaryDirectory(prefix="cmh-openai-review-") as temporary:
         root = Path(temporary)
@@ -292,6 +315,8 @@ def invoke_openai(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 
                     "elapsed_seconds": round(time.monotonic() - started, 3),
                     "failure_markers": _failure_markers(stderr, stdout),
                     **_observed_events(stdout)}
+        if spec.executable is not None:
+            evidence["binary_sha256"] = spec.executable_sha256
         if timed_out or process.returncode != 0:
             raise InvocationFailure(_failure_category(stderr, stdout, timed_out=timed_out),
                                     "canonical Codex invocation did not complete", evidence)
