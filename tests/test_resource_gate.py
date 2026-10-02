@@ -359,6 +359,12 @@ class ResourceGateTests(unittest.TestCase):
         self.env["CMH_RESOURCE_FREEZE_SHA256"] = digest(self.freeze.read_bytes())
         export = self.root / "synthetic-official-export.csv"
         private(export, {"fixture": "account tariff and daily total"})
+        raw_cli = self.root / "synthetic-cli-session.json"
+        private(raw_cli, {"usage": {"input_tokens": 1, "output_tokens": 1,
+                                    "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+                                    "output_tokens_details": {"thinking_tokens": 0}},
+                          "modelUsage": {"deepseek-flash": observed["raw_model_usage"]},
+                          "total_cost_usd": 0.000011})
         recovery = self.root / "synthetic-recovery.json"
         rows = self.rows()
         private(recovery, sign_authorization({
@@ -373,6 +379,9 @@ class ResourceGateTests(unittest.TestCase):
             "resumption_approved": True, "approval_source": "synthetic explicit future approval",
             "dispositions": [{"number": 2, "request_id": original["request_id"],
                               "row_sha256": digest(canonical(original)),
+                              "raw_cli_artifact_path": str(raw_cli),
+                              "raw_cli_artifact_sha256": digest(raw_cli.read_bytes()),
+                              "official_usd_snapshot_estimate_microusd": 2,
                               "classification": "CLI_FALLBACK_ESTIMATE_NOT_BILLED",
                               "settlement_status": "ESTIMATED_ONLY",
                               "confirmed_billed_cost": "UNKNOWN",
@@ -403,6 +412,11 @@ class ResourceGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ResourceGateDenied, "evidence hash changed"):
             self.call("openai")
         recovery.write_bytes(original_recovery)
+        original_raw = raw_cli.read_bytes()
+        private(raw_cli, {"fixture": "changed CLI usage"})
+        with self.assertRaisesRegex(ResourceGateDenied, "raw CLI evidence hash changed"):
+            self.call("openai")
+        raw_cli.write_bytes(original_raw)
         lane["price_microusd_per_million"]["output"] += 1
         self.publish(); self.env["CMH_RESOURCE_AUTH_SHA256"] = digest(self.approval.read_bytes())
         with self.assertRaisesRegex(ResourceGateDenied, "identity mismatch"):

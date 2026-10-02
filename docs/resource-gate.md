@@ -69,7 +69,9 @@ For a future, explicitly approved recovery, the signed resource authorization
 must bind the official export by SHA256, the verified route and price evidence,
 and a private HMAC-signed disposition for each historical CLI fallback overage.
 The disposition binds the frozen prefix, exact request number and row SHA256,
-retains the original overage, records `confirmed_billed_cost=UNKNOWN`, and
+the original CLI session artifact and its cache split by SHA256, and an
+independently recomputed official-price estimate within the old reservation.
+It retains the original overage, records `confirmed_billed_cost=UNKNOWN`, and
 cannot refund any reservation. Only the specified immutable rows may cease
 blocking later launches. This check is mission-wide, including OpenAI calls.
 An unlisted overage, missing or changed evidence, or unapproved recovery still

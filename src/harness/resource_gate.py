@@ -239,12 +239,45 @@ def _approved_billing_recovery(auth: dict, lane: dict, frozen: dict,
         row = rows[number - 1]
         usage = row.get("reported_usage")
         tokens = usage.get("tokens") if isinstance(usage, dict) else None
+        raw_name, raw_hash = item.get("raw_cli_artifact_path"), item.get("raw_cli_artifact_sha256")
+        if (not isinstance(raw_name, str) or not Path(raw_name).is_absolute() or
+                Path(raw_name).is_symlink() or not isinstance(raw_hash, str) or len(raw_hash) != 64):
+            raise ResourceGateDenied("billing recovery raw CLI evidence missing")
+        try:
+            raw_bytes = Path(raw_name).read_bytes()
+        except OSError as exc:
+            raise ResourceGateDenied("billing recovery raw CLI evidence unavailable") from exc
+        if digest(raw_bytes) != raw_hash:
+            raise ResourceGateDenied("billing recovery raw CLI evidence hash changed")
+        raw_cli = json.loads(raw_bytes)
+        raw_usage = raw_cli.get("usage") if isinstance(raw_cli, dict) else None
+        raw_model = raw_cli.get("modelUsage", {}).get(row.get("model")) if isinstance(raw_cli, dict) else None
+        read = raw_usage.get("cache_read_input_tokens") if isinstance(raw_usage, dict) else None
+        created = raw_usage.get("cache_creation_input_tokens") if isinstance(raw_usage, dict) else None
+        if (not isinstance(tokens, dict) or
+                any(type(tokens.get(k)) is not int for k in ("input", "output", "reasoning", "cache")) or
+                type(read) is not int or read < 0 or
+                type(created) is not int or created < 0 or
+                raw_usage.get("input_tokens") != tokens.get("input") or
+                raw_usage.get("output_tokens") != tokens.get("output") or
+                read + created != tokens.get("cache") or
+                (raw_usage.get("output_tokens_details") or {}).get("thinking_tokens") != tokens.get("reasoning") or
+                not isinstance(raw_model, dict) or raw_model.get("costBasis") != "unknown" or
+                type(raw_cli.get("total_cost_usd")) not in (int, float) or
+                round(raw_cli["total_cost_usd"] * 1_000_000) != usage.get("cli_reported_cost_microunits")):
+            raise ResourceGateDenied("billing recovery raw usage does not match ledger")
+        prices = lane["price_microusd_per_million"]
+        estimate = ((tokens["input"] + created) * prices["input_cache_miss"] +
+                    read * prices["cache_hit"] + tokens["output"] * prices["output"] + 999_999) // 1_000_000
         if (row.get("provider") != "deepseek" or row.get("status") != "RETURNED" or
-                not isinstance(tokens, dict) or
                 any(type(tokens.get(k)) is not int or tokens[k] < 0 or
                     tokens[k] > row["token_reservation"][k]
                     for k in ("input", "output", "reasoning", "cache")) or
                 tokens["reasoning"] > tokens["output"] or
+                estimate > row["cost_reservation_microunits"] or
+                item.get("official_usd_snapshot_estimate_microusd") != estimate or
+                (type(row.get("estimated_cost_microusd")) is int and
+                 row["estimated_cost_microusd"] != estimate) or
                 type(usage.get("cli_reported_cost_microunits")) is not int or
                 usage["cli_reported_cost_microunits"] <= row.get("cost_reservation_microunits", -1) or
                 row.get("cost_overage_source") == "AUTHORIZED_PRICE_ESTIMATE" or
