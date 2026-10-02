@@ -963,12 +963,14 @@ class Supervisor:
             row = self.journal.mission(mission_id)
             active_turn = row["codex_turn_state"] == "RUNNING"
             pending_review = after == State.REVIEW and str(row["pending_gate"] or "").startswith("review:")
+            review_backoff = (after == State.REVIEW and row["review_retry_after"] is not None
+                              and float(row["review_retry_after"]) > time.time())
             pending_production = after == State.POST_MERGE and row["pending_gate"] == "production-gate"
             pending_external_gate = (after == State.TEST and row["pending_gate"] in spec.required_gates
                                      and row["ci_state"] == "PENDING")
             if after in TERMINAL or after in {State.BLOCKED_EXTERNAL, State.BLOCKED_POLICY} or self.journal.status(mission_id).background_jobs or (
                     before.state == after and after in {State.CI, State.MERGE, State.WAITING_APPROVAL}
-                    ) or pending_review or pending_production or pending_external_gate or (before.state == after and after in {State.IMPLEMENT, State.REVIEW, State.CI}
+                    ) or pending_review or review_backoff or pending_production or pending_external_gate or (before.state == after and after in {State.IMPLEMENT, State.REVIEW, State.CI}
                                             and active_turn):
                 return after
         raise RuntimeError("supervisor progress limit reached")
@@ -1003,6 +1005,11 @@ class Supervisor:
             if state == State.REVIEW and str(self.journal.mission(mission_id)["pending_gate"] or "").startswith("review:"):
                 return state
             row = self.journal.mission(mission_id)
+            if state == State.REVIEW and row["review_retry_after"] is not None:
+                remaining = float(row["review_retry_after"]) - time.time()
+                if remaining > 0:
+                    time.sleep(min(poll_interval, remaining))
+                    continue
             pending_ci = ((state == State.CI and row["pending_gate"] == "github-ci")
                           or (state == State.MERGE and row["pending_gate"] == "pre-merge-ci"))
             pending_production = (state == State.POST_MERGE
@@ -1018,6 +1025,9 @@ class Supervisor:
                 return state
         row = self.journal.mission(mission_id)
         if ((State(row["current_state"]) == State.CI and row["pending_gate"] == "github-ci")
+                or (State(row["current_state"]) == State.REVIEW
+                    and row["review_retry_after"] is not None
+                    and float(row["review_retry_after"]) > time.time())
                 or (State(row["current_state"]) == State.MERGE and row["pending_gate"] == "pre-merge-ci")
                 or (State(row["current_state"]) == State.POST_MERGE
                     and row["pending_gate"] == "production-gate")

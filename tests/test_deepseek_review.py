@@ -20,6 +20,13 @@ review = importlib.util.module_from_spec(spec); spec.loader.exec_module(review)
 BASE, HEAD = "a" * 40, "b" * 40
 TEST_SECRET = "unit-test-review-secret"
 
+
+def process_is_live(pid):
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1][0] != "Z"
+    except FileNotFoundError:
+        return False
+
 _validate = review.validate
 def _validated(*args, **kwargs):
     kwargs.setdefault("secret", TEST_SECRET)
@@ -153,10 +160,10 @@ class DeepSeekReceiptTest(unittest.TestCase):
                                        "prompt", os.environ.copy(), 1)
             child_pid = int(marker.read_text())
             for _ in range(40):
-                if not Path(f"/proc/{child_pid}").exists():
+                if not process_is_live(child_pid):
                     break
                 time.sleep(0.05)
-            self.assertFalse(Path(f"/proc/{child_pid}").exists())
+            self.assertFalse(process_is_live(child_pid))
 
     def test_invoke_reviewer_interrupt_terminates_process_group(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -167,7 +174,11 @@ class DeepSeekReceiptTest(unittest.TestCase):
             def interrupt_after_start(_seconds):
                 calls[0] += 1
                 if calls[0] == 1:
-                    return original_sleep(0.1)
+                    deadline = time.monotonic() + 1
+                    while not marker.exists() and time.monotonic() < deadline:
+                        original_sleep(0.01)
+                    self.assertTrue(marker.exists(), "child PID marker was not published")
+                    return None
                 raise KeyboardInterrupt()
             with patch.object(review.time, "sleep", side_effect=interrupt_after_start):
                 with self.assertRaises(KeyboardInterrupt):
@@ -175,10 +186,10 @@ class DeepSeekReceiptTest(unittest.TestCase):
                                            "prompt", os.environ.copy(), 30)
             child_pid = int(marker.read_text())
             for _ in range(40):
-                if not Path(f"/proc/{child_pid}").exists():
+                if not process_is_live(child_pid):
                     break
                 original_sleep(0.05)
-            self.assertFalse(Path(f"/proc/{child_pid}").exists())
+            self.assertFalse(process_is_live(child_pid))
 
     def test_legacy_oversized_scope_rejected_before_any_launcher_or_model_call(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -223,9 +234,9 @@ class DeepSeekReceiptTest(unittest.TestCase):
                 review.invoke_reviewer([sys.executable,'-c',program,str(marker)],'prompt',os.environ.copy(),1)
             pid=int(marker.read_text())
             for _ in range(40):
-                if not Path(f'/proc/{pid}').exists():break
+                if not process_is_live(pid):break
                 time.sleep(0.05)
-            self.assertFalse(Path(f'/proc/{pid}').exists())
+            self.assertFalse(process_is_live(pid))
 
     def test_v5_receipts_are_stale_after_resource_and_dispute_audit_policy(self):
         with self.assertRaisesRegex(ValueError,'exact-head binding'):

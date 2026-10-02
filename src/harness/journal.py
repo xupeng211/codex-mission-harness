@@ -29,7 +29,7 @@ class Journal:
     """SQLite is a journal/cache: Git, GitHub and project gates remain canonical truth."""
 
     def __init__(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(

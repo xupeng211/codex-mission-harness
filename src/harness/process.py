@@ -80,7 +80,9 @@ class ProcessSupervisor:
 
     def _secure_log_root(self) -> None:
         self.log_root = Path(self.log_root).absolute()
+        self._check_log_ancestors()
         self.log_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._check_log_ancestors()
         try:
             info = self.log_root.lstat()
         except OSError as exc:
@@ -96,6 +98,20 @@ class ProcessSupervisor:
         if stat.S_IMODE(secured.st_mode) & 0o077:
             raise RuntimeError("process log directory is not private")
         self.log_root = self.log_root.resolve(strict=True)
+
+    def _check_log_ancestors(self) -> None:
+        """Reject ancestors another user can replace or redirect."""
+        uid = os.getuid()
+        for parent in self.log_root.parents:
+            if not parent.exists() and not parent.is_symlink():
+                continue
+            info = parent.lstat()
+            mode = stat.S_IMODE(info.st_mode)
+            root_sticky = info.st_uid == 0 and bool(mode & stat.S_ISVTX)
+            if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                    or info.st_uid not in (0, uid)
+                    or ((mode & 0o022) and not root_sticky)):
+                raise RuntimeError(f"process log ancestor is unsafe: {parent}")
 
     @staticmethod
     def _open_private_log(path: Path):

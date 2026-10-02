@@ -96,6 +96,9 @@ class ProjectGateSandboxTest(unittest.TestCase):
         common = self.repo / ".git"
         self.assertIn((str(invocation.config_path), str(common / "config")), ro_bind_pairs)
         self.assertIn((str(invocation.config_path), "/mnt/.git/config"), ro_bind_pairs)
+        config_mount = argv.index(str(invocation.config_path))
+        self.assertGreater(config_mount, argv.index(str(self.repo)))
+        self.assertGreater(argv.index("/mnt/.git/config"), argv.index("/mnt"))
         # This fixture lives under /tmp, which the sandbox masks. The helper
         # recreates only the target parents before mounting the sanitized file.
         self.assertIn(str(common), argv)
@@ -147,7 +150,7 @@ class ProjectGateSandboxTest(unittest.TestCase):
     def test_writable_bubblewrap_launcher_is_rejected_before_preflight(self):
         fake = self.root / "bwrap"
         fake.write_text("#!/bin/sh\nexit 0\n")
-        fake.chmod(0o700)
+        fake.chmod(0o722)
         with patch("harness.sandbox.shutil.which", return_value=str(fake)):
             with self.assertRaisesRegex(SandboxUnavailable, "executable is not trusted"):
                 _trusted_bwrap()
@@ -159,6 +162,8 @@ class ProjectGateSandboxTest(unittest.TestCase):
             preflight_project_gate(invocation)
         launched = run.call_args.args[0]
         self.assertEqual(launched[launched.index("--") + 1:], ["/bin/true"])
+        self.assertIn("--unshare-all", launched)
+        self.assertNotIn("--share-net", launched)
         failure = subprocess.CompletedProcess([], 1, "", "namespace unavailable")
         with patch("harness.sandbox.subprocess.run", return_value=failure):
             with self.assertRaisesRegex(SandboxUnavailable, "preflight exited 1"):
@@ -194,6 +199,10 @@ class ProjectGateSandboxTest(unittest.TestCase):
                 ).strip(),
             }, self.logs, "hostile-makefile",
         )
+        try:
+            preflight_project_gate(invocation)
+        except SandboxUnavailable as exc:
+            self.skipTest(f"bubblewrap isolation is unavailable: {exc}")
         host_env = {**os.environ, "GH_TOKEN": "controller-secret-marker"}
         result = subprocess.run(
             invocation.argv, cwd=invocation.cwd, env=host_env,

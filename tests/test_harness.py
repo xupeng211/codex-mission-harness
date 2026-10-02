@@ -158,9 +158,13 @@ class HarnessTest(unittest.TestCase):
 
     def _prepare_agent_preflight(self, adapter, worktree):
         with patch.object(adapter, "discover_pr", return_value=GateResult(
-                "PASS", "fixture PR", data={"number": 2, "repo": "owner/repo"},
+                "PASS", "fixture PR", data={"number": 2, "repo": "owner/repo",
+                                            "head": "a" * 40, "base": "main",
+                                            "base_sha": "c" * 40},
         )), patch.object(adapter, "_pr_state", return_value=GateResult(
-                "PASS", "fixture PR body", data={"body": "review context\n"},
+                "PASS", "fixture PR body", data={"repo": "owner/repo",
+                    "head": "a" * 40, "base": "main", "base_sha": "c" * 40,
+                    "state": "OPEN", "body": "review context\n"},
         )):
             return adapter.prepare_gate(
                 "agent-preflight", worktree=str(worktree), base="c" * 40,
@@ -426,6 +430,19 @@ class HarnessTest(unittest.TestCase):
         with patch.object(self.supervisor.process, "start") as duplicate_start:
             self.assertEqual(self.supervisor.step(self.spec.mission_id, spec), State.REVIEW)
         duplicate_start.assert_not_called()
+        with patch.object(self.supervisor.process, "start") as duplicate_start:
+            self.assertEqual(
+                self.supervisor.run_until_wait(self.spec.mission_id, spec, limit=2),
+                State.REVIEW,
+            )
+        duplicate_start.assert_not_called()
+        with patch("harness.supervisor.time.sleep") as wait:
+            self.assertEqual(
+                self.supervisor.run_until_terminal(self.spec.mission_id, spec,
+                                                   limit=1, poll_interval=0.01),
+                State.REVIEW,
+            )
+        wait.assert_called_once()
 
         # Consume retry two after its deadline, then prove the third failure
         # becomes terminal instead of creating a fourth invocation.
@@ -2101,6 +2118,20 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
             path = Path(row[key])
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
+    def test_process_log_root_rejects_redirectable_ancestors(self):
+        root = Path(self.tmp.name)
+        safe = root / "safe-logs"
+        safe.mkdir(mode=0o700)
+        redirect = root / "redirect"
+        redirect.symlink_to(safe, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, "ancestor is unsafe"):
+            ProcessSupervisor(self.journal, redirect / "logs")
+        writable = root / "writable"
+        writable.mkdir(mode=0o777)
+        writable.chmod(0o777)
+        with self.assertRaisesRegex(RuntimeError, "ancestor is unsafe"):
+            ProcessSupervisor(self.journal, writable / "logs")
+
     def test_release_pipe_failure_reaps_child_and_retires_running_lease(self):
         class FailingStdin:
             def write(self, payload):
@@ -3172,6 +3203,24 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         for directory in (body_path.parent, body_path.parent.parent, body_path.parent.parent.parent):
             self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
 
+    def test_preflight_rejects_pr_change_between_discovery_and_body_fetch(self):
+        adapter = FootballPredictionAdapter()
+        discovery = {"number": 2, "repo": "owner/repo", "head": "a" * 40,
+                     "base": "main", "base_sha": "c" * 40}
+        for changed in ({"head": "b" * 40}, {"base_sha": "d" * 40},
+                        {"state": "CLOSED"}):
+            current = {**discovery, "state": "OPEN", "body": "stale\n", **changed}
+            with self.subTest(changed=changed), \
+                    patch.object(adapter, "discover_pr", return_value=GateResult(
+                        "PASS", data=discovery)), \
+                    patch.object(adapter, "_pr_state", return_value=GateResult(
+                        "PASS", data=current)):
+                result = adapter.prepare_gate(
+                    "agent-preflight", worktree=str(self.worktree), base="c" * 40,
+                    head="a" * 40, mission_id="safe-demo", scope_file="scope.json",
+                )
+                self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+
     def test_preflight_rejects_symlinked_evidence_root_without_writing_through(self):
         root = Path(self.tmp.name)
         victim = root / "victim-evidence"
@@ -3776,7 +3825,8 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         self.assertNotIn(secret.encode(), raw)
         self.assertNotIn(b"structured output schema", raw)
 
-    def _deepseek_receiptless_wrapper_result(self, *, tamper_sidecar=False):
+    def _deepseek_receiptless_wrapper_result(self, *, tamper_sidecar=False,
+                                             mismatched_attempt=False):
         adapter, worktree, evidence_dir, _, stdout = self._review_fixture("deepseek")
         attempt_id = "e" * 32
         run_dir = evidence_dir / attempt_id
@@ -3837,7 +3887,8 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
                 "deepseek", worktree=str(worktree), base="a" * 40, head="b" * 40,
                 mission_id="mission", scope_file=str(worktree / "scope.json"),
                 stdout_path=str(stdout), evidence_dir=str(evidence_dir),
-                attempt_id="9" * 32, terminal_status="EXITED", exit_code=1,
+                attempt_id=("9" if mismatched_attempt else "e") * 32,
+                terminal_status="EXITED", exit_code=1,
             )
         return result
 
@@ -3861,6 +3912,13 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         self.assertFalse(Supervisor._review_retryable_failure(
             JobResult("review", "EXITED", 1, "b" * 40), result,
         ))
+
+    def test_deepseek_failure_from_other_attempt_cannot_trigger_retry(self):
+        result = self._deepseek_receiptless_wrapper_result(mismatched_attempt=True)
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+        self.assertEqual(result.failure_classification,
+                         ReviewFailureClassification.UNKNOWN_EXTERNAL_FAILURE)
+        self.assertFalse(result.data["retryable"])
 
     def test_receiptless_incomplete_or_completed_event_stream_never_approves(self):
         incomplete, _ = self._receiptless_codex_attempt(
@@ -4006,13 +4064,31 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         with self.assertRaisesRegex(RuntimeError, "content differs from the commit"):
             adapter._trusted_base_checkout(str(repo), base)
 
+    def test_trusted_base_verifies_scripts_beyond_explicit_contract_paths(self):
+        adapter = FootballPredictionAdapter()
+        repo, _ = self._target_git_repo()
+        extra = repo / "scripts/devops/pr_ready_check.py"
+        extra.write_text("# committed extra script\n")
+        subprocess.run(["git", "add", str(extra.relative_to(repo))], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "extra trusted script"], cwd=repo, check=True)
+        base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+        trusted = adapter._trusted_base_checkout(str(repo), base)
+        self.assertEqual((trusted / extra.relative_to(repo)).read_bytes(), extra.read_bytes())
+        (trusted / extra.relative_to(repo)).write_text("# changed\n")
+        subprocess.run(["git", "update-index", "--assume-unchanged",
+                        str(extra.relative_to(repo))], cwd=trusted, check=True)
+        with self.assertRaisesRegex(RuntimeError, "content differs from the commit"):
+            adapter._trusted_base_checkout(str(repo), base)
+
     def test_untrusted_stdout_cannot_redirect_receipt_validation_code(self):
         adapter, worktree, evidence_dir, _, stdout = self._review_fixture()
         external_receipt = Path(self.tmp.name) / "outside-receipt.json"
         external_receipt.write_text("{}")
         stdout.write_text(json.dumps({"review_receipt": str(external_receipt), "status": "PASS"}))
         with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
-                patch.object(adapter, "_trusted_base_checkout") as trusted:
+                patch.object(adapter, "_trusted_base_checkout") as trusted, \
+                patch.object(adapter, "_read_private_review_log",
+                             wraps=adapter._read_private_review_log) as read_private:
             result = adapter.review_result(
                 "codex", worktree=str(worktree), base="a" * 40, head="b" * 40,
                 mission_id="mission", scope_file=str(worktree / "scope.json"),
@@ -4020,6 +4096,8 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
             )
         self.assertEqual(result.status, "BLOCKED_EXTERNAL")
         trusted.assert_not_called()
+        self.assertNotIn(external_receipt,
+                         [call.args[0] for call in read_private.call_args_list])
 
     def test_review_evidence_symlink_is_rejected_before_receipt_use(self):
         adapter, worktree, evidence_dir, _, stdout = self._review_fixture()
@@ -4132,12 +4210,14 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         with patch.object(adapter, "_trusted_base_checkout", return_value=Path("/trusted")), \
                 patch.object(adapter, "_assert_safe_local_git_config"), \
                 patch.object(adapter, "_repo_from_origin", return_value="owner/project"), \
-                patch.object(adapter, "_call", side_effect=[completed, subprocess.CompletedProcess([], 0, "", "")]), \
+                patch.object(adapter, "_call", side_effect=[completed, subprocess.CompletedProcess([], 0, "", "")]) as call, \
                 patch.object(adapter, "_run", side_effect=["", main_sha, "e" * 40]) as run:
             result = adapter.post_merge("/worktree", merge_sha, 7, "owner/project", "feature", "b" * 40)
         self.assertEqual(result.status, "PASS")
         self.assertEqual(run.call_args_list[1].args[0], ["git", "rev-parse", "origin/main"])
         self.assertEqual(run.call_args_list[2].args[0], ["git", "rev-parse", f"{main_sha}^{{tree}}"])
+        self.assertEqual(call.call_args_list[1].args[0],
+                         ["git", "merge-base", "--is-ancestor", merge_sha, main_sha])
 
     def test_post_merge_bootstraps_trusted_project_imports_in_isolated_python(self):
         adapter = FootballPredictionAdapter()
@@ -4513,12 +4593,16 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
         subprocess.run(["git", "-C", str(repo), "config", "user.name", "Harness Test"], check=True)
         (repo / "tracked.txt").write_text("safe\n")
-        subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+        (repo / ".gitattributes").write_text("tracked.txt filter=evil\n")
+        subprocess.run(["git", "-C", str(repo), "add", "tracked.txt", ".gitattributes"], check=True)
         subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
         head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
-        subprocess.run(["git", "-C", str(repo), "config", "filter.evil.smudge", "false"], check=True)
+        marker = Path(self.tmp.name) / "smudge-executed"
+        subprocess.run(["git", "-C", str(repo), "config", "filter.evil.smudge",
+                        f"sh -c 'touch {marker}; cat'"], check=True)
         with self.assertRaisesRegex(RuntimeError, "executable local Git configuration"):
             FootballPredictionAdapter()._trusted_base_checkout(str(repo), head)
+        self.assertFalse(marker.exists(), "checkout ran an untrusted smudge filter")
 
     def test_production_mission_rejects_unexecutable_post_merge_gates(self):
         raw = dict(self.spec.__dict__, adapter="footballprediction",
@@ -4539,10 +4623,12 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
                 patch.object(adapter, "_pr_state", return_value=GateResult(
                     "PASS", "PR", data={"head": "a" * 40, "base": "main", "state": "OPEN",
                                          "base_sha": "c" * 40})), \
+                patch.object(adapter, "_trusted_base_checkout", return_value=Path("/trusted")), \
                 patch.object(adapter, "_call", return_value=subprocess.CompletedProcess(
-                            [], 0, json.dumps(report), "")):
+                            [], 0, json.dumps(report), "")) as call:
                     result = adapter.ci("/fixture", "a" * 40, base_sha="c" * 40)
                 self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+                call.assert_called()
 
     def test_ci_reuses_durable_pr_and_rejects_identity_change(self):
         adapter = FootballPredictionAdapter()
