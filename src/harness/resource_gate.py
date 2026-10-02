@@ -247,6 +247,9 @@ def _approved_billing_recovery(auth: dict, lane: dict, frozen: dict,
                 tokens["reasoning"] > tokens["output"] or
                 type(usage.get("cli_reported_cost_microunits")) is not int or
                 usage["cli_reported_cost_microunits"] <= row.get("cost_reservation_microunits", -1) or
+                row.get("cost_overage_source") == "AUTHORIZED_PRICE_ESTIMATE" or
+                (type(row.get("estimated_cost_microusd")) is int and
+                 row["estimated_cost_microusd"] > row["cost_reservation_microunits"]) or
                 item.get("request_id") != row.get("request_id") or
                 item.get("row_sha256") != digest(canonical(row)) or
                 item.get("classification") != "CLI_FALLBACK_ESTIMATE_NOT_BILLED" or
