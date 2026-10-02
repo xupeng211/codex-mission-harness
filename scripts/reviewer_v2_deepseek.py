@@ -165,6 +165,7 @@ def _invoke(command: list[str], prompt: str, env: dict, timeout: int, token: str
                  schema_validation_entered=False, schema_validation_result="NOT_ENTERED",
                  parser_error_class=None, schema_validation_error_class=None,
                  schema_validation_reason=None, source_binding_diagnostic=None)
+    os.environ["CMH_RESOURCE_STAGE"] = artifact
     try:
         completed = legacy.invoke_reviewer(command, _bounded(prompt), env, timeout)
     except subprocess.TimeoutExpired as exc:
@@ -293,6 +294,7 @@ def run(args: argparse.Namespace) -> dict:
             (f"group-{i:03d}", "group") for i in range(len(groups))] + [("aggregate", "cross-group")]
         run = ReviewRun(Path(args.evidence), root, identity, stages, legacy, prefix="deepseek-v2-")
         run_id, evidence, evidence_fd = run.state["review_run_id"], run.path, run.fd
+        os.environ["CMH_RESOURCE_RUN_ID"] = run_id
         settings = tempfile.NamedTemporaryFile(mode="w", delete=False)
         settings.write('{"permissions":{"allow":[],"deny":["Bash","Edit","Write",'
                        '"Read","Glob","Grep","WebFetch","WebSearch"]}}')

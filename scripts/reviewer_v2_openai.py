@@ -501,9 +501,11 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
     run_state = ReviewRun(evidence, root, identity, stage_plan, secure,
                           prefix="openai-v2-")
     run_id, child_fd = run_state.state["review_run_id"], run_state.fd
+    os.environ["CMH_RESOURCE_RUN_ID"] = run_id
     path = run_state.path / "receipt.json"
     artifact_hashes = {}
     def stage_run(name, kind, prompt, execute, validate_result):
+        os.environ["CMH_RESOURCE_STAGE"] = name
         raw, result = run_state.stage(name, kind, prompt.encode(), execute, validate_result)
         artifact_hashes[name + ".json"] = _sha(raw)
         return raw, result
@@ -520,6 +522,7 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
         # Authenticate first, then exercise the same Codex structured
         # invocation path and chunk schema used by the review lane.
         preflight(spec, probe=False, timeout=min(timeout, 120))
+        os.environ["CMH_RESOURCE_STAGE"] = "structured-preflight"
         invoke_codex(
             'Return JSON with an empty findings array. Use the exact chunk schema.',
             spec, stage="chunk", timeout=min(timeout, 120),

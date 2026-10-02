@@ -18,7 +18,7 @@ from harness.openai_invocation import (InvocationFailure, MAX_EVENT_STREAM_BYTES
 
 class OpenAIInvocationTests(unittest.TestCase):
     def test_preflight_result_requires_exact_structured_schema(self):
-        from harness.openai_invocation import invoke_openai
+        from harness.openai_invocation import _invoke_openai_unmetered as invoke_openai
         from harness.model_registry import load_registry
         from reviewer_v2_openai import _schema
         schema = _schema(False)
@@ -47,7 +47,7 @@ class OpenAIInvocationTests(unittest.TestCase):
                                           schema, timeout=1)
 
     def test_zero_exit_error_event_is_rejected_and_classified_for_bounded_resume(self):
-        from harness.openai_invocation import invoke_openai
+        from harness.openai_invocation import _invoke_openai_unmetered as invoke_openai
         for message, category in [('stream disconnected: connection reset', 'TRANSIENT_TRANSPORT'),
                                   ('HTTP 401 unauthorized', 'AUTHENTICATION_FAILURE')]:
             stream = (b'{"type":"thread.started"}\n{"type":"turn.started"}\n' +
@@ -66,7 +66,7 @@ class OpenAIInvocationTests(unittest.TestCase):
             self.assertFalse(caught.exception.evidence.get('structured_result_present', False))
 
     def test_agent_message_cannot_invent_retryable_transport_failure(self):
-        from harness.openai_invocation import invoke_openai
+        from harness.openai_invocation import _invoke_openai_unmetered as invoke_openai
         stream = (b'{"type":"thread.started"}\n{"type":"turn.started"}\n' +
                   json.dumps({'type':'item.completed','item':{'type':'agent_message',
                               'text':'connection reset 401 unauthorised'}}).encode()+b'\n')
@@ -149,12 +149,12 @@ class OpenAIInvocationTests(unittest.TestCase):
             self.assertFalse(_trusted_ca_path(alias / "ca-certificates.crt", directory=False))
 
     def test_model_identity_is_required(self):
-        from harness.openai_invocation import invoke_openai
+        from harness.openai_invocation import _invoke_openai_unmetered as invoke_openai
         with self.assertRaises(ValueError):
             invoke_openai("x", ModelSpec("openai", "", "high"), {}, timeout=1)
 
     def test_process_exit_and_missing_result_never_pass(self):
-        from harness.openai_invocation import invoke_openai
+        from harness.openai_invocation import _invoke_openai_unmetered as invoke_openai
         complete = (b'{"type":"thread.started"}\n{"type":"turn.started"}\n'
                     b'{"type":"item.completed","item":{"type":"agent_message"}}\n'
                     b'{"type":"turn.completed"}\n')
@@ -170,7 +170,7 @@ class OpenAIInvocationTests(unittest.TestCase):
                 self.assertFalse(caught.exception.evidence.get("structured_result_present", False))
 
     def test_timeout_kills_process_group_and_retains_incomplete_events(self):
-        from harness.openai_invocation import invoke_openai
+        from harness.openai_invocation import _invoke_openai_unmetered as invoke_openai
         process = Mock(pid=1234, returncode=-9)
         process.communicate.side_effect = [subprocess.TimeoutExpired("codex", 1),
             (b'{"type":"thread.started"}\n{"type":"turn.started"}\n', b"")]
@@ -186,7 +186,7 @@ class OpenAIInvocationTests(unittest.TestCase):
         self.assertFalse(caught.exception.evidence["terminal_observed"])
 
     def test_timeout_process_group_exit_race_is_classified(self):
-        from harness.openai_invocation import invoke_openai
+        from harness.openai_invocation import _invoke_openai_unmetered as invoke_openai
         process = Mock(pid=1234, returncode=-9)
         process.communicate.side_effect = [subprocess.TimeoutExpired("codex", 1), (b"", b"")]
         with patch("harness.openai_invocation.canonical_environment", return_value={}), \
@@ -198,7 +198,7 @@ class OpenAIInvocationTests(unittest.TestCase):
         self.assertEqual(caught.exception.category, "TURN_TIMEOUT_UNDIAGNOSED")
 
     def test_broken_provider_pipe_is_classified_and_cleanup_attempted(self):
-        from harness.openai_invocation import invoke_openai
+        from harness.openai_invocation import _invoke_openai_unmetered as invoke_openai
         process = Mock(pid=1234)
         process.communicate.side_effect = [BrokenPipeError(), (b"", b"")]
         with patch("harness.openai_invocation.canonical_environment", return_value={}), \

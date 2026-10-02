@@ -77,6 +77,7 @@ def main() -> int:
     if not auth_path:
         parser.error("--auth-key-file is required (DeepSeek may reuse --token-file)")
     auth_key = read_private_token(Path(auth_path))
+    os.environ["CMH_RESOURCE_RUN_ID"] = uuid.uuid4().hex
     result = qualify_live(spec, token_file=args.token_file, timeout=args.timeout)
     if not result.passed:
         print(json.dumps({"status": "FAIL", "identity": result.identity,

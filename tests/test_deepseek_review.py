@@ -129,7 +129,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
     def test_reviewer_output_is_bounded_before_read_or_receipt(self):
         program = f"import sys;sys.stdout.write('x'*{review.MAX_REVIEW_OUTPUT_BYTES + 1})"
         with self.assertRaisesRegex(ValueError, "output exceeds bound"):
-            review.invoke_reviewer([sys.executable, "-c", program], "prompt", os.environ.copy(), 5)
+            review._invoke_reviewer_unmetered([sys.executable, "-c", program], "prompt", os.environ.copy(), 5)
 
     def test_exact_diff_has_byte_ceiling(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -156,7 +156,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
                        "'import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(30)']);"
                        "pathlib.Path(sys.argv[1]).write_text(str(child.pid));time.sleep(30)")
             with self.assertRaises(subprocess.TimeoutExpired):
-                review.invoke_reviewer([sys.executable, "-c", program, str(marker)],
+                review._invoke_reviewer_unmetered([sys.executable, "-c", program, str(marker)],
                                        "prompt", os.environ.copy(), 1)
             child_pid = int(marker.read_text())
             for _ in range(40):
@@ -182,7 +182,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
                 raise KeyboardInterrupt()
             with patch.object(review.time, "sleep", side_effect=interrupt_after_start):
                 with self.assertRaises(KeyboardInterrupt):
-                    review.invoke_reviewer(["/bin/sh", "-c", program, "sh", str(marker)],
+                    review._invoke_reviewer_unmetered(["/bin/sh", "-c", program, "sh", str(marker)],
                                            "prompt", os.environ.copy(), 30)
             child_pid = int(marker.read_text())
             for _ in range(40):
@@ -231,7 +231,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
                      "'import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(30)']);"
                      "pathlib.Path(sys.argv[1]).write_text(str(child.pid));time.sleep(30)")
             with self.assertRaises(subprocess.TimeoutExpired):
-                review.invoke_reviewer([sys.executable,'-c',program,str(marker)],'prompt',os.environ.copy(),1)
+                review._invoke_reviewer_unmetered([sys.executable,'-c',program,str(marker)],'prompt',os.environ.copy(),1)
             pid=int(marker.read_text())
             for _ in range(40):
                 if not process_is_live(pid):break

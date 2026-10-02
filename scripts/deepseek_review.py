@@ -20,6 +20,7 @@ from harness.review_failures import (  # noqa: E402
     ReviewFailureDetails,
     classify_process_failure,
 )
+from harness.resource_gate import model_request  # noqa: E402
 
 VERSION = "cmh-deepseek-review/v6"
 MODEL = "deepseek-flash"
@@ -970,7 +971,7 @@ def bounded_prompt_bytes(prompt_text):
         raise ValueError("review request exceeds the configured bounded prompt size")
     return rendered
 
-def invoke_reviewer(command, prompt_text, env, timeout):
+def _invoke_reviewer_unmetered(command, prompt_text, env, timeout):
     # Keep source and synthesis prompts on stdin, not argv. The bounded request
     # limit is enforced before this call, independently of the operating system's
     # argv limit. Claude Code print mode supports prompts on stdin.
@@ -1022,6 +1023,43 @@ def invoke_reviewer(command, prompt_text, env, timeout):
         stdout_file.seek(0); stderr_file.seek(0)
         return subprocess.CompletedProcess(command, process.returncode,
                 stdout_file.read(MAX_REVIEW_OUTPUT_BYTES), stderr_file.read(MAX_REVIEW_OUTPUT_BYTES))
+
+
+class _NonzeroReviewerResult(Exception):
+    def __init__(self, result):
+        self.result = result
+
+
+def invoke_reviewer(command, prompt_text, env, timeout):
+    """Account in the original Mission ledger before spawning the reviewer."""
+    try:
+        index = command.index("--model")
+        model = command[index + 1]
+    except (ValueError, IndexError) as exc:
+        raise ValueError("reviewer command must declare its exact model") from exc
+    try:
+        with model_request(provider="deepseek", model=model, prompt=prompt_text.encode(),
+                           stage=os.environ.get("CMH_RESOURCE_STAGE", "deepseek-invocation")) as reservation:
+            result = _invoke_reviewer_unmetered(command, prompt_text, env, timeout)
+            if result.returncode:
+                raise _NonzeroReviewerResult(result)
+            try:
+                envelope = json.loads(result.stdout)
+                usage = envelope.get("usage")
+            except (ValueError, UnicodeDecodeError, AttributeError):
+                usage = None
+            if isinstance(usage, dict):
+                observed = {"tokens": {
+                    "input": usage.get("input_tokens"), "output": usage.get("output_tokens"),
+                    "reasoning": usage.get("output_tokens_details", {}).get("thinking_tokens"),
+                    "cache": usage.get("cache_creation_input_tokens", 0) + usage.get("cache_read_input_tokens", 0)}}
+                if isinstance(envelope.get("total_cost_usd"), (int, float)):
+                    observed["cli_reported_cost_microunits"] = round(envelope["total_cost_usd"] * 1_000_000)
+                    observed["cost_classification"] = "OBSERVED_UNBILLED"
+                reservation.observe(observed)
+            return result
+    except _NonzeroReviewerResult as exc:
+        return exc.result
 
 
 def bounded_diff(root, base, head, *, max_bytes=MAX_V2_DIFF_BYTES, timeout=30):

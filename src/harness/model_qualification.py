@@ -20,6 +20,7 @@ from typing import Callable
 
 from .model_registry import ModelSpec
 from .openai_invocation import invoke_openai, InvocationFailure, InvocationResult
+from .resource_gate import ResourceGateDenied, model_request
 from .reviewer_v2_contract import bind_findings, parse_synthesis
 
 QUALIFICATION_VERSION = "cmh-model-qualification/v5"
@@ -109,6 +110,8 @@ def _evaluate_cases(spec: ModelSpec, invoke: Callable[[ModelSpec, str], str], *,
             # every remaining fixture.
             failed.extend(item.name for item in CASES[index:])
             break
+        except ResourceGateDenied:
+            raise
         except (ValueError, RuntimeError, TimeoutError, subprocess.TimeoutExpired):
             failed.append(case.name)
         else:
@@ -137,7 +140,7 @@ _SCHEMA = {"type": "object", "properties": {"decisions": {"type": "array", "item
     "required": ["decisions", "findings", "summary"], "additionalProperties": False}
 
 
-def _actual_provider_invoke(spec: ModelSpec, prompt: str, *, token: str | None,
+def _actual_provider_invoke_unmetered(spec: ModelSpec, prompt: str, *, token: str | None,
                             timeout: int) -> str | InvocationResult:
     """One bounded, noninteractive call to the exact configured model."""
     with tempfile.TemporaryDirectory(prefix="cmh-model-qualification-") as temporary:
@@ -199,10 +202,33 @@ def _actual_provider_invoke(spec: ModelSpec, prompt: str, *, token: str | None,
                 envelope = json.loads(output)
                 if envelope.get("is_error") or not isinstance(envelope.get("structured_output"), dict):
                     raise ValueError("provider returned no structured output")
-                return json.dumps(envelope["structured_output"])
+                return InvocationResult(json.dumps(envelope["structured_output"]),
+                                        {"usage": envelope.get("usage"),
+                                         "cli_reported_cost_usd": envelope.get("total_cost_usd")})
             except (TypeError, ValueError) as exc:
                 raise RuntimeError("DeepSeek qualification output invalid") from exc
     raise ValueError("unsupported provider")
+
+
+def _actual_provider_invoke(spec: ModelSpec, prompt: str, *, token: str | None,
+                            timeout: int) -> str | InvocationResult:
+    # Codex's lower-level invocation sees the active reservation and does not
+    # append a second logical call for the same qualification case.
+    with model_request(provider=spec.provider, model=spec.model, prompt=prompt.encode(),
+                       stage="qualification-case") as reservation:
+        result = _actual_provider_invoke_unmetered(spec, prompt, token=token, timeout=timeout)
+        if isinstance(result, InvocationResult):
+            usage = result.evidence.get("usage")
+            if isinstance(usage, dict):
+                observed = {"tokens": {
+                    "input": usage.get("input_tokens"), "output": usage.get("output_tokens"),
+                    "reasoning": usage.get("output_tokens_details", {}).get("thinking_tokens", 0),
+                    "cache": usage.get("cache_creation_input_tokens", 0) + usage.get("cache_read_input_tokens", 0)}}
+                if isinstance(result.evidence.get("cli_reported_cost_usd"), (int, float)):
+                    observed["cli_reported_cost_microunits"] = round(result.evidence["cli_reported_cost_usd"] * 1_000_000)
+                    observed["cost_classification"] = "OBSERVED_UNBILLED"
+                reservation.observe(observed)
+        return result
 
 
 def qualify_live(spec: ModelSpec, *, token_file: str | Path | None = None,

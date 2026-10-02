@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .model_registry import ModelSpec
+from .resource_gate import model_request
 
 CANONICAL_BINARY = Path("/usr/lib/chatgpt/resources/codex")
 CANONICAL_HOME = Path("/home/xupeng/.cmh-openai-reviewer-home")
@@ -222,7 +223,7 @@ def _observed_events(raw: bytes) -> dict:
                                      ("turn.completed", "turn.failed"))}
 
 
-def invoke_openai(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 120,
+def _invoke_openai_unmetered(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 120,
                   binary: Path = CANONICAL_BINARY,
                   codex_home: Path = CANONICAL_HOME,
                   source_env: dict[str, str] | None = None) -> InvocationResult:
@@ -321,3 +322,18 @@ def invoke_openai(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 
         evidence["response_sha256"] = hashlib.sha256(response.encode()).hexdigest()
         evidence["structured_result_present"] = True
         return InvocationResult(response, evidence)
+
+
+def invoke_openai(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 120,
+                  binary: Path = CANONICAL_BINARY, codex_home: Path = CANONICAL_HOME,
+                  source_env: dict[str, str] | None = None) -> InvocationResult:
+    """Reserve the original Mission's resources before any Codex subprocess."""
+    if spec.provider != "openai" or not isinstance(prompt, str):
+        raise ValueError("configured OpenAI model and prompt are required")
+    with model_request(provider="openai", model=spec.model, prompt=prompt.encode(),
+                       stage=os.environ.get("CMH_RESOURCE_STAGE", "openai-invocation")) as reservation:
+        result = _invoke_openai_unmetered(prompt, spec, schema, timeout=timeout,
+                                         binary=binary, codex_home=codex_home,
+                                         source_env=source_env)
+        reservation.observe(result.evidence.get("usage"))
+        return result
