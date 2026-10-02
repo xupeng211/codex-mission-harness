@@ -293,6 +293,15 @@ class FootballPredictionAdapter:
             return pr
         facts = pr.data if isinstance(pr.data, dict) else {}
         detail = self._pr_state(worktree, int(facts["number"]), str(facts["repo"]))
+        if detail.status != "PASS":
+            return detail
+        current = detail.data if isinstance(detail.data, dict) else {}
+        if (current.get("repo") != facts.get("repo")
+                or current.get("head") != head.lower()
+                or current.get("base") != facts.get("base")
+                or current.get("base_sha") != facts.get("base_sha")
+                or current.get("state") != "OPEN"):
+            return GateResult("BLOCKED_EXTERNAL", "PR identity changed before preflight input preparation")
         body = (detail.data or {}).get("body") if isinstance(detail.data, dict) else None
         if not isinstance(body, str):
             return GateResult("BLOCKED_EXTERNAL", "PR discovery omitted a usable PR body")
@@ -998,7 +1007,7 @@ class FootballPredictionAdapter:
 
     def _deepseek_wrapper_failure(
         self, payload: dict[str, Any], *, evidence_dir: Path, mission_id: str,
-        base: str, head: str, repository: str,
+        base: str, head: str, repository: str, current_attempt_id: str | None,
     ) -> dict[str, Any] | None:
         """Accept a DeepSeek typed failure only with its exact private sidecar."""
         try:
@@ -1077,6 +1086,7 @@ class FootballPredictionAdapter:
                 or record.get("head_sha") != head.lower()
                 or not isinstance(attempt_id, str)
                 or re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None
+                or attempt_id != current_attempt_id
                 or path.parent.name != attempt_id
                 or not isinstance(diff_sha, str)
                 or re.fullmatch(r"[0-9a-f]{64}", diff_sha) is None
@@ -1227,6 +1237,7 @@ class FootballPredictionAdapter:
                     typed_wrapper_failure = self._deepseek_wrapper_failure(
                         wrapper_payload, evidence_dir=evidence_dir, mission_id=mission_id,
                         base=base, head=head, repository=repository,
+                        current_attempt_id=attempt_id,
                     )
                     if typed_wrapper_failure is not None:
                         wrapper_failure = typed_wrapper_failure
