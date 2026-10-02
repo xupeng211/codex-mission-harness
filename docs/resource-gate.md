@@ -27,6 +27,9 @@ snapshot of the settled request prefix. Removing or changing a frozen request
 cannot restore capacity. Review and
 qualification runners set the run ID; stage invocations set the stage ID.
 Missing, altered or pending context denies the request before `Popen`.
+If the signed numeric start and the original UTC `started_at` text disagree,
+the wall gate uses the earlier instant. The historical Mission records differ
+by 63.599698 seconds; this conservative check preserves both original values.
 OpenAI Codex, DeepSeek Reviewer V2 and both qualification paths call this
 gate. A nested Codex call inside one qualification case shares that case's
 reservation, so it adds only one logical request.

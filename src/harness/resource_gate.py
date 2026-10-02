@@ -16,6 +16,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
+from datetime import datetime
 from pathlib import Path
 
 
@@ -307,6 +308,24 @@ def _disclosed_cli_fallback(row: dict) -> bool:
             isinstance(model_usage, dict) and model_usage.get("costBasis") == "unknown")
 
 
+def _conservative_wall_start(auth: dict) -> float:
+    epoch = auth.get("original_started_epoch")
+    if type(epoch) not in (int, float):
+        raise ResourceGateDenied("original wall-clock start missing")
+    label = auth.get("original_started_at_utc")
+    if label is None:
+        return epoch
+    if not isinstance(label, str):
+        raise ResourceGateDenied("original wall-clock start invalid")
+    try:
+        parsed = datetime.fromisoformat(label.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("timezone required")
+        return min(epoch, parsed.timestamp())
+    except ValueError as exc:
+        raise ResourceGateDenied("original wall-clock start invalid") from exc
+
+
 def normalize_deepseek_usage(usage: dict | None, cli_cost_usd: object = None,
                              model_usage: dict | None = None) -> dict:
     """Keep Claude CLI's disjoint input/cache fields and session cost visible."""
@@ -473,7 +492,7 @@ def reserve(*, provider: str, model: str, prompt: bytes, stage: str,
                for row in rows[baseline:]):
             raise ResourceGateDenied("unreconciled historical cost estimate over reservation")
         if (len(rows) >= auth.get("max_logical_model_calls", -1) or
-                time.time() - auth.get("original_started_epoch", 0) >= auth.get("max_wall_clock_seconds", -1)):
+                time.time() - _conservative_wall_start(auth) >= auth.get("max_wall_clock_seconds", -1)):
             raise ResourceGateDenied("logical-call or wall-clock hard stop reached")
         prior = [row for row in rows[baseline:] if row.get("provider") == provider]
         for category, cap in lane["token_limit"].items():

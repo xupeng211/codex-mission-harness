@@ -4,6 +4,7 @@ import os
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -532,6 +533,7 @@ class ResourceGateTests(unittest.TestCase):
         self.publish(); self.env["CMH_RESOURCE_AUTH_SHA256"] = digest(self.approval.read_bytes())
         with self.assertRaisesRegex(ResourceGateDenied, "hard stop"):
             self.call()
+
         call_wall["after"]["max_wall_clock_seconds"] = 1000
         private(self.call_wall, call_wall)
         self.payload["max_wall_clock_seconds"] = 1000
@@ -544,6 +546,14 @@ class ResourceGateTests(unittest.TestCase):
             r = self.call(); r.settle("RETURNED")
         with self.assertRaisesRegex(ResourceGateDenied, "hard stop"):
             self.call()
+
+    def test_earlier_original_started_at_is_conservative_wall_start(self):
+        self.payload["original_started_at_utc"] = datetime.fromtimestamp(
+            time.time() - 2000, timezone.utc).isoformat()
+        self.publish(); self.env["CMH_RESOURCE_AUTH_SHA256"] = digest(self.approval.read_bytes())
+        with self.assertRaisesRegex(ResourceGateDenied, "wall-clock hard stop"):
+            self.call()
+        self.assertEqual(len(self.rows()), 1)
 
 
 if __name__ == "__main__":
