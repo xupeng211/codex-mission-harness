@@ -158,6 +158,21 @@ def _limits(value: dict, provider: str, model: str) -> dict:
             lane.get("cost_unit") not in {"USD", "CODEX_SUBSCRIPTION_UNITS"}):
         raise ResourceGateDenied("invalid cost budget")
     if provider == "deepseek":
+        if lane.get("billing_route_verified") is not True:
+            raise ResourceGateDenied("DeepSeek billing route is not verified")
+        for label in ("price_source", "billing_route_evidence"):
+            raw_path = lane.get(label + "_path")
+            source_hash = lane.get(label + "_sha256")
+            if (not isinstance(raw_path, str) or not Path(raw_path).is_absolute() or
+                    Path(raw_path).is_symlink() or not isinstance(source_hash, str) or
+                    len(source_hash) != 64):
+                raise ResourceGateDenied("DeepSeek " + label + " is not bound to signed evidence")
+            try:
+                source = Path(raw_path).read_bytes()
+            except OSError as exc:
+                raise ResourceGateDenied("DeepSeek " + label + " cannot be read") from exc
+            if digest(source) != source_hash:
+                raise ResourceGateDenied("DeepSeek " + label + " hash changed")
         prices = lane.get("price_microusd_per_million", {})
         if set(prices) != {"input_cache_miss", "output", "cache_hit"} or any(
                 type(price) is not int or price <= 0 for price in prices.values()):

@@ -60,6 +60,16 @@ class ResourceGateTests(unittest.TestCase):
                                       "deepseek": lane("deepseek-flash", "USD")}}
         self.payload["providers"]["deepseek"]["price_microusd_per_million"] = {
             "input_cache_miss": 300000, "output": 1200000, "cache_hit": 6000}
+        self.price_source = self.root / "synthetic-price-source.json"
+        private(self.price_source, {"fixture": "synthetic-price-source"})
+        self.route_evidence = self.root / "synthetic-route-evidence.json"
+        private(self.route_evidence, {"fixture": "synthetic-billing-route"})
+        self.payload["providers"]["deepseek"].update({
+            "billing_route_verified": True,
+            "price_source_path": str(self.price_source),
+            "price_source_sha256": digest(self.price_source.read_bytes()),
+            "billing_route_evidence_path": str(self.route_evidence),
+            "billing_route_evidence_sha256": digest(self.route_evidence.read_bytes())})
         self.publish()
         self.freeze = self.root / "ledger-freeze.json"
         self.freeze_current_history()
@@ -98,6 +108,20 @@ class ResourceGateTests(unittest.TestCase):
                 self.call()
             self.assertEqual(len(self.rows()), 1)
             self.payload[field] = "APPROVED"
+
+    def test_unverified_billing_route_or_price_source_blocks_before_reservation(self):
+        lane = self.payload["providers"]["deepseek"]
+        lane["billing_route_verified"] = False
+        self.publish(); self.env["CMH_RESOURCE_AUTH_SHA256"] = digest(self.approval.read_bytes())
+        with self.assertRaisesRegex(ResourceGateDenied, "billing route"):
+            self.call("deepseek")
+        self.assertEqual(len(self.rows()), 1)
+        lane["billing_route_verified"] = True
+        self.publish(); self.env["CMH_RESOURCE_AUTH_SHA256"] = digest(self.approval.read_bytes())
+        private(self.price_source, {"fixture": "tampered-price-source"})
+        with self.assertRaisesRegex(ResourceGateDenied, "price_source hash changed"):
+            self.call("deepseek")
+        self.assertEqual(len(self.rows()), 1)
 
     def test_missing_contract_blocks_actual_openai_subprocess(self):
         from harness.openai_invocation import invoke_openai

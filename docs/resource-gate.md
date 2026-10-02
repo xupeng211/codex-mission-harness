@@ -13,6 +13,11 @@ an authorization version and human approval source. The gate requires both
 `token_authorization` and `cost_authorization` to be `APPROVED`. Ordinary model
 configuration cannot raise the call or wall limits. An approval for one
 provider or model cannot spend another provider's reserve.
+DeepSeek also requires the signed authorization to declare a verified billing
+route and bind the price source and independent route evidence by absolute
+path and SHA256. The earlier authorization has no route evidence and continues
+to deny DeepSeek launches. Public API prices alone do not prove which account
+or channel was charged.
 
 Set `CMH_RESOURCE_AUTHORIZATION`, `CMH_RESOURCE_AUTH_SHA256`,
 `CMH_RESOURCE_GATE_KEY_FILE`, `CMH_RESOURCE_LEDGER`, and
