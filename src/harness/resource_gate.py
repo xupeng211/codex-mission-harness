@@ -180,6 +180,96 @@ def _limits(value: dict, provider: str, model: str) -> dict:
     return lane
 
 
+def _approved_billing_recovery(auth: dict, lane: dict, frozen: dict,
+                               rows: list[dict], key_path: Path) -> set[int]:
+    """Permit only explicitly signed dispositions of immutable CLI fallback estimates.
+
+    This never changes a ledger row or its debit.  The original authorization
+    has no recovery policy and therefore continues to block requests 255/256.
+    """
+    policy = lane.get("cli_cost_policy")
+    if policy is None:
+        return set()
+    if policy != "VERIFIED_OFFICIAL_PRICE_WITH_DISCLOSED_CLI_FALLBACK" or (
+            auth.get("billing_recovery_approved") is not True or
+            not isinstance(auth.get("billing_recovery_approval_source"), str) or
+            not auth["billing_recovery_approval_source"]):
+        raise ResourceGateDenied("official billing recovery requires explicit signed approval")
+    for label in ("official_billing_export", "billing_recovery"):
+        name, expected = lane.get(label + "_path"), lane.get(label + "_sha256")
+        if (not isinstance(name, str) or not Path(name).is_absolute() or
+                Path(name).is_symlink() or not isinstance(expected, str) or len(expected) != 64):
+            raise ResourceGateDenied("billing recovery evidence path/hash missing")
+        try:
+            raw = _private(Path(name)) if label == "billing_recovery" else Path(name).read_bytes()
+        except OSError as exc:
+            raise ResourceGateDenied("billing recovery evidence unavailable") from exc
+        if digest(raw) != expected:
+            raise ResourceGateDenied("billing recovery evidence hash changed")
+        if label == "billing_recovery":
+            evidence_raw = raw
+    evidence = json.loads(evidence_raw)
+    signature = evidence.pop("authorization_hmac_sha256", None)
+    expected_signature = hmac.new(_private(key_path), canonical(evidence), hashlib.sha256).hexdigest()
+    if not isinstance(signature, str) or not hmac.compare_digest(signature, expected_signature):
+        raise ResourceGateDenied("billing recovery evidence signature invalid")
+    if (evidence.get("version") != "cmh-deepseek-official-billing-recovery/v1" or
+            evidence.get("mission_id") != auth["mission_id"] or
+            evidence.get("frozen_calls") != frozen["frozen_calls"] or
+            evidence.get("frozen_requests_sha256") != frozen["frozen_requests_sha256"] or
+            evidence.get("source_daily_export_sha256") != lane["official_billing_export_sha256"] or
+            evidence.get("model") != lane["model"] or
+            not isinstance(lane.get("billing_account_key_name"), str) or
+            not lane["billing_account_key_name"] or
+            evidence.get("account_key_name") != lane["billing_account_key_name"] or
+            evidence.get("price_source_sha256") != lane["price_source_sha256"] or
+            evidence.get("billing_route_evidence_sha256") != lane["billing_route_evidence_sha256"] or
+            evidence.get("official_price_microusd_per_million") != lane["price_microusd_per_million"] or
+            evidence.get("resumption_approved") is not True or
+            evidence.get("approval_source") != auth["billing_recovery_approval_source"]):
+        raise ResourceGateDenied("billing recovery approval/evidence identity mismatch")
+    dispositions = evidence.get("dispositions")
+    if not isinstance(dispositions, list) or not dispositions:
+        raise ResourceGateDenied("billing recovery requires exact request dispositions")
+    permitted: set[int] = set()
+    for item in dispositions:
+        number = item.get("number") if isinstance(item, dict) else None
+        if type(number) is not int or number in permitted or not 1 <= number <= frozen["frozen_calls"]:
+            raise ResourceGateDenied("billing recovery request number invalid")
+        row = rows[number - 1]
+        usage = row.get("reported_usage")
+        tokens = usage.get("tokens") if isinstance(usage, dict) else None
+        if (row.get("provider") != "deepseek" or row.get("status") != "RETURNED" or
+                not isinstance(tokens, dict) or
+                any(type(tokens.get(k)) is not int or tokens[k] < 0 or
+                    tokens[k] > row["token_reservation"][k]
+                    for k in ("input", "output", "reasoning", "cache")) or
+                tokens["reasoning"] > tokens["output"] or
+                type(usage.get("cli_reported_cost_microunits")) is not int or
+                usage["cli_reported_cost_microunits"] <= row.get("cost_reservation_microunits", -1) or
+                item.get("request_id") != row.get("request_id") or
+                item.get("row_sha256") != digest(canonical(row)) or
+                item.get("classification") != "CLI_FALLBACK_ESTIMATE_NOT_BILLED" or
+                item.get("settlement_status") != "ESTIMATED_ONLY" or
+                item.get("confirmed_billed_cost") != "UNKNOWN" or
+                item.get("reservation_refund_microusd") != 0 or
+                item.get("retain_original_overage") is not True):
+            raise ResourceGateDenied("billing recovery request evidence invalid")
+        permitted.add(number)
+    return permitted
+
+
+def _disclosed_cli_fallback(row: dict) -> bool:
+    usage = row.get("reported_usage")
+    model_usage = usage.get("raw_model_usage") if isinstance(usage, dict) else None
+    return (row.get("cost_basis_policy") == "VERIFIED_OFFICIAL_PRICE_WITH_DISCLOSED_CLI_FALLBACK" and
+            row.get("cli_fallback_over_reservation_observed") is True and
+            row.get("estimated_cost_classification") == "ESTIMATED_NOT_BILLED" and
+            type(row.get("estimated_cost_microusd")) is int and
+            row["estimated_cost_microusd"] <= row.get("cost_reservation_microunits", -1) and
+            isinstance(model_usage, dict) and model_usage.get("costBasis") == "unknown")
+
+
 def normalize_deepseek_usage(usage: dict | None, cli_cost_usd: object = None,
                              model_usage: dict | None = None) -> dict:
     """Keep Claude CLI's disjoint input/cache fields and session cost visible."""
@@ -280,8 +370,17 @@ class Reservation:
                     record["usage_accounting"] = "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS"
                 elif prices and cli_cost > record["cost_reservation_microunits"] and (
                         record["usage_accounting"] != "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS"):
-                    record["usage_accounting"] = "OVER_RESERVATION_BLOCK_FUTURE_CALLS"
-                    record["cost_overage_source"] = "CLI_ESTIMATE_UNBILLED"
+                    if record.get("cost_basis_policy") == (
+                            "VERIFIED_OFFICIAL_PRICE_WITH_DISCLOSED_CLI_FALLBACK"):
+                        if not isinstance(model_usage, dict) or model_usage.get("costBasis") != "unknown":
+                            record["usage_accounting"] = "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS"
+                        else:
+                            # Preserve the high CLI estimate as evidence.  Only the signed,
+                            # account-bound official price determines the budget estimate.
+                            record["cli_fallback_over_reservation_observed"] = True
+                    else:
+                        record["usage_accounting"] = "OVER_RESERVATION_BLOCK_FUTURE_CALLS"
+                        record["cost_overage_source"] = "CLI_ESTIMATE_UNBILLED"
             _write_atomic(self.ledger, ledger)
 
 
@@ -317,15 +416,23 @@ def reserve(*, provider: str, model: str, prompt: bytes, stage: str,
         if (frozen["frozen_calls"] < baseline or len(rows) < frozen["frozen_calls"] or
                 digest(canonical(rows[:frozen["frozen_calls"]])) != frozen["frozen_requests_sha256"]):
             raise ResourceGateDenied("frozen request history differs from signed checkpoint")
+        # The historical stop is mission-wide: the same signed disposition
+        # must be checked before either provider can resume.
+        recovery_lane = auth.get("providers", {}).get("deepseek", {})
+        if recovery_lane.get("cli_cost_policy") is not None:
+            _limits(auth, "deepseek", recovery_lane.get("model"))
+        permitted = _approved_billing_recovery(auth, recovery_lane, frozen, rows, key_path)
         if any(row.get("status") in {"STARTED", "UNKNOWN"} or
-               row.get("usage_accounting") in {"OVER_RESERVATION_BLOCK_FUTURE_CALLS",
-                                                "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS"} for row in rows):
+               row.get("usage_accounting") == "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS" or
+               (row.get("usage_accounting") == "OVER_RESERVATION_BLOCK_FUTURE_CALLS" and
+                row["number"] not in permitted) for row in rows):
             raise ResourceGateDenied("unreconciled or over-reservation request blocks new launch")
         if any(row.get("provider") == "deepseek" and
                isinstance(row.get("reported_usage"), dict) and
                type(row["reported_usage"].get("cli_reported_cost_microunits")) is int and
                row["reported_usage"]["cli_reported_cost_microunits"] >
-               row.get("cost_reservation_microunits", -1)
+               row.get("cost_reservation_microunits", -1) and
+               row["number"] not in permitted and not _disclosed_cli_fallback(row)
                for row in rows[baseline:]):
             raise ResourceGateDenied("unreconciled historical cost estimate over reservation")
         if (len(rows) >= auth.get("max_logical_model_calls", -1) or
@@ -350,6 +457,8 @@ def reserve(*, provider: str, model: str, prompt: bytes, stage: str,
                      "cost_unit": lane["cost_unit"], "usage_accounting": "FULL_RESERVATION_RETAINED"})
         if provider == "deepseek":
             rows[-1]["price_microusd_per_million"] = lane["price_microusd_per_million"]
+            if lane.get("cli_cost_policy") is not None:
+                rows[-1]["cost_basis_policy"] = lane["cli_cost_policy"]
         _write_atomic(ledger_path, ledger)
     return Reservation(ledger_path, request_id, env["CMH_RESOURCE_AUTH_SHA256"], provider, model)
 

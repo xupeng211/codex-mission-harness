@@ -55,3 +55,31 @@ blocks subsequent calls; it cannot be retroactively undone.
 
 The separate Token and cost authorization must be explicitly approved and
 signed before live review begins.
+
+## Official daily billing recovery (dormant until separately approved)
+
+The 2026-10-02 DeepSeek export reports a paid `deepseek-flash`/`harness`
+**day-level** CNY total and a unit price for each token category. It has no
+provider request IDs or per-request charge. Requests 255 and 256 therefore
+remain `ESTIMATED_ONLY`/`UNRESOLVED`; the original rows and full reservations
+are immutable. The Claude CLI's `costBasis=unknown` value is retained as an
+unbilled estimate, not silently recast as an invoice.
+
+For a future, explicitly approved recovery, the signed resource authorization
+must bind the official export by SHA256, the verified route and price evidence,
+and a private HMAC-signed disposition for each historical CLI fallback overage.
+The disposition binds the frozen prefix, exact request number and row SHA256,
+retains the original overage, records `confirmed_billed_cost=UNKNOWN`, and
+cannot refund any reservation. Only the specified immutable rows may cease
+blocking later launches. This check is mission-wide, including OpenAI calls.
+An unlisted overage, missing or changed evidence, or unapproved recovery still
+blocks before a subprocess starts.
+
+If that later authorization also selects
+`VERIFIED_OFFICIAL_PRICE_WITH_DISCLOSED_CLI_FALLBACK`, a new DeepSeek request
+stores the high CLI fallback estimate as an observed discrepancy. The signed
+official USD price estimate remains the cost budget comparison. Missing or
+inconsistent usage, a non-`unknown` CLI cost basis, or an official estimate
+above the authorized per-call reserve fails closed. This optional policy is
+not present in the current authorization; no model request is authorized by
+the code change or the daily export alone.

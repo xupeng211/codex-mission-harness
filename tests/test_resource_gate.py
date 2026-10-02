@@ -344,6 +344,88 @@ class ResourceGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ResourceGateDenied, "historical cost estimate"):
             self.call("deepseek")
 
+    def test_signed_official_basis_disposes_only_bound_cli_fallback_overage(self):
+        r = self.call("deepseek")
+        observed = {"tokens": {"input": 1, "output": 1, "reasoning": 0, "cache": 0},
+                    "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                    "cli_reported_cost_microunits": 11,
+                    "raw_model_usage": {"inputTokens": 1, "outputTokens": 1,
+                                        "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+                                        "thinkingTokens": 0, "costUSD": 0.000011,
+                                        "costBasis": "unknown"}}
+        r.observe(observed); r.settle("RETURNED")
+        original = dict(self.rows()[-1])
+        self.freeze_current_history()
+        self.env["CMH_RESOURCE_FREEZE_SHA256"] = digest(self.freeze.read_bytes())
+        export = self.root / "synthetic-official-export.csv"
+        private(export, {"fixture": "account tariff and daily total"})
+        recovery = self.root / "synthetic-recovery.json"
+        rows = self.rows()
+        private(recovery, sign_authorization({
+            "version": "cmh-deepseek-official-billing-recovery/v1",
+            "mission_id": "mission-a", "frozen_calls": len(rows),
+            "frozen_requests_sha256": digest(canonical(rows)),
+            "source_daily_export_sha256": digest(export.read_bytes()),
+            "model": "deepseek-flash", "account_key_name": "synthetic-harness",
+            "price_source_sha256": digest(self.price_source.read_bytes()),
+            "billing_route_evidence_sha256": digest(self.route_evidence.read_bytes()),
+            "official_price_microusd_per_million": self.payload["providers"]["deepseek"]["price_microusd_per_million"],
+            "resumption_approved": True, "approval_source": "synthetic explicit future approval",
+            "dispositions": [{"number": 2, "request_id": original["request_id"],
+                              "row_sha256": digest(canonical(original)),
+                              "classification": "CLI_FALLBACK_ESTIMATE_NOT_BILLED",
+                              "settlement_status": "ESTIMATED_ONLY",
+                              "confirmed_billed_cost": "UNKNOWN",
+                              "reservation_refund_microusd": 0,
+                              "retain_original_overage": True}]}, self.key.read_bytes()))
+        lane = self.payload["providers"]["deepseek"]
+        lane.update({"cli_cost_policy": "VERIFIED_OFFICIAL_PRICE_WITH_DISCLOSED_CLI_FALLBACK",
+                     "billing_account_key_name": "synthetic-harness",
+                     "official_billing_export_path": str(export),
+                     "official_billing_export_sha256": digest(export.read_bytes()),
+                     "billing_recovery_path": str(recovery),
+                     "billing_recovery_sha256": digest(recovery.read_bytes())})
+        self.payload["billing_recovery_approved"] = True
+        self.payload["billing_recovery_approval_source"] = "synthetic explicit future approval"
+        self.publish(); self.env["CMH_RESOURCE_AUTH_SHA256"] = digest(self.approval.read_bytes())
+        second = self.call("deepseek")
+        second.observe(observed); second.settle("RETURNED")
+        self.assertEqual(self.rows()[1], original)
+        self.assertEqual(self.rows()[2]["usage_accounting"], "FULL_RESERVATION_RETAINED")
+        self.assertTrue(self.rows()[2]["cli_fallback_over_reservation_observed"])
+        original_export = export.read_bytes()
+        private(export, {"fixture": "changed daily export"})
+        with self.assertRaisesRegex(ResourceGateDenied, "evidence hash changed"):
+            self.call("openai")
+        export.write_bytes(original_export)
+        original_recovery = recovery.read_bytes()
+        private(recovery, {"fixture": "changed disposition"})
+        with self.assertRaisesRegex(ResourceGateDenied, "evidence hash changed"):
+            self.call("openai")
+        recovery.write_bytes(original_recovery)
+        lane["price_microusd_per_million"]["output"] += 1
+        self.publish(); self.env["CMH_RESOURCE_AUTH_SHA256"] = digest(self.approval.read_bytes())
+        with self.assertRaisesRegex(ResourceGateDenied, "identity mismatch"):
+            self.call("openai")
+        lane["price_microusd_per_million"]["output"] -= 1
+        self.publish(); self.env["CMH_RESOURCE_AUTH_SHA256"] = digest(self.approval.read_bytes())
+        third = self.call("openai")
+        third.settle("FAILED")
+        self.assertEqual(self.rows()[3]["cost_reservation_microunits"], 10)
+
+    def test_recovery_policy_without_explicit_approval_cannot_clear_old_overage(self):
+        r = self.call("deepseek")
+        r.observe({"tokens": {"input": 1, "output": 1, "reasoning": 0, "cache": 0},
+                   "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                   "cli_reported_cost_microunits": 11})
+        r.settle("RETURNED")
+        self.payload["providers"]["deepseek"]["cli_cost_policy"] = (
+            "VERIFIED_OFFICIAL_PRICE_WITH_DISCLOSED_CLI_FALLBACK")
+        self.publish(); self.env["CMH_RESOURCE_AUTH_SHA256"] = digest(self.approval.read_bytes())
+        with self.assertRaises(ResourceGateDenied):
+            self.call("deepseek")
+        self.assertEqual(len(self.rows()), 2)
+
     def test_same_request_cannot_settle_twice(self):
         r = self.call("openai")
         r.settle("RETURNED")
