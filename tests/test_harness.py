@@ -3233,6 +3233,47 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
                 )
                 self.assertEqual(result.status, "BLOCKED_EXTERNAL")
 
+    def test_preflight_rejects_a_different_review_base(self):
+        adapter = FootballPredictionAdapter()
+        with patch.object(adapter, "discover_pr", return_value=GateResult(
+                "PASS", data={"number": 2, "repo": "owner/repo", "head": "a" * 40,
+                              "base": "main", "base_sha": "c" * 40})), \
+                patch.object(adapter, "_pr_state", return_value=GateResult(
+                    "PASS", data={"repo": "owner/repo", "head": "a" * 40,
+                                  "base": "main", "base_sha": "c" * 40,
+                                  "state": "OPEN", "body": "review context\n"})):
+            result = adapter.prepare_gate(
+                "agent-preflight", worktree=str(self.worktree), base="b" * 40,
+                head="a" * 40, mission_id="safe-demo", scope_file="scope.json")
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+
+    def test_worktree_git_config_cannot_hide_executable_filter(self):
+        repo = Path(self.tmp.name) / "worktree-config-fixture"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "extensions.worktreeConfig", "true"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "--worktree",
+                        "filter.fixture.process", "/bin/false"], check=True)
+        with self.assertRaisesRegex(RuntimeError, "executable local Git configuration"):
+            FootballPredictionAdapter._assert_safe_local_git_config(
+                str(repo), FootballPredictionAdapter._trusted_git_environment())
+
+    def test_review_path_rejects_an_untrusted_git_binary(self):
+        adapter = FootballPredictionAdapter()
+        with patch.object(FootballPredictionAdapter, "_validate_executable", side_effect=RuntimeError(
+                "trusted executable has unsafe ownership or permissions")):
+            with self.assertRaisesRegex(RuntimeError, "unsafe ownership"):
+                adapter._trusted_review_path(str(self.worktree))
+
+    def test_legacy_pr_adapter_receives_the_pinned_base(self):
+        received = []
+
+        def legacy(worktree, head, pr_number=None, pr_repo=None, base_sha=None):
+            received.append(base_sha)
+
+        Supervisor._invoke_pr_adapter(legacy, "/fixture", "a" * 40, 2,
+                                      "owner/repo", pr_base_sha="b" * 40)
+        self.assertEqual(received, ["b" * 40])
+
     def test_preflight_rejects_symlinked_evidence_root_without_writing_through(self):
         root = Path(self.tmp.name)
         victim = root / "victim-evidence"

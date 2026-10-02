@@ -73,6 +73,8 @@ class Supervisor:
                            base_sha: str | None = None,
                            pr_base_sha: str | None = None):
         """Support legacy and current signatures without positional-arity guesses."""
+        if base_sha is None:
+            base_sha = pr_base_sha
         parameters = inspect.signature(method).parameters
         positional = [worktree, head]
         keywords = {}
@@ -402,6 +404,9 @@ class Supervisor:
                 expected_pr = identity["merge_claim_pr_number"] or identity["pr_number"]
                 expected_repo = identity["merge_claim_pr_repo"] or identity["pr_repo"]
                 expected_pr_base = identity["merge_claim_pr_base_sha"] or identity["pr_base_sha"]
+                if not expected_pr_base and not isinstance(self.adapter, SimulatedAdapter):
+                    advance(State.BLOCKED_EXTERNAL, "merge claim has no durable PR base SHA")
+                    return State.BLOCKED_EXTERNAL
                 if not data.get("pr") or not data.get("merge_sha"):
                     if not isinstance(self.adapter, SimulatedAdapter):
                         advance(State.BLOCKED_EXTERNAL, "merge PASS omitted PR or merge SHA")
