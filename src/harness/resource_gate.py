@@ -138,6 +138,11 @@ def _limits(value: dict, provider: str, model: str) -> dict:
             lane["cost_limit_microunits"] <= 0 or
             lane.get("cost_unit") not in {"USD", "CODEX_SUBSCRIPTION_UNITS"}):
         raise ResourceGateDenied("invalid cost budget")
+    if provider == "deepseek":
+        prices = lane.get("price_microusd_per_million", {})
+        if set(prices) != {"input_cache_miss", "output", "cache_hit"} or any(
+                type(price) is not int or price <= 0 for price in prices.values()):
+            raise ResourceGateDenied("DeepSeek cost estimate requires an authorized price table")
     return lane
 
 
@@ -172,10 +177,17 @@ class Reservation:
                        tokens[k] > record["token_reservation"][k]
                        for k in ("input", "output", "reasoning", "cache")):
                     record["usage_accounting"] = "OVER_RESERVATION_BLOCK_FUTURE_CALLS"
-                observed_cost = self.reported_usage.get("cli_reported_cost_microunits")
-                if observed_cost is not None and (type(observed_cost) is not int or
-                        observed_cost < 0 or observed_cost > record["cost_reservation_microunits"]):
-                    record["usage_accounting"] = "OVER_RESERVATION_BLOCK_FUTURE_CALLS"
+                prices = record.get("price_microusd_per_million")
+                if prices and all(type(tokens.get(k)) is int and tokens[k] >= 0
+                                  for k in ("input", "output", "cache")):
+                    numerator = (tokens["input"] * prices["input_cache_miss"] +
+                                 tokens["output"] * prices["output"] +
+                                 tokens["cache"] * prices["cache_hit"])
+                    estimate = (numerator + 999_999) // 1_000_000
+                    record["estimated_cost_microusd"] = estimate
+                    record["estimated_cost_classification"] = "ESTIMATED_NOT_BILLED"
+                    if estimate > record["cost_reservation_microunits"]:
+                        record["usage_accounting"] = "OVER_RESERVATION_BLOCK_FUTURE_CALLS"
             _write_atomic(self.ledger, ledger)
 
 
@@ -228,6 +240,8 @@ def reserve(*, provider: str, model: str, prompt: bytes, stage: str,
                      "token_reservation": lane["token_reservation"],
                      "cost_reservation_microunits": lane["cost_reservation_microunits"],
                      "cost_unit": lane["cost_unit"], "usage_accounting": "FULL_RESERVATION_RETAINED"})
+        if provider == "deepseek":
+            rows[-1]["price_microusd_per_million"] = lane["price_microusd_per_million"]
         _write_atomic(ledger_path, ledger)
     return Reservation(ledger_path, request_id, env["CMH_RESOURCE_AUTH_SHA256"], provider, model)
 

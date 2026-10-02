@@ -26,9 +26,11 @@ reservation, so it adds only one logical request.
 Each call debits its full approved input, output, reasoning, cache and cost
 reservation before launch. The debit remains after success, failure or
 missing usage. Reported usage and CLI USD metadata are stored separately;
-they are not confirmed bills. A reported value above its reserve blocks later
-calls. Resume reads an already committed review stage without invoking the
-model, so it makes no new reservation.
+they are not confirmed bills. DeepSeek cost estimates use the signed peak
+price table and reported token counts; CLI USD metadata is never treated as a
+bill or compared to the USD reserve. A token or price-based estimate above its
+reserve blocks later calls. Resume reads an already committed review stage
+without invoking the model, so it makes no new reservation.
 
 **Limit of this contract:** The existing Codex CLI does not expose complete
 input, output and hidden reasoning token usage, and neither current CLI path

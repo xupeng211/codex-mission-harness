@@ -56,6 +56,8 @@ class ResourceGateTests(unittest.TestCase):
                         "call_wall_authorization_sha256": digest(self.call_wall.read_bytes()),
                         "providers": {"openai": lane("gpt-5.6-sol", "CODEX_SUBSCRIPTION_UNITS"),
                                       "deepseek": lane("deepseek-flash", "USD")}}
+        self.payload["providers"]["deepseek"]["price_microusd_per_million"] = {
+            "input_cache_miss": 300000, "output": 1200000, "cache_hit": 6000}
         self.publish()
         self.env = {"CMH_RESOURCE_AUTHORIZATION": str(self.approval),
                     "CMH_RESOURCE_AUTH_SHA256": digest(self.approval.read_bytes()),
@@ -164,6 +166,23 @@ class ResourceGateTests(unittest.TestCase):
         r.settle("RETURNED")
         with self.assertRaisesRegex(ResourceGateDenied, "over-reservation"):
             self.call()
+
+    def test_cli_usd_metadata_is_not_misrepresented_as_billed_cost(self):
+        r = self.call("deepseek")
+        r.observe({"tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": 0},
+                   "cli_reported_cost_microunits": 9999999,
+                   "cost_classification": "OBSERVED_UNBILLED"})
+        r.settle("RETURNED")
+        self.assertEqual(self.rows()[-1]["estimated_cost_microusd"], 0)
+        self.assertEqual(self.rows()[-1]["usage_accounting"], "FULL_RESERVATION_RETAINED")
+
+    def test_authorized_price_estimate_over_reservation_blocks_following_call(self):
+        r = self.call("deepseek")
+        r.observe({"tokens": {"input": 0, "output": 10, "reasoning": 0, "cache": 0}})
+        r.settle("RETURNED")
+        self.assertGreater(self.rows()[-1]["estimated_cost_microusd"], 10)
+        with self.assertRaisesRegex(ResourceGateDenied, "over-reservation"):
+            self.call("deepseek")
 
     def test_tampered_approval_or_ordinary_limit_raise_fails(self):
         self.payload["max_logical_model_calls"] = 6
