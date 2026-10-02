@@ -98,6 +98,25 @@ def _authorization(path: Path, key_path: Path, approval_sha256: str) -> dict:
     return value
 
 
+def _frozen_prefix(path: Path, key_path: Path, expected_sha256: str,
+                   mission_id: str, ledger_path: Path) -> dict:
+    raw = _private(path)
+    if digest(raw) != expected_sha256:
+        raise ResourceGateDenied("frozen ledger attestation hash changed")
+    value = json.loads(raw)
+    signature = value.pop("authorization_hmac_sha256", None)
+    expected = hmac.new(_private(key_path), canonical(value), hashlib.sha256).hexdigest()
+    if not isinstance(signature, str) or not hmac.compare_digest(signature, expected):
+        raise ResourceGateDenied("frozen ledger attestation signature invalid")
+    if (value.get("version") != "cmh-ledger-freeze/v1" or
+            value.get("mission_id") != mission_id or
+            value.get("ledger_path") != str(ledger_path) or
+            type(value.get("frozen_calls")) is not int or value["frozen_calls"] < 1 or
+            not isinstance(value.get("frozen_requests_sha256"), str)):
+        raise ResourceGateDenied("frozen ledger attestation identity invalid")
+    return value
+
+
 def _write_atomic(path: Path, payload: dict) -> None:
     temporary = path.with_name("." + path.name + "." + uuid.uuid4().hex + ".tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -146,6 +165,26 @@ def _limits(value: dict, provider: str, model: str) -> dict:
     return lane
 
 
+def normalize_deepseek_usage(usage: dict | None, cli_cost_usd: object = None,
+                             model_usage: dict | None = None) -> dict:
+    """Keep Claude CLI's disjoint input/cache fields and session cost visible."""
+    raw = usage if isinstance(usage, dict) else {}
+    read = raw.get("cache_read_input_tokens")
+    created = raw.get("cache_creation_input_tokens")
+    observed = {"tokens": {
+        "input": raw.get("input_tokens"), "output": raw.get("output_tokens"),
+        "reasoning": (raw.get("output_tokens_details") or {}).get("thinking_tokens")
+        if isinstance(raw.get("output_tokens_details"), dict) else None,
+        "cache": read + created if type(read) is int and type(created) is int else None},
+        "cache_read_tokens": read, "cache_creation_tokens": created,
+        "usage_scope": "CLI_SESSION_AGGREGATE", "raw_usage_fields": raw,
+        "raw_model_usage": model_usage if isinstance(model_usage, dict) else None,
+        "cost_classification": "OBSERVED_UNBILLED"}
+    if type(cli_cost_usd) in (int, float) and cli_cost_usd >= 0:
+        observed["cli_reported_cost_microunits"] = round(cli_cost_usd * 1_000_000)
+    return observed
+
+
 class Reservation:
     def __init__(self, ledger: Path, request_id: str, authorization_sha256: str,
                  provider: str, model: str):
@@ -171,30 +210,63 @@ class Reservation:
             record["duration_seconds"] = round(record["finished_epoch"] - record["started_epoch"], 3)
             record["reported_usage"] = self.reported_usage if self.reported_usage is not None else "UNKNOWN"
             record["usage_accounting"] = "FULL_RESERVATION_RETAINED"
+            if self.reported_usage is None and self.provider == "deepseek":
+                record["usage_accounting"] = "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS"
             if self.reported_usage is not None:
                 tokens = self.reported_usage.get("tokens", {})
-                if any(type(tokens.get(k)) is not int or tokens[k] < 0 or
-                       tokens[k] > record["token_reservation"][k]
-                       for k in ("input", "output", "reasoning", "cache")) or (
-                           all(type(tokens.get(k)) is int for k in ("input", "output", "reasoning", "cache"))
-                           and (tokens["reasoning"] > tokens["output"] or tokens["cache"] > tokens["input"])):
+                complete = isinstance(tokens, dict) and all(
+                    type(tokens.get(k)) is int and tokens[k] >= 0
+                    for k in ("input", "output", "reasoning", "cache"))
+                if not complete:
+                    record["usage_accounting"] = "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS"
+                elif any(tokens[k] > record["token_reservation"][k]
+                         for k in ("input", "output", "reasoning", "cache")):
                     record["usage_accounting"] = "OVER_RESERVATION_BLOCK_FUTURE_CALLS"
+                if complete and tokens["reasoning"] > tokens["output"]:
+                    record["usage_accounting"] = "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS"
                 prices = record.get("price_microusd_per_million")
-                if prices and all(type(tokens.get(k)) is int and tokens[k] >= 0
-                                  for k in ("input", "output", "reasoning", "cache")) and (
-                                      tokens["reasoning"] <= tokens["output"] and
-                                      tokens["cache"] <= tokens["input"]):
-                    # Provider input/output totals already include cached and
-                    # reasoning tokens respectively. Price each token once.
-                    cache_tokens = tokens["cache"]
-                    numerator = ((tokens["input"] - cache_tokens) * prices["input_cache_miss"] +
+                read = self.reported_usage.get("cache_read_tokens")
+                created = self.reported_usage.get("cache_creation_tokens")
+                if prices and complete and (type(read) is not int or read < 0 or
+                        type(created) is not int or created < 0 or
+                        read + created != tokens["cache"]):
+                    record["usage_accounting"] = "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS"
+                model_usage = self.reported_usage.get("raw_model_usage")
+                if prices and model_usage is not None and (
+                        not isinstance(model_usage, dict) or
+                        any(model_usage.get(name) != expected for name, expected in (
+                            ("inputTokens", tokens.get("input") if isinstance(tokens, dict) else None),
+                            ("outputTokens", tokens.get("output") if isinstance(tokens, dict) else None),
+                            ("cacheReadInputTokens", read),
+                            ("cacheCreationInputTokens", created),
+                            ("thinkingTokens", tokens.get("reasoning") if isinstance(tokens, dict) else None)))):
+                    record["usage_accounting"] = "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS"
+                if prices and complete and type(read) is int and read >= 0 and (
+                        type(created) is int and created >= 0 and
+                        read + created == tokens["cache"] and
+                        tokens["reasoning"] <= tokens["output"]):
+                    # Claude CLI input_tokens excludes cache read/creation.
+                    # output_tokens already contains thinking_tokens.
+                    numerator = ((tokens["input"] + created) * prices["input_cache_miss"] +
                                  tokens["output"] * prices["output"] +
-                                 cache_tokens * prices["cache_hit"])
+                                 read * prices["cache_hit"])
                     estimate = (numerator + 999_999) // 1_000_000
                     record["estimated_cost_microusd"] = estimate
                     record["estimated_cost_classification"] = "ESTIMATED_NOT_BILLED"
                     if estimate > record["cost_reservation_microunits"]:
                         record["usage_accounting"] = "OVER_RESERVATION_BLOCK_FUTURE_CALLS"
+                        record["cost_overage_source"] = "AUTHORIZED_PRICE_ESTIMATE"
+                cli_cost = self.reported_usage.get("cli_reported_cost_microunits")
+                if prices and isinstance(model_usage, dict) and (
+                        type(model_usage.get("costUSD")) not in (int, float) or
+                        round(model_usage["costUSD"] * 1_000_000) != cli_cost):
+                    record["usage_accounting"] = "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS"
+                if prices and (type(cli_cost) is not int or cli_cost < 0):
+                    record["usage_accounting"] = "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS"
+                elif prices and cli_cost > record["cost_reservation_microunits"] and (
+                        record["usage_accounting"] != "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS"):
+                    record["usage_accounting"] = "OVER_RESERVATION_BLOCK_FUTURE_CALLS"
+                    record["cost_overage_source"] = "CLI_ESTIMATE_UNBILLED"
             _write_atomic(self.ledger, ledger)
 
 
@@ -202,7 +274,8 @@ def reserve(*, provider: str, model: str, prompt: bytes, stage: str,
             environment: dict[str, str] | None = None) -> Reservation:
     env = os.environ if environment is None else environment
     needed = ("CMH_RESOURCE_AUTHORIZATION", "CMH_RESOURCE_AUTH_SHA256", "CMH_RESOURCE_GATE_KEY_FILE",
-              "CMH_RESOURCE_LEDGER", "CMH_RESOURCE_MISSION_ID", "CMH_RESOURCE_RUN_ID")
+              "CMH_RESOURCE_LEDGER", "CMH_RESOURCE_MISSION_ID", "CMH_RESOURCE_RUN_ID",
+              "CMH_RESOURCE_FREEZE", "CMH_RESOURCE_FREEZE_SHA256")
     if any(not env.get(name) for name in needed):
         raise ResourceGateDenied("complete approved resource context is required before model launch")
     auth_path, key_path, ledger_path = (Path(env[name]) for name in
@@ -213,6 +286,8 @@ def reserve(*, provider: str, model: str, prompt: bytes, stage: str,
         raise ResourceGateDenied("budget authorization is bound to the original request ledger")
     if auth.get("mission_id") != env["CMH_RESOURCE_MISSION_ID"] or not env["CMH_RESOURCE_RUN_ID"].strip():
         raise ResourceGateDenied("mission/run authorization mismatch")
+    frozen = _frozen_prefix(Path(env["CMH_RESOURCE_FREEZE"]), key_path,
+                            env["CMH_RESOURCE_FREEZE_SHA256"], auth["mission_id"], ledger_path)
     lane = _limits(auth, provider, model)
     lock = ledger_path.with_name(ledger_path.name + ".lock")
     with _locked(lock):
@@ -224,9 +299,20 @@ def reserve(*, provider: str, model: str, prompt: bytes, stage: str,
         if type(baseline) is not int or baseline < 0 or len(rows) < baseline or \
                 digest(canonical(rows[:baseline])) != auth.get("baseline_requests_sha256"):
             raise ResourceGateDenied("historical request ledger differs from authorized baseline")
+        if (frozen["frozen_calls"] < baseline or len(rows) < frozen["frozen_calls"] or
+                digest(canonical(rows[:frozen["frozen_calls"]])) != frozen["frozen_requests_sha256"]):
+            raise ResourceGateDenied("frozen request history differs from signed checkpoint")
         if any(row.get("status") in {"STARTED", "UNKNOWN"} or
-               row.get("usage_accounting") == "OVER_RESERVATION_BLOCK_FUTURE_CALLS" for row in rows):
+               row.get("usage_accounting") in {"OVER_RESERVATION_BLOCK_FUTURE_CALLS",
+                                                "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS"} for row in rows):
             raise ResourceGateDenied("unreconciled or over-reservation request blocks new launch")
+        if any(row.get("provider") == "deepseek" and
+               isinstance(row.get("reported_usage"), dict) and
+               type(row["reported_usage"].get("cli_reported_cost_microunits")) is int and
+               row["reported_usage"]["cli_reported_cost_microunits"] >
+               row.get("cost_reservation_microunits", -1)
+               for row in rows[baseline:]):
+            raise ResourceGateDenied("unreconciled historical cost estimate over reservation")
         if (len(rows) >= auth.get("max_logical_model_calls", -1) or
                 time.time() - auth.get("original_started_epoch", 0) >= auth.get("max_wall_clock_seconds", -1)):
             raise ResourceGateDenied("logical-call or wall-clock hard stop reached")

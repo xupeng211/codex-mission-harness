@@ -142,6 +142,19 @@ class ResumeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "artifact changed"):
             self.open()
 
+    def test_accounting_runtime_revision_invalidates_completed_chunk(self):
+        old = self.open()
+        self.do_stage(old, 0)
+        old_path = old.path
+        old.close()
+        revised_identity = dict(self.identity, runner_hash="e" * 64,
+                                invocation_hash="f" * 64)
+        revised = self.open(revised_identity)
+        self.assertNotEqual(revised.path, old_path)
+        self.assertEqual(revised.state["completed_order"], [])
+        self.assertEqual(revised.state["next_stage"], "chunk-000")
+        revised.close()
+
     def test_concurrent_lease_and_stale_lease_recovery(self):
         run = self.open()
         with self.assertRaisesRegex(RuntimeError, "active review lease"):

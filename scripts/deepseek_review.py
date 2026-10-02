@@ -1049,14 +1049,11 @@ def invoke_reviewer(command, prompt_text, env, timeout):
             except (ValueError, UnicodeDecodeError, AttributeError):
                 usage = None
             if isinstance(usage, dict):
-                observed = {"tokens": {
-                    "input": usage.get("input_tokens"), "output": usage.get("output_tokens"),
-                    "reasoning": usage.get("output_tokens_details", {}).get("thinking_tokens"),
-                    "cache": usage.get("cache_creation_input_tokens", 0) + usage.get("cache_read_input_tokens", 0)}}
-                if isinstance(envelope.get("total_cost_usd"), (int, float)):
-                    observed["cli_reported_cost_microunits"] = round(envelope["total_cost_usd"] * 1_000_000)
-                    observed["cost_classification"] = "OBSERVED_UNBILLED"
-                reservation.observe(observed)
+                from harness.resource_gate import normalize_deepseek_usage
+                reservation.observe(normalize_deepseek_usage(
+                    usage, envelope.get("total_cost_usd"),
+                    envelope.get("modelUsage", {}).get(model)
+                    if isinstance(envelope.get("modelUsage"), dict) else None))
             return result
     except _NonzeroReviewerResult as exc:
         return exc.result

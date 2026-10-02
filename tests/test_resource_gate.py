@@ -8,7 +8,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness.resource_gate import (ResourceGateDenied, canonical, digest,
-                                   model_request, reserve, sign_authorization)
+                                   model_request, normalize_deepseek_usage, reserve,
+                                   sign_authorization)
 from harness.model_registry import ModelSpec
 
 
@@ -18,6 +19,7 @@ def private(path, data):
 
 
 class ResourceGateTests(unittest.TestCase):
+    REQUEST_256 = json.loads((Path(__file__).parent / "fixtures" / "request_256_usage.json").read_text())
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -59,14 +61,25 @@ class ResourceGateTests(unittest.TestCase):
         self.payload["providers"]["deepseek"]["price_microusd_per_million"] = {
             "input_cache_miss": 300000, "output": 1200000, "cache_hit": 6000}
         self.publish()
+        self.freeze = self.root / "ledger-freeze.json"
+        self.freeze_current_history()
         self.env = {"CMH_RESOURCE_AUTHORIZATION": str(self.approval),
                     "CMH_RESOURCE_AUTH_SHA256": digest(self.approval.read_bytes()),
                     "CMH_RESOURCE_GATE_KEY_FILE": str(self.key),
                     "CMH_RESOURCE_LEDGER": str(self.ledger),
-                    "CMH_RESOURCE_MISSION_ID": "mission-a", "CMH_RESOURCE_RUN_ID": "run-a"}
+                    "CMH_RESOURCE_MISSION_ID": "mission-a", "CMH_RESOURCE_RUN_ID": "run-a",
+                    "CMH_RESOURCE_FREEZE": str(self.freeze),
+                    "CMH_RESOURCE_FREEZE_SHA256": digest(self.freeze.read_bytes())}
 
     def publish(self):
         private(self.approval, sign_authorization(self.payload, self.key.read_bytes()))
+
+    def freeze_current_history(self):
+        rows = json.loads(self.ledger.read_bytes())["requests"]
+        private(self.freeze, sign_authorization({
+            "version": "cmh-ledger-freeze/v1", "mission_id": "mission-a",
+            "ledger_path": str(self.ledger), "frozen_calls": len(rows),
+            "frozen_requests_sha256": digest(canonical(rows))}, self.key.read_bytes()))
 
     def call(self, provider="openai", model=None, environment=None):
         return reserve(provider=provider, model=model or ("gpt-5.6-sol" if provider == "openai"
@@ -170,15 +183,19 @@ class ResourceGateTests(unittest.TestCase):
     def test_cli_usd_metadata_is_not_misrepresented_as_billed_cost(self):
         r = self.call("deepseek")
         r.observe({"tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": 0},
+                   "cache_read_tokens": 0, "cache_creation_tokens": 0,
                    "cli_reported_cost_microunits": 9999999,
                    "cost_classification": "OBSERVED_UNBILLED"})
         r.settle("RETURNED")
         self.assertEqual(self.rows()[-1]["estimated_cost_microusd"], 0)
-        self.assertEqual(self.rows()[-1]["usage_accounting"], "FULL_RESERVATION_RETAINED")
+        self.assertEqual(self.rows()[-1]["usage_accounting"], "OVER_RESERVATION_BLOCK_FUTURE_CALLS")
+        self.assertEqual(self.rows()[-1]["cost_overage_source"], "CLI_ESTIMATE_UNBILLED")
 
     def test_authorized_price_estimate_over_reservation_blocks_following_call(self):
         r = self.call("deepseek")
-        r.observe({"tokens": {"input": 0, "output": 10, "reasoning": 0, "cache": 0}})
+        r.observe({"tokens": {"input": 0, "output": 10, "reasoning": 0, "cache": 0},
+                   "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                   "cli_reported_cost_microunits": 0})
         r.settle("RETURNED")
         self.assertGreater(self.rows()[-1]["estimated_cost_microusd"], 10)
         with self.assertRaisesRegex(ResourceGateDenied, "over-reservation"):
@@ -186,9 +203,143 @@ class ResourceGateTests(unittest.TestCase):
 
     def test_reasoning_and_cache_tokens_are_priced_once(self):
         r = self.call("deepseek")
-        r.observe({"tokens": {"input": 10, "output": 10, "reasoning": 8, "cache": 8}})
+        r.observe({"tokens": {"input": 10, "output": 10, "reasoning": 8, "cache": 8},
+                   "cache_read_tokens": 8, "cache_creation_tokens": 0,
+                   "cli_reported_cost_microunits": 0})
         r.settle("RETURNED")
-        self.assertEqual(self.rows()[-1]["estimated_cost_microusd"], 13)
+        self.assertEqual(self.rows()[-1]["estimated_cost_microusd"], 16)
+
+    def test_request_256_cache_read_may_exceed_non_cached_input(self):
+        self.payload["providers"]["deepseek"]["cost_reservation_microunits"] = 3_000_000
+        self.payload["providers"]["deepseek"]["cost_limit_microunits"] = 9_000_000
+        self.payload["providers"]["deepseek"]["token_reservation"] = {
+            "input": 64_000, "output": 128_000, "reasoning": 128_000, "cache": 64_000}
+        self.payload["providers"]["deepseek"]["token_limit"] = {
+            "input": 192_000, "output": 384_000, "reasoning": 384_000, "cache": 192_000}
+        self.publish(); self.env["CMH_RESOURCE_AUTH_SHA256"] = digest(self.approval.read_bytes())
+        usage = self.REQUEST_256["usage"]
+        r = self.call("deepseek")
+        r.observe({"tokens": {"input": usage["input_tokens"], "output": usage["output_tokens"],
+                              "reasoning": usage["output_tokens_details"]["thinking_tokens"],
+                              "cache": usage["cache_read_input_tokens"]},
+                   "cache_read_tokens": usage["cache_read_input_tokens"],
+                   "cache_creation_tokens": usage["cache_creation_input_tokens"],
+                   "cli_reported_cost_microunits": round(self.REQUEST_256["total_cost_usd"] * 1_000_000)})
+        r.settle("RETURNED")
+        self.assertEqual(self.rows()[-1]["usage_accounting"], "FULL_RESERVATION_RETAINED")
+        self.assertEqual(self.rows()[-1]["estimated_cost_microusd"], 153633)
+
+    def test_request_256_raw_fields_normalize_without_reasoning_duplication(self):
+        raw = self.REQUEST_256["usage"]
+        observed = normalize_deepseek_usage(
+            raw, self.REQUEST_256["total_cost_usd"],
+            self.REQUEST_256["modelUsage"]["deepseek-flash"])
+        self.assertEqual(observed["tokens"], {
+            "input": 9566, "output": 125504, "reasoning": 0, "cache": 26368})
+        self.assertEqual(observed["cache_read_tokens"], 26368)
+        self.assertEqual(observed["cache_creation_tokens"], 0)
+        self.assertEqual(observed["cli_reported_cost_microunits"], 2553618)
+        self.assertEqual(observed["raw_usage_fields"], raw)
+        self.assertEqual(observed["usage_scope"], "CLI_SESSION_AGGREGATE")
+
+    def test_request_256_cli_estimate_over_cost_reservation_stops_future_call(self):
+        self.payload["providers"]["deepseek"]["token_reservation"] = {
+            "input": 64_000, "output": 128_000, "reasoning": 128_000, "cache": 64_000}
+        self.payload["providers"]["deepseek"]["token_limit"] = {
+            "input": 192_000, "output": 384_000, "reasoning": 384_000, "cache": 192_000}
+        self.publish(); self.env["CMH_RESOURCE_AUTH_SHA256"] = digest(self.approval.read_bytes())
+        usage = self.REQUEST_256["usage"]
+        r = self.call("deepseek")
+        r.observe({"tokens": {"input": usage["input_tokens"], "output": usage["output_tokens"],
+                              "reasoning": 0, "cache": usage["cache_read_input_tokens"]},
+                   "cache_read_tokens": usage["cache_read_input_tokens"],
+                   "cache_creation_tokens": 0,
+                   "cli_reported_cost_microunits": round(self.REQUEST_256["total_cost_usd"] * 1_000_000)})
+        r.settle("RETURNED")
+        self.assertEqual(self.rows()[-1]["usage_accounting"], "OVER_RESERVATION_BLOCK_FUTURE_CALLS")
+        self.assertEqual(self.rows()[-1]["cost_overage_source"], "CLI_ESTIMATE_UNBILLED")
+
+    def test_inconsistent_cache_split_and_missing_usage_fail_closed(self):
+        for observed in (
+            {"tokens": {"input": 2, "output": 3, "reasoning": 0, "cache": 4},
+             "cache_read_tokens": 3, "cache_creation_tokens": 0,
+             "cli_reported_cost_microunits": 0},
+            {"tokens": {"input": None, "output": 3, "reasoning": 0, "cache": 0},
+             "cache_read_tokens": 0, "cache_creation_tokens": 0,
+             "cli_reported_cost_microunits": 0},
+            {"tokens": {"input": 2, "output": 3, "reasoning": 0, "cache": 0},
+             "cache_read_tokens": 0, "cache_creation_tokens": 0},
+            {"tokens": {"input": 2, "output": 3, "reasoning": 0, "cache": 0},
+             "cache_read_tokens": 0, "cache_creation_tokens": 0,
+             "cli_reported_cost_microunits": 0,
+             "raw_model_usage": {"inputTokens": 9, "outputTokens": 3,
+                                 "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+                                 "thinkingTokens": 0, "costUSD": 0}},
+        ):
+            with self.subTest(observed=observed):
+                r = self.call("deepseek")
+                r.observe(observed)
+                r.settle("RETURNED")
+                self.assertEqual(self.rows()[-1]["usage_accounting"],
+                                 "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS")
+                with self.assertRaisesRegex(ResourceGateDenied, "unreconciled"):
+                    self.call("deepseek")
+                # Keep the same fixture budget, but reset only synthetic rows.
+                private(self.ledger, {"counter_semantics": "original mission ledger",
+                                      "requests": list(self.history)})
+
+    def test_unknown_request_retains_full_debit_and_blocks(self):
+        r = self.call("openai")
+        r.settle("UNKNOWN")
+        self.assertEqual(self.rows()[-1]["cost_reservation_microunits"], 10)
+        self.assertEqual(self.rows()[-1]["token_reservation"]["input"], 10)
+        with self.assertRaisesRegex(ResourceGateDenied, "unreconciled"):
+            self.call("openai")
+
+    def test_frozen_abnormal_history_cannot_be_removed_to_regain_capacity(self):
+        r = self.call("openai")
+        r.observe({"tokens": {"input": 11, "output": 0, "reasoning": 0, "cache": 0}})
+        r.settle("RETURNED")
+        self.freeze_current_history()
+        self.env["CMH_RESOURCE_FREEZE_SHA256"] = digest(self.freeze.read_bytes())
+        rows = self.rows()
+        private(self.ledger, {"counter_semantics": "original mission ledger",
+                              "requests": rows[:-1]})
+        with self.assertRaisesRegex(ResourceGateDenied, "frozen request history"):
+            self.call("openai")
+
+    def test_legacy_settlement_cannot_hide_cli_cost_overage(self):
+        r = self.call("deepseek")
+        r.observe({"tokens": {"input": 1, "output": 1, "reasoning": 0, "cache": 0},
+                   "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                   "cli_reported_cost_microunits": 11})
+        r.settle("RETURNED")
+        rows = self.rows()
+        rows[-1]["usage_accounting"] = "FULL_RESERVATION_RETAINED"  # old runtime defect
+        private(self.ledger, {"counter_semantics": "original mission ledger", "requests": rows})
+        with self.assertRaisesRegex(ResourceGateDenied, "historical cost estimate"):
+            self.call("deepseek")
+
+    def test_same_request_cannot_settle_twice(self):
+        r = self.call("openai")
+        r.settle("RETURNED")
+        with self.assertRaisesRegex(ResourceGateDenied, "settlement identity/state mismatch"):
+            r.settle("RETURNED")
+        self.assertEqual(len(self.rows()), 2)
+
+    def test_overage_blocks_real_deepseek_invoker_before_subprocess(self):
+        import deepseek_review
+        r = self.call("deepseek")
+        r.observe({"tokens": {"input": 1, "output": 10, "reasoning": 0, "cache": 0},
+                   "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                   "cli_reported_cost_microunits": 11})
+        r.settle("RETURNED")
+        with patch.dict(os.environ, self.env, clear=True), \
+             patch("deepseek_review._invoke_reviewer_unmetered") as launch:
+            with self.assertRaisesRegex(ResourceGateDenied, "unreconciled"):
+                deepseek_review.invoke_reviewer(["/bin/false", "--model", "deepseek-flash"],
+                                                "fixture", {}, 1)
+            launch.assert_not_called()
 
     def test_tampered_approval_or_ordinary_limit_raise_fails(self):
         self.payload["max_logical_model_calls"] = 6

@@ -220,14 +220,9 @@ def _actual_provider_invoke(spec: ModelSpec, prompt: str, *, token: str | None,
         if isinstance(result, InvocationResult):
             usage = result.evidence.get("usage")
             if isinstance(usage, dict):
-                observed = {"tokens": {
-                    "input": usage.get("input_tokens"), "output": usage.get("output_tokens"),
-                    "reasoning": usage.get("output_tokens_details", {}).get("thinking_tokens", 0),
-                    "cache": usage.get("cache_creation_input_tokens", 0) + usage.get("cache_read_input_tokens", 0)}}
-                if isinstance(result.evidence.get("cli_reported_cost_usd"), (int, float)):
-                    observed["cli_reported_cost_microunits"] = round(result.evidence["cli_reported_cost_usd"] * 1_000_000)
-                    observed["cost_classification"] = "OBSERVED_UNBILLED"
-                reservation.observe(observed)
+                from .resource_gate import normalize_deepseek_usage
+                reservation.observe(normalize_deepseek_usage(
+                    usage, result.evidence.get("cli_reported_cost_usd")))
         return result
 
 

@@ -16,7 +16,10 @@ provider or model cannot spend another provider's reserve.
 
 Set `CMH_RESOURCE_AUTHORIZATION`, `CMH_RESOURCE_AUTH_SHA256`,
 `CMH_RESOURCE_GATE_KEY_FILE`, `CMH_RESOURCE_LEDGER`, and
-`CMH_RESOURCE_MISSION_ID` from the trusted controller. Review and
+`CMH_RESOURCE_MISSION_ID` from the trusted controller. The controller must also
+provide `CMH_RESOURCE_FREEZE` and `CMH_RESOURCE_FREEZE_SHA256` for a signed
+snapshot of the settled request prefix. Removing or changing a frozen request
+cannot restore capacity. Review and
 qualification runners set the run ID; stage invocations set the stage ID.
 Missing, altered or pending context denies the request before `Popen`.
 OpenAI Codex, DeepSeek Reviewer V2 and both qualification paths call this
@@ -26,11 +29,14 @@ reservation, so it adds only one logical request.
 Each call debits its full approved input, output, reasoning, cache and cost
 reservation before launch. The debit remains after success, failure or
 missing usage. Reported usage and CLI USD metadata are stored separately;
-they are not confirmed bills. DeepSeek cost estimates use the signed peak
-price table and reported token counts. Reasoning is a subset of output and
-cache is a subset of input, so neither is charged twice. CLI USD metadata is never treated as a
-bill or compared to the USD reserve. A token or price-based estimate above its
-reserve blocks later calls. Resume reads an already committed review stage
+they are not confirmed bills. Claude CLI reports non-cached input, cache read,
+cache creation and output as separate counters aggregated over a CLI session.
+Thinking tokens are part of output. DeepSeek's signed official-price estimate
+charges non-cached input and cache creation at the cache-miss rate, cache read
+at the cache-hit rate, and output once. The CLI's distinct first-party cost
+estimate is also compared with the per-request USD reservation; an overage in
+either estimate blocks later calls without being labelled a confirmed bill.
+Missing or inconsistent DeepSeek usage blocks later calls. Resume reads an already committed review stage
 without invoking the model, so it makes no new reservation.
 
 **Limit of this contract:** The existing Codex CLI does not expose complete
