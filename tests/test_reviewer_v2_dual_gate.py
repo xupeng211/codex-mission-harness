@@ -16,11 +16,49 @@ sys.path.insert(0, str(ROOT / "src"))
 import reviewer_v2_gate as gate  # noqa: E402
 import reviewer_v2_openai as review  # noqa: E402
 from harness.model_registry import ModelSpec  # noqa: E402
-from harness.openai_invocation import InvocationFailure  # noqa: E402
+from harness.openai_invocation import InvocationFailure, _matches_schema  # noqa: E402
 
 
 def git(root, *args):
     return subprocess.check_output(["git", "-C", str(root), *args]).decode().strip()
+
+
+class SummaryContractTests(unittest.TestCase):
+    def test_group_and_synthesis_schema_reject_parser_invalid_summaries(self):
+        for group in (False, True):
+            schema = review._schema(group, synthesis=not group)
+            for summary in ("x" * 31, "x" * 4001, " " * 32,
+                            " " + "x" * 32, "x" * 32 + "\n"):
+                value = {"findings": [], "summary": summary}
+                if group:
+                    value["decisions"] = []
+                with self.subTest(group=group, summary_length=len(summary)):
+                    self.assertFalse(_matches_schema(value, schema))
+                    if summary in ("x" * 31, "x" * 4001, " " * 32):
+                        parser = review._result if group else review._synthesis_result
+                        with self.assertRaisesRegex(ValueError, "summary"):
+                            if group:
+                                parser(review._canon(value), group=True)
+                            else:
+                                parser(review._canon(value))
+            for length in (32, 4000):
+                value = {"findings": [], "summary": "x" * length}
+                if group:
+                    value["decisions"] = []
+                with self.subTest(group=group, legal_length=length):
+                    self.assertTrue(_matches_schema(value, schema))
+                    if group:
+                        self.assertEqual(review._result(review._canon(value), group=True), value)
+                    else:
+                        self.assertEqual(review._synthesis_result(review._canon(value)), value)
+
+    def test_prompts_state_summary_length_contract(self):
+        group_prompt = review._prompt("GROUP REVIEW", base="a" * 40, head="b" * 40,
+                                      diff=b"+changed\n", ids=[])
+        synthesis_prompt = review._synthesis_prompt([], "a" * 40, "b" * 40)
+        for prompt in (group_prompt, synthesis_prompt):
+            self.assertIn("32 to 4000", prompt)
+            self.assertIn("no leading or trailing whitespace", prompt)
 
 
 class OpenAIContractTests(unittest.TestCase):

@@ -103,15 +103,17 @@ def _plan(diff: bytes) -> tuple[list[dict], list[dict]]:
 
 
 def _schema(group: bool, synthesis: bool = False) -> dict:
+    summary = {"type": "string", "minLength": 32, "maxLength": 4000,
+               "pattern": r"^\S[\s\S]*\S$"}
     finding = {"type": "object", "additionalProperties": False,
                "required": ["severity", "title", "evidence"],
                "properties": {"severity": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
                               "title": {"type": "string"}, "evidence": {"type": "string"}}}
     properties = {"findings": {"type": "array", "items": finding}}
     if synthesis:
-        properties["summary"] = {"type": "string"}
+        properties["summary"] = summary
     elif group:
-        properties.update({"summary": {"type": "string"},
+        properties.update({"summary": summary,
                            "decisions": {"type": "array", "items": {
                                "type": "object", "additionalProperties": False,
                                "required": ["finding_id", "decision", "rationale", "source_quote",
@@ -147,7 +149,8 @@ def _synthesis_prompt(summaries: list[str], base: str, head: str) -> str:
             "bounded source-review summaries. Report any additional cross-group problems. "
             "Existing group blockers are mechanically retained and cannot be removed here. "
             "Reevaluate original disputed findings in disposition_audit for cross-group risks; report a NEW finding if a local dispute is unsound. "
-            "Return JSON with findings and a concrete summary. "
+            "Return JSON with findings and a concrete summary of 32 to 4000 characters, "
+            "with no leading or trailing whitespace. "
             f"Base {base}; head {head}. Group summaries: " + json.dumps(summaries, ensure_ascii=False))
 
 
@@ -182,7 +185,8 @@ def _prompt(kind: str, *, base: str, head: str, diff: bytes, ids: list[dict] | N
                          "to UTF-8 byte offsets delimiting source_quote in this group source. "
                          "For UPHELD use empty source_quote/source_id and zero offsets. "
                          "Bind each evidence reference to its finding_id. "
-                         "Also report any additional problems and summarize cross-file impact. "
+                         "Also report any additional problems and summarize cross-file impact "
+                         "in 32 to 4000 characters with no leading or trailing whitespace. "
                          f"GroupSourceId: {_sha(diff)}. "
                          f"Blockers: {json.dumps(ids, ensure_ascii=False)}. ")
     try:
