@@ -27,8 +27,8 @@ Each call debits its full approved input, output, reasoning, cache and cost
 reservation before launch. The debit remains after success, failure or
 missing usage. Reported usage and CLI USD metadata are stored separately;
 they are not confirmed bills. DeepSeek cost estimates use the signed peak
-price table and reported token counts. Reasoning is added to output for this
-estimate even when the provider may include it in output already. CLI USD metadata is never treated as a
+price table and reported token counts. Reasoning is a subset of output and
+cache is a subset of input, so neither is charged twice. CLI USD metadata is never treated as a
 bill or compared to the USD reserve. A token or price-based estimate above its
 reserve blocks later calls. Resume reads an already committed review stage
 without invoking the model, so it makes no new reservation.
@@ -42,6 +42,5 @@ explicitly approve this UNKNOWN-usage policy or require a metered/capped
 transport before live review. A single observed overage is retained and
 blocks subsequent calls; it cannot be retroactively undone.
 
-Current Stage A has **no approved Token or cost artifact**. The existing
-call/wall approval alone cannot pass the gate. Never sign a proposed budget
-until the user separately approves its numbers and accounting semantics.
+The separate Token and cost authorization must be explicitly approved and
+signed before live review begins.

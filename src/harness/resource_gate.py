@@ -175,14 +175,21 @@ class Reservation:
                 tokens = self.reported_usage.get("tokens", {})
                 if any(type(tokens.get(k)) is not int or tokens[k] < 0 or
                        tokens[k] > record["token_reservation"][k]
-                       for k in ("input", "output", "reasoning", "cache")):
+                       for k in ("input", "output", "reasoning", "cache")) or (
+                           all(type(tokens.get(k)) is int for k in ("input", "output", "reasoning", "cache"))
+                           and (tokens["reasoning"] > tokens["output"] or tokens["cache"] > tokens["input"])):
                     record["usage_accounting"] = "OVER_RESERVATION_BLOCK_FUTURE_CALLS"
                 prices = record.get("price_microusd_per_million")
                 if prices and all(type(tokens.get(k)) is int and tokens[k] >= 0
-                                  for k in ("input", "output", "reasoning", "cache")):
-                    numerator = (tokens["input"] * prices["input_cache_miss"] +
-                                 (tokens["output"] + tokens["reasoning"]) * prices["output"] +
-                                 tokens["cache"] * prices["cache_hit"])
+                                  for k in ("input", "output", "reasoning", "cache")) and (
+                                      tokens["reasoning"] <= tokens["output"] and
+                                      tokens["cache"] <= tokens["input"]):
+                    # Provider input/output totals already include cached and
+                    # reasoning tokens respectively. Price each token once.
+                    cache_tokens = tokens["cache"]
+                    numerator = ((tokens["input"] - cache_tokens) * prices["input_cache_miss"] +
+                                 tokens["output"] * prices["output"] +
+                                 cache_tokens * prices["cache_hit"])
                     estimate = (numerator + 999_999) // 1_000_000
                     record["estimated_cost_microusd"] = estimate
                     record["estimated_cost_classification"] = "ESTIMATED_NOT_BILLED"

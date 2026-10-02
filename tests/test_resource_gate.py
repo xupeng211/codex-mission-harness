@@ -184,11 +184,11 @@ class ResourceGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ResourceGateDenied, "over-reservation"):
             self.call("deepseek")
 
-    def test_reasoning_tokens_are_conservatively_priced_as_output(self):
+    def test_reasoning_and_cache_tokens_are_priced_once(self):
         r = self.call("deepseek")
-        r.observe({"tokens": {"input": 0, "output": 0, "reasoning": 10, "cache": 0}})
+        r.observe({"tokens": {"input": 10, "output": 10, "reasoning": 8, "cache": 8}})
         r.settle("RETURNED")
-        self.assertEqual(self.rows()[-1]["estimated_cost_microusd"], 12)
+        self.assertEqual(self.rows()[-1]["estimated_cost_microusd"], 13)
 
     def test_tampered_approval_or_ordinary_limit_raise_fails(self):
         self.payload["max_logical_model_calls"] = 6
