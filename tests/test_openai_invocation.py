@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from trusted_invocation_fixture import canonical_fixture
 from harness.model_registry import ModelSpec
-from harness.openai_invocation import (InvocationFailure, _failure_category,
+from harness.openai_invocation import (InvocationFailure, MAX_EVENT_STREAM_BYTES, _failure_category,
                                        _failure_markers, _observed_events, _matches_schema,
                                        canonical_environment, parse_events)
 
@@ -102,6 +102,16 @@ class OpenAIInvocationTests(unittest.TestCase):
         for bad in (good.replace(b'turn.completed', b'turn.failed'), good[:40]):
             with self.assertRaises(ValueError):
                 parse_events(bad)
+
+    def test_large_bounded_event_stream_keeps_structured_completion(self):
+        prefix = b'{"type":"thread.started"}\n{"type":"turn.started"}\n'
+        message = b'{"type":"item.completed","item":{"type":"agent_message"}}\n'
+        event = b'{"type":"item.completed","item":{"type":"reasoning","text":"' + b'x' * 850_000 + b'"}}\n'
+        complete = prefix + event + message + b'{"type":"turn.completed"}\n'
+        self.assertGreater(len(complete), 4 * 128_000)
+        self.assertTrue(parse_events(complete)["terminal_completion"])
+        with self.assertRaisesRegex(ValueError, "exceeds bound"):
+            parse_events(complete + b" " * MAX_EVENT_STREAM_BYTES)
 
     def test_environment_does_not_inherit_provider_routing(self):
         with canonical_fixture() as (binary, home):

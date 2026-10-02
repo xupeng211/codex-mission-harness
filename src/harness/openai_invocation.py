@@ -28,6 +28,9 @@ CA_NAMES = ("CODEX_CA_CERTIFICATE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO",
             "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "SSL_CERT_DIR", "SSL_CERT_FILE")
 MAX_PROMPT_BYTES = 400_000
 MAX_RESPONSE_BYTES = 128_000
+# Codex JSONL may contain several agent-message events before the bounded
+# final structured response. Keep a separate finite transport envelope.
+MAX_EVENT_STREAM_BYTES = 2_000_000
 
 
 class InvocationFailure(RuntimeError):
@@ -95,7 +98,7 @@ def _trusted_ca_path(path: Path, *, directory: bool) -> bool:
 
 def parse_events(raw: bytes) -> dict:
     """Read bounded JSONL and require a real completed Codex turn."""
-    if len(raw) > MAX_RESPONSE_BYTES * 4:
+    if len(raw) > MAX_EVENT_STREAM_BYTES:
         raise ValueError("Codex event stream exceeds bound")
     types = []
     messages = 0
