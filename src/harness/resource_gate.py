@@ -276,8 +276,9 @@ def _approved_billing_recovery(auth: dict, lane: dict, frozen: dict,
                 tokens["reasoning"] > tokens["output"] or
                 estimate > row["cost_reservation_microunits"] or
                 item.get("official_usd_snapshot_estimate_microusd") != estimate or
-                (type(row.get("estimated_cost_microusd")) is int and
-                 row["estimated_cost_microusd"] != estimate) or
+                item.get("original_estimated_cost_microusd") != row.get("estimated_cost_microusd", "UNKNOWN") or
+                item.get("legacy_estimate_incorrect_or_missing") is not (
+                    row.get("estimated_cost_microusd") != estimate) or
                 type(usage.get("cli_reported_cost_microunits")) is not int or
                 usage["cli_reported_cost_microunits"] <= row.get("cost_reservation_microunits", -1) or
                 row.get("cost_overage_source") == "AUTHORIZED_PRICE_ESTIMATE" or

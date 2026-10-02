@@ -382,6 +382,8 @@ class ResourceGateTests(unittest.TestCase):
                               "raw_cli_artifact_path": str(raw_cli),
                               "raw_cli_artifact_sha256": digest(raw_cli.read_bytes()),
                               "official_usd_snapshot_estimate_microusd": 2,
+                              "original_estimated_cost_microusd": original["estimated_cost_microusd"],
+                              "legacy_estimate_incorrect_or_missing": False,
                               "classification": "CLI_FALLBACK_ESTIMATE_NOT_BILLED",
                               "settlement_status": "ESTIMATED_ONLY",
                               "confirmed_billed_cost": "UNKNOWN",

@@ -74,6 +74,9 @@ independently recomputed official-price estimate within the old reservation.
 It retains the original overage, records `confirmed_billed_cost=UNKNOWN`, and
 cannot refund any reservation. Only the specified immutable rows may cease
 blocking later launches. This check is mission-wide, including OpenAI calls.
+Request 255's old estimate used the superseded cache mapping (54,110 versus
+57,220 recomputed micro-USD); request 256 has no old official estimate. The
+signed disposition must state those facts without rewriting either row.
 An unlisted overage, missing or changed evidence, or unapproved recovery still
 blocks before a subprocess starts.
 
