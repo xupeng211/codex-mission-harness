@@ -202,17 +202,18 @@ class ReviewRun:
         else:
             os.unlink(artifact, dir_fd=self.fd)
             os.fsync(self.fd)
+        diagnostic_start = len(self.state.get("diagnostic_artifacts", []))
         try:
             raw = execute()
         except BaseException as exc:
-            if kind in {"group", "cross-group"}:
-                self._failed_response(name, kind, input_bytes, None, exc)
+            if kind in {"chunk", "group", "cross-group"}:
+                self._failed_response(name, kind, input_bytes, None, exc, diagnostic_start)
             raise
         try:
             result = validate(raw)
         except BaseException as exc:
-            if kind in {"group", "cross-group"}:
-                self._failed_response(name, kind, input_bytes, raw, exc)
+            if kind in {"chunk", "group", "cross-group"}:
+                self._failed_response(name, kind, input_bytes, raw, exc, diagnostic_start)
             raise
         self.storage.write_private_artifact(self.fd, artifact, raw, uuid.uuid4().hex)
         self.state["completed"][name] = {
@@ -233,7 +234,8 @@ class ReviewRun:
         return raw, result
 
     def _failed_response(self, name: str, kind: str, prompt: bytes,
-                         raw: bytes | None, exc: BaseException) -> None:
+                         raw: bytes | None, exc: BaseException,
+                         diagnostic_start: int) -> None:
         """Append private diagnostics before a failing stage can be retried."""
         label = f"{name}-failed-raw-{uuid.uuid4().hex}.json"
         structured = None
@@ -245,26 +247,20 @@ class ReviewRun:
             except (ValueError, UnicodeError):
                 pass
         source_error = getattr(exc, "__cause__", None) or exc
-        request = None
-        ledger_path = os.environ.get("CMH_RESOURCE_LEDGER")
-        if ledger_path:
-            try:
-                rows = json.loads(Path(ledger_path).read_bytes())["requests"]
-                matches = [row for row in rows
-                           if row.get("run_id") == self.state["review_run_id"]
-                           and row.get("stage") in {name, name + ".json"}
-                           and row.get("prompt_sha256") == sha256(prompt)]
-                if len(matches) == 1:
-                    row = matches[0]
-                    request = {key: row.get(key) for key in
-                               ("number", "request_id", "status", "reported_usage")}
-            except (OSError, ValueError, KeyError):
-                pass
+        request = self._resource_request(name, prompt)
+        transport = next((item for item in reversed(self.state.get("diagnostic_artifacts", [])[diagnostic_start:])
+                          if item["path"].startswith(name + "-transport-")), None)
+        stream_status = "OUTPUT_PRESERVED" if raw is not None else "OUTPUT_NOT_PRODUCED"
+        if transport is not None and raw is None:
+            captured = json.loads(self.storage.read_private_artifact(self.fd, transport["path"]))
+            if captured.get("stdout_size") or captured.get("stderr_size"):
+                stream_status = "OUTPUT_PARTIAL"
         record = {"version": "cmh-failed-review-response/v1", "stage": name,
                   "kind": kind, "identity": self.identity,
                   "prompt_sha256": sha256(prompt), "prompt_base64": base64.b64encode(prompt).decode(),
                   "prompt_utf8": prompt.decode("utf-8", "replace"),
                   "raw_model_output_status": "OUTPUT_NOT_PRODUCED" if raw is None else "RETURNED",
+                  "stream_status": stream_status, "transport_artifact": transport,
                   "raw_model_output_sha256": sha256(raw) if raw is not None else None,
                   "raw_model_output_base64": base64.b64encode(raw).decode() if raw is not None else None,
                   "raw_model_output_utf8": raw.decode("utf-8", "replace") if raw is not None else None,
@@ -280,6 +276,24 @@ class ReviewRun:
         self._index_diagnostic(label, rendered)
         self.last_failed_raw_artifact = label
         self.last_failed_raw_sha256 = sha256(rendered)
+
+    def _resource_request(self, name: str, prompt: bytes) -> dict | None:
+        request = None
+        ledger_path = os.environ.get("CMH_RESOURCE_LEDGER")
+        if ledger_path:
+            try:
+                rows = json.loads(Path(ledger_path).read_bytes())["requests"]
+                matches = [row for row in rows
+                           if row.get("run_id") == self.state["review_run_id"]
+                           and row.get("stage") in {name, name + ".json"}
+                           and row.get("prompt_sha256") == sha256(prompt)]
+                if len(matches) == 1:
+                    row = matches[0]
+                    request = {key: row.get(key) for key in
+                               ("number", "request_id", "status", "reported_usage")}
+            except (OSError, ValueError, KeyError):
+                pass
+        return request
 
     def _index_diagnostic(self, label: str, rendered: bytes) -> None:
         # If interrupted between the two fsyncs, the uniquely named private
@@ -300,9 +314,14 @@ class ReviewRun:
                   "stdout_status": "REDACTED_CREDENTIAL_ECHO" if secret_echo else
                                    "OUTPUT_NOT_PRODUCED" if stdout is None else "CAPTURED",
                   "stdout_sha256": sha256(stdout) if stdout is not None else None,
+                  "stdout_size": len(stdout) if stdout is not None else None,
                   "stdout_base64": base64.b64encode(stdout).decode() if stdout is not None else None,
+                  "stderr_status": "REDACTED_CREDENTIAL_ECHO" if secret_echo else
+                                   "OUTPUT_NOT_PRODUCED" if stderr is None else "CAPTURED",
                   "stderr_sha256": sha256(stderr) if stderr is not None else None,
+                  "stderr_size": len(stderr) if stderr is not None else None,
                   "stderr_base64": base64.b64encode(stderr).decode() if stderr is not None else None,
+                  "resource_request": self._resource_request(name, prompt),
                   "resource_run_id": self.state["review_run_id"]}
         rendered = canonical(record)
         self.storage.write_private_artifact(self.fd, label, rendered, uuid.uuid4().hex)

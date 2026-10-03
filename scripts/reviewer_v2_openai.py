@@ -497,8 +497,7 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
     def call(prompt, group):
         stage = "synthesis" if group == "synthesis" else "group" if group else "chunk"
         current = os.environ.get("CMH_RESOURCE_STAGE", "")
-        sink = (lambda p, out, err: run_state.capture_transport(current, p, out, err)) \
-            if stage in {"group", "synthesis"} else None
+        sink = lambda p, out, err: run_state.capture_transport(current, p, out, err)
         return invoke_codex(prompt, spec, stage=stage, timeout=timeout,
                             transport_sink=sink)
     chunks, groups = _plan(diff)

@@ -176,11 +176,104 @@ class ResumeTests(unittest.TestCase):
         capture, = run.path.glob("group-000-failed-raw-*.json")
         record = json.loads(capture.read_bytes())
         self.assertEqual(record["raw_model_output_status"], "OUTPUT_NOT_PRODUCED")
+        self.assertEqual(record["stream_status"], "OUTPUT_PARTIAL")
         transport, = run.path.glob("group-000-transport-*.json")
         stream = json.loads(transport.read_bytes())
         self.assertEqual(stream["stdout_base64"], "cGFydGlhbCBzdGRvdXQ=")
         self.assertFalse((run.path / "receipt.json").exists())
         self.assertEqual(len(run.state["diagnostic_artifacts"]), 2)
+        run.close()
+
+    def test_chunk_invocation_failure_keeps_private_raw_streams(self):
+        run = self.open()
+        def broken():
+            run.capture_transport("chunk-000", b"exact prompt", b"partial stdout", b"cli error")
+            raise RuntimeError("CLI failed")
+        with self.assertRaisesRegex(RuntimeError, "CLI failed"):
+            run.stage("chunk-000", "chunk", b"exact prompt", broken, lambda _: None)
+        capture, = run.path.glob("chunk-000-failed-raw-*.json")
+        record = json.loads(capture.read_bytes())
+        self.assertEqual(record["raw_model_output_status"], "OUTPUT_NOT_PRODUCED")
+        transport, = run.path.glob("chunk-000-transport-*.json")
+        stream = json.loads(transport.read_bytes())
+        self.assertEqual(stream["stdout_base64"], "cGFydGlhbCBzdGRvdXQ=")
+        self.assertEqual(stream["stderr_base64"], "Y2xpIGVycm9y")
+        self.assertFalse((run.path / "receipt.json").exists())
+        run.close()
+        resumed = self.open()
+        self.assertEqual(len(resumed.state["diagnostic_artifacts"]), 2)
+        resumed.close()
+
+    def test_chunk_failure_stream_presence_and_parser_matrix(self):
+        for stdout, stderr, expected in ((b"out", None, "OUTPUT_PARTIAL"),
+                                         (None, b"err", "OUTPUT_PARTIAL"),
+                                         (None, None, "OUTPUT_NOT_PRODUCED")):
+            with self.subTest(stdout=stdout, stderr=stderr), tempfile.TemporaryDirectory() as tmp:
+                self.evidence = Path(tmp) / "evidence"
+                run = self.open()
+                def broken():
+                    run.capture_transport("chunk-000", b"prompt", stdout, stderr)
+                    raise RuntimeError("CLI exited")
+                with self.assertRaisesRegex(RuntimeError, "CLI exited"):
+                    run.stage("chunk-000", "chunk", b"prompt", broken, lambda _: None)
+                capture, = run.path.glob("chunk-000-failed-raw-*.json")
+                record = json.loads(capture.read_bytes())
+                self.assertEqual(record["stream_status"], expected)
+                transport, = run.path.glob("chunk-000-transport-*.json")
+                stream = json.loads(transport.read_bytes())
+                self.assertEqual(stream["stdout_size"], None if stdout is None else len(stdout))
+                self.assertEqual(stream["stderr_size"], None if stderr is None else len(stderr))
+                run.close()
+                resumed = self.open()
+                resumed.validate_state()
+                self.assertFalse((resumed.path / "receipt.json").exists())
+                resumed.close()
+
+        self.evidence = Path(self.temp.name) / "parse-failure"
+        run = self.open()
+        with self.assertRaisesRegex(ValueError, "incomplete model output"):
+            run.stage("chunk-000", "chunk", b"prompt", lambda: b'{"partial":',
+                      lambda _: (_ for _ in ()).throw(ValueError("incomplete model output")))
+        capture, = run.path.glob("chunk-000-failed-raw-*.json")
+        record = json.loads(capture.read_bytes())
+        self.assertEqual(record["raw_model_output_utf8"], '{"partial":')
+        self.assertEqual(record["stream_status"], "OUTPUT_PRESERVED")
+        self.assertFalse((run.path / "receipt.json").exists())
+        run.close()
+
+    def test_chunk_diagnostic_write_error_fails_closed(self):
+        run = self.open()
+        def broken():
+            run.capture_transport("chunk-000", b"prompt", b"partial", b"error")
+            raise RuntimeError("CLI failed")
+        original = run.storage.write_private_artifact
+        def fail_response(fd, name, raw, nonce):
+            if "failed-raw" in name:
+                raise OSError("diagnostic storage failed")
+            return original(fd, name, raw, nonce)
+        with patch.object(run.storage, "write_private_artifact", side_effect=fail_response):
+            with self.assertRaisesRegex(OSError, "diagnostic storage failed"):
+                run.stage("chunk-000", "chunk", b"prompt", broken, lambda _: None)
+        self.assertFalse((run.path / "receipt.json").exists())
+        self.assertEqual(run.state["next_stage"], "chunk-000")
+        self.assertEqual(len(list(run.path.glob("chunk-000-transport-*.json"))), 1)
+        run.close()
+        resumed = self.open()
+        resumed.validate_state()
+        resumed.close()
+
+    def test_chunk_failures_append_without_overwriting(self):
+        run = self.open()
+        for payload in (b"first", b"second"):
+            def broken():
+                run.capture_transport("chunk-000", b"prompt", payload, None)
+                raise RuntimeError("CLI failed")
+            with self.assertRaisesRegex(RuntimeError, "CLI failed"):
+                run.stage("chunk-000", "chunk", b"prompt", broken, lambda _: None)
+        artifacts = list(run.path.glob("chunk-000-transport-*.json"))
+        self.assertEqual(len(artifacts), 2)
+        self.assertEqual({json.loads(p.read_bytes())["stdout_size"] for p in artifacts}, {5, 6})
+        self.assertEqual(len(list(run.path.glob("chunk-000-failed-raw-*.json"))), 2)
         run.close()
 
     def test_cross_group_failure_append_only_and_private(self):

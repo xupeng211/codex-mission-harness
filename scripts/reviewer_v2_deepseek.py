@@ -334,7 +334,10 @@ def run(args: argparse.Namespace) -> dict:
             raw_bytes, findings = run.stage(name, "chunk", prompt.encode(),
                 lambda: _invoke(chunk_command, prompt, env, args.timeout, token,
                                 stage="chunk", evidence_fd=evidence_fd,
-                                artifact=name + ".json", state=stage_state, persist=False)[0].encode(),
+                                artifact=name + ".json", state=stage_state, persist=False,
+                                transport_sink=lambda p, out, err, secret_echo=False:
+                                    run.capture_transport(name, p, out, err,
+                                                          secret_echo=secret_echo))[0].encode(),
                 lambda data: _parse_stage(data.decode(), parse_chunk, stage_state))
             output_hash = sha256(raw_bytes)
             chunk["bound_findings"] = bind_findings(findings, "C", chunk["index"])
