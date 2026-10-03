@@ -43,14 +43,17 @@ class ReviewerV2ContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "source quote"):
             parse_synthesis(self.response([decision]), self.expected, source=None)
 
-    def test_structured_dispute_binds_id_source_and_exact_byte_range(self):
+    def test_structured_dispute_derives_unique_exact_byte_range(self):
         quote = "if value is None: raise ValueError()"
         start = SOURCE.index(quote.encode())
         decision = {**self.decision(kind="DISPUTED", quote=quote),
-                    "source_id": sha256(SOURCE), "quote_start": start,
-                    "quote_end": start + len(quote.encode())}
-        self.assertEqual(parse_synthesis(self.response([decision]), self.expected,
-                                         source=SOURCE, structured_evidence=True)["review_result"], "PASS")
+                    "source_id": sha256(SOURCE)}
+        result = parse_synthesis(self.response([decision]), self.expected,
+                                 source=SOURCE, structured_evidence=True)
+        self.assertEqual(result["review_result"], "PASS")
+        self.assertEqual((result["source_bindings"][0]["quote_start"],
+                          result["source_bindings"][0]["quote_end"]),
+                         (start, start + len(quote.encode())))
         for changed in ({"finding_id": "C999F999"}, {"source_id": "0" * 64},
                         {"quote_start": start + 1}, {"quote_end": start + 1}):
             with self.subTest(changed=changed), self.assertRaises(ValueError):
@@ -96,13 +99,14 @@ class ReviewerV2ContractTests(unittest.TestCase):
         quote = "clé = '正常'"
         start = source.index(quote.encode())
         decision = {**self.decision(kind="DISPUTED", quote=quote), "source_id": sha256(source),
-                    "quote_start": start, "quote_end": start + len(quote.encode())}
-        self.assertEqual(parse_synthesis(self.response([decision]), self.expected, source=source,
-                                         structured_evidence=True)["review_result"], "PASS")
+                    }
+        result = parse_synthesis(self.response([decision]), self.expected, source=source,
+                                 structured_evidence=True)
+        self.assertEqual(result["review_result"], "PASS")
+        self.assertEqual(result["source_bindings"][0]["quote_start"], start)
         for change, subclass in (({"source_id": "0" * 64}, "SOURCE_ID_MISMATCH"),
-                                 ({"quote_start": start - 1}, "QUOTE_RANGE_MISMATCH"),
-                                 ({"quote_end": start + len(quote)}, "QUOTE_RANGE_MISMATCH"),
-                                 ({"quote_end": len(source) + 1}, "RANGE_OUT_OF_BOUNDS")):
+                                 ({"source_quote": "clé = 'normale'"}, "QUOTE_NOT_EXACT"),
+                                 ({"source_quote": ""}, "QUOTE_TOO_SHORT")):
             with self.subTest(change=change), self.assertRaises(SourceBindingError) as caught:
                 parse_synthesis(self.response([{**decision, **change}]), self.expected,
                                 source=source, structured_evidence=True)

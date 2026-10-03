@@ -19,7 +19,7 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
         raw = json.dumps({"findings": [], "decisions": [{
             "finding_id": expected[0]["finding_id"], "decision": "UPHELD",
             "rationale": "This source confirms the original minor issue.",
-            "source_quote": "", "source_id": "", "quote_start": 0, "quote_end": 0}],
+            "source_quote": "", "source_id": ""}],
             "summary": "The change contains one nonblocking finding only."})
         state = {"stage": "group"}
         with self.assertRaises(reviewer.ReviewStageFailure):
@@ -59,7 +59,7 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
                         "finding_id": "C000F000", "decision": "DISPUTED",
                         "rationale": "Synthetic rationale with enough length for this decision.",
                         "source_quote": "diff --git a/source.py", "source_id": "0" * 64,
-                        "quote_start": 0, "quote_end": 22}],
+                        }],
                         "summary": "This synthetic group response has an invalid source identity."}}).encode(), b""),
             }
             for category, group_response in cases.items():
@@ -124,7 +124,7 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
                                     "rationale": "The diff header does not establish the claimed blocker.",
                                     "source_quote": quote.decode(),
                                     "source_id": reviewer.sha256(source),
-                                    "quote_start": 0, "quote_end": len(quote)}],
+                                    }],
                                     "summary": "The exact source reference resolves the claimed blocker."}
                             else:
                                 output = {"findings": [], "decisions": [],

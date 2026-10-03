@@ -363,7 +363,7 @@ class FullDiffTests(unittest.TestCase):
             blockers = json.loads(text)
             decisions = [{'finding_id': b['finding_id'], 'decision': 'UPHELD',
                 'rationale': 'The original blocker persists in this fixture.', 'source_quote': '',
-                'source_id': '', 'quote_start': 0, 'quote_end': 0} for b in blockers]
+                'source_id': ''} for b in blockers]
             return full.canonical({'findings': [], 'decisions': decisions,
                                   'summary': 'The group retains all original blocking findings.'})
         r, _ = openai._assemble(d, self.base, self.head, call)
@@ -377,7 +377,7 @@ class FullDiffTests(unittest.TestCase):
         expected = deepseek.bind_findings([finding], 'C', 0)
         decision = {'finding_id': 'C000F000', 'decision': 'UPHELD',
                     'rationale': 'The original source confirms this fixture blocker.',
-                    'source_quote': '', 'source_id': '', 'quote_start': 0, 'quote_end': 0}
+                    'source_quote': '', 'source_id': ''}
         for decisions in ([], [decision, decision]):
             raw = full.canonical({'findings': [], 'decisions': decisions,
                                   'summary': 'The fixture verifies complete exact once dispositions.'}).decode()

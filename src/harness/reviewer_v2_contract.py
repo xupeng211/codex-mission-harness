@@ -6,11 +6,47 @@ severity preservation, coverage, and the derived verdict.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import os
 import re
+from pathlib import Path
+
+from .resource_gate import _private
 
 
 BLOCKING = frozenset({"P0", "P1", "P2"})
+SOURCE_BINDING_VERSION = "exact-unique-utf8-quote/v1"
+FORMAL_MISSION_ID = "HARNESS_AUTONOMOUS_PRE_MERGE_DELIVERY"
+
+
+def contract_authorization_identity(mission_id: str) -> str:
+    """Require the separately signed contract approval for formal review runs."""
+    if mission_id != FORMAL_MISSION_ID:
+        return "OFFLINE_FIXTURE_ONLY"
+    path, key_path, expected_hash = (os.environ.get(name) for name in
+        ("CMH_SOURCE_BINDING_AUTHORIZATION", "CMH_RESOURCE_GATE_KEY_FILE",
+         "CMH_SOURCE_BINDING_AUTH_SHA256"))
+    if not path or not key_path or not expected_hash:
+        raise ValueError("signed source binding authorization is required")
+    raw = _private(Path(path))
+    if sha256(raw) != expected_hash:
+        raise ValueError("source binding authorization hash mismatch")
+    value = json.loads(raw)
+    signature = value.pop("authorization_hmac_sha256", None)
+    expected = hmac.new(_private(Path(key_path)), canonical(value), hashlib.sha256).hexdigest()
+    if not isinstance(signature, str) or not hmac.compare_digest(signature, expected):
+        raise ValueError("source binding authorization signature mismatch")
+    if (value.get("version") != "cmh-source-binding-contract-authorization/v1"
+            or value.get("mission_id") != mission_id
+            or value.get("new_contract") !=
+            "model_submitted_verbatim_quote_and_source_id; machine_derived_unique_exact_utf8_range"
+            or value.get("resource_limits_unchanged") is not True
+            or value.get("chunk_cross_identity_migration_authorized") is not False
+            or value.get("historical_requests_286_324_unchanged") is not True
+            or value.get("historical_failures_not_pass") is not True):
+        raise ValueError("source binding authorization scope mismatch")
+    return expected_hash
 
 
 class SourceBindingError(ValueError):
@@ -103,15 +139,19 @@ def _unwrap(raw: str) -> dict:
     return value
 
 
-def validate_source_binding(decision: dict, source: bytes | None) -> None:
-    """Bind a disputed quote to exact bytes of this stage's immutable source."""
+def validate_source_binding(decision: dict, source: bytes | None) -> dict:
+    """Locate only the model's verbatim quote in this immutable Group source."""
     source_id = decision.get("source_id")
-    start, end = decision.get("quote_start"), decision.get("quote_end")
+    if set(decision) != {"finding_id", "decision", "rationale", "source_quote", "source_id"}:
+        raise SourceBindingError("INVALID_REFERENCE_FIELDS", "source_reference",
+                                 "MODEL_QUOTE_ONLY", decision, source)
     if decision["decision"] == "UPHELD":
-        if source_id != "" or start != 0 or end != 0 or decision["source_quote"]:
+        if source_id != "" or decision["source_quote"]:
             raise SourceBindingError("UPHELD_UNEXPECTED_SOURCE", "source_reference",
                                      "UPHELD_REFERENCE_MUST_BE_EMPTY", decision, source)
-        return
+        return {"finding_id": decision["finding_id"], "validation": "UPHELD_NO_REFERENCE",
+                "source_id": "", "source_sha256": None, "quote_sha256": None,
+                "quote_start": 0, "quote_end": 0, "locator_version": SOURCE_BINDING_VERSION}
     quote = decision["source_quote"].encode("utf-8")
     if source is None:
         raise SourceBindingError("SOURCE_UNAVAILABLE", "source_id",
@@ -119,18 +159,20 @@ def validate_source_binding(decision: dict, source: bytes | None) -> None:
     if source_id != sha256(source):
         raise SourceBindingError("SOURCE_ID_MISMATCH", "source_id",
                                  "GROUP_SOURCE_HASH_MATCH", decision, source)
-    if type(start) is not int or type(end) is not int:
-        raise SourceBindingError("RANGE_NOT_INTEGER", "quote_range",
-                                 "UTF8_BYTE_RANGE_INTEGER", decision, source)
-    if start < 0 or end > len(source) or start >= end:
-        raise SourceBindingError("RANGE_OUT_OF_BOUNDS", "quote_range",
-                                 "UTF8_BYTE_RANGE_IN_GROUP", decision, source)
     if len(quote.strip()) < 12:
         raise SourceBindingError("QUOTE_TOO_SHORT", "source_quote",
                                  "MINIMUM_QUOTE_BYTES", decision, source)
-    if source[start:end] != quote:
-        raise SourceBindingError("QUOTE_RANGE_MISMATCH", "source_quote",
-                                 "EXACT_UTF8_BYTES_AT_RANGE", decision, source)
+    start = source.find(quote)
+    if start < 0:
+        raise SourceBindingError("QUOTE_NOT_EXACT", "source_quote",
+                                 "EXACT_UTF8_GROUP_SOURCE", decision, source)
+    if source.find(quote, start + 1) >= 0:
+        raise SourceBindingError("QUOTE_AMBIGUOUS", "source_quote",
+                                 "UNIQUE_UTF8_GROUP_SOURCE", decision, source)
+    return {"finding_id": decision["finding_id"], "validation": "EXACT_UNIQUE_UTF8",
+            "source_id": source_id, "source_sha256": sha256(source),
+            "quote_sha256": sha256(quote), "quote_start": start,
+            "quote_end": start + len(quote), "locator_version": SOURCE_BINDING_VERSION}
 
 
 def parse_synthesis(raw: str, expected: list[dict], *, source: bytes | None,
@@ -153,6 +195,8 @@ def parse_synthesis(raw: str, expected: list[dict], *, source: bytes | None,
     if len(required) != sum(item["severity"] in BLOCKING for item in expected):
         raise ValueError("duplicate finding identity")
     observed = {}
+    bindings = []
+    used_references = set()
     for decision in value["decisions"]:
         if isinstance(decision, dict) and isinstance(decision.get("finding_id"), str):
             if decision["finding_id"] not in required:
@@ -161,7 +205,7 @@ def parse_synthesis(raw: str, expected: list[dict], *, source: bytes | None,
                 raise ValueError("duplicate disposition finding_id")
         decision_fields = {"finding_id", "decision", "rationale", "source_quote"}
         if structured_evidence:
-            decision_fields |= {"source_id", "quote_start", "quote_end"}
+            decision_fields.add("source_id")
         if (not isinstance(decision, dict)
                 or set(decision) != decision_fields
                 or not isinstance(decision.get("finding_id"), str)
@@ -173,7 +217,14 @@ def parse_synthesis(raw: str, expected: list[dict], *, source: bytes | None,
                 or not isinstance(decision.get("source_quote"), str)):
             raise ValueError("invalid or duplicate disposition")
         if structured_evidence:
-            validate_source_binding(decision, source)
+            binding = validate_source_binding(decision, source)
+            reference = (binding["source_id"], binding["quote_start"], binding["quote_end"])
+            if decision["decision"] == "DISPUTED":
+                if reference in used_references:
+                    raise SourceBindingError("EVIDENCE_REUSED", "source_quote",
+                                             "DISTINCT_FINDING_EVIDENCE", decision, source)
+                used_references.add(reference)
+            bindings.append(binding)
         elif decision["decision"] == "DISPUTED":
             quote = decision["source_quote"].strip()
             if (source is None or len(quote) < 12
@@ -189,7 +240,8 @@ def parse_synthesis(raw: str, expected: list[dict], *, source: bytes | None,
                (item["finding_id"] in observed
                 and observed[item["finding_id"]]["decision"] == "UPHELD")]
     findings = carried + new_findings
-    return {"decisions": value["decisions"], "new_findings": new_findings,
+    return {"decisions": value["decisions"], "source_bindings": bindings,
+            "new_findings": new_findings,
             "summary": value["summary"], "findings": findings,
             "review_result": "FAIL" if any(item["severity"] in BLOCKING
                                        for item in findings) else "PASS"}
@@ -199,7 +251,7 @@ def validate_bound_result(result: dict, expected: list[dict], source: bytes | No
                           *, structured_evidence: bool = False) -> None:
     """Recompute every derived field when validating a durable receipt."""
     if not isinstance(result, dict) or set(result) != {
-            "decisions", "new_findings", "summary", "findings", "review_result"}:
+            "decisions", "source_bindings", "new_findings", "summary", "findings", "review_result"}:
         raise ValueError("invalid bound result")
     model_fields = {key: result[key] for key in ("decisions", "summary")}
     model_fields["findings"] = result["new_findings"]

@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import deepseek_review as legacy  # noqa: E402
 from harness.reviewer_v2_contract import (  # noqa: E402
     SourceBindingError, bind_findings, canonical, parse_chunk, parse_synthesis, sha256,
-    validate_bound_result,
+    validate_bound_result, contract_authorization_identity,
 )
 from harness.model_registry import load_registry  # noqa: E402
 from harness.model_qualification import validate_qualification_receipt  # noqa: E402
@@ -118,14 +118,12 @@ FINDING_SCHEMA = {"type": "object", "additionalProperties": False,
                       "evidence": {"type": "string", "minLength": 1}}}
 DECISION_SCHEMA = {"type": "object", "additionalProperties": False,
                    "required": ["finding_id", "decision", "rationale", "source_quote",
-                                "source_id", "quote_start", "quote_end"],
+                                "source_id"],
                    "properties": {"finding_id": {"type": "string"},
                                   "decision": {"enum": ["UPHELD", "DISPUTED"]},
                                   "rationale": {"type": "string", "minLength": 24},
                                   "source_quote": {"type": "string"},
-                                  "source_id": {"type": "string"},
-                                  "quote_start": {"type": "integer", "minimum": 0},
-                                  "quote_end": {"type": "integer", "minimum": 0}}}
+                                  "source_id": {"type": "string"}}}
 CHUNK_SCHEMA = {"type": "object", "additionalProperties": False,
                 "required": ["findings"], "properties": {
                     "findings": {"type": "array", "items": FINDING_SCHEMA}}}
@@ -289,6 +287,7 @@ def run(args: argparse.Namespace) -> dict:
             raise ValueError("live DeepSeek review requires an independent reviewer qualification receipt")
         qualified = validate_qualification_receipt(qualification, model, auth_key=auth_key,
                                        role="independent_reviewer", registry_path=registry_path)
+        contract_auth_sha = contract_authorization_identity(args.mission_id)
         identity = {"provider": model.provider, "role": "independent_reviewer",
                     "model": model.model, "model_configuration": model.identity(),
                     "repository": repository, "mission_id": args.mission_id,
@@ -298,6 +297,7 @@ def run(args: argparse.Namespace) -> dict:
                     "invocation_hash": sha256(Path(legacy.__file__).read_bytes()),
                     "schema_manifest_hash": sha256(canonical({"chunk": CHUNK_SCHEMA,
                                                              "synthesis": SYNTHESIS_SCHEMA})),
+                    "source_binding_contract_authorization_sha256": contract_auth_sha,
                     "qualification_receipt_identity": sha256(Path(qualification).read_bytes())
                     if Path(qualification).exists() else sha256(str(qualification).encode()),
                     "input_manifest_identity": sha256(canonical({"chunks": chunks, "groups": groups})),
@@ -353,9 +353,10 @@ def run(args: argparse.Namespace) -> dict:
                       "Do not invent, omit, or repeat finding_id values. "
                       "UPHELD preserves the original finding automatically. DISPUTED requires "
                       "a specific rationale and source_quote copied exactly from this source. "
-                      "For DISPUTED, source_id must equal GroupSourceId and quote_start/quote_end "
-                      "must delimit the exact UTF-8 bytes of source_quote in this group source. "
-                      "For UPHELD use empty source_quote/source_id and zero offsets. "
+                      "For DISPUTED, source_id must equal GroupSourceId and source_quote "
+                      "must be a verbatim, uniquely occurring quote in this group source. "
+                      "The verifier computes UTF-8 byte offsets; do not submit offsets. "
+                      "For UPHELD use empty source_quote/source_id. "
                       "Each evidence reference belongs to its decision finding_id. "
                       "findings contains only NEW findings; "
                       "never copy supplied findings into it. Summarize interactions for cross-group review.\n"
@@ -396,7 +397,7 @@ def run(args: argparse.Namespace) -> dict:
                   + "Reevaluate all original disputed findings and their group decisions for cross-group risks; add NEW findings if local disputes are unsound. "
                   "Analyze cross-group interactions using bounded summaries. You have no exact "
                   "source at this stage and must UPHOLD every supplied P0/P1/P2 finding. "
-                  "Use empty source_quote/source_id and zero quote offsets. "
+                  "Use empty source_quote/source_id; do not submit quote offsets. "
                   "findings contains only NEW cross-group findings. "
                   "Every blocker needs one decision keyed by finding_id.\n"
                   "Decide RequiredFindingIds exactly once; no P3 IDs, invented IDs, or repeats.\n"
@@ -416,6 +417,7 @@ def run(args: argparse.Namespace) -> dict:
                    "mission_id": args.mission_id, "base_sha": base, "head_sha": head,
                    "registry_sha256": sha256(registry.path.read_bytes()),
                    "runner_sha256": sha256(Path(__file__).read_bytes()),
+                   "source_binding_contract_authorization_sha256": contract_auth_sha,
                    "diff_sha256": diff_hash, "provider": model.provider, "model": model.model,
                    "reasoning_effort": model.reasoning_effort, "chunks": chunks, "groups": groups,
                    "aggregate_result": result, "aggregate_output_sha256": output_hash,
@@ -531,6 +533,7 @@ def validate(receipt: dict, base: str, head: str, root: Path | None = None,
                 "provider", "model", "reasoning_effort", "chunks", "groups", "aggregate_result",
                 "aggregate_output_sha256", "review_result", "findings", "command_sha256",
                 "completed_at", "integrity_sha256", "auth_hmac_sha256", "full_manifest", "execution_identity", "task_assignments"}
+    required.add("source_binding_contract_authorization_sha256")
     if not isinstance(receipt, dict) or set(receipt) != required:
         raise ValueError("invalid V2 receipt shape")
     if (receipt["version"] != VERSION or receipt["base_sha"] != base
@@ -545,6 +548,8 @@ def validate(receipt: dict, base: str, head: str, root: Path | None = None,
         raise ValueError("receipt model mismatch")
     if mission_id is not None and receipt["mission_id"] != mission_id:
         raise ValueError("receipt mission mismatch")
+    if receipt["source_binding_contract_authorization_sha256"] != contract_authorization_identity(receipt["mission_id"]):
+        raise ValueError("source binding contract authorization mismatch")
     if repository is not None and receipt["repository"] != repository:
         raise ValueError("receipt repository mismatch")
     unsigned = dict(receipt)

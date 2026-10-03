@@ -31,7 +31,8 @@ from harness.model_registry import ModelSpec, load_registry, preflight  # noqa: 
 from harness.model_qualification import validate_qualification_receipt  # noqa: E402
 from harness.openai_invocation import InvocationFailure, invoke_openai  # noqa: E402
 import harness.openai_invocation as invocation_module  # noqa: E402
-from harness.reviewer_v2_contract import SourceBindingError, bind_findings, validate_source_binding  # noqa: E402
+from harness.reviewer_v2_contract import (SourceBindingError, bind_findings,  # noqa: E402
+                                          validate_source_binding, contract_authorization_identity)
 from harness import full_diff_manifest as full
 from harness.review_resume import ReviewRun  # noqa: E402
 
@@ -83,7 +84,7 @@ def _result(raw: bytes, *, group: bool = False) -> dict:
         for decision in decisions:
             if (not isinstance(decision, dict)
                     or set(decision) != {"finding_id", "decision", "rationale", "source_quote",
-                                         "source_id", "quote_start", "quote_end"}
+                                         "source_id"}
                     or not isinstance(decision["finding_id"], str)
                     or not re.fullmatch(r"C[0-9]{3}F[0-9]{3}", decision["finding_id"])
                     or decision["decision"] not in {"UPHELD", "DISPUTED"}
@@ -91,8 +92,6 @@ def _result(raw: bytes, *, group: bool = False) -> dict:
                     or len(decision["rationale"].strip()) < 24
                     or not isinstance(decision["source_quote"], str)
                     or not isinstance(decision["source_id"], str)
-                    or type(decision["quote_start"]) is not int
-                    or type(decision["quote_end"]) is not int
                     or (decision["decision"] == "UPHELD" and decision["source_quote"] != "")):
                 raise ValueError("invalid blocker decision")
     return value
@@ -117,14 +116,12 @@ def _schema(group: bool, synthesis: bool = False) -> dict:
                            "decisions": {"type": "array", "items": {
                                "type": "object", "additionalProperties": False,
                                "required": ["finding_id", "decision", "rationale", "source_quote",
-                                            "source_id", "quote_start", "quote_end"],
+                                            "source_id"],
                                "properties": {"finding_id": {"type": "string"},
                                               "decision": {"type": "string", "enum": ["UPHELD", "DISPUTED"]},
                                               "rationale": {"type": "string"},
                                               "source_quote": {"type": "string"},
-                                              "source_id": {"type": "string"},
-                                              "quote_start": {"type": "integer", "minimum": 0},
-                                              "quote_end": {"type": "integer", "minimum": 0}}}}})
+                                              "source_id": {"type": "string"}}}}})
     return {"type": "object", "additionalProperties": False,
             "required": list(properties), "properties": properties}
 
@@ -182,9 +179,10 @@ def _prompt(kind: str, *, base: str, head: str, diff: bytes, ids: list[dict] | N
                          "A DISPUTED decision needs specific reasoning and a verbatim source quote "
                          "from this supplied group diff only. If no exact quote in this group source "
                          "supports a dispute, choose UPHELD. Never quote another group or chunk. "
-                         "For DISPUTED set source_id to GroupSourceId and quote_start/quote_end "
-                         "to UTF-8 byte offsets delimiting source_quote in this group source. "
-                         "For UPHELD use empty source_quote/source_id and zero offsets. "
+                         "For DISPUTED set source_id to GroupSourceId and copy an exact, "
+                         "uniquely occurring source_quote from this group source. "
+                         "The verifier computes UTF-8 byte offsets; do not submit offsets. "
+                         "For UPHELD use empty source_quote/source_id. "
                          "Bind each evidence reference to its finding_id. "
                          "Also report any additional problems and summarize cross-file impact "
                          "in 32 to 4000 characters with no leading or trailing whitespace. "
@@ -200,14 +198,25 @@ def _prompt(kind: str, *, base: str, head: str, diff: bytes, ids: list[dict] | N
 def _decide(blockers: list[dict], result: dict, source: bytes) -> list[dict]:
     expected = {item["finding_id"]: item for item in blockers}
     seen = set()
+    bindings = []
+    used = set()
     for item in result["decisions"]:
         identifier = item["finding_id"]
         if identifier not in expected or identifier in seen:
             raise ValueError("unknown or repeated blocker ID")
         seen.add(identifier)
-        validate_source_binding(item, source)
+        binding = validate_source_binding(item, source)
+        if item["decision"] == "DISPUTED":
+            reference = (binding["source_id"], binding["quote_start"], binding["quote_end"])
+            if reference in used:
+                raise ValueError("source quote reused for another finding")
+            used.add(reference)
+        bindings.append(binding)
     if seen != set(expected):
         raise ValueError("missing blocker disposition")
+    if "source_bindings" in result and result["source_bindings"] != bindings:
+        raise ValueError("derived source binding changed")
+    result["source_bindings"] = bindings
     return [expected[item["finding_id"]] for item in result["decisions"]
             if item["decision"] == "UPHELD"]
 
@@ -354,6 +363,8 @@ def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec
             or receipt.get("runner_sha256") != _sha(Path(__file__).read_bytes())
             or receipt.get("invocation_sha256") != _sha(Path(invocation_module.__file__).read_bytes())
             or receipt.get("schema_manifest_sha256") != _schema_manifest_sha()
+            or receipt.get("source_binding_contract_authorization_sha256") !=
+               contract_authorization_identity(receipt.get("mission_id"))
             or receipt.get("base_sha") != base or receipt.get("head_sha") != head):
         raise ValueError("OpenAI receipt model or exact HEAD mismatch")
     unsigned = dict(receipt)
@@ -382,12 +393,18 @@ def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec
     for actual, expected in zip(receipt["groups"], expected_groups):
         if any(actual.get(key) != value for key, value in expected.items()):
             raise ValueError("OpenAI group source mismatch")
-        result = _result(_canon(actual.get("result")), group=True)
+        stored = actual.get("result")
+        if not isinstance(stored, dict) or "source_bindings" not in stored:
+            raise ValueError("OpenAI source binding evidence missing")
+        result = _result(_canon({key: stored[key] for key in
+                                ("findings", "decisions", "summary")}), group=True)
         blockers = actual.get("source_blockers")
         if not isinstance(blockers, list):
             raise ValueError("OpenAI blocker binding missing")
         source = diff[expected["start"]:expected["end"]]
         _decide(blockers, result, source)
+        if result != stored:
+            raise ValueError("OpenAI derived source binding differs")
     # Recompute the final verdict from the validated, durably bound artifacts.
     findings = []
     for group in receipt["groups"]:
@@ -450,6 +467,9 @@ def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec
                         else "chunk")
                 raw = secure.read_private_artifact(directory_fd, f"{kind}-{item['index']:03d}.json")
                 parsed = _synthesis_result(raw) if kind == "synthesis" else _result(raw, group=kind == "group")
+                if kind == "group":
+                    _decide(item["source_blockers"], parsed,
+                            diff[item["start"]:item["end"]])
                 if _sha(raw) != item.get("output_sha256") or parsed != item["result"]:
                     raise ValueError("OpenAI durable artifact mismatch")
         finally:
@@ -497,6 +517,8 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
                 "runner_hash": _sha(Path(__file__).read_bytes()),
                 "invocation_hash": _sha(Path(invocation_module.__file__).read_bytes()),
                 "schema_manifest_hash": _schema_manifest_sha(),
+                "source_binding_contract_authorization_sha256":
+                    contract_authorization_identity(mission_id),
                 "qualification_receipt_identity": qualification_identity,
                 "input_manifest_identity": _sha(_canon({"chunks": chunks, "groups": groups})),
                 "full_manifest_sha256": manifest["manifest_sha256"],
@@ -539,6 +561,8 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
                         "runner_sha256": _sha(Path(__file__).read_bytes()),
                         "invocation_sha256": _sha(Path(invocation_module.__file__).read_bytes()),
                         "schema_manifest_sha256": _schema_manifest_sha()})
+        receipt["source_binding_contract_authorization_sha256"] = identity[
+            "source_binding_contract_authorization_sha256"]
         receipt['task_assignments'] = full.review_tasks(diff, manifest)
         receipt['full_manifest'] = manifest
         receipt['execution_identity'] = expected_execution(receipt, manifest, _sha(_canon(qualified)), spec)

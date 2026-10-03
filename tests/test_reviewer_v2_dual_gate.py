@@ -63,7 +63,7 @@ class SummaryContractTests(unittest.TestCase):
 
 class OpenAIContractTests(unittest.TestCase):
     def test_disputed_originals_survive_all_cross_group_synthesis_levels(self):
-        diff=b'a'*960100
+        diff=b''.join(f'{i:012d}'.encode()+b'a'*(32000-12) for i in range(30))+b'000000000030'+b'a'*88
         observed=[]
         def call(prompt,kind):
             if kind is False:
@@ -73,8 +73,9 @@ class OpenAIContractTests(unittest.TestCase):
                 source=prompt.split('EXACT DIFF TEXT (UTF-8):\n',1)[1].encode()
                 decisions=[{'finding_id':b['finding_id'],'decision':'DISPUTED',
                     'rationale':'Local source appears to refute the original concern.',
-                    'source_quote':'a'*12,'source_id':review._sha(source),
-                    'quote_start':0,'quote_end':12} for b in blockers]
+                    'source_quote':f"{int(b['finding_id'][1:4]):012d}",
+                    'source_id':review._sha(source),
+                    } for b in blockers]
                 return review._canon({'findings':[],'decisions':decisions,
                     'summary':'The bounded group has locally disputed the chunk concerns.'})
             summaries=json.loads(prompt.split('Group summaries: ',1)[1])
@@ -133,7 +134,8 @@ class OpenAIContractTests(unittest.TestCase):
                        registry_sha256=review._sha(review.load_registry().path.read_bytes()),
                        runner_sha256=review._sha(Path(review.__file__).read_bytes()),
                        invocation_sha256=review._sha(Path(review.invocation_module.__file__).read_bytes()),
-                       schema_manifest_sha256=review._schema_manifest_sha())
+                       schema_manifest_sha256=review._schema_manifest_sha(),
+                       source_binding_contract_authorization_sha256="OFFLINE_FIXTURE_ONLY")
         _, manifest = review.full.build_manifest(self.root, self.base, self.head, receipt['repository'])
         receipt['task_assignments'] = review.full.review_tasks(self.diff, manifest)
         receipt['full_manifest'] = manifest
@@ -237,7 +239,7 @@ class OpenAIContractTests(unittest.TestCase):
             "finding_id": "C000F000", "decision": "DISPUTED",
             "rationale": "This rationale claims the blocker does not apply.",
             "source_quote": "a quotation absent from the diff", "source_id": review._sha(self.diff),
-            "quote_start": 0, "quote_end": 32}],
+            }],
             "summary": "The group was reviewed but its dispute lacks source evidence."}).encode()
         calls = 0
         def invoke(_prompt, _spec, *, stage, timeout, transport_sink=None):
@@ -271,7 +273,7 @@ class OpenAIContractTests(unittest.TestCase):
             return json.dumps({"findings": [], "decisions": [{
                 "finding_id": "C000F000", "decision": "UPHELD",
                 "rationale": "The original finding remains valid in this exact source.",
-                "source_quote": "", "source_id": "", "quote_start": 0, "quote_end": 0}],
+                "source_quote": "", "source_id": ""}],
                 "summary": "The original blocker remains present after source review."}).encode()
         with patch.object(review, "validate_qualification_receipt", return_value={}), \
              patch.object(review, "preflight"), \
@@ -323,7 +325,7 @@ class OpenAIContractTests(unittest.TestCase):
                     decisions = [{"finding_id": identifier, "decision": "UPHELD",
                                   "rationale": "The changed source makes the issue persist.",
                                   "source_quote": "", "source_id": "",
-                                  "quote_start": 0, "quote_end": 0} for identifier in ids]
+                                  } for identifier in ids]
                     return json.dumps({"findings": [], "decisions": decisions,
                                        "summary": "The source was reviewed with its original finding."}).encode()
                 with self.assertRaises(ValueError):
@@ -336,7 +338,7 @@ class OpenAIContractTests(unittest.TestCase):
                 return json.dumps({"findings": [blocker]}).encode()
             return json.dumps({"findings": [], "decisions": [{"finding_id": "C000F000",
                 "decision": "UPHELD", "rationale": "The changed source makes the issue persist.",
-                "source_quote": "", "source_id": "", "quote_start": 0, "quote_end": 0}],
+                "source_quote": "", "source_id": ""}],
                 "summary": "The blocker remains in the reviewed source."}).encode()
         receipt, _ = review._assemble(self.diff, self.base, self.head, call)
         self.assertEqual(receipt["review_result"], "FAIL")
