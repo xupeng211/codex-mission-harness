@@ -226,7 +226,8 @@ def _observed_events(raw: bytes) -> dict:
 def _invoke_openai_unmetered(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 120,
                   binary: Path = CANONICAL_BINARY,
                   codex_home: Path = CANONICAL_HOME,
-                  source_env: dict[str, str] | None = None) -> InvocationResult:
+                  source_env: dict[str, str] | None = None,
+                  transport_sink=None) -> InvocationResult:
     if spec.provider != "openai" or not spec.model or not spec.reasoning_effort:
         raise ValueError("configured OpenAI model and reasoning are required")
     if timeout < 1 or timeout > 900:
@@ -281,6 +282,8 @@ def _invoke_openai_unmetered(prompt: str, spec: ModelSpec, schema: dict, *, time
                                      "reasoning_effort": spec.reasoning_effort,
                                      "command_sha256": command_sha,
                                      "io_error_class": type(exc).__name__}) from exc
+        if transport_sink is not None:
+            transport_sink(prompt.encode(), stdout, stderr)
         evidence = {"binary": str(binary), "codex_home": str(codex_home),
                     "provider": spec.provider, "model": spec.model,
                     "reasoning_effort": spec.reasoning_effort,
@@ -326,7 +329,8 @@ def _invoke_openai_unmetered(prompt: str, spec: ModelSpec, schema: dict, *, time
 
 def invoke_openai(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 120,
                   binary: Path = CANONICAL_BINARY, codex_home: Path = CANONICAL_HOME,
-                  source_env: dict[str, str] | None = None) -> InvocationResult:
+                  source_env: dict[str, str] | None = None,
+                  transport_sink=None) -> InvocationResult:
     """Reserve the original Mission's resources before any Codex subprocess."""
     if spec.provider != "openai" or not isinstance(prompt, str):
         raise ValueError("configured OpenAI model and prompt are required")
@@ -334,6 +338,7 @@ def invoke_openai(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 
                        stage=os.environ.get("CMH_RESOURCE_STAGE", "openai-invocation")) as reservation:
         result = _invoke_openai_unmetered(prompt, spec, schema, timeout=timeout,
                                          binary=binary, codex_home=codex_home,
-                                         source_env=source_env)
+                                         source_env=source_env,
+                                         transport_sink=transport_sink)
         reservation.observe(result.evidence.get("usage"))
         return result

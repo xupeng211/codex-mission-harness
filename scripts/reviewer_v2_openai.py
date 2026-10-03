@@ -154,7 +154,8 @@ def _synthesis_prompt(summaries: list[str], base: str, head: str) -> str:
             f"Base {base}; head {head}. Group summaries: " + json.dumps(summaries, ensure_ascii=False))
 
 
-def invoke_codex(prompt: str, spec: ModelSpec, *, stage: str, timeout: int = 900) -> bytes:
+def invoke_codex(prompt: str, spec: ModelSpec, *, stage: str, timeout: int = 900,
+                 transport_sink=None) -> bytes:
     """One fresh, isolated model call. No implicit model or provider fallback."""
     if spec.provider != "openai" or not spec.reasoning_effort:
         raise ValueError("OpenAI model role is required")
@@ -162,7 +163,7 @@ def invoke_codex(prompt: str, spec: ModelSpec, *, stage: str, timeout: int = 900
         raise ValueError("invalid OpenAI review stage")
     result = invoke_openai(
         prompt, spec, _schema(stage == "group", stage == "synthesis"),
-        timeout=timeout,
+        timeout=timeout, transport_sink=transport_sink,
     )
     return result.response.encode()
 
@@ -473,9 +474,13 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
     registry = load_registry(registry_path)
     if spec != registry.role("final_reviewer"):
         raise ValueError("review model differs from selected registry")
-    call = lambda prompt, group: invoke_codex(
-        prompt, spec, stage="synthesis" if group == "synthesis" else
-        "group" if group else "chunk", timeout=timeout)
+    def call(prompt, group):
+        stage = "synthesis" if group == "synthesis" else "group" if group else "chunk"
+        current = os.environ.get("CMH_RESOURCE_STAGE", "")
+        sink = (lambda p, out, err: run_state.capture_transport(current, p, out, err)) \
+            if stage in {"group", "synthesis"} else None
+        return invoke_codex(prompt, spec, stage=stage, timeout=timeout,
+                            transport_sink=sink)
     chunks, groups = _plan(diff)
     stage_plan = [(f"chunk-{i:03d}", "chunk") for i in range(len(chunks))] + [
         (f"group-{i:03d}", "group") for i in range(len(groups))]
@@ -556,6 +561,10 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
                    else "CANCELLED" if isinstance(exc, KeyboardInterrupt)
                    else "REVIEW_RESULT_INVALID", "error_type": type(exc).__name__,
                    "artifact_sha256": artifact_hashes,
+                   "failed_raw_model_artifact": getattr(run_state, "last_failed_raw_artifact", None),
+                   "failed_raw_model_artifact_sha256": getattr(run_state, "last_failed_raw_sha256", None),
+                   "transport_artifact": getattr(run_state, "last_transport_artifact", None),
+                   "transport_artifact_sha256": getattr(run_state, "last_transport_sha256", None),
                    "invocation_evidence": dict(exc.evidence) if isinstance(exc, InvocationFailure) else {},
                    "recorded_at": int(time.time())}
         current_stage = run_state.state.get("next_stage")

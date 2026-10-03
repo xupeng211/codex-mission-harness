@@ -256,7 +256,7 @@ class FullDiffTests(unittest.TestCase):
             spec = openai.load_registry().role(role)
             qualified[spec.provider] = {'role': role, 'mode': 'real_provider', 'identity': spec.identity(),
                                         'offline_test_only': True}
-        def oa(prompt, spec, *, stage, timeout):
+        def oa(prompt, spec, *, stage, timeout, transport_sink=None):
             return full.canonical({'findings': []} if stage == 'chunk' else
                 {'findings': [], 'summary': 'Offline mock reviewed the supplied source completely.',
                  **({'decisions': []} if stage == 'group' else {})})
@@ -429,7 +429,7 @@ class FullDiffTests(unittest.TestCase):
         spec = openai.load_registry().role('final_reviewer')
         counts = {}
         interrupted = False
-        def invoke(prompt, model, *, stage, timeout):
+        def invoke(prompt, model, *, stage, timeout, transport_sink=None):
             nonlocal interrupted
             identity = full.sha256(prompt.encode())
             if stage == 'synthesis' and not interrupted:

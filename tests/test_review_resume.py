@@ -143,6 +143,56 @@ class ResumeTests(unittest.TestCase):
         self.assertTrue(json.loads((original / "state.json").read_text())["invalidated"])
         fresh.close()
 
+    def test_group_validation_failure_retains_exact_prompt_and_raw_response(self):
+        run = self.open()
+        for index in range(5):
+            self.do_stage(run, index)
+        with self.assertRaisesRegex(ValueError, "synthetic binding failure"):
+            run.stage("group-000", "group", b"exact group prompt",
+                      lambda: b'{"decisions":[{"source_quote":"exact model bytes"}]}',
+                      lambda _raw: (_ for _ in ()).throw(ValueError("synthetic binding failure")))
+        self.assertFalse((run.path / "group-000.json").exists())
+        captures = list(run.path.glob("group-000-failed-raw-*.json"))
+        self.assertEqual(len(captures), 1)
+        record = json.loads(captures[0].read_bytes())
+        self.assertEqual(record["prompt_utf8"], "exact group prompt")
+        self.assertEqual(record["raw_model_output_utf8"],
+                         '{"decisions":[{"source_quote":"exact model bytes"}]}')
+        self.assertEqual(run.state["next_stage"], "group-000")
+        run.close()
+
+    def test_group_invocation_failure_marks_output_not_produced(self):
+        run = self.open()
+        for index in range(5):
+            self.do_stage(run, index)
+        def broken():
+            run.capture_transport("group-000", b"exact prompt", b"partial stdout", b"cli error")
+            raise RuntimeError("CLI failed")
+        with self.assertRaisesRegex(RuntimeError, "CLI failed"):
+            run.stage("group-000", "group", b"exact prompt", broken, lambda _: None)
+        capture, = run.path.glob("group-000-failed-raw-*.json")
+        record = json.loads(capture.read_bytes())
+        self.assertEqual(record["raw_model_output_status"], "OUTPUT_NOT_PRODUCED")
+        transport, = run.path.glob("group-000-transport-*.json")
+        stream = json.loads(transport.read_bytes())
+        self.assertEqual(stream["stdout_base64"], "cGFydGlhbCBzdGRvdXQ=")
+        self.assertFalse((run.path / "receipt.json").exists())
+        run.close()
+
+    def test_cross_group_failure_append_only_and_private(self):
+        run = self.open()
+        for index in range(7):
+            self.do_stage(run, index)
+        for _ in range(2):
+            with self.assertRaisesRegex(ValueError, "bad schema"):
+                run.stage("cross-group", "cross-group", b"same prompt", lambda: b"{bad",
+                          lambda _: (_ for _ in ()).throw(ValueError("bad schema")))
+        captures = list(run.path.glob("cross-group-failed-raw-*.json"))
+        self.assertEqual(len(captures), 2)
+        self.assertTrue(all(path.stat().st_mode & 0o777 == 0o600 for path in captures))
+        self.assertEqual(run.state["next_stage"], "cross-group")
+        run.close()
+
     def test_identity_invalidation_and_artifact_tamper_fail_closed(self):
         for changed in ("head_sha", "schema_manifest_hash", "runner_hash"):
             with self.subTest(changed=changed), tempfile.TemporaryDirectory() as tmp:

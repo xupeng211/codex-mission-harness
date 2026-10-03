@@ -200,7 +200,7 @@ class OpenAIContractTests(unittest.TestCase):
         evidence = Path(self.temp.name) / "interrupted"
         evidence.mkdir(mode=0o700)
         calls = 0
-        def invoke(_prompt, _spec, *, stage, timeout):
+        def invoke(_prompt, _spec, *, stage, timeout, transport_sink=None):
             nonlocal calls
             calls += 1
             if calls == 1:  # structured preflight
@@ -240,7 +240,7 @@ class OpenAIContractTests(unittest.TestCase):
             "quote_start": 0, "quote_end": 32}],
             "summary": "The group was reviewed but its dispute lacks source evidence."}).encode()
         calls = 0
-        def invoke(_prompt, _spec, *, stage, timeout):
+        def invoke(_prompt, _spec, *, stage, timeout, transport_sink=None):
             nonlocal calls
             calls += 1
             if calls == 1:
@@ -262,7 +262,7 @@ class OpenAIContractTests(unittest.TestCase):
         self.assertEqual(failure["resume_policy_reason"], "bounded source binding retry")
         self.assertFalse((run_dir / "receipt.json").exists())
         requested = []
-        def retry(_prompt, _spec, *, stage, timeout):
+        def retry(_prompt, _spec, *, stage, timeout, transport_sink=None):
             requested.append(stage)
             if stage == "chunk" and len(requested) == 1:
                 return b'{"findings":[]}'  # fresh structured preflight

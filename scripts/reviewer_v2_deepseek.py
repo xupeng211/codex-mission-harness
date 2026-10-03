@@ -151,7 +151,8 @@ def _bounded(prompt: str) -> str:
 
 def _invoke(command: list[str], prompt: str, env: dict, timeout: int, token: str,
             *, stage: str, evidence_fd: int, artifact: str,
-            state: dict | None = None, persist: bool = True) -> tuple[str, str]:
+            state: dict | None = None, persist: bool = True,
+            transport_sink=None) -> tuple[str, str]:
     state = {} if state is None else state
     state.pop("timeout_at", None)
     state.pop("output_sha256", None)
@@ -175,6 +176,10 @@ def _invoke(command: list[str], prompt: str, env: dict, timeout: int, token: str
     try:
         completed = legacy.invoke_reviewer(command, _bounded(prompt), env, timeout)
     except subprocess.TimeoutExpired as exc:
+        if transport_sink is not None:
+            transport_sink(prompt.encode(), legacy._captured_bytes(exc.output),
+                           legacy._captured_bytes(exc.stderr),
+                           secret_echo=legacy._credential_echoed(exc.output, exc.stderr, token))
         state.update(timeout_at=int(time.time()), finished_at=int(time.time()),
                      duration_seconds=round(time.monotonic() - started_monotonic, 3),
                      stderr_markers=_stderr_markers(exc.stderr),
@@ -200,6 +205,10 @@ def _invoke(command: list[str], prompt: str, env: dict, timeout: int, token: str
                  **stream_metadata(completed.stdout, completed.stderr),
                  cli_wrapper=cli_wrapper_summary(completed.stdout),
                  stderr_markers=_stderr_markers(completed.stderr))
+    if transport_sink is not None:
+        transport_sink(prompt.encode(), legacy._captured_bytes(completed.stdout),
+                       legacy._captured_bytes(completed.stderr),
+                       secret_echo=legacy._credential_echoed(completed.stdout, completed.stderr, token))
     if legacy._credential_echoed(completed.stdout, completed.stderr, token):
         state.update(sanitized_error_class="AUTH_ERROR", resume_policy_reason="credential echoed")
         raise ReviewStageFailure("AUTH_ERROR", stage)
@@ -358,7 +367,10 @@ def run(args: argparse.Namespace) -> dict:
             raw_bytes, result = run.stage(name, "group", prompt.encode(),
                 lambda: _invoke(synthesis_command, prompt, env, args.timeout, token,
                                 stage="group", evidence_fd=evidence_fd,
-                                artifact=name + ".json", state=stage_state, persist=False)[0].encode(),
+                                artifact=name + ".json", state=stage_state, persist=False,
+                                transport_sink=lambda p, out, err, secret_echo=False:
+                                    run.capture_transport(name, p, out, err,
+                                                          secret_echo=secret_echo))[0].encode(),
                 lambda data: _parse_stage(data.decode(), lambda value: parse_synthesis(
                     value, expected, source=source, structured_evidence=True), stage_state))
             output_hash = sha256(raw_bytes)
@@ -393,7 +405,10 @@ def run(args: argparse.Namespace) -> dict:
         raw_bytes, result = run.stage("aggregate", "cross-group", prompt.encode(),
             lambda: _invoke(synthesis_command, prompt, env, args.timeout, token,
                             stage="cross-group", evidence_fd=evidence_fd,
-                            artifact="aggregate.json", state=stage_state, persist=False)[0].encode(),
+                            artifact="aggregate.json", state=stage_state, persist=False,
+                            transport_sink=lambda p, out, err, secret_echo=False:
+                                run.capture_transport("aggregate", p, out, err,
+                                                      secret_echo=secret_echo))[0].encode(),
             lambda data: _parse_stage(data.decode(), lambda value: parse_synthesis(
                 value, expected, source=None, structured_evidence=True), stage_state))
         output_hash = sha256(raw_bytes)
@@ -473,7 +488,11 @@ def run(args: argparse.Namespace) -> dict:
                    "schema_validation_error_class": stage_state.get("schema_validation_error_class"),
                    "schema_validation_reason": stage_state.get("schema_validation_reason"),
                    "source_binding_diagnostic": stage_state.get("source_binding_diagnostic"),
-                   "output_sha256": stage_state.get("output_sha256")}
+                   "output_sha256": stage_state.get("output_sha256"),
+                   "failed_raw_model_artifact": getattr(run, "last_failed_raw_artifact", None),
+                   "failed_raw_model_artifact_sha256": getattr(run, "last_failed_raw_sha256", None)}
+        failure["transport_artifact"] = getattr(run, "last_transport_artifact", None)
+        failure["transport_artifact_sha256"] = getattr(run, "last_transport_sha256", None)
         failure["integrity_sha256"] = sha256(canonical(failure))
         if auth_key:
             failure["auth_hmac_sha256"] = _receipt_hmac(failure, auth_key)

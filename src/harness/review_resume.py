@@ -8,6 +8,7 @@ is the recovery authority.
 """
 from __future__ import annotations
 
+import base64
 import fcntl
 import hashlib
 import json
@@ -196,8 +197,18 @@ class ReviewRun:
         else:
             os.unlink(artifact, dir_fd=self.fd)
             os.fsync(self.fd)
-        raw = execute()
-        result = validate(raw)
+        try:
+            raw = execute()
+        except BaseException as exc:
+            if kind in {"group", "cross-group"}:
+                self._failed_response(name, kind, input_bytes, None, exc)
+            raise
+        try:
+            result = validate(raw)
+        except BaseException as exc:
+            if kind in {"group", "cross-group"}:
+                self._failed_response(name, kind, input_bytes, raw, exc)
+            raise
         self.storage.write_private_artifact(self.fd, artifact, raw, uuid.uuid4().hex)
         self.state["completed"][name] = {
             "artifact_path": artifact, "artifact_sha256": sha256(raw),
@@ -215,6 +226,75 @@ class ReviewRun:
         self.state["final_completed"] = next_index == len(self.stages)
         _atomic_state(self.fd, self.state)
         return raw, result
+
+    def _failed_response(self, name: str, kind: str, prompt: bytes,
+                         raw: bytes | None, exc: BaseException) -> None:
+        """Append private diagnostics before a failing stage can be retried."""
+        label = f"{name}-failed-raw-{uuid.uuid4().hex}.json"
+        structured = None
+        if raw is not None:
+            try:
+                envelope = json.loads(raw)
+                if isinstance(envelope, dict):
+                    structured = envelope.get("structured_output", envelope)
+            except (ValueError, UnicodeError):
+                pass
+        source_error = getattr(exc, "__cause__", None) or exc
+        request = None
+        ledger_path = os.environ.get("CMH_RESOURCE_LEDGER")
+        if ledger_path:
+            try:
+                rows = json.loads(Path(ledger_path).read_bytes())["requests"]
+                matches = [row for row in rows
+                           if row.get("run_id") == self.state["review_run_id"]
+                           and row.get("stage") in {name, name + ".json"}
+                           and row.get("prompt_sha256") == sha256(prompt)]
+                if len(matches) == 1:
+                    row = matches[0]
+                    request = {key: row.get(key) for key in
+                               ("number", "request_id", "status", "reported_usage")}
+            except (OSError, ValueError, KeyError):
+                pass
+        record = {"version": "cmh-failed-review-response/v1", "stage": name,
+                  "kind": kind, "identity": self.identity,
+                  "prompt_sha256": sha256(prompt), "prompt_base64": base64.b64encode(prompt).decode(),
+                  "prompt_utf8": prompt.decode("utf-8", "replace"),
+                  "raw_model_output_status": "OUTPUT_NOT_PRODUCED" if raw is None else "RETURNED",
+                  "raw_model_output_sha256": sha256(raw) if raw is not None else None,
+                  "raw_model_output_base64": base64.b64encode(raw).decode() if raw is not None else None,
+                  "raw_model_output_utf8": raw.decode("utf-8", "replace") if raw is not None else None,
+                  "structured_output": structured,
+                  "parser_error_class": type(source_error).__name__,
+                  "parser_error": str(source_error),
+                  "source_binding_diagnostic": getattr(source_error, "details", None),
+                  "resource_request": request,
+                  "resource_stage": os.environ.get("CMH_RESOURCE_STAGE"),
+                  "resource_run_id": self.state["review_run_id"]}
+        rendered = canonical(record)
+        self.storage.write_private_artifact(self.fd, label, rendered, uuid.uuid4().hex)
+        self.last_failed_raw_artifact = label
+        self.last_failed_raw_sha256 = sha256(rendered)
+
+    def capture_transport(self, name: str, prompt: bytes, stdout: bytes | None,
+                          stderr: bytes | None, *, secret_echo: bool = False) -> None:
+        """Append a private transport snapshot before parsing can discard streams."""
+        if secret_echo:
+            stdout = stderr = None
+        label = f"{name}-transport-{uuid.uuid4().hex}.json"
+        record = {"version": "cmh-review-transport/v1", "stage": name,
+                  "identity": self.identity, "prompt_sha256": sha256(prompt),
+                  "prompt_base64": base64.b64encode(prompt).decode(),
+                  "stdout_status": "REDACTED_CREDENTIAL_ECHO" if secret_echo else
+                                   "OUTPUT_NOT_PRODUCED" if stdout is None else "CAPTURED",
+                  "stdout_sha256": sha256(stdout) if stdout is not None else None,
+                  "stdout_base64": base64.b64encode(stdout).decode() if stdout is not None else None,
+                  "stderr_sha256": sha256(stderr) if stderr is not None else None,
+                  "stderr_base64": base64.b64encode(stderr).decode() if stderr is not None else None,
+                  "resource_run_id": self.state["review_run_id"]}
+        rendered = canonical(record)
+        self.storage.write_private_artifact(self.fd, label, rendered, uuid.uuid4().hex)
+        self.last_transport_artifact = label
+        self.last_transport_sha256 = sha256(rendered)
 
     def receipt(self, name: str, raw: bytes, validate: Callable[[], object]) -> Path:
         if not self.state["final_completed"]:
