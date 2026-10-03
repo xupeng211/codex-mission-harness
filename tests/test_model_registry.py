@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from harness.model_qualification import (CASES, QualificationResult, expected_findings,
                                          evaluate_cases, qualification_receipt, QualificationEvidence,
+                                         _actual_provider_invoke_unmetered,
                                          validate_qualification_receipt,
                                          require_builder_qualification)
 from harness.openai_invocation import InvocationFailure, canonical_environment
@@ -183,6 +184,29 @@ class QualificationContractTests(unittest.TestCase):
             self.assertEqual(record["exact_failure_reason"], "semantic decision mismatch")
             self.assertEqual(record["parser_result"], "PASS")
             self.assertEqual(record["parsed_result"]["new_findings"], [false_finding])
+
+    def test_local_fixture_transport_bytes_are_preserved_before_parse(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); root.chmod(0o700)
+            fake = root / "fixture-local-launcher"
+            envelope = json.dumps({"structured_output": {"decisions": [], "findings": [],
+                                                          "summary": self.summary},
+                                   "usage": {"input_tokens": 1, "output_tokens": 1}})
+            fake.write_text("#!/usr/bin/python3\nimport sys\n"
+                            f"sys.stdout.write({envelope!r})\n"
+                            "sys.stderr.write('fixture-stderr')\n")
+            fake.chmod(0o700)
+            evidence = QualificationEvidence(root / "diagnostics")
+            with patch("harness.model_registry.trusted_claude_launcher",
+                       return_value=(str(fake), "/usr/bin")):
+                result = _actual_provider_invoke_unmetered(
+                    load_registry().role("independent_reviewer"), "fixture prompt",
+                    token="synthetic-fixture-token", timeout=5,
+                    transport_sink=lambda stdout, stderr, code:
+                        evidence.capture_transport("clean", stdout, stderr, code))
+            self.assertEqual(json.loads(result.response)["findings"], [])
+            self.assertEqual((root / "diagnostics" / "clean.stdout").read_bytes(), envelope.encode())
+            self.assertEqual((root / "diagnostics" / "clean.stderr").read_bytes(), b"fixture-stderr")
 
     def test_provider_invocation_failure_stops_remaining_qualification_calls(self):
         calls = []
