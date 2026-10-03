@@ -258,7 +258,29 @@ class OpenAIContractTests(unittest.TestCase):
         self.assertEqual(failure["status"], "BLOCKED")
         self.assertEqual(failure["failure_category"], "REVIEW_RESULT_INVALID")
         self.assertNotIn("group-000.json", failure["artifact_sha256"])
+        self.assertTrue(failure["resume_allowed"])
+        self.assertEqual(failure["resume_policy_reason"], "bounded source binding retry")
         self.assertFalse((run_dir / "receipt.json").exists())
+        requested = []
+        def retry(_prompt, _spec, *, stage, timeout):
+            requested.append(stage)
+            if stage == "chunk" and len(requested) == 1:
+                return b'{"findings":[]}'  # fresh structured preflight
+            if stage == "chunk":
+                raise AssertionError("committed Chunk must not be recalled")
+            return json.dumps({"findings": [], "decisions": [{
+                "finding_id": "C000F000", "decision": "UPHELD",
+                "rationale": "The original finding remains valid in this exact source.",
+                "source_quote": "", "source_id": "", "quote_start": 0, "quote_end": 0}],
+                "summary": "The original blocker remains present after source review."}).encode()
+        with patch.object(review, "validate_qualification_receipt", return_value={}), \
+             patch.object(review, "preflight"), \
+             patch.object(review, "invoke_codex", side_effect=retry):
+            receipt = review.run(self.root, self.base, self.head, evidence, "test-key", self.spec,
+                                 qualification_path="fixture-qualification")
+        self.assertEqual(requested, ["chunk", "group"])
+        self.assertEqual(json.loads(receipt.read_text())["review_result"], "FAIL")
+        self.assertTrue(json.loads((run_dir / "state.json").read_text())["receipt_written"])
 
     def test_preflight_provider_failure_publishes_no_approval_receipt(self):
         evidence = Path(self.temp.name) / "evidence"

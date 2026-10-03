@@ -31,7 +31,7 @@ from harness.model_registry import ModelSpec, load_registry, preflight  # noqa: 
 from harness.model_qualification import validate_qualification_receipt  # noqa: E402
 from harness.openai_invocation import InvocationFailure, invoke_openai  # noqa: E402
 import harness.openai_invocation as invocation_module  # noqa: E402
-from harness.reviewer_v2_contract import bind_findings, validate_source_binding  # noqa: E402
+from harness.reviewer_v2_contract import SourceBindingError, bind_findings, validate_source_binding  # noqa: E402
 from harness import full_diff_manifest as full
 from harness.review_resume import ReviewRun  # noqa: E402
 
@@ -558,6 +558,13 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
                    "artifact_sha256": artifact_hashes,
                    "invocation_evidence": dict(exc.evidence) if isinstance(exc, InvocationFailure) else {},
                    "recorded_at": int(time.time())}
+        if isinstance(exc, SourceBindingError) and os.environ.get("CMH_RESOURCE_STAGE", "").startswith("group-"):
+            # One fresh answer for the same Group may correct a model-supplied
+            # byte reference. ReviewRun keeps every committed prerequisite and
+            # enforces the existing single retry limit.
+            failure["resume_allowed"] = True
+            failure["resume_policy_reason"] = "bounded source binding retry"
+            failure["source_binding_diagnostic"] = exc.details
         failure_path = run_state.failure(failure, auth_key)
         if isinstance(exc, InvocationFailure):
             exc.evidence["failure_record"] = str(failure_path)
