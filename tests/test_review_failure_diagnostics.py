@@ -106,6 +106,24 @@ class DiagnosticTests(unittest.TestCase):
             self.assertFalse(state["schema_validation_entered"])
             self.assertNotIn("fixture-secret", json.dumps(state))
 
+    def test_chunk_nonzero_passes_exact_streams_to_private_sink(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = Path(temporary) / "settings.json"
+            settings.write_text("{}")
+            stdout, stderr = b'{"is_error":true}', b"cli failed"
+            completed = subprocess.CompletedProcess([], 1, stdout, stderr)
+            captured = []
+            with patch.object(runner.legacy, "invoke_reviewer", return_value=completed):
+                with self.assertRaises(runner.ReviewStageFailure):
+                    runner._invoke(["/bin/claude", "--settings", str(settings)], "chunk prompt",
+                                   {"HOME": "/nonexistent"}, 30, "fixture-secret",
+                                   stage="chunk", evidence_fd=0, artifact="chunk-001.json",
+                                   state={}, persist=False,
+                                   transport_sink=lambda prompt, out, err, **kwargs:
+                                       captured.append((prompt, out, err, kwargs)))
+            self.assertEqual(captured[0][:3], (b"chunk prompt", stdout, stderr))
+            self.assertFalse(captured[0][3]["secret_echo"])
+
     def test_success_then_parser_and_schema_failure_flags(self):
         state = {"stage": "group"}
         self.assertEqual(runner._parse_stage('{"ok":true}', json.loads, state), {"ok": True})
