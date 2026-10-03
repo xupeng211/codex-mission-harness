@@ -87,6 +87,12 @@ def _parse_stage(raw: str, parser, state: dict):
                 "parser_entered": state["parser_entered"],
                 "schema_validation_entered": state["schema_validation_entered"],
                 "validation_result": "FAIL"}
+            if state.get("stage") == "group":
+                # The model supplied a bad byte reference. The source and all
+                # prior durable stages are still valid, so permit one fresh
+                # model response for this exact stage under ReviewRun's limit.
+                state["resume_allowed"] = True
+                state["resume_policy_reason"] = "bounded source binding retry"
         if not raw.strip():
             category = "EMPTY_OUTPUT"
         else:

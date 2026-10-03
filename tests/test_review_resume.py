@@ -118,6 +118,31 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(self.counts["chunk-000"], 2)
         self.assertEqual(len(list(self.evidence.rglob("chunk-000.json"))), 1)
 
+    def test_source_binding_retry_keeps_chunks_once_then_stops(self):
+        run = self.open()
+        for index in range(5):
+            self.do_stage(run, index)
+        original = run.path
+        first = json.loads(run.failure({"failure_category": "SCHEMA_VALIDATION_FAILED",
+            "resume_allowed": True, "resume_policy_reason": "bounded source binding retry"}).read_text())
+        self.assertTrue(first["resume_allowed"])
+        self.assertEqual(first["next_stage"], "group-000")
+        run.close()
+        resumed = self.open()
+        self.assertEqual(resumed.path, original)
+        self.assertEqual(resumed.state["completed_chunk_ids"],
+                         [f"chunk-{i:03d}" for i in range(5)])
+        second = json.loads(resumed.failure({"failure_category": "SCHEMA_VALIDATION_FAILED",
+            "resume_allowed": True, "resume_policy_reason": "bounded source binding retry"}).read_text())
+        self.assertFalse(second["resume_allowed"])
+        self.assertEqual(second["resume_policy_reason"], "bounded stage retry exhausted")
+        resumed.close()
+        fresh = self.open()
+        self.assertNotEqual(fresh.path, original)
+        self.assertEqual(fresh.state["next_stage"], "chunk-000")
+        self.assertTrue(json.loads((original / "state.json").read_text())["invalidated"])
+        fresh.close()
+
     def test_identity_invalidation_and_artifact_tamper_fail_closed(self):
         for changed in ("head_sha", "schema_manifest_hash", "runner_hash"):
             with self.subTest(changed=changed), tempfile.TemporaryDirectory() as tmp:

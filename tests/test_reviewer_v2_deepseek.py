@@ -106,8 +106,47 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
                         self.assertEqual(detail["stage_id"], "group-000.json")
                         self.assertEqual(detail["validation_rule"], "GROUP_SOURCE_HASH_MATCH")
                         self.assertEqual(detail["validation_result"], "FAIL")
+                        self.assertTrue(failure["resume_allowed"])
+                        self.assertFalse(list(evidence.rglob("deepseek-v2-receipt-*.json")))
+                        self.assertEqual(failure["resume_policy_reason"],
+                                         "bounded source binding retry")
+                        source = reviewer.full.read_diff(root, base, head)
+                        quote = b"diff --git a/source.py b/source.py"
+                        self.assertEqual(source.count(quote), 1)
+                        requested = []
+                        def retry(_command, prompt, _env, _timeout):
+                            requested.append(prompt)
+                            if "Scope=chunk" in prompt:
+                                raise AssertionError("committed Chunk must not be recalled")
+                            if "Scope=group" in prompt:
+                                output = {"findings": [], "decisions": [{
+                                    "finding_id": "C000F000", "decision": "DISPUTED",
+                                    "rationale": "The diff header does not establish the claimed blocker.",
+                                    "source_quote": quote.decode(),
+                                    "source_id": reviewer.sha256(source),
+                                    "quote_start": 0, "quote_end": len(quote)}],
+                                    "summary": "The exact source reference resolves the claimed blocker."}
+                            else:
+                                output = {"findings": [], "decisions": [],
+                                          "summary": "Cross-group review found no additional issues."}
+                            return subprocess.CompletedProcess([], 0,
+                                json.dumps({"structured_output": output}).encode(), b"")
+                        with (patch.object(reviewer.legacy, "resolve_claude_launcher",
+                                           return_value=("/bin/true", "/usr/bin:/bin")),
+                              patch.object(reviewer.legacy, "read_token_file",
+                                           return_value="fixture-token"),
+                              patch.object(reviewer, "validate_qualification_receipt",
+                                           return_value={}),
+                              patch.object(reviewer.legacy, "invoke_reviewer", side_effect=retry)):
+                            resumed = reviewer.run(args)
+                        self.assertEqual(resumed["status"], "PASS")
+                        self.assertEqual(len(requested), 2)
+                        resumed_state = json.loads((failure_path.parent / "state.json").read_text())
+                        self.assertTrue(resumed_state["receipt_written"])
+                        self.assertEqual(resumed_state["completed_chunk_ids"], ["chunk-000"])
                     self.assertNotIn("fixture-token", failure_path.read_text())
-                    self.assertFalse(list(evidence.rglob("deepseek-v2-receipt-*.json")))
+                    if category != "SCHEMA_VALIDATION_FAILED":
+                        self.assertFalse(list(evidence.rglob("deepseek-v2-receipt-*.json")))
 
     def test_commit_last_receipt_and_exact_source_validation(self):
         self._exercise_receipt()
