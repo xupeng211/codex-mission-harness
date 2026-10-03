@@ -589,6 +589,47 @@ class ResourceGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ResourceGateDenied, "provider independent call budget"):
             self.call("deepseek")
 
+    def test_signed_qualification_scope_enforces_provider_prompt_order_and_four_calls(self):
+        parent = self.root / "parent-authorization.json"
+        self.payload["providers"]["deepseek"]["token_limit"] = {
+            key: 100 for key in ("input", "cache", "output", "reasoning")}
+        self.payload["providers"]["deepseek"]["cost_limit_microunits"] = 50
+        private(parent, sign_authorization(self.payload, self.key.read_bytes()))
+        prompts = [f"case-{i}".encode() for i in range(4)]
+        self.payload.update({
+            "authorization_id": "bounded-qualification-only",
+            "approval_source": "SYNTHETIC_ONE_ATTEMPT_APPROVAL",
+            "previous_authorization_sha256": digest(parent.read_bytes()),
+            "execution_scope_parent_path": str(parent),
+            "execution_scope_parent_sha256": digest(parent.read_bytes()),
+            "execution_scope": {
+                "version": "cmh-one-qualification/v1", "provider": "deepseek",
+                "model": "deepseek-flash", "stage": "qualification-case",
+                "baseline_calls": 1,
+                "baseline_requests_sha256": digest(canonical(self.history)),
+                "max_new_calls": 4, "run_id": "run-a",
+                "prompt_sha256_in_order": [digest(p) for p in prompts]}})
+        self.publish()
+        self.env["CMH_RESOURCE_AUTH_SHA256"] = digest(self.approval.read_bytes())
+        before = self.ledger.read_bytes()
+        for provider, model, prompt, stage in (("openai", "gpt-5.6-sol", prompts[0], "qualification-case"),
+                                               ("deepseek", "deepseek-flash", prompts[1], "qualification-case"),
+                                               ("deepseek", "deepseek-flash", prompts[0], "chunk-000")):
+            with self.assertRaises(ResourceGateDenied):
+                reserve(provider=provider, model=model, prompt=prompt,
+                        stage=stage, environment=self.env)
+        self.assertEqual(self.ledger.read_bytes(), before)
+        for prompt in prompts:
+            reservation = reserve(provider="deepseek", model="deepseek-flash",
+                                  prompt=prompt, stage="qualification-case", environment=self.env)
+            reservation.observe({"tokens": {"input": 1, "cache": 0, "output": 1, "reasoning": 0},
+                                 "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                                 "cli_reported_cost_microunits": 1})
+            reservation.settle("RETURNED")
+        with self.assertRaises(ResourceGateDenied):
+            reserve(provider="deepseek", model="deepseek-flash", prompt=prompts[0],
+                    stage="qualification-case", environment=self.env)
+
     def test_request_286_exception_requires_exact_signed_row_and_does_not_cover_future_overage(self):
         old = self.rows()
         old.extend({"number": i, "provider": "deepseek", "status": "FAILED"}

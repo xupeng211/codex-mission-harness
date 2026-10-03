@@ -97,6 +97,35 @@ def _authorization(path: Path, key_path: Path, approval_sha256: str) -> dict:
             value.get("baseline_calls") != approved.get("calls_used") or
             value.get("baseline_ledger_sha256") != call_wall.get("before", {}).get("ledger_sha256")):
         raise ResourceGateDenied("ordinary configuration cannot raise call/wall hard limits")
+    scope = value.get("execution_scope")
+    if scope is not None:
+        parent_path = Path(value.get("execution_scope_parent_path", ""))
+        parent_sha = value.get("execution_scope_parent_sha256")
+        if parent_path == path or not isinstance(parent_sha, str):
+            raise ResourceGateDenied("scoped authorization parent invalid")
+        parent = _authorization(parent_path, key_path, parent_sha)
+        if parent.get("execution_scope") is not None:
+            raise ResourceGateDenied("nested execution scope prohibited")
+        allowed_changes = {"authorization_id", "approval_source", "approved_at_epoch",
+                           "previous_authorization_sha256", "execution_scope",
+                           "execution_scope_parent_path", "execution_scope_parent_sha256"}
+        if any(value.get(k) != parent.get(k) for k in set(value) | set(parent)
+               if k not in allowed_changes):
+            raise ResourceGateDenied("scoped authorization changed existing resource contract")
+        if (not isinstance(scope, dict) or scope.get("version") != "cmh-one-qualification/v1" or
+                scope.get("provider") != "deepseek" or
+                scope.get("stage") != "qualification-case" or
+                scope.get("model") != value["providers"]["deepseek"]["model"] or
+                type(scope.get("baseline_calls")) is not int or
+                type(scope.get("max_new_calls")) is not int or
+                scope.get("max_new_calls") != 4 or
+                not isinstance(scope.get("run_id"), str) or not scope["run_id"] or
+                not isinstance(scope.get("baseline_requests_sha256"), str) or
+                not isinstance(scope.get("prompt_sha256_in_order"), list) or
+                len(scope["prompt_sha256_in_order"]) != 4 or
+                any(not isinstance(item, str) or not re.fullmatch(r"[0-9a-f]{64}", item)
+                    for item in scope["prompt_sha256_in_order"])):
+            raise ResourceGateDenied("qualification execution scope invalid")
     return value
 
 
@@ -533,6 +562,20 @@ def reserve(*, provider: str, model: str, prompt: bytes, stage: str,
         if (frozen["frozen_calls"] < baseline or len(rows) < frozen["frozen_calls"] or
                 digest(canonical(rows[:frozen["frozen_calls"]])) != frozen["frozen_requests_sha256"]):
             raise ResourceGateDenied("frozen request history differs from signed checkpoint")
+        scope = auth.get("execution_scope")
+        if scope is not None:
+            scope_start = scope["baseline_calls"]
+            if (len(rows) < scope_start or
+                    digest(canonical(rows[:scope_start])) != scope["baseline_requests_sha256"] or
+                    len(rows) - scope_start >= scope["max_new_calls"] or
+                    provider != scope["provider"] or model != scope["model"] or
+                    stage != scope["stage"] or env["CMH_RESOURCE_RUN_ID"] != scope["run_id"] or
+                    digest(prompt) != scope["prompt_sha256_in_order"][len(rows) - scope_start] or
+                    any(row.get("authorization_sha256") != env["CMH_RESOURCE_AUTH_SHA256"] or
+                        row.get("run_id") != scope["run_id"] or
+                        row.get("stage") != scope["stage"]
+                        for row in rows[scope_start:])):
+                raise ResourceGateDenied("bounded qualification scope or prompt order mismatch")
         # The historical stop is mission-wide: the same signed disposition
         # must be checked before either provider can resume.
         recovery_lane = auth.get("providers", {}).get("deepseek", {})

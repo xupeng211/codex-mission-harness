@@ -109,8 +109,44 @@ class QualificationEvidence:
             "stderr_sha256": hashlib.sha256(stderr).hexdigest()}, sort_keys=True).encode())
 
     def record_case(self, case_name: str, record: dict):
+        reservation = self.directory / (case_name + ".reservation.json")
+        if reservation.exists():
+            details = json.loads(reservation.read_bytes())
+            record["resource_request_id"] = details["request_id"]
+            ledger_path = os.environ.get("CMH_RESOURCE_LEDGER")
+            if ledger_path:
+                rows = json.loads(Path(ledger_path).read_bytes()).get("requests", [])
+                matching = [row for row in rows if row.get("request_id") == details["request_id"]]
+                if len(matching) == 1:
+                    record["resource_request_number"] = matching[0]["number"]
+                    record["invocation_usage"] = matching[0].get("reported_usage")
+                    record["resource_status"] = matching[0].get("status")
         self._write(case_name + ".json", json.dumps(record, sort_keys=True,
                                                      ensure_ascii=False).encode() + b"\n")
+        files = sorted(path for path in self.directory.iterdir()
+                       if path.is_file() and path.name != "checkpoint.json")
+        checkpoint = {"version": "cmh-qualification-diagnostics/v1",
+                      "files": {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                                for path in files}, "last_case": case_name,
+                      "last_verdict": record["verdict"]}
+        pending = self.directory / ".checkpoint.pending"
+        descriptor = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(json.dumps(checkpoint, sort_keys=True).encode() + b"\n")
+            stream.flush(); os.fsync(stream.fileno())
+        os.replace(pending, self.directory / "checkpoint.json")
+        directory_fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def capture_reservation(self, case_name: str, request_id: str):
+        self._write(case_name + ".reservation.json",
+                    json.dumps({"request_id": request_id}, sort_keys=True).encode() + b"\n")
+
+    def capture_prompt(self, case_name: str, prompt: str):
+        self._write(case_name + ".prompt", prompt.encode("utf-8"))
 
 
 @dataclass(frozen=True)
@@ -137,6 +173,8 @@ def _evaluate_cases(spec: ModelSpec, invoke: Callable[[ModelSpec, str], str], *,
     passed, failed, hashes = [], [], []
     for index, case in enumerate(CASES):
         prompt = qualification_prompt(case)
+        if evidence is not None:
+            evidence.capture_prompt(case.name, prompt)
         record = {"case_id": case.name, "model_identity": spec.identity(), "mode": mode,
                   "prompt": prompt, "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
                   "source": case.source, "expected_findings": expected_findings(case),
@@ -171,7 +209,7 @@ def _evaluate_cases(spec: ModelSpec, invoke: Callable[[ModelSpec, str], str], *,
             # One failed provider invocation already invalidates the whole
             # certificate. Do not repeat an auth failure or stalled turn for
             # every remaining fixture.
-            failed.extend(item.name for item in CASES[index:])
+            failed.append(case.name)
             break
         except ResourceGateDenied:
             raise
@@ -179,6 +217,13 @@ def _evaluate_cases(spec: ModelSpec, invoke: Callable[[ModelSpec, str], str], *,
             record["exact_failure_reason"] = str(exc)
             record["error_class"] = type(exc).__name__
             failed.append(case.name)
+            if mode == "real_provider":
+                break
+        except (KeyboardInterrupt, SystemExit) as exc:
+            record["failure_phase"] = "INTERRUPTED"
+            record["error_class"] = type(exc).__name__
+            record["exact_failure_reason"] = "qualification interrupted"
+            raise
         else:
             record["failure_phase"] = None
             record["verdict"] = "PASS"
@@ -289,11 +334,14 @@ def _actual_provider_invoke_unmetered(spec: ModelSpec, prompt: str, *, token: st
 
 
 def _actual_provider_invoke(spec: ModelSpec, prompt: str, *, token: str | None,
-                            timeout: int, transport_sink=None) -> str | InvocationResult:
+                            timeout: int, transport_sink=None,
+                            reservation_sink=None) -> str | InvocationResult:
     # Codex's lower-level invocation sees the active reservation and does not
     # append a second logical call for the same qualification case.
     with model_request(provider=spec.provider, model=spec.model, prompt=prompt.encode(),
                        stage="qualification-case") as reservation:
+        if reservation_sink is not None:
+            reservation_sink(reservation.request_id)
         result = _actual_provider_invoke_unmetered(spec, prompt, token=token, timeout=timeout,
                                                    transport_sink=transport_sink)
         if isinstance(result, InvocationResult):
@@ -321,7 +369,11 @@ def qualify_live(spec: ModelSpec, *, token_file: str | Path | None = None,
                                transport_sink=(lambda stdout, stderr, code:
                                    evidence.capture_transport(next(case.name for case in CASES
                                        if qualification_prompt(case) == prompt), stdout, stderr, code))
-                               if evidence is not None and actual.provider == "deepseek" else None),
+                               if evidence is not None and actual.provider == "deepseek" else None,
+                               reservation_sink=(lambda request_id:
+                                   evidence.capture_reservation(next(case.name for case in CASES
+                                       if qualification_prompt(case) == prompt), request_id))
+                               if evidence is not None else None),
                            mode="real_provider", evidence=evidence)
 
 

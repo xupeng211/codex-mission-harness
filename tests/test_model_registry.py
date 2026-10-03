@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -6,7 +7,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness.model_qualification import (CASES, QualificationResult, expected_findings,
+                                         qualification_prompt,
                                          evaluate_cases, qualification_receipt, QualificationEvidence,
+                                         _evaluate_cases,
                                          _actual_provider_invoke_unmetered,
                                          validate_qualification_receipt,
                                          require_builder_qualification)
@@ -208,6 +211,43 @@ class QualificationContractTests(unittest.TestCase):
             self.assertEqual((root / "diagnostics" / "clean.stdout").read_bytes(), envelope.encode())
             self.assertEqual((root / "diagnostics" / "clean.stderr").read_bytes(), b"fixture-stderr")
 
+    def test_failed_cli_partial_output_and_request_usage_are_durable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); root.chmod(0o700)
+            fake = root / "fixture-failing-launcher"
+            fake.write_text("#!/usr/bin/python3\nimport sys\n"
+                            "sys.stdout.write('partial model output')\n"
+                            "sys.stderr.write('synthetic CLI failure')\n"
+                            "raise SystemExit(1)\n")
+            fake.chmod(0o700)
+            evidence = QualificationEvidence(root / "diagnostics")
+            ledger = root / "ledger.json"
+            ledger.write_text(json.dumps({"requests": [{"number": 295,
+                "request_id": "synthetic-295", "status": "FAILED",
+                "reported_usage": {"tokens": {"input": 3, "output": 5}}}]}))
+            with patch("harness.model_registry.trusted_claude_launcher",
+                       return_value=(str(fake), "/usr/bin")), \
+                 patch.dict("os.environ", {"CMH_RESOURCE_LEDGER": str(ledger)}):
+                evidence.capture_prompt("clean", qualification_prompt(CASES[0]))
+                evidence.capture_reservation("clean", "synthetic-295")
+                with self.assertRaises(RuntimeError):
+                    _actual_provider_invoke_unmetered(
+                        load_registry().role("independent_reviewer"),
+                        qualification_prompt(CASES[0]), token="synthetic-fixture-token",
+                        timeout=5, transport_sink=lambda stdout, stderr, code:
+                            evidence.capture_transport("clean", stdout, stderr, code))
+                evidence.record_case("clean", {"case_id": "clean", "verdict": "FAIL",
+                    "exact_failure_reason": "DeepSeek model qualification provider call failed"})
+            record = json.loads((root / "diagnostics" / "clean.json").read_text())
+            self.assertEqual(record["resource_request_number"], 295)
+            self.assertEqual(record["invocation_usage"]["tokens"]["output"], 5)
+            self.assertEqual((root / "diagnostics" / "clean.stdout").read_bytes(),
+                             b"partial model output")
+            self.assertEqual((root / "diagnostics" / "clean.stderr").read_bytes(),
+                             b"synthetic CLI failure")
+            checkpoint = json.loads((root / "diagnostics" / "checkpoint.json").read_text())
+            self.assertIn("clean.transport.json", checkpoint["files"])
+
     def test_diagnostic_binds_structured_response_to_usage_and_request(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); root.chmod(0o700)
@@ -228,7 +268,7 @@ class QualificationContractTests(unittest.TestCase):
             raise InvocationFailure("AUTHENTICATION_FAILURE", "auth failed", {})
         result = evaluate_cases(load_registry().role("final_reviewer"), fail_once)
         self.assertEqual(len(calls), 1)
-        self.assertEqual(result.cases_failed, tuple(case.name for case in CASES))
+        self.assertEqual(result.cases_failed, ("clean",))
 
     def test_provider_timeout_is_a_failed_qualification_case(self):
         def timeout(_spec, _prompt):
@@ -236,6 +276,60 @@ class QualificationContractTests(unittest.TestCase):
         result = evaluate_cases(load_registry().role("independent_reviewer"), timeout)
         self.assertFalse(result.passed)
         self.assertEqual(result.cases_failed, tuple(case.name for case in CASES))
+
+    def test_real_qualification_failures_stop_and_leave_private_hashed_checkpoint(self):
+        false_finding = {"severity": "P1", "title": "Invented blocker", "evidence": "No support"}
+        scenarios = [
+            ("false_clean", lambda case: self.raw([], findings=[false_finding])),
+            ("missed_blocker", lambda case: self.raw([])),
+            ("schema_invalid", lambda case: '{"decisions":"wrong"}'),
+            ("parser_exception", lambda case: 'not-json'),
+            ("cli_incomplete", lambda case: (_ for _ in ()).throw(RuntimeError("partial CLI output"))),
+            ("source_binding", lambda case: self.raw([self.decision(
+                expected_findings(case)[0]["finding_id"], "DISPUTED",
+                source_quote="not in source")]) if case.name == "single_blocker" else self.raw([])),
+        ]
+        for label, response in scenarios:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary); root.chmod(0o700)
+                evidence = QualificationEvidence(root / "diagnostics")
+                calls = []
+                def invoke(_spec, prompt):
+                    case = next(item for item in CASES if qualification_prompt(item) == prompt)
+                    calls.append(case.name)
+                    return response(case)
+                # Skip clean only for the blocker and binding cases; a synthetic
+                # clean response is supplied to reach the intended fixture.
+                if label in ("missed_blocker", "source_binding"):
+                    original = invoke
+                    def invoke(_spec, prompt):
+                        case = next(item for item in CASES if qualification_prompt(item) == prompt)
+                        return self.raw([]) if case.name == "clean" else original(_spec, prompt)
+                result = _evaluate_cases(load_registry().role("independent_reviewer"), invoke,
+                                         mode="real_provider", evidence=evidence)
+                self.assertFalse(result.passed)
+                self.assertLessEqual(len(calls), 2)
+                self.assertEqual(len(result.cases_failed), 1)
+                checkpoint = json.loads((root / "diagnostics" / "checkpoint.json").read_text())
+                for filename, sha in checkpoint["files"].items():
+                    self.assertEqual(hashlib.sha256((root / "diagnostics" / filename).read_bytes()).hexdigest(), sha)
+                failed = json.loads((root / "diagnostics" /
+                                     (result.cases_failed[0] + ".json")).read_text())
+                self.assertIsNotNone(failed["exact_failure_reason"])
+                self.assertTrue((root / "diagnostics" /
+                                 (result.cases_failed[0] + ".prompt")).exists())
+
+    def test_interrupted_qualification_preserves_checkpoint_before_reraising(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); root.chmod(0o700)
+            evidence = QualificationEvidence(root / "diagnostics")
+            with self.assertRaises(KeyboardInterrupt):
+                _evaluate_cases(load_registry().role("independent_reviewer"),
+                                lambda _spec, _prompt: (_ for _ in ()).throw(KeyboardInterrupt()),
+                                mode="real_provider", evidence=evidence)
+            record = json.loads((root / "diagnostics" / "clean.json").read_text())
+            self.assertEqual(record["failure_phase"], "INTERRUPTED")
+            self.assertTrue((root / "diagnostics" / "checkpoint.json").exists())
 
     def test_provider_errors_are_not_format_retries(self):
         for message, expected in (("HTTP 401", ReviewFailureClassification.AUTHENTICATION_FAILURE),
