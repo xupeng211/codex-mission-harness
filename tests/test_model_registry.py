@@ -10,7 +10,7 @@ from harness.model_qualification import (CASES, QualificationResult, expected_fi
                                          _actual_provider_invoke_unmetered,
                                          validate_qualification_receipt,
                                          require_builder_qualification)
-from harness.openai_invocation import InvocationFailure, canonical_environment
+from harness.openai_invocation import InvocationFailure, InvocationResult, canonical_environment
 from trusted_invocation_fixture import canonical_fixture
 from harness.model_registry import load_registry, preflight, trusted_claude_launcher
 from harness.review_failures import ReviewFailureClassification, classify_process_failure
@@ -207,6 +207,19 @@ class QualificationContractTests(unittest.TestCase):
             self.assertEqual(json.loads(result.response)["findings"], [])
             self.assertEqual((root / "diagnostics" / "clean.stdout").read_bytes(), envelope.encode())
             self.assertEqual((root / "diagnostics" / "clean.stderr").read_bytes(), b"fixture-stderr")
+
+    def test_diagnostic_binds_structured_response_to_usage_and_request(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); root.chmod(0o700)
+            evidence = QualificationEvidence(root / "diagnostics")
+            usage = {"input_tokens": 4, "output_tokens": 7}
+            evaluate_cases(load_registry().role("independent_reviewer"),
+                           lambda _spec, _prompt: InvocationResult(
+                               self.raw([]), {"resource_request_id": "synthetic-request",
+                                              "usage": usage}), evidence=evidence)
+            record = json.loads((root / "diagnostics" / "clean.json").read_text())
+            self.assertEqual(record["resource_request_id"], "synthetic-request")
+            self.assertEqual(record["invocation_usage"], usage)
 
     def test_provider_invocation_failure_stops_remaining_qualification_calls(self):
         calls = []

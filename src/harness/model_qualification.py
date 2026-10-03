@@ -142,6 +142,7 @@ def _evaluate_cases(spec: ModelSpec, invoke: Callable[[ModelSpec, str], str], *,
                   "source": case.source, "expected_findings": expected_findings(case),
                   "expected_decisions": case.expected, "structured_output_raw": None,
                   "structured_output_sha256": None, "parsed_result": None,
+                  "resource_request_id": None, "invocation_usage": None,
                   "parser_result": "UNKNOWN", "source_binding_result": "UNKNOWN",
                   "failure_phase": None,
                   "exact_failure_reason": None, "verdict": "FAIL"}
@@ -149,6 +150,8 @@ def _evaluate_cases(spec: ModelSpec, invoke: Callable[[ModelSpec, str], str], *,
             record["failure_phase"] = "INVOCATION"
             raw = invoke(spec, prompt)
             if isinstance(raw, InvocationResult):
+                record["resource_request_id"] = raw.evidence.get("resource_request_id")
+                record["invocation_usage"] = raw.evidence.get("usage")
                 raw = raw.response
             record["structured_output_raw"] = raw
             record["structured_output_sha256"] = hashlib.sha256(raw.encode()).hexdigest()
@@ -299,6 +302,8 @@ def _actual_provider_invoke(spec: ModelSpec, prompt: str, *, token: str | None,
                 from .resource_gate import normalize_deepseek_usage
                 reservation.observe(normalize_deepseek_usage(
                     usage, result.evidence.get("cli_reported_cost_usd")))
+            return InvocationResult(result.response, dict(result.evidence,
+                                                         resource_request_id=reservation.request_id))
         return result
 
 
