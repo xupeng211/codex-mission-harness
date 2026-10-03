@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import stat
 import time
 import uuid
@@ -179,6 +180,65 @@ def _limits(value: dict, provider: str, model: str) -> dict:
                 type(price) is not int or price <= 0 for price in prices.values()):
             raise ResourceGateDenied("DeepSeek cost estimate requires an authorized price table")
     return lane
+
+
+def _stage_reservation(lane: dict, provider: str, stage: str) -> dict:
+    """Select a signed reservation using the runner's stage, never model output."""
+    if provider != "deepseek" or "stage_token_reservation" not in lane:
+        return lane["token_reservation"]
+    if stage == "qualification-case" or re.fullmatch(r"chunk-[0-9]{3}\.json", stage):
+        kind = "chunk_or_qualification"
+    elif re.fullmatch(r"group-[0-9]{3}\.json", stage) or stage == "aggregate.json":
+        kind = "group_or_cross_group"
+    else:
+        raise ResourceGateDenied("unrecognized DeepSeek review stage")
+    stages = lane["stage_token_reservation"]
+    if set(stages) != {"chunk_or_qualification", "group_or_cross_group"}:
+        raise ResourceGateDenied("stage token contract incomplete")
+    selected = stages[kind]
+    if set(selected) != {"input", "cache", "output", "reasoning"} or any(
+            type(v) is not int or v <= 0 for v in selected.values()):
+        raise ResourceGateDenied("stage token reservation invalid")
+    if stages["chunk_or_qualification"] != lane["token_reservation"]:
+        raise ResourceGateDenied("chunk reservation differs from base contract")
+    return selected
+
+
+def _approved_token_recovery(auth: dict, rows: list[dict], key_path: Path) -> set[int]:
+    name, expected_hash = auth.get("token_recovery_path"), auth.get("token_recovery_sha256")
+    if name is None and expected_hash is None:
+        return set()
+    if not isinstance(name, str) or not Path(name).is_absolute() or not isinstance(expected_hash, str):
+        raise ResourceGateDenied("token recovery evidence missing")
+    raw = _private(Path(name))
+    if digest(raw) != expected_hash:
+        raise ResourceGateDenied("token recovery evidence hash changed")
+    evidence = json.loads(raw)
+    signature = evidence.pop("authorization_hmac_sha256", None)
+    expected = hmac.new(_private(key_path), canonical(evidence), hashlib.sha256).hexdigest()
+    if not isinstance(signature, str) or not hmac.compare_digest(signature, expected):
+        raise ResourceGateDenied("token recovery signature invalid")
+    if (evidence.get("version") != "cmh-request286-token-recovery/v1" or
+            evidence.get("mission_id") != auth.get("mission_id") or
+            evidence.get("authorization_id") != auth.get("authorization_id") or
+            evidence.get("request_number") != 286 or len(rows) < 286 or
+            evidence.get("first_286_rows_sha256") != digest(canonical(rows[:286])) or
+            evidence.get("original_ledger_sha256") != auth.get("request286_original_ledger_sha256") or
+            evidence.get("row_286_sha256") != digest(canonical(rows[285])) or
+            evidence.get("refund") != 0 or evidence.get("retain_original_overage") is not True or
+            evidence.get("source_binding_result") != "FAILED_MODEL_OUTPUT_ERROR"):
+        raise ResourceGateDenied("request 286 token recovery identity invalid")
+    row = rows[285]
+    if (row.get("provider") != "deepseek" or row.get("model") != "deepseek-flash" or
+            row.get("stage") != "group-000.json" or row.get("status") != "RETURNED" or
+            row.get("request_id") != evidence.get("request_id") or
+            row.get("usage_accounting") != "OVER_RESERVATION_BLOCK_FUTURE_CALLS" or
+            row.get("token_reservation") != {"input": 64000, "cache": 64000,
+                                              "output": 128000, "reasoning": 128000} or
+            row.get("reported_usage", {}).get("tokens") != {"input": 47636, "cache": 132096,
+                                                             "output": 130294, "reasoning": 0}):
+        raise ResourceGateDenied("request 286 original overage changed")
+    return {286}
 
 
 def _approved_billing_recovery(auth: dict, lane: dict, frozen: dict,
@@ -459,6 +519,7 @@ def reserve(*, provider: str, model: str, prompt: bytes, stage: str,
     frozen = _frozen_prefix(Path(env["CMH_RESOURCE_FREEZE"]), key_path,
                             env["CMH_RESOURCE_FREEZE_SHA256"], auth["mission_id"], ledger_path)
     lane = _limits(auth, provider, model)
+    reservation = _stage_reservation(lane, provider, stage)
     lock = ledger_path.with_name(ledger_path.name + ".lock")
     with _locked(lock):
         ledger = json.loads(_private(ledger_path))
@@ -478,6 +539,7 @@ def reserve(*, provider: str, model: str, prompt: bytes, stage: str,
         if recovery_lane.get("cli_cost_policy") is not None:
             _limits(auth, "deepseek", recovery_lane.get("model"))
         permitted = _approved_billing_recovery(auth, recovery_lane, frozen, rows, key_path)
+        permitted |= _approved_token_recovery(auth, rows, key_path)
         if any(row.get("status") in {"STARTED", "UNKNOWN"} or
                row.get("usage_accounting") == "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS" or
                (row.get("usage_accounting") == "OVER_RESERVATION_BLOCK_FUTURE_CALLS" and
@@ -495,8 +557,11 @@ def reserve(*, provider: str, model: str, prompt: bytes, stage: str,
                 time.time() - _conservative_wall_start(auth) >= auth.get("max_wall_clock_seconds", -1)):
             raise ResourceGateDenied("logical-call or wall-clock hard stop reached")
         prior = [row for row in rows[baseline:] if row.get("provider") == provider]
+        if "max_new_calls" in lane and (type(lane["max_new_calls"]) is not int or
+                                        len(prior) >= lane["max_new_calls"]):
+            raise ResourceGateDenied("provider independent call budget exhausted")
         for category, cap in lane["token_limit"].items():
-            if sum(row["token_reservation"][category] for row in prior) + lane["token_reservation"][category] > cap:
+            if sum(row["token_reservation"][category] for row in prior) + reservation[category] > cap:
                 raise ResourceGateDenied("provider token budget exhausted: " + category)
         if sum(row["cost_reservation_microunits"] for row in prior) + lane["cost_reservation_microunits"] > lane["cost_limit_microunits"]:
             raise ResourceGateDenied("provider cost budget exhausted")
@@ -508,7 +573,7 @@ def reserve(*, provider: str, model: str, prompt: bytes, stage: str,
                          "stage": stage, "run_id": env["CMH_RESOURCE_RUN_ID"],
                          "prompt_sha256": digest(prompt)})), "prompt_sha256": digest(prompt),
                      "input_bytes": len(prompt), "started_epoch": time.time(), "status": "STARTED",
-                     "token_reservation": lane["token_reservation"],
+                     "token_reservation": reservation,
                      "cost_reservation_microunits": lane["cost_reservation_microunits"],
                      "cost_unit": lane["cost_unit"], "usage_accounting": "FULL_RESERVATION_RETAINED"})
         if provider == "deepseek":

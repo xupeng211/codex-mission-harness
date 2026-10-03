@@ -555,6 +555,86 @@ class ResourceGateTests(unittest.TestCase):
             self.call()
         self.assertEqual(len(self.rows()), 1)
 
+    def test_signed_stage_contract_selects_exact_deepseek_reservations(self):
+        lane = self.payload["providers"]["deepseek"]
+        lane["stage_token_reservation"] = {
+            "chunk_or_qualification": dict(lane["token_reservation"]),
+            "group_or_cross_group": {"input": 10, "cache": 20, "output": 20, "reasoning": 10}}
+        lane["token_limit"] = {key: 100 for key in lane["token_limit"]}
+        lane["cost_limit_microunits"] = 100
+        self.publish(); self.env["CMH_RESOURCE_AUTH_SHA256"] = digest(self.approval.read_bytes())
+        for stage, expected_cache in (("qualification-case", 10), ("chunk-000.json", 10),
+                                      ("group-000.json", 20), ("aggregate.json", 20)):
+            r = reserve(provider="deepseek", model="deepseek-flash", prompt=b"fixture",
+                        stage=stage, environment=self.env)
+            self.assertEqual(self.rows()[-1]["token_reservation"]["cache"], expected_cache)
+            r.observe({"tokens": {"input": 1, "cache": 0, "output": 1, "reasoning": 0},
+                       "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                       "cli_reported_cost_microunits": 1})
+            r.settle("RETURNED")
+        before = len(self.rows())
+        with self.assertRaisesRegex(ResourceGateDenied, "unrecognized DeepSeek review stage"):
+            reserve(provider="deepseek", model="deepseek-flash", prompt=b"fixture",
+                    stage="group-forged", environment=self.env)
+        self.assertEqual(len(self.rows()), before)
+
+    def test_independent_provider_call_cap(self):
+        self.payload["providers"]["deepseek"]["max_new_calls"] = 1
+        self.publish(); self.env["CMH_RESOURCE_AUTH_SHA256"] = digest(self.approval.read_bytes())
+        first = self.call("deepseek")
+        first.observe({"tokens": {"input": 1, "cache": 0, "output": 1, "reasoning": 0},
+                       "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                       "cli_reported_cost_microunits": 1})
+        first.settle("RETURNED")
+        with self.assertRaisesRegex(ResourceGateDenied, "provider independent call budget"):
+            self.call("deepseek")
+
+    def test_request_286_exception_requires_exact_signed_row_and_does_not_cover_future_overage(self):
+        old = self.rows()
+        old.extend({"number": i, "provider": "deepseek", "status": "FAILED"}
+                   for i in range(2, 286))
+        row = {"number": 286, "provider": "deepseek", "model": "deepseek-flash",
+               "stage": "group-000.json", "request_id": "original-286", "status": "RETURNED",
+               "usage_accounting": "OVER_RESERVATION_BLOCK_FUTURE_CALLS",
+               "token_reservation": {"input": 64000, "cache": 64000,
+                                     "output": 128000, "reasoning": 128000},
+               "reported_usage": {"tokens": {"input": 47636, "cache": 132096,
+                                              "output": 130294, "reasoning": 0}}}
+        old.append(row)
+        private(self.ledger, {"requests": old})
+        self.payload["baseline_ledger_sha256"] = digest(self.ledger.read_bytes())
+        self.payload["request286_original_ledger_sha256"] = digest(self.ledger.read_bytes())
+        self.payload["max_logical_model_calls"] = 300
+        self.payload["providers"]["openai"]["max_new_calls"] = 5
+        wall = json.loads(self.call_wall.read_text())
+        wall["before"]["ledger_sha256"] = self.payload["baseline_ledger_sha256"]
+        wall["after"].update(max_logical_model_calls=300)
+        private(self.call_wall, wall)
+        self.payload["call_wall_authorization_sha256"] = digest(self.call_wall.read_bytes())
+        self.freeze_current_history()
+        self.env["CMH_RESOURCE_FREEZE_SHA256"] = digest(self.freeze.read_bytes())
+        self.publish(); self.env["CMH_RESOURCE_AUTH_SHA256"] = digest(self.approval.read_bytes())
+        with self.assertRaisesRegex(ResourceGateDenied, "unreconciled"):
+            self.call()
+        disposition = self.root / "request-286-disposition.json"
+        evidence = {"version": "cmh-request286-token-recovery/v1", "mission_id": "mission-a",
+                    "authorization_id": self.payload["authorization_id"], "request_number": 286,
+                    "request_id": "original-286", "first_286_rows_sha256": digest(canonical(old)),
+                    "original_ledger_sha256": self.payload["baseline_ledger_sha256"],
+                    "row_286_sha256": digest(canonical(row)), "refund": 0,
+                    "retain_original_overage": True,
+                    "source_binding_result": "FAILED_MODEL_OUTPUT_ERROR"}
+        private(disposition, sign_authorization(evidence, self.key.read_bytes()))
+        self.payload.update(token_recovery_path=str(disposition),
+                            token_recovery_sha256=digest(disposition.read_bytes()))
+        self.publish(); self.env["CMH_RESOURCE_AUTH_SHA256"] = digest(self.approval.read_bytes())
+        next_call = self.call(); next_call.settle("RETURNED")
+        self.assertEqual(self.rows()[285], row)
+        later = self.rows(); later[-1]["usage_accounting"] = "OVER_RESERVATION_BLOCK_FUTURE_CALLS"
+        private(self.ledger, {"requests": later})
+        with self.assertRaisesRegex(ResourceGateDenied, "unreconciled"):
+            self.call()
+
 
 if __name__ == "__main__":
     unittest.main()
