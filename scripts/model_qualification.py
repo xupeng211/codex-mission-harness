@@ -78,10 +78,13 @@ def main() -> int:
         parser.error("--auth-key-file is required (DeepSeek may reuse --token-file)")
     auth_key = read_private_token(Path(auth_path))
     os.environ["CMH_RESOURCE_RUN_ID"] = uuid.uuid4().hex
-    result = qualify_live(spec, token_file=args.token_file, timeout=args.timeout)
+    diagnostics = args.output.with_name(args.output.stem + '-diagnostics')
+    result = qualify_live(spec, token_file=args.token_file, timeout=args.timeout,
+                          evidence_dir=diagnostics)
     if not result.passed:
         print(json.dumps({"status": "FAIL", "identity": result.identity,
-                          "cases_failed": result.cases_failed}), file=sys.stderr)
+                          "cases_failed": result.cases_failed,
+                          "diagnostics": str(diagnostics)}), file=sys.stderr)
         return 1
     receipt = qualification_receipt(result, auth_key=auth_key, role=args.role,
                                     registry_path=args.registry)

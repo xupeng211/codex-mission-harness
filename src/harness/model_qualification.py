@@ -71,6 +71,48 @@ def qualification_prompt(case: QualificationCase) -> str:
             f"{json.dumps(expected_findings(case), sort_keys=True)}")
 
 
+class QualificationEvidence:
+    """Private, append-only raw evidence; never grants a qualification receipt."""
+
+    def __init__(self, directory: Path):
+        self.directory = Path(directory)
+        if not self.directory.is_absolute() or self.directory.is_symlink():
+            raise ValueError("qualification diagnostics require an absolute non-symlink path")
+        parent = self.directory.parent.stat()
+        if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o077:
+            raise ValueError("qualification diagnostic parent must be private")
+        self.directory.mkdir(mode=0o700)
+        info = self.directory.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or
+                stat.S_IMODE(info.st_mode) != 0o700):
+            raise ValueError("qualification diagnostics require a private directory")
+
+    def _write(self, name: str, data: bytes):
+        if name.split(".")[0] not in {case.name for case in CASES} or len(data) > 262_144:
+            raise ValueError("qualification diagnostic name or size invalid")
+        path = self.directory / name
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+
+    def capture_transport(self, case_name: str, stdout: bytes, stderr: bytes, returncode: int):
+        self._write(case_name + ".stdout", stdout)
+        self._write(case_name + ".stderr", stderr)
+        self._write(case_name + ".transport.json", json.dumps({
+            "returncode": returncode, "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+            "stderr_sha256": hashlib.sha256(stderr).hexdigest()}, sort_keys=True).encode())
+
+    def record_case(self, case_name: str, record: dict):
+        self._write(case_name + ".json", json.dumps(record, sort_keys=True,
+                                                     ensure_ascii=False).encode() + b"\n")
+
+
 @dataclass(frozen=True)
 class QualificationResult:
     identity: dict[str, str | None]
@@ -86,7 +128,7 @@ class QualificationResult:
 
 
 def _evaluate_cases(spec: ModelSpec, invoke: Callable[[ModelSpec, str], str], *,
-                    mode: str) -> QualificationResult:
+                    mode: str, evidence: QualificationEvidence | None = None) -> QualificationResult:
     """Evaluate responses from an invoker; injected invokers cannot certify a model.
 
     This function does not retry or substitute a model. A provider failure or
@@ -94,17 +136,35 @@ def _evaluate_cases(spec: ModelSpec, invoke: Callable[[ModelSpec, str], str], *,
     """
     passed, failed, hashes = [], [], []
     for index, case in enumerate(CASES):
+        prompt = qualification_prompt(case)
+        record = {"case_id": case.name, "model_identity": spec.identity(), "mode": mode,
+                  "prompt": prompt, "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                  "source": case.source, "expected_findings": expected_findings(case),
+                  "expected_decisions": case.expected, "structured_output_raw": None,
+                  "structured_output_sha256": None, "parsed_result": None,
+                  "parser_result": "UNKNOWN", "source_binding_result": "UNKNOWN",
+                  "failure_phase": None,
+                  "exact_failure_reason": None, "verdict": "FAIL"}
         try:
-            raw = invoke(spec, qualification_prompt(case))
+            record["failure_phase"] = "INVOCATION"
+            raw = invoke(spec, prompt)
             if isinstance(raw, InvocationResult):
                 raw = raw.response
+            record["structured_output_raw"] = raw
+            record["structured_output_sha256"] = hashlib.sha256(raw.encode()).hexdigest()
+            record["failure_phase"] = "PARSER_OR_SOURCE_BINDING"
             bound = parse_synthesis(raw, expected_findings(case), source=case.source.encode())
+            record["parsed_result"] = bound
+            record["parser_result"] = "PASS"
+            record["source_binding_result"] = "PASS"
+            record["failure_phase"] = "QUALIFICATION_VERDICT"
             decisions = {item["finding_id"]: item["decision"] for item in bound["decisions"]}
             expected = {expected_findings(case)[int(key[1:])-1]["finding_id"]: value
                         for key, value in case.expected.items()}
             if decisions != expected or bound["new_findings"]:
                 raise ValueError("semantic decision mismatch")
-        except InvocationFailure:
+        except InvocationFailure as exc:
+            record["exact_failure_reason"] = str(exc)
             # One failed provider invocation already invalidates the whole
             # certificate. Do not repeat an auth failure or stalled turn for
             # every remaining fixture.
@@ -112,18 +172,26 @@ def _evaluate_cases(spec: ModelSpec, invoke: Callable[[ModelSpec, str], str], *,
             break
         except ResourceGateDenied:
             raise
-        except (ValueError, RuntimeError, TimeoutError, subprocess.TimeoutExpired):
+        except (ValueError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as exc:
+            record["exact_failure_reason"] = str(exc)
+            record["error_class"] = type(exc).__name__
             failed.append(case.name)
         else:
+            record["failure_phase"] = None
+            record["verdict"] = "PASS"
             passed.append(case.name)
             hashes.append(hashlib.sha256(raw.encode("utf-8")).hexdigest())
+        finally:
+            if evidence is not None:
+                evidence.record_case(case.name, record)
     return QualificationResult(spec.identity(), mode, tuple(passed),
                                tuple(failed), tuple(hashes))
 
 
-def evaluate_cases(spec: ModelSpec, invoke: Callable[[ModelSpec, str], str]) -> QualificationResult:
+def evaluate_cases(spec: ModelSpec, invoke: Callable[[ModelSpec, str], str], *,
+                   evidence: QualificationEvidence | None = None) -> QualificationResult:
     """Exercise deterministic fixtures; this result can never certify a provider."""
-    return _evaluate_cases(spec, invoke, mode="deterministic_fixture")
+    return _evaluate_cases(spec, invoke, mode="deterministic_fixture", evidence=evidence)
 
 
 _SCHEMA = {"type": "object", "properties": {"decisions": {"type": "array", "items": {
@@ -141,7 +209,7 @@ _SCHEMA = {"type": "object", "properties": {"decisions": {"type": "array", "item
 
 
 def _actual_provider_invoke_unmetered(spec: ModelSpec, prompt: str, *, token: str | None,
-                            timeout: int) -> str | InvocationResult:
+                            timeout: int, transport_sink=None) -> str | InvocationResult:
     """One bounded, noninteractive call to the exact configured model."""
     with tempfile.TemporaryDirectory(prefix="cmh-model-qualification-") as temporary:
         root = Path(temporary)
@@ -192,10 +260,17 @@ def _actual_provider_invoke_unmetered(spec: ModelSpec, prompt: str, *, token: st
                     except ProcessLookupError:
                         pass
                     process.wait()
+                    if transport_sink is not None:
+                        output_file.seek(0); error_file.seek(0)
+                        transport_sink(output_file.read(128_001), error_file.read(128_001), process.returncode)
                     raise
                 output_file.seek(0)
                 output = output_file.read(128_001)
+                error_file.seek(0)
+                error = error_file.read(128_001)
                 returncode = process.returncode
+                if transport_sink is not None:
+                    transport_sink(output, error, returncode)
             if returncode:
                 raise RuntimeError("DeepSeek model qualification provider call failed")
             try:
@@ -211,12 +286,13 @@ def _actual_provider_invoke_unmetered(spec: ModelSpec, prompt: str, *, token: st
 
 
 def _actual_provider_invoke(spec: ModelSpec, prompt: str, *, token: str | None,
-                            timeout: int) -> str | InvocationResult:
+                            timeout: int, transport_sink=None) -> str | InvocationResult:
     # Codex's lower-level invocation sees the active reservation and does not
     # append a second logical call for the same qualification case.
     with model_request(provider=spec.provider, model=spec.model, prompt=prompt.encode(),
                        stage="qualification-case") as reservation:
-        result = _actual_provider_invoke_unmetered(spec, prompt, token=token, timeout=timeout)
+        result = _actual_provider_invoke_unmetered(spec, prompt, token=token, timeout=timeout,
+                                                   transport_sink=transport_sink)
         if isinstance(result, InvocationResult):
             usage = result.evidence.get("usage")
             if isinstance(usage, dict):
@@ -227,16 +303,21 @@ def _actual_provider_invoke(spec: ModelSpec, prompt: str, *, token: str | None,
 
 
 def qualify_live(spec: ModelSpec, *, token_file: str | Path | None = None,
-                 timeout: int = 120) -> QualificationResult:
+                 timeout: int = 120, evidence_dir: Path | None = None) -> QualificationResult:
     """Run actual provider calls after noninteractive auth validation."""
     from .model_registry import preflight, read_private_token
 
     preflight(spec, token_file=token_file)
     token = read_private_token(Path(token_file)) if token_file else None
+    evidence = QualificationEvidence(evidence_dir) if evidence_dir is not None else None
     return _evaluate_cases(spec,
                            lambda actual, prompt: _actual_provider_invoke(
-                               actual, prompt, token=token, timeout=timeout),
-                           mode="real_provider")
+                               actual, prompt, token=token, timeout=timeout,
+                               transport_sink=(lambda stdout, stderr, code:
+                                   evidence.capture_transport(next(case.name for case in CASES
+                                       if qualification_prompt(case) == prompt), stdout, stderr, code))
+                               if evidence is not None and actual.provider == "deepseek" else None),
+                           mode="real_provider", evidence=evidence)
 
 
 def qualification_receipt(result: QualificationResult, *, auth_key: str,

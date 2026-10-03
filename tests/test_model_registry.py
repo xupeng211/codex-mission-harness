@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness.model_qualification import (CASES, QualificationResult, expected_findings,
-                                         evaluate_cases, qualification_receipt,
+                                         evaluate_cases, qualification_receipt, QualificationEvidence,
                                          validate_qualification_receipt,
                                          require_builder_qualification)
 from harness.openai_invocation import InvocationFailure, canonical_environment
@@ -151,6 +151,38 @@ class QualificationContractTests(unittest.TestCase):
         result = evaluate_cases(spec, lambda _spec, _prompt: self.raw([]))
         self.assertFalse(result.passed)
         self.assertIn("single_blocker", result.cases_failed)
+
+    def test_failed_case_keeps_exact_raw_and_verdict_diagnostic(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); root.chmod(0o700)
+            evidence = QualificationEvidence(root / "diagnostics")
+            result = evaluate_cases(load_registry().role("independent_reviewer"),
+                                    lambda _spec, _prompt: self.raw([]), evidence=evidence)
+            self.assertFalse(result.passed)
+            case = json.loads((root / "diagnostics" / "single_blocker.json").read_text())
+            self.assertEqual(case["structured_output_raw"], self.raw([]))
+            self.assertEqual(case["exact_failure_reason"], "missing blocker disposition")
+            self.assertEqual(case["failure_phase"], "PARSER_OR_SOURCE_BINDING")
+            self.assertEqual((root / "diagnostics" / "single_blocker.json").stat().st_mode & 0o777, 0o600)
+            evidence.capture_transport("single_blocker", b'{"structured_output":{}}', b"cli-error", 0)
+            self.assertEqual((root / "diagnostics" / "single_blocker.stdout").read_bytes(),
+                             b'{"structured_output":{}}')
+            self.assertEqual((root / "diagnostics" / "single_blocker.stderr").read_bytes(), b"cli-error")
+
+    def test_false_clean_finding_is_recorded_as_verdict_failure(self):
+        false_finding = {"severity": "P1", "title": "Invented blocker", "evidence": "No support"}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); root.chmod(0o700)
+            evidence = QualificationEvidence(root / "diagnostics")
+            result = evaluate_cases(load_registry().role("independent_reviewer"),
+                                    lambda _spec, _prompt: self.raw([], findings=[false_finding]),
+                                    evidence=evidence)
+            self.assertIn("clean", result.cases_failed)
+            record = json.loads((root / "diagnostics" / "clean.json").read_text())
+            self.assertEqual(record["failure_phase"], "QUALIFICATION_VERDICT")
+            self.assertEqual(record["exact_failure_reason"], "semantic decision mismatch")
+            self.assertEqual(record["parser_result"], "PASS")
+            self.assertEqual(record["parsed_result"]["new_findings"], [false_finding])
 
     def test_provider_invocation_failure_stops_remaining_qualification_calls(self):
         calls = []
