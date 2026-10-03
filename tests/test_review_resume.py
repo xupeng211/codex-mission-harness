@@ -160,6 +160,9 @@ class ResumeTests(unittest.TestCase):
                          '{"decisions":[{"source_quote":"exact model bytes"}]}')
         self.assertEqual(run.state["next_stage"], "group-000")
         run.close()
+        resumed = self.open()
+        self.assertEqual(len(resumed.state["diagnostic_artifacts"]), 1)
+        resumed.close()
 
     def test_group_invocation_failure_marks_output_not_produced(self):
         run = self.open()
@@ -177,6 +180,7 @@ class ResumeTests(unittest.TestCase):
         stream = json.loads(transport.read_bytes())
         self.assertEqual(stream["stdout_base64"], "cGFydGlhbCBzdGRvdXQ=")
         self.assertFalse((run.path / "receipt.json").exists())
+        self.assertEqual(len(run.state["diagnostic_artifacts"]), 2)
         run.close()
 
     def test_cross_group_failure_append_only_and_private(self):

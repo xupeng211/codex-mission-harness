@@ -144,6 +144,7 @@ class ReviewRun:
                       "completed_chunk_ids": [], "completed_group_ids": [],
                       "cross_group_completed": False, "final_completed": False,
                       "receipt_written": False, "created_at": time.time_ns(),
+                      "diagnostic_artifacts": [],
                       "failure_count": 0, "last_failure": None,
                       "lease": {"pid": os.getpid(), "start_ticks": _start_ticks(), "run_id": run_id}}
         _atomic_state(self.fd, self.state)
@@ -172,6 +173,10 @@ class ReviewRun:
             raw = self.storage.read_private_artifact(self.fd, record["artifact_path"])
             if sha256(raw) != record.get("artifact_sha256") or sha256(raw) != record["output_hash"]:
                 raise ValueError("committed review artifact changed")
+        for diagnostic in self.state.get("diagnostic_artifacts", []):
+            raw = self.storage.read_private_artifact(self.fd, diagnostic["path"])
+            if sha256(raw) != diagnostic["sha256"]:
+                raise ValueError("review diagnostic artifact changed")
 
     def stage(self, name: str, kind: str, input_bytes: bytes, execute: Callable[[], bytes],
               validate: Callable[[bytes], object]) -> tuple[bytes, object]:
@@ -272,8 +277,16 @@ class ReviewRun:
                   "resource_run_id": self.state["review_run_id"]}
         rendered = canonical(record)
         self.storage.write_private_artifact(self.fd, label, rendered, uuid.uuid4().hex)
+        self._index_diagnostic(label, rendered)
         self.last_failed_raw_artifact = label
         self.last_failed_raw_sha256 = sha256(rendered)
+
+    def _index_diagnostic(self, label: str, rendered: bytes) -> None:
+        # If interrupted between the two fsyncs, the uniquely named private
+        # artifact remains discoverable but never becomes a completed stage.
+        self.state.setdefault("diagnostic_artifacts", []).append(
+            {"path": label, "sha256": sha256(rendered)})
+        _atomic_state(self.fd, self.state)
 
     def capture_transport(self, name: str, prompt: bytes, stdout: bytes | None,
                           stderr: bytes | None, *, secret_echo: bool = False) -> None:
@@ -293,6 +306,7 @@ class ReviewRun:
                   "resource_run_id": self.state["review_run_id"]}
         rendered = canonical(record)
         self.storage.write_private_artifact(self.fd, label, rendered, uuid.uuid4().hex)
+        self._index_diagnostic(label, rendered)
         self.last_transport_artifact = label
         self.last_transport_sha256 = sha256(rendered)
 
