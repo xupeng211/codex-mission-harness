@@ -558,7 +558,10 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
                    "artifact_sha256": artifact_hashes,
                    "invocation_evidence": dict(exc.evidence) if isinstance(exc, InvocationFailure) else {},
                    "recorded_at": int(time.time())}
-        if isinstance(exc, SourceBindingError) and os.environ.get("CMH_RESOURCE_STAGE", "").startswith("group-"):
+        current_stage = run_state.state.get("next_stage")
+        if (isinstance(exc, SourceBindingError)
+                and current_stage == os.environ.get("CMH_RESOURCE_STAGE")
+                and (current_stage, "group") in stage_plan):
             # One fresh answer for the same Group may correct a model-supplied
             # byte reference. ReviewRun keeps every committed prerequisite and
             # enforces the existing single retry limit.
