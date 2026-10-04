@@ -178,7 +178,7 @@ def _load(env, anchor, runtime, now, *, offline=False):
         if not offline and runtime['models']['openai'].get('reasoning_effort') != 'high':
             _deny('formal OpenAI reasoning contract must remain high')
         targets = auth['targets']
-        if (set(targets) != {'PR2', 'PR4'} or targets['PR4']['base'] != targets['PR2']['head']
+        if (set(targets) != {'PR2', 'PR4'}
                 or targets['PR4']['head'] != runtime['head']
                 or any(set(item) != {'base', 'head'} or any(not isinstance(v, str) or
                        not re.fullmatch('[0-9a-f]{40}', v) for v in item.values())
@@ -187,6 +187,7 @@ def _load(env, anchor, runtime, now, *, offline=False):
         if not offline:
             from .full_diff_manifest import git
             root = Path(__file__).resolve().parents[2]
+            git(root, 'merge-base', '--is-ancestor', targets['PR2']['head'], targets['PR4']['base'])
             for item in targets.values():
                 git(root, 'merge-base', '--is-ancestor', item['base'], item['head'])
         ledger = Path(auth['ledger_path'])
@@ -283,7 +284,37 @@ def _load(env, anchor, runtime, now, *, offline=False):
                     any(auth['providers'][p]['token_limit'][k] < token_minima[p][k] for k in CATEGORIES)
                     for p in minima):
                 _deny('authorization cannot cover qualification and both complete minimum reviews')
-        return dict(auth, _authorization_sha256=auth_hash, _history=history, _account=account)
+        lineage = [auth_hash]
+        current = auth
+        revision_fields = {'authorization_id', 'approved_at_epoch', 'user_approval_path',
+                           'user_approval_sha256', 'runtime', 'targets', 'account_evidence_path',
+                           'account_evidence_sha256', 'credential_identities',
+                           'previous_authorization_path', 'previous_authorization_sha256',
+                           'child_baseline_checkpoint_sha256'}
+        previous = None
+        while any(name in current for name in ('previous_authorization_path',
+                                               'previous_authorization_sha256',
+                                               'child_baseline_checkpoint_sha256')):
+            if len(lineage) >= 3:
+                _deny('at most two separately signed identity updates; further work needs human decision')
+            previous_hash = current['previous_authorization_sha256']
+            if previous_hash in lineage:
+                _deny('authorization lineage cycle')
+            prior = _signed(current['previous_authorization_path'], previous_hash, key)
+            if (current['user_approval_sha256'] == prior['user_approval_sha256'] or
+                    current['approved_at_epoch'] < prior['approved_at_epoch']):
+                _deny('each exact identity update requires a fresh independent user approval record')
+            if any(current.get(k) != prior.get(k) for k in set(current) | set(prior)
+                   if k not in revision_fields):
+                _deny('identity update cannot reset counters, start time, history or increase budgets')
+            if not isinstance(current['child_baseline_checkpoint_sha256'], str) or not re.fullmatch(
+                    '[0-9a-f]{64}', current['child_baseline_checkpoint_sha256']):
+                _deny('identity update must acknowledge the exact durable child checkpoint')
+            if previous is None:
+                previous = dict(prior, _authorization_sha256=previous_hash)
+            lineage.append(previous_hash); current = prior
+        return dict(auth, _authorization_sha256=auth_hash, _history=history, _account=account,
+                    _lineage_sha256=lineage, _previous=previous)
     except ResourceGateDenied:
         raise
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
@@ -337,6 +368,23 @@ def require_provider_credential(provider, credential_bytes):
         if (not credential_bytes or credential_identity(provider, credential_bytes, key) !=
                 auth['credential_identities'][provider]):
             _deny('actual provider credential/home differs from the authenticated account capacity route')
+
+
+def _bounded_timeout(auth, now, requested):
+    if type(requested) is not int or requested < 1:
+        _deny('delivery child timeout must be a positive bounded integer')
+    remaining = min(auth['expires_epoch'], auth['started_epoch'] + auth['max_wall_clock_seconds'],
+                    auth['_account']['expires_epoch']) - now
+    result = min(requested, 900, int(remaining))
+    if result < 1:
+        _deny('not enough valid time remains to launch a provider subprocess')
+    return result
+
+
+def bounded_delivery_timeout(requested):
+    if os.environ.get('CMH_RESOURCE_MISSION_ID') == NEW_MISSION:
+        return _bounded_timeout(load_authorization(), time.time(), requested)
+    return requested
 
 
 def require_active_transport(provider, model):
@@ -423,16 +471,17 @@ def _verify_child(path, key, auth):
     rows = ledger['requests']
     if (not isinstance(rows, list) or any(row.get('number') != i or
             row.get('mission_id') != NEW_MISSION or
-            row.get('authorization_sha256') != auth['_authorization_sha256']
+            row.get('authorization_sha256') not in auth['_lineage_sha256']
             for i, row in enumerate(rows, 1)) or
             len({r.get('request_id') for r in rows}) != len(rows)):
         _deny('delivery ledger continuity or identity invalid')
     return ledger
 
 
-def _qualification_request(rows, provider, prompt, run_id):
+def _qualification_request(rows, provider, prompt, run_id, authorization_hash=None):
     from .model_qualification import CASES, qualification_prompt
-    previous = [r for r in rows if r['provider'] == provider and r['stage'] == 'qualification-case']
+    previous = [r for r in rows if r['provider'] == provider and r['stage'] == 'qualification-case'
+                and (authorization_hash is None or r['authorization_sha256'] == authorization_hash)]
     if (len(previous) >= len(CASES) or
             any(r['run_id'] != run_id for r in previous) or
             prompt != qualification_prompt(CASES[len(previous)]).encode()):
@@ -467,7 +516,8 @@ def _reserve_validated(auth, env, provider, model, prompt, stage, now, *, offlin
         context = None
         if not offline:
             if stage == 'qualification-case':
-                _qualification_request(rows, provider, prompt, env['CMH_RESOURCE_RUN_ID'])
+                _qualification_request(rows, provider, prompt, env['CMH_RESOURCE_RUN_ID'],
+                                       auth['_authorization_sha256'])
             else:
                 context = _review_context.get()
                 if stage not in context['stages']:
@@ -475,9 +525,9 @@ def _reserve_validated(auth, env, provider, model, prompt, stage, now, *, offlin
                 attempts = {}
                 for row in prior:
                     if row.get('target') is not None:
-                        item = (row['target'], row['stage'])
+                        item = (row['authorization_sha256'], row['target'], row['stage'])
                         attempts[item] = attempts.get(item, 0) + 1
-                item = (context['target'], stage)
+                item = (auth['_authorization_sha256'], context['target'], stage)
                 if (attempts.get(item, 0) >= 2 or attempts.get(item, 0) and
                         sum(max(0, count - 1) for count in attempts.values()) >= 2):
                     _deny('same-stage or provider total bounded retry limit reached')
@@ -535,13 +585,35 @@ def reserve_delivery(*, provider, model, prompt, stage, environment=None):
     return _reserve_validated(auth, env, provider, model, prompt, stage, time.time())
 
 
-def initialize_ledger():
-    """Called only in a future independently approved activation; no signing of approval."""
-    auth = load_authorization(); path = Path(auth['ledger_path'])
+def _activate_validated(auth, env, *, offline=False):
+    if auth['evidence_domain'] != ('OFFLINE_TEST' if offline else 'FORMAL'):
+        _deny('synthetic activation cannot become effective formal authority')
+    path = Path(auth['ledger_path']); key = _read(env['CMH_RESOURCE_GATE_KEY_FILE'])
     with _locked(path.with_name(path.name + '.lock')):
+        if not offline:
+            auth = load_authorization(env)
         if path.exists() or _checkpoint_path(path).exists():
-            _deny('delivery ledger already exists; never reset history')
+            previous = auth['_previous']
+            if previous is None or digest(_read(_checkpoint_path(path))) != auth['child_baseline_checkpoint_sha256']:
+                _deny('existing delivery history needs a signed exact-checkpoint identity update')
+            previous['_lineage_sha256'] = auth['_lineage_sha256'][1:]
+            ledger = _verify_child(path, key, previous)
+            if any(r.get('status') in {'STARTED', 'UNKNOWN'} or r.get('usage_accounting') in
+                   {'USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS', 'OVER_RESERVATION_BLOCK_FUTURE_CALLS'}
+                   for r in ledger['requests']):
+                _deny('identity update cannot clear an unreconciled child request')
+            ledger['authorization_sha256'] = auth['_authorization_sha256']
+            _write_child(path, ledger, key)
+            return
+        if auth['_previous'] is not None:
+            _deny('identity update cannot replace missing child history with an empty ledger')
         ledger = {'version': LEDGER_VERSION, 'evidence_domain': 'FORMAL', 'mission_id': NEW_MISSION,
                   'parent_ledger_sha256': auth['parent']['ledger_sha256'],
                   'authorization_sha256': auth['_authorization_sha256'], 'requests': []}
-        _write_child(path, ledger, _read(os.environ['CMH_RESOURCE_GATE_KEY_FILE']))
+        ledger['evidence_domain'] = auth['evidence_domain']
+        _write_child(path, ledger, key)
+
+
+def initialize_ledger():
+    """Future signed activation/update only. This never signs an execution approval."""
+    _activate_validated(load_authorization(), os.environ)

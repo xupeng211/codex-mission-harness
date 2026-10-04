@@ -261,6 +261,8 @@ def _actual_provider_invoke_unmetered(spec: ModelSpec, prompt: str, *, token: st
     """One bounded, noninteractive call to the exact configured model."""
     from .formal_delivery_gate import require_active_transport
     require_active_transport(spec.provider, spec.model)
+    from .formal_delivery_gate import bounded_delivery_timeout
+    timeout = bounded_delivery_timeout(timeout)
     if spec.provider == "deepseek":
         from .formal_delivery_gate import require_provider_credential
         require_provider_credential("deepseek", token.encode() if isinstance(token, str) else b"")

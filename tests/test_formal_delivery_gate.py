@@ -117,12 +117,12 @@ class FormalDeliveryGateTests(unittest.TestCase):
     def write(self, path, value):
         path.write_bytes(canonical(value) + b'\n'); path.chmod(0o600)
 
-    def publish(self):
+    def publish(self, update_child=True):
         self.write(self.account_path, sign_authorization(self.accounts, self.key.read_bytes()))
         self.payload['account_evidence_sha256'] = digest(self.account_path.read_bytes())
         self.write(self.auth, sign_authorization(self.payload, self.key.read_bytes()))
         self.env['CMH_RESOURCE_AUTH_SHA256'] = digest(self.auth.read_bytes())
-        if self.ledger.exists():
+        if update_child and self.ledger.exists():
             ledger = json.loads(self.ledger.read_bytes())
             ledger['authorization_sha256'] = self.env['CMH_RESOURCE_AUTH_SHA256']
             gate._write_child(self.ledger, ledger, self.key.read_bytes())
@@ -390,6 +390,61 @@ class FormalDeliveryGateTests(unittest.TestCase):
     def test_45_future_envelope_must_fit_capacity_before_first_call(self):
         self.payload['providers']['openai']['cost_limit_microunits'] = 200000000; self.publish()
         with self.assertRaises(ResourceGateDenied): self.load()
+
+    def prepare_revision(self, index):
+        previous = self.root / f'previous-{index}.json'
+        previous.write_bytes(self.auth.read_bytes()); previous.chmod(0o600)
+        approval = self.root / f'approval-{index}.txt'
+        approval.write_text(f'OFFLINE SYNTHETIC independent identity approval {index}'); approval.chmod(0o600)
+        self.payload.update(authorization_id=f'synthetic-revision-{index}', approved_at_epoch=self.now,
+                            user_approval_path=str(approval), user_approval_sha256=digest(approval.read_bytes()),
+                            previous_authorization_path=str(previous),
+                            previous_authorization_sha256=digest(previous.read_bytes()),
+                            child_baseline_checkpoint_sha256=digest(gate._checkpoint_path(self.ledger).read_bytes()))
+        self.publish(update_child=False)
+
+    def test_46_signed_identity_revision_preserves_counters_and_parent(self):
+        old = self.parent.read_bytes(); reservation = self.reserve()
+        reservation.observe({'tokens': {k: 0 for k in gate.CATEGORIES}}); reservation.settle('RETURNED')
+        before = json.loads(self.ledger.read_bytes())['requests']
+        self.prepare_revision(1)
+        value = self.load(); gate._activate_validated(value, self.env, offline=True)
+        after = json.loads(self.ledger.read_bytes())['requests']
+        self.assertEqual(before, after)
+        self.assertEqual(old, self.parent.read_bytes())
+        self.assertEqual(len(value['_lineage_sha256']), 2)
+        self.reserve()
+        self.assertEqual(len(json.loads(self.ledger.read_bytes())['requests']), 2)
+
+    def test_47_identity_revision_cannot_raise_budget_or_reset_clock(self):
+        self.prepare_revision(1)
+        for name in ('max_new_calls', 'started_epoch'):
+            old = self.payload[name]; self.payload[name] += 1; self.publish(update_child=False)
+            with self.assertRaises(ResourceGateDenied): self.load()
+            self.payload[name] = old
+
+    def test_48_identity_revision_cannot_clear_unknown(self):
+        self.reserve().settle('FAILED'); self.prepare_revision(1)
+        with self.assertRaises(ResourceGateDenied):
+            gate._activate_validated(self.load(), self.env, offline=True)
+
+    def test_49_identity_revision_cannot_replace_missing_history(self):
+        self.prepare_revision(1); self.ledger.unlink()
+        with self.assertRaises(ResourceGateDenied):
+            gate._activate_validated(self.load(), self.env, offline=True)
+
+    def test_50_identity_revision_is_bounded_and_needs_fresh_approval(self):
+        for i in (1, 2):
+            self.prepare_revision(i); gate._activate_validated(self.load(), self.env, offline=True)
+        self.prepare_revision(3)
+        with self.assertRaises(ResourceGateDenied): self.load()
+
+    def test_51_subprocess_timeout_cannot_outlive_authority_or_account_proof(self):
+        value = self.load()
+        self.assertEqual(gate._bounded_timeout(value, 1000, 900), 100)
+        value['_account']['expires_epoch'] = 1007
+        self.assertEqual(gate._bounded_timeout(value, 1000, 900), 7)
+        with self.assertRaises(ResourceGateDenied): gate._bounded_timeout(value, 1007, 900)
 
 
 if __name__ == '__main__': unittest.main()

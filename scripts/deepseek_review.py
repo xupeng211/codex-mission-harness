@@ -975,6 +975,8 @@ def _invoke_reviewer_unmetered(command, prompt_text, env, timeout):
     from harness.formal_delivery_gate import require_active_transport
     model = command[command.index("--model") + 1] if "--model" in command else ""
     require_active_transport("deepseek", model)
+    from harness.formal_delivery_gate import bounded_delivery_timeout
+    timeout = bounded_delivery_timeout(timeout)
     from harness.formal_delivery_gate import NEW_MISSION, require_provider_credential
     if os.environ.get("CMH_RESOURCE_MISSION_ID") == NEW_MISSION:
         credential = env.get("ANTHROPIC_API_KEY", "")

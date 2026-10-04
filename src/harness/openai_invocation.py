@@ -230,6 +230,8 @@ def _invoke_openai_unmetered(prompt: str, spec: ModelSpec, schema: dict, *, time
                   transport_sink=None) -> InvocationResult:
     from .formal_delivery_gate import require_active_transport
     require_active_transport(spec.provider, spec.model)
+    from .formal_delivery_gate import bounded_delivery_timeout
+    timeout = bounded_delivery_timeout(timeout)
     from .formal_delivery_gate import NEW_MISSION, require_provider_credential, _read
     if os.environ.get("CMH_RESOURCE_MISSION_ID") == NEW_MISSION:
         require_provider_credential("openai", _read(Path(codex_home) / "auth.json"))
