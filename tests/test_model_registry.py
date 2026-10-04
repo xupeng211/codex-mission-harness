@@ -188,6 +188,8 @@ class QualificationContractTests(unittest.TestCase):
             self.assertEqual(record["parser_result"], "PASS")
             self.assertEqual(record["parsed_result"]["new_findings"], [false_finding])
 
+    # This transport-only fixture mocks the separately tested live resource gate.
+    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args: None)
     def test_local_fixture_transport_bytes_are_preserved_before_parse(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); root.chmod(0o700)
@@ -211,6 +213,8 @@ class QualificationContractTests(unittest.TestCase):
             self.assertEqual((root / "diagnostics" / "clean.stdout").read_bytes(), envelope.encode())
             self.assertEqual((root / "diagnostics" / "clean.stderr").read_bytes(), b"fixture-stderr")
 
+    # This transport-only fixture mocks the separately tested live resource gate.
+    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args: None)
     def test_failed_cli_partial_output_and_request_usage_are_durable(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); root.chmod(0o700)

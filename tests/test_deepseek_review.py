@@ -126,6 +126,8 @@ def run_fixture(root, *, large_diff=False):
     return args, Path(args.evidence)
 
 class DeepSeekReceiptTest(unittest.TestCase):
+    # This transport-only fixture mocks the separately tested live resource gate.
+    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args: None)
     def test_reviewer_output_is_bounded_before_read_or_receipt(self):
         program = f"import sys;sys.stdout.write('x'*{review.MAX_REVIEW_OUTPUT_BYTES + 1})"
         with self.assertRaisesRegex(ValueError, "output exceeds bound"):
@@ -147,6 +149,8 @@ class DeepSeekReceiptTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "bounded source size"):
                 review.bounded_diff(repo, base, head, max_bytes=32)
 
+    # This transport-only fixture mocks the separately tested live resource gate.
+    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args: None)
     def test_invoke_reviewer_timeout_terminates_process_group(self):
         with tempfile.TemporaryDirectory() as directory:
             marker = Path(directory) / "child.pid"
@@ -165,6 +169,8 @@ class DeepSeekReceiptTest(unittest.TestCase):
                 time.sleep(0.05)
             self.assertFalse(process_is_live(child_pid))
 
+    # This transport-only fixture mocks the separately tested live resource gate.
+    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args: None)
     def test_invoke_reviewer_interrupt_terminates_process_group(self):
         with tempfile.TemporaryDirectory() as directory:
             marker = Path(directory) / "child.pid"
@@ -223,6 +229,8 @@ class DeepSeekReceiptTest(unittest.TestCase):
                 review.bounded_diff(Path('/nonexistent'),'--output=/tmp/unwanted',HEAD)
             process.assert_not_called()
 
+    # This transport-only fixture mocks the separately tested live resource gate.
+    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args: None)
     def test_timeout_kills_descendant_even_if_leader_exits_on_term(self):
         with tempfile.TemporaryDirectory() as directory:
             marker=Path(directory)/'child.pid'

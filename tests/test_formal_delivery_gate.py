@@ -446,5 +446,20 @@ class FormalDeliveryGateTests(unittest.TestCase):
         self.assertEqual(gate._bounded_timeout(value, 1000, 900), 7)
         with self.assertRaises(ResourceGateDenied): gate._bounded_timeout(value, 1007, 900)
 
+    def test_52_removing_mission_environment_cannot_bypass_raw_transports(self):
+        from harness.openai_invocation import _invoke_openai_unmetered
+        from harness.model_qualification import _actual_provider_invoke_unmetered
+        from harness.model_registry import ModelSpec
+        import deepseek_review
+        with patch.dict('os.environ', {}, clear=True), patch('subprocess.Popen') as spawn:
+            for call in (
+                    lambda: _invoke_openai_unmetered('fixture', ModelSpec('openai', 'gpt-5.6-sol', 'high'), {}),
+                    lambda: _actual_provider_invoke_unmetered(ModelSpec('deepseek', 'deepseek-flash'),
+                             'fixture', token='SYNTHETIC_ONLY', timeout=1),
+                    lambda: deepseek_review._invoke_reviewer_unmetered(
+                             ['synthetic', '--model', 'deepseek-flash'], 'fixture', {}, 1)):
+                with self.assertRaises(ResourceGateDenied): call()
+            spawn.assert_not_called()
+
 
 if __name__ == '__main__': unittest.main()

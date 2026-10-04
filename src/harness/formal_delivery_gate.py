@@ -391,8 +391,10 @@ def require_active_transport(provider, model):
     """The lower-level CLI helpers cannot bypass activation or atomic reservation."""
     from .resource_gate import _active_reservation
     active = _active_reservation.get()
-    if active is not None and active.execution_allowed is not True:
+    if active is None or active.execution_allowed is not True:
         _deny('synthetic reservations cannot enter provider transport')
+    if (active.provider, active.model) != (provider, model):
+        _deny('raw provider transport differs from its active resource reservation')
     if os.environ.get('CMH_RESOURCE_MISSION_ID') == NEW_MISSION:
         auth = load_authorization()
         if (active is None or active.ledger_key_path is None or
@@ -403,6 +405,27 @@ def require_active_transport(provider, model):
         if not any(row.get('request_id') == active.request_id and row.get('status') == 'STARTED'
                    and row.get('evidence_domain') == 'FORMAL' for row in ledger['requests']):
             _deny('raw provider transport reservation identity or state invalid')
+    else:
+        from .resource_gate import _authorization
+        try:
+            env = os.environ
+            if env['CMH_RESOURCE_MISSION_ID'] != OLD_MISSION:
+                _deny('raw transport cannot select an unapproved legacy mission')
+            authenticate_legacy_signer(env['CMH_RESOURCE_GATE_KEY_FILE'])
+            auth = _authorization(Path(env['CMH_RESOURCE_AUTHORIZATION']),
+                                  Path(env['CMH_RESOURCE_GATE_KEY_FILE']), env['CMH_RESOURCE_AUTH_SHA256'])
+            if (auth['mission_id'] != OLD_MISSION or auth['ledger_path'] != str(active.ledger)
+                    or active.authorization_sha256 != env['CMH_RESOURCE_AUTH_SHA256']):
+                _deny('raw legacy transport authorization identity mismatch')
+            rows = json.loads(_read(active.ledger))['requests']
+            if any(row.get('usage_accounting') == 'USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS'
+                   or row.get('status') == 'UNKNOWN' for row in rows):
+                _deny('raw legacy transport cannot bypass unresolved historical usage')
+            if not any(row.get('request_id') == active.request_id and row.get('status') == 'STARTED'
+                       for row in rows):
+                _deny('raw legacy transport lacks a durable active reservation')
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise ResourceGateDenied('raw legacy transport needs authenticated resource context') from exc
 
 
 def bind_review(mission_id, root, base, head, registry_hash, spec, qualification):
