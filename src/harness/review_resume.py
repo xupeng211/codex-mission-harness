@@ -206,7 +206,8 @@ class ReviewRun:
         try:
             raw = execute()
         except BaseException as exc:
-            if kind in {"chunk", "group", "cross-group"}:
+            from .resource_gate import FundingPause
+            if not isinstance(exc, FundingPause) and kind in {"chunk", "group", "cross-group"}:
                 self._failed_response(name, kind, input_bytes, None, exc, diagnostic_start)
             raise
         try:
@@ -223,6 +224,7 @@ class ReviewRun:
         self.state["completed_order"].append(name)
         self.state["failure_count"] = 0
         self.state["last_failure"] = None
+        self.state["funding_status"] = None
         next_index = index + 1
         self.state["current_stage"] = name
         self.state["next_stage"] = self.stages[next_index][0] if next_index < len(self.stages) else "receipt"
@@ -352,14 +354,15 @@ class ReviewRun:
         return path
 
     def failure(self, failure: dict, auth_key: str | None = None) -> Path:
+        funding = failure.get("failure_category") == "PAUSED_AWAITING_MANUAL_FUNDING"
         failure.pop("integrity_sha256", None)
         failure.pop("auth_hmac_sha256", None)
-        attempt = self.state.get("failure_count", 0) + 1
+        attempt = self.state.get("failure_count", 0) + (0 if funding else 1)
         inferred = failure.get("failure_category") in {
             "CANCELLED", "CHILD_PROCESS_TIMEOUT", "MODEL_TIMEOUT", "TRANSPORT_ERROR",
             "TURN_TIMEOUT_UNDIAGNOSED", "TRANSIENT_CAPACITY", "TRANSIENT_TRANSPORT",
             "RATE_LIMIT", "PROVIDER_ERROR"}
-        allowed = bool(failure.get("resume_allowed", inferred)) and attempt <= 1
+        allowed = funding or (bool(failure.get("resume_allowed", inferred)) and attempt <= 1)
         reason = failure.get("resume_policy_reason", "category policy")
         if not allowed and attempt > 1:
             reason = "bounded stage retry exhausted"
@@ -382,6 +385,7 @@ class ReviewRun:
             name = f"failure-{uuid.uuid4().hex}.json"
         self.storage.write_private_artifact(self.fd, name, canonical(failure), uuid.uuid4().hex)
         self.state["failure_count"] = attempt
+        self.state["funding_status"] = "PAUSED_AWAITING_MANUAL_FUNDING" if funding else None
         self.state["last_failure"] = {"artifact_path": name, "resume_allowed": allowed,
                                       "stage": self.state["next_stage"]}
         _atomic_state(self.fd, self.state)

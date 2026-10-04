@@ -25,6 +25,16 @@ class ResourceGateDenied(RuntimeError):
     pass
 
 
+class FundingPause(ResourceGateDenied):
+    """A pre-reservation funding stop, never a failed provider request."""
+
+    def __init__(self, reason, *, required=0, available=0):
+        super().__init__(reason)
+        self.details = {'status': 'PAUSED_AWAITING_MANUAL_FUNDING', 'reason': reason,
+                        'required_microusd': required, 'available_microusd': available,
+                        'shortfall_microusd': max(0, required - available)}
+
+
 _active_reservation: ContextVar[Reservation | None] = ContextVar("cmh_active_resource_reservation", default=None)
 
 
@@ -515,7 +525,8 @@ class Reservation:
                     estimate = (numerator + 999_999) // 1_000_000
                     record["estimated_cost_microusd"] = estimate
                     record["estimated_cost_classification"] = "ESTIMATED_NOT_BILLED"
-                    if estimate > record["cost_reservation_microunits"]:
+                    if estimate > min(record["cost_reservation_microunits"],
+                                      record.get("wallet_exposure_microusd", record["cost_reservation_microunits"])):
                         record["usage_accounting"] = "OVER_RESERVATION_BLOCK_FUTURE_CALLS"
                         record["cost_overage_source"] = "AUTHORIZED_PRICE_ESTIMATE"
                 cli_cost = self.reported_usage.get("cli_reported_cost_microunits")

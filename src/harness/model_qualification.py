@@ -20,7 +20,7 @@ from typing import Callable
 
 from .model_registry import ModelSpec
 from .openai_invocation import invoke_openai, InvocationFailure, InvocationResult
-from .resource_gate import ResourceGateDenied, model_request
+from .resource_gate import ResourceGateDenied, FundingPause, model_request
 from .reviewer_v2_contract import bind_findings, parse_synthesis
 
 QUALIFICATION_VERSION = "cmh-model-qualification/v5"
@@ -74,14 +74,14 @@ def qualification_prompt(case: QualificationCase) -> str:
 class QualificationEvidence:
     """Private, append-only raw evidence; never grants a qualification receipt."""
 
-    def __init__(self, directory: Path):
+    def __init__(self, directory: Path, *, resume: bool = False):
         self.directory = Path(directory)
         if not self.directory.is_absolute() or self.directory.is_symlink():
             raise ValueError("qualification diagnostics require an absolute non-symlink path")
         parent = self.directory.parent.stat()
         if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o077:
             raise ValueError("qualification diagnostic parent must be private")
-        self.directory.mkdir(mode=0o700)
+        self.directory.mkdir(mode=0o700, exist_ok=resume)
         info = self.directory.lstat()
         if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or
                 stat.S_IMODE(info.st_mode) != 0o700):
@@ -146,7 +146,56 @@ class QualificationEvidence:
                     json.dumps({"request_id": request_id}, sort_keys=True).encode() + b"\n")
 
     def capture_prompt(self, case_name: str, prompt: str):
-        self._write(case_name + ".prompt", prompt.encode("utf-8"))
+        path = self.directory / (case_name + ".prompt")
+        if path.exists():
+            from .resource_gate import _private
+            if _private(path) != prompt.encode("utf-8"):
+                raise ResourceGateDenied("qualification prompt changed on funding resume")
+        else:
+            self._write(case_name + ".prompt", prompt.encode("utf-8"))
+
+    def delivery_progress(self, spec, record=None):
+        """Authenticate reuse against the existing signed resource checkpoint."""
+        from . import formal_delivery_gate as gate
+        from .resource_gate import _locked, _private, digest, canonical
+        auth = gate.load_authorization()
+        key = _private(Path(os.environ['CMH_RESOURCE_GATE_KEY_FILE']))
+        path = Path(auth['ledger_path'])
+        run_id = os.environ['CMH_RESOURCE_RUN_ID']
+        if spec.identity() != auth['runtime']['models'][spec.provider]:
+            raise ResourceGateDenied('qualification progress model differs from signed runtime')
+        name = spec.provider + '/' + run_id
+        with _locked(path.with_name(path.name + '.lock')):
+            ledger = gate._verify_child(path, key, auth)
+            identity = dict(gate.qualification_binding(auth), model=spec.identity(),
+                            evidence_directory=str(self.directory), run_id=run_id)
+            entry = ledger.get('qualification_progress', {}).get(name, {'identity': identity, 'cases': []})
+            if entry['identity'] != identity:
+                raise ResourceGateDenied('qualification resume execution identity changed')
+            rows = [r for r in ledger['requests'] if r['provider'] == spec.provider and
+                    r['stage'] == 'qualification-case' and r['authorization_sha256'] == auth['_authorization_sha256']]
+            if any(r['run_id'] != run_id or r.get('status') != 'RETURNED' or
+                   r.get('usage_accounting') != 'FULL_RESERVATION_RETAINED' for r in rows):
+                raise ResourceGateDenied('qualification resume cannot reuse failed, unknown or other-run requests')
+            result = []
+            for i, item in enumerate(entry['cases']):
+                raw = _private(self.directory / (CASES[i].name + '.json'))
+                value = json.loads(raw)
+                if (digest(raw) != item['sha256'] or value['resource_request_id'] != rows[i]['request_id']
+                        or value['model_identity'] != spec.identity() or value['verdict'] != 'PASS'):
+                    raise ResourceGateDenied('qualification progress artifact or reservation changed')
+                result.append(value)
+            if record is not None:
+                i = len(result)
+                if (i >= len(CASES) or record['case_id'] != CASES[i].name or record['verdict'] != 'PASS'
+                        or len(rows) != i + 1 or record['resource_request_id'] != rows[i]['request_id']):
+                    raise ResourceGateDenied('qualification progress must commit exactly the next successful call')
+                entry['cases'].append({'sha256': digest(_private(self.directory / (CASES[i].name + '.json')))})
+                ledger.setdefault('qualification_progress', {})[name] = entry
+                gate._write_child(path, ledger, key)
+            elif len(rows) != len(result):
+                raise ResourceGateDenied('uncommitted qualification request cannot be replayed')
+            return result
 
 
 @dataclass(frozen=True)
@@ -171,10 +220,22 @@ def _evaluate_cases(spec: ModelSpec, invoke: Callable[[ModelSpec, str], str], *,
     missing/invalid response fails that case and preserves the model identity.
     """
     passed, failed, hashes = [], [], []
+    from .formal_delivery_gate import NEW_MISSION
+    resumable = mode == "real_provider" and os.environ.get('CMH_RESOURCE_MISSION_ID') == NEW_MISSION
+    if resumable and evidence is None:
+        raise ResourceGateDenied('delivery qualification requires durable evidence')
+    completed = evidence.delivery_progress(spec) if resumable else []
+    result_mode = mode
+    if resumable:
+        from .formal_delivery_gate import load_authorization
+        if load_authorization()['evidence_domain'] != 'FORMAL':
+            result_mode = 'offline_delivery_fixture'
     for index, case in enumerate(CASES):
         prompt = qualification_prompt(case)
         if evidence is not None:
             evidence.capture_prompt(case.name, prompt)
+        reused = index < len(completed)
+        paused = False
         record = {"case_id": case.name, "model_identity": spec.identity(), "mode": mode,
                   "prompt": prompt, "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
                   "source": case.source, "expected_findings": expected_findings(case),
@@ -186,7 +247,7 @@ def _evaluate_cases(spec: ModelSpec, invoke: Callable[[ModelSpec, str], str], *,
                   "exact_failure_reason": None, "verdict": "FAIL"}
         try:
             record["failure_phase"] = "INVOCATION"
-            raw = invoke(spec, prompt)
+            raw = completed[index]["structured_output_raw"] if reused else invoke(spec, prompt)
             if isinstance(raw, InvocationResult):
                 record["resource_request_id"] = raw.evidence.get("resource_request_id")
                 record["invocation_usage"] = raw.evidence.get("usage")
@@ -211,6 +272,9 @@ def _evaluate_cases(spec: ModelSpec, invoke: Callable[[ModelSpec, str], str], *,
             # every remaining fixture.
             failed.append(case.name)
             break
+        except FundingPause:
+            paused = True
+            raise
         except ResourceGateDenied:
             raise
         except (ValueError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as exc:
@@ -230,9 +294,11 @@ def _evaluate_cases(spec: ModelSpec, invoke: Callable[[ModelSpec, str], str], *,
             passed.append(case.name)
             hashes.append(hashlib.sha256(raw.encode("utf-8")).hexdigest())
         finally:
-            if evidence is not None:
+            if evidence is not None and not reused and not paused:
                 evidence.record_case(case.name, record)
-    return QualificationResult(spec.identity(), mode, tuple(passed),
+                if resumable and record['verdict'] == 'PASS':
+                    evidence.delivery_progress(spec, record)
+    return QualificationResult(spec.identity(), result_mode, tuple(passed),
                                tuple(failed), tuple(hashes))
 
 
@@ -369,9 +435,21 @@ def qualify_live(spec: ModelSpec, *, token_file: str | Path | None = None,
     """Run actual provider calls after noninteractive auth validation."""
     from .model_registry import preflight, read_private_token
 
+    from .formal_delivery_gate import NEW_MISSION, load_authorization, qualification_binding
+    if os.environ.get('CMH_RESOURCE_MISSION_ID') == NEW_MISSION:
+        from .resource_gate import digest, canonical
+        auth = load_authorization()
+        if evidence_dir is None or not Path(evidence_dir).is_absolute():
+            raise ResourceGateDenied('delivery qualification requires a fixed private evidence directory')
+        # The CLI normally chooses a fresh UUID. Funding continuation instead
+        # retains this exact execution+directory identity, without CLI changes.
+        os.environ['CMH_RESOURCE_RUN_ID'] = digest(canonical(dict(
+            qualification_binding(auth), model=spec.identity(), directory=str(evidence_dir))))
     preflight(spec, token_file=token_file)
     token = read_private_token(Path(token_file)) if token_file else None
-    evidence = QualificationEvidence(evidence_dir) if evidence_dir is not None else None
+    from .formal_delivery_gate import NEW_MISSION
+    evidence = QualificationEvidence(evidence_dir, resume=os.environ.get('CMH_RESOURCE_MISSION_ID') == NEW_MISSION) \
+        if evidence_dir is not None else None
     return _evaluate_cases(spec,
                            lambda actual, prompt: _actual_provider_invoke(
                                actual, prompt, token=token, timeout=timeout,

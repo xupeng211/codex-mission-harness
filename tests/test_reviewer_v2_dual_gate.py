@@ -228,7 +228,7 @@ class OpenAIContractTests(unittest.TestCase):
         self.assertEqual(failure["failure_category"], "CANCELLED")
         self.assertEqual(failure["head_sha"], self.head)
         self.assertTrue(failure["resume_allowed"])
-        self.assertEqual(failure["durable_completed_stages"], ["chunk-000"])
+        self.assertEqual(failure["durable_completed_stages"], ["structured-preflight", "chunk-000"])
         self.assertEqual(failure["next_stage"], "chunk-001")
 
     def test_invalid_group_result_preserves_raw_stage_and_never_publishes_receipt(self):
@@ -266,8 +266,6 @@ class OpenAIContractTests(unittest.TestCase):
         requested = []
         def retry(_prompt, _spec, *, stage, timeout, transport_sink=None):
             requested.append(stage)
-            if stage == "chunk" and len(requested) == 1:
-                return b'{"findings":[]}'  # fresh structured preflight
             if stage == "chunk":
                 raise AssertionError("committed Chunk must not be recalled")
             return json.dumps({"findings": [], "decisions": [{
@@ -280,7 +278,7 @@ class OpenAIContractTests(unittest.TestCase):
              patch.object(review, "invoke_codex", side_effect=retry):
             receipt = review.run(self.root, self.base, self.head, evidence, "test-key", self.spec,
                                  qualification_path="fixture-qualification")
-        self.assertEqual(requested, ["chunk", "group"])
+        self.assertEqual(requested, ["group"])
         self.assertEqual(json.loads(receipt.read_text())["review_result"], "FAIL")
         self.assertTrue(json.loads((run_dir / "state.json").read_text())["receipt_written"])
 
@@ -300,6 +298,41 @@ class OpenAIContractTests(unittest.TestCase):
         self.assertEqual(record["failure_category"], "AUTHENTICATION_FAILURE")
         self.assertEqual(record["head_sha"], self.head)
         self.assertFalse(list(evidence.rglob("receipt.json")))
+
+    def test_funding_pause_resumes_without_repeating_structured_preflight(self):
+        from harness.resource_gate import FundingPause
+        evidence = Path(self.temp.name) / "funding-pause"
+        evidence.mkdir(mode=0o700)
+        calls = []
+        def first(prompt, spec, **kwargs):
+            calls.append(kwargs["stage"])
+            if len(calls) == 1:
+                return b'{"findings":[]}'
+            raise FundingPause("OFFLINE funds exhausted", required=2, available=1)
+        with patch.object(review, "validate_qualification_receipt", return_value={}), \
+             patch.object(review, "preflight"), patch.object(review, "invoke_codex", side_effect=first):
+            with self.assertRaises(FundingPause):
+                review.run(self.root, self.base, self.head, evidence, "test-key", self.spec,
+                           qualification_path="fixture-qualification")
+        run_dir, = (item for item in evidence.iterdir() if item.is_dir())
+        state = json.loads((run_dir / "state.json").read_text())
+        self.assertEqual(state["failure_count"], 0)
+        self.assertEqual(state["next_stage"], "chunk-000")
+        self.assertEqual(state["funding_status"], "PAUSED_AWAITING_MANUAL_FUNDING")
+        self.assertFalse((run_dir / "receipt.json").exists())
+        resumed_calls = []
+        def resume(prompt, spec, **kwargs):
+            resumed_calls.append(kwargs["stage"])
+            if kwargs["stage"] == "chunk":
+                return b'{"findings":[]}'
+            return json.dumps({"findings": [], "decisions": [],
+                "summary": "This exact source was fully reviewed without remaining blockers."}).encode()
+        with patch.object(review, "validate_qualification_receipt", return_value={}), \
+             patch.object(review, "preflight"), patch.object(review, "invoke_codex", side_effect=resume):
+            review.run(self.root, self.base, self.head, evidence, "test-key", self.spec,
+                       qualification_path="fixture-qualification")
+        self.assertEqual(resumed_calls, ["chunk", "group"])
+        self.assertEqual(len([item for item in evidence.iterdir() if item.is_dir()]), 1)
 
     def test_live_review_requires_matching_final_reviewer_qualification(self):
         evidence = Path(self.temp.name) / "evidence"

@@ -16,7 +16,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
-from .resource_gate import (ResourceGateDenied, Reservation, _locked, _private,
+from .resource_gate import (ResourceGateDenied, FundingPause, Reservation, _locked, _private,
                             _write_atomic, canonical, digest, sign_authorization)
 
 OLD_MISSION = 'HARNESS_AUTONOMOUS_PRE_MERGE_DELIVERY'
@@ -26,6 +26,8 @@ ACCOUNT_VERSION = 'cmh-shared-capacity-attestation/v1'
 LEDGER_VERSION = 'cmh-current-delivery-ledger/v1'
 SOURCE_VERSION = 'exact-unique-utf8-quote/v1'
 CAPACITY_POLICY = 'AUTHORITATIVE_NET_CAPACITY_NO_UNBOUNDED_PRIOR_LIABILITY'
+STAGED_POLICY = 'FIXED_BUDGET_STAGED_NET_WALLET/v1'
+FUNDS_VERSION = 'cmh-staged-wallet-snapshot/v1'
 CATEGORIES = ('input', 'cache', 'output', 'reasoning')
 EVIDENCE_ROOT = Path('/home/xupeng/codex-mission-harness-evidence/autonomous-premerge-20261002')
 DELIVERY_LEDGER = EVIDENCE_ROOT / 'current-version-delivery-ledger.json'
@@ -203,6 +205,8 @@ def _load(env, anchor, runtime, now, *, offline=False):
         for name in ('max_new_calls', 'shared_max_calls'):
             if not _integer(auth[name], 1):
                 _deny('delivery logical call limit invalid')
+        if auth.get('deepseek_funding_policy') is not None:
+            _validate_funding_policy(auth)
         account = _signed(auth['account_evidence_path'], auth['account_evidence_sha256'], key)
         if (account.get('version') != ACCOUNT_VERSION or account.get('evidence_domain') != domain
                 or account.get('parent_ledger_sha256') != anchor.ledger_sha256
@@ -253,7 +257,9 @@ def _load(env, anchor, runtime, now, *, offline=False):
                                                 'output': 192000, 'reasoning': 128000}}:
                     _deny('DeepSeek Group/Cross-group reservation contract must be preserved')
             exposure = history[provider]['cost'] + item['other_reserved_microunits'] + lane['cost_limit_microunits']
-            if exposure > min(item['available_microunits'], auth['shared_cost_limits'][provider]):
+            wallet_limit = (auth['shared_cost_limits'][provider] if provider == 'deepseek' and
+                            auth.get('deepseek_funding_policy') else item['available_microunits'])
+            if exposure > min(wallet_limit, auth['shared_cost_limits'][provider]):
                 _deny('shared account evidence cannot cover the complete approved future envelope')
             if any(history[provider]['tokens'][k] + item['other_tokens'][k] + lane['token_limit'][k] >
                    auth['shared_token_limits'][provider][k] for k in CATEGORIES):
@@ -337,6 +343,127 @@ def authenticate_legacy_signer(key_path):
     _signed(HISTORICAL_AUTHORIZATION, PRODUCTION_ANCHOR.authorization_sha256, _read(key_path))
 
 
+def _validate_funding_policy(auth):
+    policy = auth['deepseek_funding_policy']
+    if (policy.get('version') != STAGED_POLICY or policy.get('execution_unit') != 'ONE_PROVIDER_CALL'
+            or policy.get('manual_top_up_only') is not True
+            or policy.get('provider_enforced_unit_bound') is not True
+            or policy.get('provider_no_overdraft') is not True
+            or not _integer(policy.get('max_snapshot_age_seconds'), 1)
+            or not _integer(policy.get('safety_margin_microusd'))
+            or set(policy.get('unit_upper_bound_microusd', {})) !=
+                {'chunk_or_qualification', 'group_or_cross_group'}
+            or any(not _integer(v, 1) or v > auth['providers']['deepseek']['cost_reservation_microunits']
+                   for v in policy['unit_upper_bound_microusd'].values())):
+        _deny('staged funding requires proven provider bounds within the unchanged mission debit')
+    # This signed policy must cite actual official pricing, enforced request
+    # bounds and no-overdraft rules. An internal 0.40 debit is not such proof.
+    for name in ('pricing', 'enforced_bound', 'no_overdraft'):
+        if digest(_read(policy[name + '_source_path'])) != policy[name + '_source_sha256']:
+            _deny('official unit financial safety rules missing or changed')
+
+
+def _snapshot(auth, path, sha, key, now):
+    try:
+        value = _signed(path, sha, key)
+        policy = auth['deepseek_funding_policy']
+        if (value.get('version') != FUNDS_VERSION or value.get('evidence_domain') != auth['evidence_domain']
+                or value.get('authorization_sha256') != auth['_authorization_sha256']
+                or value.get('parent_ledger_sha256') != auth['parent']['ledger_sha256']
+                or value.get('account_id') != auth['account_ids']['deepseek']
+                or value.get('credential_identity') != auth['credential_identities']['deepseek']
+                or value.get('route') != 'deepseek-flash' or value.get('unit') != 'USD'
+                or value.get('policy_sha256') != digest(canonical(policy))
+                or value.get('no_unbounded_prior_liability') is not True
+                or value.get('historical_settlement_in_net_balance') is not True
+                or value.get('settlement_coverage_verified') is not True
+                or value.get('exclusive_allocation') is not True
+                or not _integer(value.get('epoch'), 1)
+                or not _integer(value.get('observed_epoch')) or not _integer(value.get('expires_epoch'))
+                or value['expires_epoch'] > value['observed_epoch'] + policy['max_snapshot_age_seconds']
+                or value['expires_epoch'] <= value['observed_epoch']
+                or any(not _integer(value.get(k)) for k in
+                       ('available_microusd', 'unsettled_liability_microusd',
+                        'other_allocations_microusd', 'covered_requests'))):
+            _deny('wallet account, settlement, liability or conversion evidence invalid')
+        for name in ('official', 'conversion', 'settlement'):
+            if digest(_read(value[name + '_source_path'])) != value[name + '_source_sha256']:
+                _deny('wallet official, currency or settlement source changed')
+        if not value['observed_epoch'] <= now < value['expires_epoch']:
+            raise FundingPause('余额证据未生效或已过期；请提供新的可信快照')
+        return value
+    except (OSError, KeyError, ValueError, TypeError) as exc:
+        raise ResourceGateDenied('wallet snapshot malformed or incomplete') from exc
+
+
+def _current_funds(auth, ledger, key, now):
+    entry = ledger.get('funding')
+    if not entry:
+        raise FundingPause('缺少可信余额快照；未预留、未发起请求')
+    value = _snapshot(auth, entry['path'], entry['sha256'], key, now)
+    rows = ledger['requests']
+    n = value['covered_requests']
+    if (entry['epoch'] != value['epoch'] or n > len(rows)
+            or value['covered_prefix_sha256'] != digest(canonical(rows[:n]))
+            or any(r.get('status') != 'RETURNED' or r.get('usage_accounting') != 'FULL_RESERVATION_RETAINED'
+                   for r in rows[:n])):
+        _deny('wallet settlement coverage differs from authenticated request prefix')
+    return value
+
+
+def _funding_check(auth, ledger, key, stage, now):
+    value = _current_funds(auth, ledger, key, now)
+    name = ('group_or_cross_group' if stage.startswith('group') or
+            stage.startswith('aggregate') else 'chunk_or_qualification')
+    upper = auth['deepseek_funding_policy']['unit_upper_bound_microusd'][name]
+    # No refund of mission debits. Only cash already officially reflected in
+    # the net balance is excluded from the post-snapshot cash suffix.
+    suffix = sum(r['wallet_exposure_microusd'] for r in ledger['requests'][value['covered_requests']:]
+                 if r['provider'] == 'deepseek')
+    free = (value['available_microusd'] - value['unsettled_liability_microusd'] -
+            value['other_allocations_microusd'] - suffix)
+    required = upper + auth['deepseek_funding_policy']['safety_margin_microusd']
+    if free < required:
+        raise FundingPause('余额不足；请手动补款并刷新可信证据', required=required, available=free)
+    return dict(value, _unit_exposure=upper)
+
+
+def _refresh_validated(auth, env, snapshot_path, snapshot_sha256, now, *, offline=False):
+    """Adopt separately signed capacity, never sign/replace execution authority."""
+    if auth['evidence_domain'] != ('OFFLINE_TEST' if offline else 'FORMAL'):
+        _deny('offline funds cannot activate formal execution')
+    path = Path(auth['ledger_path']); key = _read(env['CMH_RESOURCE_GATE_KEY_FILE'])
+    with _locked(path.with_name(path.name + '.lock')):
+        if not offline:
+            auth = load_authorization(env); now = time.time()
+        if not auth.get('deepseek_funding_policy'):
+            _deny('signed mission does not permit staged wallet refresh')
+        ledger = _verify_child(path, key, auth)
+        if any(r.get('status') in {'STARTED', 'UNKNOWN'} or r.get('usage_accounting') in
+               {'USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS', 'OVER_RESERVATION_BLOCK_FUTURE_CALLS'}
+               for r in ledger['requests']):
+            _deny('funding refresh cannot clear in-flight, unknown or overage requests')
+        value = _snapshot(auth, snapshot_path, snapshot_sha256, key, now)
+        old = ledger.get('funding')
+        if (value.get('previous_snapshot_sha256') != (old['sha256'] if old else None)
+                or value['epoch'] != (old['epoch'] + 1 if old else 1)
+                or value.get('baseline_checkpoint_sha256') != digest(_read(_checkpoint_path(path)))
+                or old and value['observed_epoch'] < old['observed_epoch']
+                or old and value['covered_requests'] < old['covered_requests']):
+            _deny('funding epoch replay, rollback or checkpoint drift')
+        candidate = dict(ledger, funding={'path': str(snapshot_path), 'sha256': snapshot_sha256,
+            'epoch': value['epoch'], 'observed_epoch': value['observed_epoch'],
+            'covered_requests': value['covered_requests']})
+        _current_funds(auth, candidate, key, now)
+        # Pause stays until a complete, atomic resource reservation succeeds.
+        _write_child(path, candidate, key)
+
+
+def refresh_wallet_snapshot(snapshot_path, snapshot_sha256):
+    """Future account-owner-signed evidence only; no credentials or top-up."""
+    _refresh_validated(load_authorization(), os.environ, snapshot_path, snapshot_sha256, time.time())
+
+
 def qualification_binding(auth):
     return {'mission_id': NEW_MISSION, 'authorization_sha256': auth['_authorization_sha256'],
             'parent_ledger_sha256': auth['parent']['ledger_sha256'],
@@ -375,6 +502,15 @@ def _bounded_timeout(auth, now, requested):
         _deny('delivery child timeout must be a positive bounded integer')
     remaining = min(auth['expires_epoch'], auth['started_epoch'] + auth['max_wall_clock_seconds'],
                     auth['_account']['expires_epoch']) - now
+    from .resource_gate import _active_reservation
+    active = _active_reservation.get()
+    if auth.get('deepseek_funding_policy') and active is not None and active.provider == 'deepseek':
+        ledger = _verify_child(Path(auth['ledger_path']), _read(active.ledger_key_path), auth)
+        try:
+            funds = _current_funds(auth, ledger, _read(active.ledger_key_path), now)
+        except FundingPause as exc:
+            raise ResourceGateDenied('funding validity lost after STARTED; retain unknown freeze') from exc
+        remaining = min(remaining, funds['expires_epoch'] - now)
     result = min(requested, 900, int(remaining))
     if result < 1:
         _deny('not enough valid time remains to launch a provider subprocess')
@@ -402,6 +538,15 @@ def require_active_transport(provider, model):
                 active.authorization_sha256 != auth['_authorization_sha256']):
             _deny('raw provider transport requires an active formal delivery reservation')
         ledger = _checked_child(active.ledger, _read(active.ledger_key_path))
+        if provider == 'deepseek' and auth.get('deepseek_funding_policy'):
+            try:
+                snapshot = _current_funds(auth, ledger, _read(active.ledger_key_path), time.time())
+            except FundingPause as exc:
+                raise ResourceGateDenied('funding validity lost after STARTED; retain unknown freeze') from exc
+            row = next((r for r in ledger['requests'] if r.get('request_id') == active.request_id), {})
+            if (row.get('funding_epoch') != snapshot['epoch'] or
+                    row.get('funding_snapshot_sha256') != ledger['funding']['sha256']):
+                _deny('transport funding epoch differs from its atomic reservation')
         if not any(row.get('request_id') == active.request_id and row.get('status') == 'STARTED'
                    and row.get('evidence_domain') == 'FORMAL' for row in ledger['requests']):
             _deny('raw provider transport reservation identity or state invalid')
@@ -571,9 +716,20 @@ def _reserve_validated(auth, env, provider, model, prompt, stage, now, *, offlin
         cost = sum(r['cost_reservation_microunits'] for r in prior) + lane['cost_reservation_microunits']
         account = auth['_account']['accounts'][provider]
         exposure = auth['_history'][provider]['cost'] + cost + account['other_reserved_microunits']
+        staged = provider == 'deepseek' and auth.get('deepseek_funding_policy')
         if (cost > lane['cost_limit_microunits'] or exposure > auth['shared_cost_limits'][provider]
-                or exposure > account['available_microunits']):
+                or not staged and exposure > account['available_microunits']):
             _deny('independent or shared account capacity exhausted')
+        funds = None
+        if staged:
+            try:
+                funds = _funding_check(auth, ledger, key, stage, now)
+            except FundingPause as exc:
+                ledger['funding_pause'] = dict(exc.details, provider=provider, stage=stage,
+                    run_id=env['CMH_RESOURCE_RUN_ID'], observed_epoch=now,
+                    request_high_water=len(rows), authorization_sha256=auth['_authorization_sha256'])
+                _write_child(path, ledger, key)
+                raise
         request_id = uuid.uuid4().hex
         row = {'number': len(rows) + 1, 'request_id': request_id, 'mission_id': NEW_MISSION,
                'authorization_sha256': auth['_authorization_sha256'], 'provider': provider,
@@ -585,6 +741,10 @@ def _reserve_validated(auth, env, provider, model, prompt, stage, now, *, offlin
                'token_reservation': reservation, 'cost_unit': lane['cost_unit'],
                'cost_reservation_microunits': lane['cost_reservation_microunits'],
                'usage_accounting': 'FULL_RESERVATION_RETAINED'}
+        if funds is not None:
+            row.update(funding_epoch=funds['epoch'], funding_snapshot_sha256=ledger['funding']['sha256'],
+                       wallet_exposure_microusd=funds['_unit_exposure'])
+            ledger.pop('funding_pause', None)
         if provider == 'deepseek':
             row['price_microusd_per_million'] = lane.get('price_microusd_per_million')
             row['cost_basis_policy'] = lane.get('cli_cost_policy')

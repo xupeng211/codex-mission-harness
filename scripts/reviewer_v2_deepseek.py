@@ -452,6 +452,11 @@ def run(args: argparse.Namespace) -> dict:
         return {"status": receipt["review_result"], "review_receipt": str(path),
                 "head_sha": head}
     except (Exception, KeyboardInterrupt) as exc:
+        from harness.resource_gate import FundingPause
+        if isinstance(exc, FundingPause):
+            if run is not None:
+                run.failure(dict(exc.details, failure_category="PAUSED_AWAITING_MANUAL_FUNDING"), auth_key)
+            raise
         category = (exc.category if isinstance(exc, ReviewStageFailure) else
                     "CANCELLED" if isinstance(exc, KeyboardInterrupt) else "INTERNAL_EXCEPTION")
         failure = {"status": "BLOCKED", "failure_category": category,

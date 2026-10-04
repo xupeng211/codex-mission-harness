@@ -154,7 +154,10 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
     def test_separate_signing_key_never_replaces_provider_credential(self):
         self._exercise_receipt(separate_auth=True)
 
-    def _exercise_receipt(self, separate_auth=False):
+    def test_funding_pause_keeps_completed_chunk_and_same_run(self):
+        self._exercise_receipt(funding_pause=True)
+
+    def _exercise_receipt(self, separate_auth=False, funding_pause=False):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "repo"
             root.mkdir()
@@ -180,7 +183,14 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
             if separate_auth:args.auth_key_file=str(signing_file)
             receipt_key="fixture-signing-key" if separate_auth else "fixture-token"
             summary = "The source change preserves the relevant contract and control flow."
+            paused, chunk_calls = [], []
             def invoke(command, prompt, env, timeout):
+                if funding_pause and "Scope=group" in prompt and not paused:
+                    from harness.resource_gate import FundingPause
+                    paused.append(True)
+                    raise FundingPause("OFFLINE funds exhausted", required=2, available=1)
+                if "Scope=chunk" in prompt:
+                    chunk_calls.append(True)
                 self.assertEqual(env["ANTHROPIC_API_KEY"],"fixture-token")
                 self.assertNotIn("fixture-signing-key",repr(env))
                 if "Scope=cross-group" in prompt:
@@ -196,7 +206,18 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
                   patch.object(reviewer.legacy, "read_token_file", side_effect=lambda path,_root: "fixture-signing-key" if str(path)==str(signing_file) else "fixture-token"),
                   patch.object(reviewer, "validate_qualification_receipt", return_value={}) as qualified,
                   patch.object(reviewer.legacy, "invoke_reviewer", side_effect=invoke)):
+                if funding_pause:
+                    from harness.resource_gate import FundingPause
+                    with self.assertRaises(FundingPause): reviewer.run(args)
+                    state_path, = evidence.glob("*/state.json")
+                    funding_state = json.loads(state_path.read_bytes())
+                    self.assertEqual(funding_state['failure_count'], 0)
+                    self.assertEqual(funding_state['funding_status'], 'PAUSED_AWAITING_MANUAL_FUNDING')
+                    self.assertEqual(funding_state['next_stage'], 'group-000')
                 response = reviewer.run(args)
+                if funding_pause:
+                    self.assertEqual(len(chunk_calls), 1)
+                    self.assertEqual(len(list(evidence.glob("*/state.json"))), 1)
             self.assertEqual(qualified.call_args.kwargs["auth_key"],receipt_key)
             receipt_path = Path(response["review_receipt"])
             self.assertEqual(response["status"], "PASS")

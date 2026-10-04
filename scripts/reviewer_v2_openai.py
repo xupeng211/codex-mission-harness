@@ -501,7 +501,7 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
         return invoke_codex(prompt, spec, stage=stage, timeout=timeout,
                             transport_sink=sink)
     chunks, groups = _plan(diff)
-    stage_plan = [(f"chunk-{i:03d}", "chunk") for i in range(len(chunks))] + [
+    stage_plan = [("structured-preflight", "preflight")] + [(f"chunk-{i:03d}", "chunk") for i in range(len(chunks))] + [
         (f"group-{i:03d}", "group") for i in range(len(groups))]
     stage_plan.extend(full.synthesis_stage_names(len(groups)))
     _, manifest = full.build_manifest(root, base, head, repository)
@@ -552,11 +552,10 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
         # Authenticate first, then exercise the same Codex structured
         # invocation path and chunk schema used by the review lane.
         preflight(spec, probe=False, timeout=min(timeout, 120))
-        os.environ["CMH_RESOURCE_STAGE"] = "structured-preflight"
-        invoke_codex(
-            'Return JSON with an empty findings array. Use the exact chunk schema.',
-            spec, stage="chunk", timeout=min(timeout, 120),
-        )
+        prompt = 'Return JSON with an empty findings array. Use the exact chunk schema.'
+        stage_run("structured-preflight", "preflight", prompt,
+                  lambda: invoke_codex(prompt, spec, stage="chunk", timeout=min(timeout, 120)),
+                  _result)
         receipt, _ = _assemble(diff, base, head, call, stage_run=stage_run, manifest=manifest)
         receipt.update({"model": spec.model, "reasoning_effort": spec.reasoning_effort,
                         "mission_id": mission_id, "repository": repository,
@@ -580,6 +579,10 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
         run_state.receipt(path.name, _canon(receipt), lambda: None)
         return path
     except (Exception, KeyboardInterrupt) as exc:
+        from harness.resource_gate import FundingPause
+        if isinstance(exc, FundingPause):
+            run_state.failure(dict(exc.details, failure_category="PAUSED_AWAITING_MANUAL_FUNDING"), auth_key)
+            raise
         failure = {"status": "BLOCKED", "base_sha": base, "head_sha": head,
                    "mission_id": mission_id, "repository": repository,
                    "diff_sha256": _sha(diff), "provider": spec.provider,

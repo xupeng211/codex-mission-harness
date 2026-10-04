@@ -459,10 +459,9 @@ class FullDiffTests(unittest.TestCase):
             again = openai.run(self.root, self.base, self.head, evidence, 'fixture-key', spec,
                                qualification_path='offline-fixture')
             self.assertEqual(receipt, again)
-            # Only the explicit structured preflight runs again; reviewed chunks/groups stay committed.
-            repeated = [k for k in counts if counts[k] > committed_counts.get(k, 0)]
-            self.assertEqual(len(repeated), 1)
-            self.assertTrue(all(v == 1 for k, v in counts.items() if k not in repeated))
+            # Structured preflight and all reviewed stages are durable; no model is recalled.
+            self.assertEqual(counts, committed_counts)
+            self.assertTrue(all(v == 1 for v in counts.values()))
 
     def test_qualification_contract_auth_cases_and_runner_binding(self):
         from harness.model_qualification import (QualificationResult, CASES, qualification_receipt,
