@@ -540,11 +540,15 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
         raise KeyboardInterrupt()
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
+    delivery_context = None
     try:
         if qualification_path is None:
             raise ValueError("live OpenAI review requires a final reviewer qualification receipt")
         qualified = validate_qualification_receipt(qualification_path, spec, auth_key=auth_key,
                                        role="final_reviewer", registry_path=registry_path)
+        from harness.formal_delivery_gate import bind_review
+        delivery_context = bind_review(mission_id, root, base, head,
+                                       _sha(registry.path.read_bytes()), spec, qualified)
         # Authenticate first, then exercise the same Codex structured
         # invocation path and chunk schema used by the review lane.
         preflight(spec, probe=False, timeout=min(timeout, 120))
@@ -605,6 +609,8 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
             exc.evidence["failure_record"] = str(failure_path)
         raise
     finally:
+        from harness.formal_delivery_gate import reset_review
+        reset_review(delivery_context)
         signal.signal(signal.SIGTERM, previous_signals[0])
         signal.signal(signal.SIGINT, previous_signals[1])
         run_state.close()

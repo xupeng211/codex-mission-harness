@@ -1,0 +1,547 @@
+"""One scoped delivery continuation; no authority is issued by this module.
+
+Production trust is bootstrapped from the immutable old authorization's HMAC,
+not an environment-selected test key. Old UNKNOWN usage is retained. A new
+call also needs separately approved, authoritative net account capacity.
+"""
+from __future__ import annotations
+
+import hmac
+import json
+import os
+import re
+import time
+import uuid
+from contextvars import ContextVar
+from dataclasses import dataclass
+from pathlib import Path
+
+from .resource_gate import (ResourceGateDenied, Reservation, _locked, _private,
+                            _write_atomic, canonical, digest, sign_authorization)
+
+OLD_MISSION = 'HARNESS_AUTONOMOUS_PRE_MERGE_DELIVERY'
+NEW_MISSION = 'HARNESS_CURRENT_VERSION_DELIVERY'
+AUTH_VERSION = 'cmh-current-delivery-authorization/v1'
+ACCOUNT_VERSION = 'cmh-shared-capacity-attestation/v1'
+LEDGER_VERSION = 'cmh-current-delivery-ledger/v1'
+SOURCE_VERSION = 'exact-unique-utf8-quote/v1'
+CAPACITY_POLICY = 'AUTHORITATIVE_NET_CAPACITY_NO_UNBOUNDED_PRIOR_LIABILITY'
+CATEGORIES = ('input', 'cache', 'output', 'reasoning')
+EVIDENCE_ROOT = Path('/home/xupeng/codex-mission-harness-evidence/autonomous-premerge-20261002')
+DELIVERY_LEDGER = EVIDENCE_ROOT / 'current-version-delivery-ledger.json'
+HISTORICAL_AUTHORIZATION = (EVIDENCE_ROOT / 'formal-60h-review/authorized-closure-20261003/'
+                            'final-dual-review-delivery-20261003/hard-delivery-resource-authorization.json')
+RUNTIME_FILES = ('src/harness/formal_delivery_gate.py', 'src/harness/resource_gate.py',
+                 'src/harness/reviewer_v2_contract.py', 'src/harness/model_qualification.py',
+                 'src/harness/model_registry.py', 'src/harness/openai_invocation.py',
+                 'src/harness/full_diff_manifest.py', 'src/harness/review_resume.py',
+                 'src/harness/codex.py',
+                 'scripts/reviewer_v2_deepseek.py', 'scripts/reviewer_v2_openai.py',
+                 'scripts/deepseek_review.py', 'scripts/model_qualification.py')
+_review_context = ContextVar('cmh_formal_delivery_review', default=None)
+
+
+@dataclass(frozen=True)
+class TrustAnchor:
+    ledger_sha256: str
+    authorization_sha256: str
+    request_sha256: str
+
+
+PRODUCTION_ANCHOR = TrustAnchor(
+    '200d702fa712629e35fb8746500e708e5382e1313b2737f8d2d25c4970160c9d',
+    'c6caca54292b61f96d91b7a714cfee60006630d72fe490c5bfc464e8b1c5aa25',
+    'aa865dcbea7392e6fe937d1566443ebc5acb4dc4d222ed4dc551fce9b9c3d153')
+
+
+def _deny(message):
+    raise ResourceGateDenied(message)
+
+
+def _integer(value, minimum=0):
+    return type(value) is int and value >= minimum
+
+
+def _read(path):
+    try:
+        path = Path(path)
+        if path.resolve() != path:
+            _deny('delivery artifact path must be canonical, private and non-symlinked')
+        return _private(path)
+    except (OSError, TypeError) as exc:
+        raise ResourceGateDenied('delivery evidence artifact is missing or inaccessible') from exc
+
+
+def _signed(path, expected_hash, key):
+    raw = _read(path)
+    if expected_hash is not None and digest(raw) != expected_hash:
+        _deny('delivery signed artifact hash mismatch')
+    try:
+        value = json.loads(raw)
+    except (ValueError, UnicodeError) as exc:
+        raise ResourceGateDenied('delivery signed artifact is malformed') from exc
+    if not isinstance(value, dict):
+        _deny('delivery signed artifact must be an object')
+    signature = value.pop('authorization_hmac_sha256', None)
+    expected = sign_authorization(value, key)['authorization_hmac_sha256']
+    if not isinstance(signature, str) or not hmac.compare_digest(signature, expected):
+        _deny('delivery artifact signature invalid')
+    return value
+
+
+def runtime_snapshot():
+    from .full_diff_manifest import git
+    from .model_registry import load_registry
+    root = Path(__file__).resolve().parents[2]
+    if git(root, 'status', '--porcelain').strip():
+        _deny('formal delivery runtime worktree is dirty')
+    registry = load_registry()
+    return {'head': git(root, 'rev-parse', 'HEAD').decode().strip(),
+            'files': {name: digest((root / name).read_bytes()) for name in RUNTIME_FILES},
+            'registry_sha256': digest(registry.path.read_bytes()),
+            'models': {p: registry.role(role).identity() for p, role in
+                       (('deepseek', 'independent_reviewer'), ('openai', 'final_reviewer'))}}
+
+
+def _history(rows):
+    result = {'global_calls': len(rows)}
+    for provider in ('deepseek', 'openai'):
+        selected = [r for r in rows if r.get('provider') == provider]
+        result[provider] = {
+            'calls': len(selected),
+            'unmetered_calls': sum(not isinstance(r.get('token_reservation'), dict) for r in selected),
+            'tokens': {k: sum(r.get('token_reservation', {}).get(k, 0) for r in selected)
+                       for k in CATEGORIES},
+            'cost': sum(r.get('cost_reservation_microunits', 0) for r in selected)}
+    return result
+
+
+def _load(env, anchor, runtime, now, *, offline=False):
+    """Pure validation seam for offline fixtures; production never injects trust."""
+    try:
+        key = _read(env['CMH_RESOURCE_GATE_KEY_FILE'])
+        auth_hash = env['CMH_RESOURCE_AUTH_SHA256']
+        auth = _signed(env['CMH_RESOURCE_AUTHORIZATION'], auth_hash, key)
+        domain = 'OFFLINE_TEST' if offline else 'FORMAL'
+        if (auth.get('version') != AUTH_VERSION or auth.get('evidence_domain') != domain
+                or auth.get('approval_source') != 'EXPLICIT_USER_APPROVAL'
+                or not isinstance(auth.get('authorization_id'), str)
+                or not auth['authorization_id'] or auth.get('activation_approved') is not True
+                or auth.get('mission_id') != NEW_MISSION
+                or env['CMH_RESOURCE_MISSION_ID'] != NEW_MISSION
+                or auth.get('scope') != ['PR2', 'PR4']
+                or auth.get('source_binding_version') != SOURCE_VERSION
+                or auth.get('source_binding_approved') is not True
+                or auth.get('old_mission_frozen') is not True
+                or auth.get('historical_actual_usage') != 'UNKNOWN'
+                or auth.get('token_accounting_basis') != 'PROSPECTIVE_PLUS_KNOWN_HISTORICAL_RESERVATIONS'
+                or auth.get('chunk_migration_allowed') is not False):
+            _deny('independent formal delivery activation approval is required')
+        if (not _integer(auth['approved_at_epoch']) or auth['approved_at_epoch'] > now or
+                digest(_read(auth['user_approval_path'])) != auth['user_approval_sha256']):
+            _deny('independent user approval provenance is missing or changed')
+        parent = auth['parent']
+        if (parent['mission_id'] != OLD_MISSION or parent['ledger_sha256'] != anchor.ledger_sha256
+                or parent['authorization_sha256'] != anchor.authorization_sha256
+                or parent['request_334_sha256'] != anchor.request_sha256
+                or parent['deepseek_reserved_microusd'] != 28800000
+                or parent.get('acceptance') != 'INCOMPLETE'
+                or parent.get('original_started_at') != '2026-10-01T16:53:04Z'):
+            _deny('immutable signed parent anchor mismatch')
+        # The fixed old authorization signature authenticates the signing key.
+        # A synthetic key cannot authenticate these pinned bytes in production.
+        legacy = _signed(parent['authorization_path'], anchor.authorization_sha256, key)
+        if (legacy.get('mission_id') != OLD_MISSION or legacy.get('baseline_calls') != 246
+                or legacy.get('version') != 'cmh-resource-budget/v1'
+                or legacy.get('ledger_path') != parent['ledger_path']):
+            _deny('parent authorization identity mismatch')
+        raw = _read(parent['ledger_path'])
+        if digest(raw) != anchor.ledger_sha256:
+            _deny('parent ledger hash mismatch')
+        rows = json.loads(raw)['requests']
+        if (len(rows) != 334 or any(r.get('number') != n for n, r in enumerate(rows, 1))
+                or digest(canonical(rows[-1])) != anchor.request_sha256
+                or rows[-1].get('mission_id') != OLD_MISSION
+                or rows[-1].get('status') != 'FAILED'
+                or rows[-1].get('reported_usage') != 'UNKNOWN'
+                or rows[-1].get('usage_accounting') != 'USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS'
+                or rows[-1].get('cost_reservation_microunits') != 400000):
+            _deny('request 334 FAILED/UNKNOWN history must remain intact')
+        history = _history(rows)
+        if history['deepseek']['cost'] != 28800000:
+            _deny('historical DeepSeek full reservation was lost')
+        if auth['runtime'] != runtime:
+            _deny('delivery Git, runtime, registry or model identity changed')
+        if (runtime['models']['deepseek']['model'] != 'deepseek-flash'
+                or runtime['models']['openai']['model'] != 'gpt-5.6-sol'):
+            _deny('formal review model changed')
+        if not offline and runtime['models']['openai'].get('reasoning_effort') != 'high':
+            _deny('formal OpenAI reasoning contract must remain high')
+        targets = auth['targets']
+        if (set(targets) != {'PR2', 'PR4'} or targets['PR4']['base'] != targets['PR2']['head']
+                or targets['PR4']['head'] != runtime['head']
+                or any(set(item) != {'base', 'head'} or any(not isinstance(v, str) or
+                       not re.fullmatch('[0-9a-f]{40}', v) for v in item.values())
+                       for item in targets.values())):
+            _deny('delivery target dependency mismatch')
+        if not offline:
+            from .full_diff_manifest import git
+            root = Path(__file__).resolve().parents[2]
+            for item in targets.values():
+                git(root, 'merge-base', '--is-ancestor', item['base'], item['head'])
+        ledger = Path(auth['ledger_path'])
+        if (str(ledger) != env['CMH_RESOURCE_LEDGER'] or ledger.resolve() != ledger
+                or ledger == Path(parent['ledger_path']) or not offline and ledger != DELIVERY_LEDGER):
+            _deny('delivery must use its fixed shared continuation ledger')
+        for name in ('started_epoch', 'expires_epoch', 'max_wall_clock_seconds'):
+            if not _integer(auth[name]):
+                _deny('delivery time contract invalid')
+        if not auth['started_epoch'] <= now < min(auth['expires_epoch'],
+                                                 auth['started_epoch'] + auth['max_wall_clock_seconds']):
+            _deny('delivery time or validity hard stop reached')
+        for name in ('max_new_calls', 'shared_max_calls'):
+            if not _integer(auth[name], 1):
+                _deny('delivery logical call limit invalid')
+        account = _signed(auth['account_evidence_path'], auth['account_evidence_sha256'], key)
+        if (account.get('version') != ACCOUNT_VERSION or account.get('evidence_domain') != domain
+                or account.get('parent_ledger_sha256') != anchor.ledger_sha256
+                or account.get('policy') != CAPACITY_POLICY
+                or any(account.get(name) is not True for name in
+                       ('no_unbounded_prior_liability', 'all_prior_activity_included', 'exclusive_allocation'))
+                or not _integer(account['observed_epoch']) or not _integer(account['expires_epoch'])
+                or not account['observed_epoch'] <= now < account['expires_epoch']):
+            _deny('authoritative net shared capacity proof is missing or expired')
+        if digest(_read(account['official_source_path'])) != account['official_source_sha256']:
+            _deny('official shared capacity evidence changed')
+        for provider in ('deepseek', 'openai'):
+            item = account['accounts'][provider]
+            lane = auth['providers'][provider]
+            unit = 'USD' if provider == 'deepseek' else 'CODEX_SUBSCRIPTION_UNITS'
+            if (item['account_id'] != auth['account_ids'][provider] or item['unit'] != unit
+                    or item['credential_identity'] != auth['credential_identities'][provider]
+                    or not isinstance(item['credential_identity'], str)
+                    or not re.fullmatch('[0-9a-f]{64}', item['credential_identity'])
+                    or lane['model'] != runtime['models'][provider]['model']
+                    or lane['cost_unit'] != unit
+                    or lane['unknown_policy'] != 'DEBIT_FULL_RESERVATION_STOP_ON_OVERAGE'
+                    or not _integer(item['available_microunits'])
+                    or not _integer(item['other_reserved_microunits'])
+                    or not _integer(item['other_calls'])
+                    or set(item['other_tokens']) != set(CATEGORIES)
+                    or any(not _integer(v) for v in item['other_tokens'].values())
+                    or not _integer(lane['max_new_calls'])
+                    or not _integer(lane['cost_limit_microunits'], 1)
+                    or not _integer(lane['cost_reservation_microunits'], 1)
+                    or any(set(lane[name]) != set(CATEGORIES) or
+                           any(not _integer(v, 1) for v in lane[name].values())
+                           for name in ('token_limit', 'token_reservation'))
+                    or set(auth['shared_token_limits'][provider]) != set(CATEGORIES)
+                    or any(not _integer(v, 1) for v in auth['shared_token_limits'][provider].values())
+                    or not _integer(auth['shared_cost_limits'][provider], 1)):
+                _deny('account, provider or bounded resource identity invalid')
+            if not offline:
+                expected_tokens = ({'input': 64000, 'cache': 64000, 'output': 128000, 'reasoning': 128000}
+                                   if provider == 'deepseek' else
+                                   {'input': 400000, 'cache': 400000, 'output': 128000, 'reasoning': 128000})
+                if (lane['token_reservation'] != expected_tokens or
+                        lane['cost_reservation_microunits'] != (400000 if provider == 'deepseek' else 1000000)):
+                    _deny('existing per-call reservation contract cannot be lowered')
+                if provider == 'deepseek' and lane.get('stage_token_reservation') != {
+                        'chunk_or_qualification': expected_tokens,
+                        'group_or_cross_group': {'input': 64000, 'cache': 192000,
+                                                'output': 192000, 'reasoning': 128000}}:
+                    _deny('DeepSeek Group/Cross-group reservation contract must be preserved')
+            exposure = history[provider]['cost'] + item['other_reserved_microunits'] + lane['cost_limit_microunits']
+            if exposure > min(item['available_microunits'], auth['shared_cost_limits'][provider]):
+                _deny('shared account evidence cannot cover the complete approved future envelope')
+            if any(history[provider]['tokens'][k] + item['other_tokens'][k] + lane['token_limit'][k] >
+                   auth['shared_token_limits'][provider][k] for k in CATEGORIES):
+                _deny('shared token envelope omits historical or other-task reservations')
+        if history['global_calls'] + auth['max_new_calls'] + sum(
+                a['other_calls'] for a in account['accounts'].values()) > auth['shared_max_calls']:
+            _deny('shared call envelope cannot cover the complete approved future budget')
+        if not offline:
+            from .full_diff_manifest import read_diff, plan, synthesis_stage_names
+            minima = {'deepseek': 4, 'openai': 4}
+            ds_chunks, ds_groups = 4, 0
+            for target in targets.values():
+                chunks, groups = plan(read_diff(root, target['base'], target['head']))
+                ds_chunks += len(chunks); ds_groups += len(groups) + 1
+                minima['deepseek'] += len(chunks) + len(groups) + 1
+                minima['openai'] += len(chunks) + len(groups) + len(synthesis_stage_names(len(groups))) + 1
+            token_minima = {
+                'deepseek': {'input': minima['deepseek'] * 64000,
+                             'cache': ds_chunks * 64000 + ds_groups * 192000,
+                             'output': ds_chunks * 128000 + ds_groups * 192000,
+                             'reasoning': minima['deepseek'] * 128000},
+                'openai': {k: minima['openai'] * (400000 if k in ('input', 'cache') else 128000)
+                           for k in CATEGORIES}}
+            if auth['max_new_calls'] < sum(minima.values()) or any(
+                    auth['providers'][p]['max_new_calls'] < minima[p] or
+                    auth['providers'][p]['cost_limit_microunits'] < minima[p] *
+                    auth['providers'][p]['cost_reservation_microunits'] or
+                    any(auth['providers'][p]['token_limit'][k] < token_minima[p][k] for k in CATEGORIES)
+                    for p in minima):
+                _deny('authorization cannot cover qualification and both complete minimum reviews')
+        return dict(auth, _authorization_sha256=auth_hash, _history=history, _account=account)
+    except ResourceGateDenied:
+        raise
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise ResourceGateDenied('formal delivery evidence missing or malformed') from exc
+
+
+def load_authorization(environment=None):
+    env = os.environ if environment is None else environment
+    # Reject a test-domain artifact before examining the runtime or any transport.
+    try:
+        value = json.loads(_read(env['CMH_RESOURCE_AUTHORIZATION']))
+        if value.get('evidence_domain') != 'FORMAL':
+            _deny('offline evidence cannot activate a formal mission')
+    except (OSError, ValueError, KeyError) as exc:
+        raise ResourceGateDenied('formal delivery authorization is required') from exc
+    return _load(env, PRODUCTION_ANCHOR, runtime_snapshot(), time.time())
+
+
+def authenticate_legacy_signer(key_path):
+    _signed(HISTORICAL_AUTHORIZATION, PRODUCTION_ANCHOR.authorization_sha256, _read(key_path))
+
+
+def qualification_binding(auth):
+    return {'mission_id': NEW_MISSION, 'authorization_sha256': auth['_authorization_sha256'],
+            'parent_ledger_sha256': auth['parent']['ledger_sha256'],
+            'runtime_sha256': digest(canonical(auth['runtime']))}
+
+
+def validate_qualification_binding(binding, auth):
+    if binding != qualification_binding(auth) or auth['evidence_domain'] != 'FORMAL':
+        _deny('old or synthetic qualification cannot authorize formal delivery')
+
+
+def require_invocation_spec(spec):
+    if os.environ.get('CMH_RESOURCE_MISSION_ID') == NEW_MISSION:
+        auth = load_authorization()
+        if spec.identity() != auth['runtime']['models'].get(spec.provider):
+            _deny('provider invocation differs from the signed model and reasoning contract')
+
+
+def credential_identity(provider, credential_bytes, key):
+    import hashlib
+    return hmac.new(key, b'cmh-delivery-account-route/v1/' + provider.encode() + b'/' + credential_bytes,
+                    hashlib.sha256).hexdigest()
+
+
+def require_provider_credential(provider, credential_bytes):
+    if os.environ.get('CMH_RESOURCE_MISSION_ID') == NEW_MISSION:
+        auth = load_authorization()
+        key = _read(os.environ['CMH_RESOURCE_GATE_KEY_FILE'])
+        if (not credential_bytes or credential_identity(provider, credential_bytes, key) !=
+                auth['credential_identities'][provider]):
+            _deny('actual provider credential/home differs from the authenticated account capacity route')
+
+
+def require_active_transport(provider, model):
+    """The lower-level CLI helpers cannot bypass activation or atomic reservation."""
+    from .resource_gate import _active_reservation
+    active = _active_reservation.get()
+    if active is not None and active.execution_allowed is not True:
+        _deny('synthetic reservations cannot enter provider transport')
+    if os.environ.get('CMH_RESOURCE_MISSION_ID') == NEW_MISSION:
+        auth = load_authorization()
+        if (active is None or active.ledger_key_path is None or
+                (active.provider, active.model) != (provider, model) or
+                active.authorization_sha256 != auth['_authorization_sha256']):
+            _deny('raw provider transport requires an active formal delivery reservation')
+        ledger = _checked_child(active.ledger, _read(active.ledger_key_path))
+        if not any(row.get('request_id') == active.request_id and row.get('status') == 'STARTED'
+                   and row.get('evidence_domain') == 'FORMAL' for row in ledger['requests']):
+            _deny('raw provider transport reservation identity or state invalid')
+
+
+def bind_review(mission_id, root, base, head, registry_hash, spec, qualification):
+    if mission_id != NEW_MISSION and os.environ.get('CMH_RESOURCE_MISSION_ID') != NEW_MISSION:
+        return None
+    auth = load_authorization()
+    validate_qualification_binding(qualification.get('delivery_binding'), auth)
+    from .full_diff_manifest import git, read_diff, plan, synthesis_stage_names
+    target = next((name for name, item in auth['targets'].items()
+                   if item == {'base': base, 'head': head}), None)
+    if (mission_id != NEW_MISSION or target is None
+            or git(root, 'rev-parse', 'HEAD').decode().strip() != head
+            or git(root, 'status', '--porcelain').strip()
+            or registry_hash != auth['runtime']['registry_sha256']
+            or spec.identity() != auth['runtime']['models'][spec.provider]):
+        _deny('review arguments differ from the signed delivery identity')
+    chunks, groups = plan(read_diff(root, base, head))
+    stages = [f'chunk-{i:03d}' for i in range(len(chunks))] + [f'group-{i:03d}' for i in range(len(groups))]
+    if spec.provider == 'deepseek':
+        stages = [name + '.json' for name in stages] + ['aggregate.json']
+    else:
+        stages += ['structured-preflight'] + [name for name, _ in synthesis_stage_names(len(groups))]
+    return _review_context.set({'target': target, 'base': base, 'head': head, 'stages': stages,
+                               'binding': qualification_binding(auth), 'provider': spec.provider})
+
+
+def reset_review(token):
+    if token is not None:
+        _review_context.reset(token)
+
+
+def _checkpoint_path(path):
+    return path.with_name(path.name + '.checkpoint.json')
+
+
+def _checked_child(path, key):
+    raw = _read(path)
+    checkpoint = _signed(_checkpoint_path(path), None, key)
+    if (checkpoint.get('ledger_path') != str(path) or checkpoint.get('ledger_sha256') != digest(raw)):
+        _deny('delivery durable checkpoint differs from ledger; recovery must fail closed')
+    ledger = _signed(path, None, key)
+    if checkpoint.get('requests') != len(ledger.get('requests', [])):
+        _deny('delivery checkpoint high-water count mismatch')
+    return ledger
+
+
+def _write_child(path, ledger, key):
+    sealed = sign_authorization(ledger, key)
+    raw_hash = digest(canonical(sealed) + b'\n')
+    checkpoint = {'ledger_path': str(path), 'ledger_sha256': raw_hash,
+                  'requests': len(ledger['requests'])}
+    # Journal intent first. A crash between writes causes a mismatch and blocks
+    # all launches; it never silently refunds a reservation.
+    _write_atomic(_checkpoint_path(path), sign_authorization(checkpoint, key))
+    _write_atomic(path, sealed)
+
+
+def _verify_child(path, key, auth):
+    ledger = _checked_child(path, key)
+    if (ledger.get('version') != LEDGER_VERSION
+            or ledger.get('evidence_domain') != auth['evidence_domain']
+            or ledger.get('mission_id') != NEW_MISSION
+            or ledger.get('parent_ledger_sha256') != auth['parent']['ledger_sha256']
+            or ledger.get('authorization_sha256') != auth['_authorization_sha256']):
+        _deny('empty or unlinked ledger cannot restart delivery accounting')
+    rows = ledger['requests']
+    if (not isinstance(rows, list) or any(row.get('number') != i or
+            row.get('mission_id') != NEW_MISSION or
+            row.get('authorization_sha256') != auth['_authorization_sha256']
+            for i, row in enumerate(rows, 1)) or
+            len({r.get('request_id') for r in rows}) != len(rows)):
+        _deny('delivery ledger continuity or identity invalid')
+    return ledger
+
+
+def _qualification_request(rows, provider, prompt, run_id):
+    from .model_qualification import CASES, qualification_prompt
+    previous = [r for r in rows if r['provider'] == provider and r['stage'] == 'qualification-case']
+    if (len(previous) >= len(CASES) or
+            any(r['run_id'] != run_id for r in previous) or
+            prompt != qualification_prompt(CASES[len(previous)]).encode()):
+        _deny('qualification is exactly one ordered four-case run; no arbitrary probe or retry')
+
+
+def _reserve_validated(auth, env, provider, model, prompt, stage, now, *, offline=False):
+    from .resource_gate import _stage_reservation, _limits
+    if auth['evidence_domain'] != ('OFFLINE_TEST' if offline else 'FORMAL'):
+        _deny('synthetic resource context cannot launch a provider')
+    if not env.get('CMH_RESOURCE_RUN_ID'):
+        _deny('delivery run identity required')
+    lane = auth['providers'][provider]
+    if not offline:
+        _limits(auth, provider, model)  # Preserve existing price/route and token safety rules.
+    if lane['model'] != model:
+        _deny('delivery model identity mismatch')
+    reservation = _stage_reservation(lane, provider, stage)
+    path = Path(auth['ledger_path']); key = _read(env['CMH_RESOURCE_GATE_KEY_FILE'])
+    with _locked(path.with_name(path.name + '.lock')):
+        if not offline:
+            auth = load_authorization(env)  # Recheck time/evidence/identity under the reservation lock.
+            lane = auth['providers'][provider]
+            reservation = _stage_reservation(lane, provider, stage)
+            if stage != 'qualification-case':
+                context = _review_context.get()
+                if not context or context['binding'] != qualification_binding(auth):
+                    _deny('review context expired or changed before atomic reservation')
+            now = time.time()
+        ledger = _verify_child(path, key, auth)
+        rows = ledger['requests']; prior = [r for r in rows if r['provider'] == provider]
+        context = None
+        if not offline:
+            if stage == 'qualification-case':
+                _qualification_request(rows, provider, prompt, env['CMH_RESOURCE_RUN_ID'])
+            else:
+                context = _review_context.get()
+                if stage not in context['stages']:
+                    _deny('review stage is outside the exact signed full-diff manifest')
+                attempts = {}
+                for row in prior:
+                    if row.get('target') is not None:
+                        item = (row['target'], row['stage'])
+                        attempts[item] = attempts.get(item, 0) + 1
+                item = (context['target'], stage)
+                if (attempts.get(item, 0) >= 2 or attempts.get(item, 0) and
+                        sum(max(0, count - 1) for count in attempts.values()) >= 2):
+                    _deny('same-stage or provider total bounded retry limit reached')
+        if any(r.get('status') in {'STARTED', 'UNKNOWN'} or r.get('usage_accounting') in
+               {'USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS', 'OVER_RESERVATION_BLOCK_FUTURE_CALLS'} for r in rows):
+            _deny('new mission has an unreconciled or in-flight request')
+        if (len(rows) >= auth['max_new_calls'] or len(prior) >= lane['max_new_calls']
+                or auth['_history']['global_calls'] + len(rows) + 1 +
+                sum(a['other_calls'] for a in auth['_account']['accounts'].values()) > auth['shared_max_calls']):
+            _deny('independent or shared logical call limit exhausted')
+        for category in CATEGORIES:
+            used = sum(r['token_reservation'][category] for r in prior)
+            if (used + reservation[category] > lane['token_limit'][category] or
+                    auth['_history'][provider]['tokens'][category] + used + reservation[category] +
+                    auth['_account']['accounts'][provider]['other_tokens'][category] >
+                    auth['shared_token_limits'][provider][category]):
+                _deny('independent or shared token reservation ceiling exhausted')
+        cost = sum(r['cost_reservation_microunits'] for r in prior) + lane['cost_reservation_microunits']
+        account = auth['_account']['accounts'][provider]
+        exposure = auth['_history'][provider]['cost'] + cost + account['other_reserved_microunits']
+        if (cost > lane['cost_limit_microunits'] or exposure > auth['shared_cost_limits'][provider]
+                or exposure > account['available_microunits']):
+            _deny('independent or shared account capacity exhausted')
+        request_id = uuid.uuid4().hex
+        row = {'number': len(rows) + 1, 'request_id': request_id, 'mission_id': NEW_MISSION,
+               'authorization_sha256': auth['_authorization_sha256'], 'provider': provider,
+               'model': model, 'run_id': env['CMH_RESOURCE_RUN_ID'], 'stage': stage,
+               'started_epoch': now, 'status': 'STARTED', 'formal_delivery_gate': True,
+               'evidence_domain': auth['evidence_domain'], 'prompt_sha256': digest(prompt),
+               'parent_ledger_sha256': auth['parent']['ledger_sha256'],
+               'account_evidence_sha256': auth['account_evidence_sha256'],
+               'token_reservation': reservation, 'cost_unit': lane['cost_unit'],
+               'cost_reservation_microunits': lane['cost_reservation_microunits'],
+               'usage_accounting': 'FULL_RESERVATION_RETAINED'}
+        if provider == 'deepseek':
+            row['price_microusd_per_million'] = lane.get('price_microusd_per_million')
+            row['cost_basis_policy'] = lane.get('cli_cost_policy')
+        if context is not None:
+            row['target'] = context['target']
+            row['review_binding'] = context['binding']
+        rows.append(row)
+        _write_child(path, ledger, key)
+    return Reservation(path, request_id, auth['_authorization_sha256'], provider, model,
+                       ledger_key_path=Path(env['CMH_RESOURCE_GATE_KEY_FILE']), execution_allowed=not offline)
+
+
+def reserve_delivery(*, provider, model, prompt, stage, environment=None):
+    env = os.environ if environment is None else environment
+    auth = load_authorization(env)
+    if stage != 'qualification-case':
+        context = _review_context.get()
+        if (not context or context['binding'] != qualification_binding(auth)
+                or context['provider'] != provider):
+            _deny('formal review needs a current qualified and signed target context')
+    return _reserve_validated(auth, env, provider, model, prompt, stage, time.time())
+
+
+def initialize_ledger():
+    """Called only in a future independently approved activation; no signing of approval."""
+    auth = load_authorization(); path = Path(auth['ledger_path'])
+    with _locked(path.with_name(path.name + '.lock')):
+        if path.exists() or _checkpoint_path(path).exists():
+            _deny('delivery ledger already exists; never reset history')
+        ledger = {'version': LEDGER_VERSION, 'evidence_domain': 'FORMAL', 'mission_id': NEW_MISSION,
+                  'parent_ledger_sha256': auth['parent']['ledger_sha256'],
+                  'authorization_sha256': auth['_authorization_sha256'], 'requests': []}
+        _write_child(path, ledger, _read(os.environ['CMH_RESOURCE_GATE_KEY_FILE']))

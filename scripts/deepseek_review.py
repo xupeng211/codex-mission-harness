@@ -972,6 +972,15 @@ def bounded_prompt_bytes(prompt_text):
     return rendered
 
 def _invoke_reviewer_unmetered(command, prompt_text, env, timeout):
+    from harness.formal_delivery_gate import require_active_transport
+    model = command[command.index("--model") + 1] if "--model" in command else ""
+    require_active_transport("deepseek", model)
+    from harness.formal_delivery_gate import NEW_MISSION, require_provider_credential
+    if os.environ.get("CMH_RESOURCE_MISSION_ID") == NEW_MISSION:
+        credential = env.get("ANTHROPIC_API_KEY", "")
+        if env.get("ANTHROPIC_AUTH_TOKEN", credential) != credential:
+            raise ValueError("DeepSeek credential routes must agree")
+        require_provider_credential("deepseek", credential.encode())
     # Keep source and synthesis prompts on stdin, not argv. The bounded request
     # limit is enforced before this call, independently of the operating system's
     # argv limit. Claude Code print mode supports prompts on stdin.

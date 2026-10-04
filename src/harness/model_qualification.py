@@ -259,6 +259,11 @@ _SCHEMA = {"type": "object", "properties": {"decisions": {"type": "array", "item
 def _actual_provider_invoke_unmetered(spec: ModelSpec, prompt: str, *, token: str | None,
                             timeout: int, transport_sink=None) -> str | InvocationResult:
     """One bounded, noninteractive call to the exact configured model."""
+    from .formal_delivery_gate import require_active_transport
+    require_active_transport(spec.provider, spec.model)
+    if spec.provider == "deepseek":
+        from .formal_delivery_gate import require_provider_credential
+        require_provider_credential("deepseek", token.encode() if isinstance(token, str) else b"")
     with tempfile.TemporaryDirectory(prefix="cmh-model-qualification-") as temporary:
         root = Path(temporary)
         schema = root / "schema.json"
@@ -336,6 +341,8 @@ def _actual_provider_invoke_unmetered(spec: ModelSpec, prompt: str, *, token: st
 def _actual_provider_invoke(spec: ModelSpec, prompt: str, *, token: str | None,
                             timeout: int, transport_sink=None,
                             reservation_sink=None) -> str | InvocationResult:
+    from .formal_delivery_gate import require_invocation_spec
+    require_invocation_spec(spec)
     # Codex's lower-level invocation sees the active reservation and does not
     # append a second logical call for the same qualification case.
     with model_request(provider=spec.provider, model=spec.model, prompt=prompt.encode(),
@@ -412,6 +419,11 @@ def qualification_receipt(result: QualificationResult, *, auth_key: str,
                    {'name': c.name, 'source': c.source, 'findings': c.findings, 'expected': c.expected}
                    for c in CASES], sort_keys=True, separators=(',', ':')).encode()).hexdigest(),
                "authentication_identity": hmac.new(auth_key.encode(), b'cmh-qualification-auth/v1', hashlib.sha256).hexdigest()}
+    from .formal_delivery_gate import NEW_MISSION, load_authorization, qualification_binding
+    if os.environ.get("CMH_RESOURCE_MISSION_ID") == NEW_MISSION:
+        if result.mode != "real_provider" or role not in {"independent_reviewer", "final_reviewer"}:
+            raise ValueError("offline qualification cannot issue a formal delivery receipt")
+        receipt["delivery_binding"] = qualification_binding(load_authorization())
     receipt["integrity_sha256"] = hmac.new(auth_key.encode(),
         json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode(), hashlib.sha256).hexdigest()
     return receipt
@@ -442,6 +454,11 @@ def validate_qualification_receipt(path: str | Path, spec: ModelSpec, *, auth_ke
                      "registry_sha256", "contract_sha256", "runner_sha256", "cli_runner_sha256",
                      "invocation_sha256", "builder_runtime_sha256",
                      "qualification_schema_sha256", "registry_code_sha256", "full_scope_contract_sha256", "review_runner_sha256", "case_manifest_sha256", "authentication_identity", "integrity_sha256"}
+    from .formal_delivery_gate import (NEW_MISSION, load_authorization,
+                                      validate_qualification_binding)
+    if os.environ.get("CMH_RESOURCE_MISSION_ID") == NEW_MISSION:
+        expected_keys.add("delivery_binding")
+        validate_qualification_binding(receipt.get("delivery_binding"), load_authorization())
     if not isinstance(receipt, dict) or set(receipt) != expected_keys \
             or receipt["version"] != QUALIFICATION_VERSION \
             or receipt["role"] != role \

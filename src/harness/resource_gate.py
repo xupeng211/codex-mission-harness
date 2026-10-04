@@ -437,9 +437,12 @@ def normalize_deepseek_usage(usage: dict | None, cli_cost_usd: object = None,
 
 class Reservation:
     def __init__(self, ledger: Path, request_id: str, authorization_sha256: str,
-                 provider: str, model: str):
+                 provider: str, model: str, *, ledger_key_path: Path | None = None,
+                 execution_allowed: bool = True):
         self.ledger, self.request_id, self.authorization_sha256 = ledger, request_id, authorization_sha256
         self.provider, self.model = provider, model
+        self.ledger_key_path = ledger_key_path
+        self.execution_allowed = execution_allowed
         self.reported_usage: dict | None = None
 
     def observe(self, usage: dict | None) -> None:
@@ -450,17 +453,26 @@ class Reservation:
     def settle(self, status: str) -> None:
         lock = self.ledger.with_name(self.ledger.name + ".lock")
         with _locked(lock):
-            ledger = json.loads(_private(self.ledger))
+            if self.ledger_key_path is not None:
+                from .formal_delivery_gate import _checked_child
+                ledger = _checked_child(self.ledger, _private(self.ledger_key_path))
+            else:
+                ledger = json.loads(_private(self.ledger))
             matches = [entry for entry in ledger["requests"] if entry.get("request_id") == self.request_id]
             if len(matches) != 1 or matches[0].get("status") != "STARTED":
                 raise ResourceGateDenied("request settlement identity/state mismatch")
             record = matches[0]
+            if record.get("formal_delivery_gate") is True and (
+                    record.get("authorization_sha256") != self.authorization_sha256 or
+                    ledger.get("authorization_sha256") != self.authorization_sha256):
+                raise ResourceGateDenied("formal delivery settlement authorization identity changed")
             record["status"] = status
             record["finished_epoch"] = time.time()
             record["duration_seconds"] = round(record["finished_epoch"] - record["started_epoch"], 3)
             record["reported_usage"] = self.reported_usage if self.reported_usage is not None else "UNKNOWN"
             record["usage_accounting"] = "FULL_RESERVATION_RETAINED"
-            if self.reported_usage is None and self.provider == "deepseek":
+            if self.reported_usage is None and (self.provider == "deepseek" or
+                                                record.get("formal_delivery_gate") is True):
                 record["usage_accounting"] = "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS"
             if self.reported_usage is not None:
                 tokens = self.reported_usage.get("tokens", {})
@@ -526,12 +538,22 @@ class Reservation:
                     else:
                         record["usage_accounting"] = "OVER_RESERVATION_BLOCK_FUTURE_CALLS"
                         record["cost_overage_source"] = "CLI_ESTIMATE_UNBILLED"
-            _write_atomic(self.ledger, ledger)
+            if record.get("formal_delivery_gate") is True and self.ledger_key_path is None:
+                raise ResourceGateDenied("formal delivery settlement needs its trusted ledger key")
+            if self.ledger_key_path is not None:
+                from .formal_delivery_gate import _write_child
+                _write_child(self.ledger, ledger, _private(self.ledger_key_path))
+            else:
+                _write_atomic(self.ledger, ledger)
 
 
 def reserve(*, provider: str, model: str, prompt: bytes, stage: str,
             environment: dict[str, str] | None = None) -> Reservation:
     env = os.environ if environment is None else environment
+    from .formal_delivery_gate import NEW_MISSION, OLD_MISSION, reserve_delivery
+    if env.get("CMH_RESOURCE_MISSION_ID") == NEW_MISSION:
+        return reserve_delivery(provider=provider, model=model, prompt=prompt,
+                                stage=stage, environment=env)
     needed = ("CMH_RESOURCE_AUTHORIZATION", "CMH_RESOURCE_AUTH_SHA256", "CMH_RESOURCE_GATE_KEY_FILE",
               "CMH_RESOURCE_LEDGER", "CMH_RESOURCE_MISSION_ID", "CMH_RESOURCE_RUN_ID",
               "CMH_RESOURCE_FREEZE", "CMH_RESOURCE_FREEZE_SHA256")
@@ -608,6 +630,11 @@ def reserve(*, provider: str, model: str, prompt: bytes, stage: str,
                 raise ResourceGateDenied("provider token budget exhausted: " + category)
         if sum(row["cost_reservation_microunits"] for row in prior) + lane["cost_reservation_microunits"] > lane["cost_limit_microunits"]:
             raise ResourceGateDenied("provider cost budget exhausted")
+        if environment is None and env.get("CMH_RESOURCE_MISSION_ID") != OLD_MISSION:
+            raise ResourceGateDenied("unapproved mission identity cannot use the legacy provider gate")
+        if environment is None:
+            from .formal_delivery_gate import authenticate_legacy_signer
+            authenticate_legacy_signer(key_path)
         request_id = uuid.uuid4().hex
         rows.append({"number": len(rows) + 1, "request_id": request_id, "provider": provider,
                      "model": model, "stage": stage, "run_id": env["CMH_RESOURCE_RUN_ID"],
@@ -624,7 +651,8 @@ def reserve(*, provider: str, model: str, prompt: bytes, stage: str,
             if lane.get("cli_cost_policy") is not None:
                 rows[-1]["cost_basis_policy"] = lane["cli_cost_policy"]
         _write_atomic(ledger_path, ledger)
-    return Reservation(ledger_path, request_id, env["CMH_RESOURCE_AUTH_SHA256"], provider, model)
+    return Reservation(ledger_path, request_id, env["CMH_RESOURCE_AUTH_SHA256"], provider, model,
+                       execution_allowed=environment is None)
 
 
 @contextmanager
@@ -632,6 +660,8 @@ def model_request(*, provider: str, model: str, prompt: bytes, stage: str,
                   environment: dict[str, str] | None = None):
     active = _active_reservation.get()
     if active is not None:
+        if environment is None and active.execution_allowed is not True:
+            raise ResourceGateDenied("synthetic resource context cannot authorize a provider launch")
         if (active.provider, active.model) != (provider, model):
             raise ResourceGateDenied("nested model differs from active reservation")
         yield active

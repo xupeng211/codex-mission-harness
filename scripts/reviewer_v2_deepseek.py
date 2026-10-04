@@ -264,6 +264,7 @@ def run(args: argparse.Namespace) -> dict:
     settings = None
     token = ""
     auth_key = ""
+    delivery_context = None
     stage_state: dict = {"stage": "setup", "stage_id": "setup", "input_sha256": diff_hash,
                          "started_at": int(time.time()), "stdout_present": False,
                          "exit_code": None, "stderr_markers": {},
@@ -287,6 +288,9 @@ def run(args: argparse.Namespace) -> dict:
             raise ValueError("live DeepSeek review requires an independent reviewer qualification receipt")
         qualified = validate_qualification_receipt(qualification, model, auth_key=auth_key,
                                        role="independent_reviewer", registry_path=registry_path)
+        from harness.formal_delivery_gate import bind_review
+        delivery_context = bind_review(args.mission_id, root, base, head,
+                                       sha256(registry.path.read_bytes()), model, qualified)
         contract_auth_sha = contract_authorization_identity(args.mission_id)
         identity = {"provider": model.provider, "role": "independent_reviewer",
                     "model": model.model, "model_configuration": model.identity(),
@@ -509,6 +513,8 @@ def run(args: argparse.Namespace) -> dict:
         wrapped.failure_artifact = str(failure_path) if failure_path else None
         raise wrapped from exc
     finally:
+        from harness.formal_delivery_gate import reset_review
+        reset_review(delivery_context)
         signal.signal(signal.SIGTERM, previous_signals[0])
         signal.signal(signal.SIGINT, previous_signals[1])
         if settings is not None:

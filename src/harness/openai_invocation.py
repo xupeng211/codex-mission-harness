@@ -228,6 +228,11 @@ def _invoke_openai_unmetered(prompt: str, spec: ModelSpec, schema: dict, *, time
                   codex_home: Path = CANONICAL_HOME,
                   source_env: dict[str, str] | None = None,
                   transport_sink=None) -> InvocationResult:
+    from .formal_delivery_gate import require_active_transport
+    require_active_transport(spec.provider, spec.model)
+    from .formal_delivery_gate import NEW_MISSION, require_provider_credential, _read
+    if os.environ.get("CMH_RESOURCE_MISSION_ID") == NEW_MISSION:
+        require_provider_credential("openai", _read(Path(codex_home) / "auth.json"))
     if spec.provider != "openai" or not spec.model or not spec.reasoning_effort:
         raise ValueError("configured OpenAI model and reasoning are required")
     if timeout < 1 or timeout > 900:
@@ -334,6 +339,8 @@ def invoke_openai(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 
     """Reserve the original Mission's resources before any Codex subprocess."""
     if spec.provider != "openai" or not isinstance(prompt, str):
         raise ValueError("configured OpenAI model and prompt are required")
+    from .formal_delivery_gate import require_invocation_spec
+    require_invocation_spec(spec)
     with model_request(provider="openai", model=spec.model, prompt=prompt.encode(),
                        stage=os.environ.get("CMH_RESOURCE_STAGE", "openai-invocation")) as reservation:
         result = _invoke_openai_unmetered(prompt, spec, schema, timeout=timeout,
