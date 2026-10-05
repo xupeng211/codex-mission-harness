@@ -28,11 +28,16 @@ class ResourceGateDenied(RuntimeError):
 class FundingPause(ResourceGateDenied):
     """A pre-reservation funding stop, never a failed provider request."""
 
-    def __init__(self, reason, *, required=0, available=0):
+    def __init__(self, reason, *, required=0, available=0, currency="USD"):
         super().__init__(reason)
+        if currency not in {'USD', 'CNY'}:
+            raise ValueError('unsupported funding currency')
+        suffix = 'microusd' if currency == 'USD' else 'microcny'
         self.details = {'status': 'PAUSED_AWAITING_MANUAL_FUNDING', 'reason': reason,
-                        'required_microusd': required, 'available_microusd': available,
-                        'shortfall_microusd': max(0, required - available)}
+                        'required_' + suffix: required, 'available_' + suffix: available,
+                        'shortfall_' + suffix: max(0, required - available)}
+        if currency == 'CNY':
+            self.details.update(currency='CNY', semantic_type='PROVIDER_CAPACITY')
 
 
 _active_reservation: ContextVar[Reservation | None] = ContextVar("cmh_active_resource_reservation", default=None)

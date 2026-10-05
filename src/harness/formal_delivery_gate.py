@@ -343,21 +343,59 @@ def authenticate_legacy_signer(key_path):
     _signed(HISTORICAL_AUTHORIZATION, PRODUCTION_ANCHOR.authorization_sha256, _read(key_path))
 
 
+def _funding_currency(auth):
+    currency = auth['deepseek_funding_policy'].get('currency', 'USD')
+    if currency not in {'USD', 'CNY'}:
+        _deny('unsupported provider capacity currency; no FX conversion')
+    return currency
+
+
+def _funding_suffix(auth):
+    return 'microcny' if _funding_currency(auth) == 'CNY' else 'microusd'
+
+
+def _native_cny_bound(policy):
+    """Signed native prices, frozen Direct policy, integer upward rounding.
+
+    Rates are micro-CNY per million tokens, never converted from USD. The
+    signing authority must attest rates against the hash-bound pricing source.
+    """
+    from .deepseek_direct import identity, MAX_CONTEXT, MAX_TOKENS
+    price = policy.get('native_price')
+    if (not isinstance(price, dict) or set(price) != {
+            'provider', 'currency', 'model', 'input_cache_miss_microcny_per_million',
+            'output_microcny_per_million'} or price['provider'] != 'deepseek' or
+            price['currency'] != 'CNY' or price['model'] != 'deepseek-flash' or
+            policy.get('direct_transport_identity') != identity()):
+        _deny('native CNY pricing or frozen Direct transport identity invalid')
+    a, b = price['input_cache_miss_microcny_per_million'], price['output_microcny_per_million']
+    if not _integer(a, 1) or not _integer(b, 1):
+        _deny('native prices must be positive integer micro-CNY per million tokens')
+    # Max over the two endpoints G=0 and G=MAX_TOKENS; reasoning is in G.
+    numerator = a * MAX_CONTEXT + max(0, b - a) * MAX_TOKENS
+    return (numerator + 999999) // 1000000
+
+
 def _validate_funding_policy(auth):
     policy = auth['deepseek_funding_policy']
+    suffix = _funding_suffix(auth)
+    native = suffix == 'microcny'
+    limits = policy.get('unit_upper_bound_' + suffix, {})
     if (policy.get('version') != STAGED_POLICY or policy.get('execution_unit') != 'ONE_PROVIDER_CALL'
             or policy.get('manual_top_up_only') is not True
             or policy.get('provider_enforced_unit_bound') is not True
             or policy.get('provider_no_overdraft') is not True
             or not _integer(policy.get('max_snapshot_age_seconds'), 1)
-            or not _integer(policy.get('safety_margin_microusd'))
-            or set(policy.get('unit_upper_bound_microusd', {})) !=
-                {'chunk_or_qualification', 'group_or_cross_group'}
-            or any(not _integer(v, 1) or v > auth['providers']['deepseek']['cost_reservation_microunits']
-                   for v in policy['unit_upper_bound_microusd'].values())):
-        _deny('staged funding requires proven provider bounds within the unchanged mission debit')
-    # This signed policy must cite actual official pricing, enforced request
-    # bounds and no-overdraft rules. An internal 0.40 debit is not such proof.
+            or not _integer(policy.get('safety_margin_' + suffix))
+            or set(limits) != {'chunk_or_qualification', 'group_or_cross_group'}
+            or any(not _integer(v, 1) for v in limits.values())):
+        _deny('staged funding requires proven currency-specific provider bounds')
+    if native:
+        if ('unit_upper_bound_microusd' in policy or 'safety_margin_microusd' in policy or
+                any(v != _native_cny_bound(policy) for v in limits.values())):
+            _deny('CNY exposure must equal the native physical bound, separate from USD debit')
+    elif any(v > auth['providers']['deepseek']['cost_reservation_microunits'] for v in limits.values()):
+        _deny('legacy USD bound exceeds mission debit')
     for name in ('pricing', 'enforced_bound', 'no_overdraft'):
         if digest(_read(policy[name + '_source_path'])) != policy[name + '_source_sha256']:
             _deny('official unit financial safety rules missing or changed')
@@ -367,12 +405,19 @@ def _snapshot(auth, path, sha, key, now):
     try:
         value = _signed(path, sha, key)
         policy = auth['deepseek_funding_policy']
+        currency, suffix = _funding_currency(auth), _funding_suffix(auth)
+        if currency == 'CNY' and (value.get('provider') != 'deepseek' or
+                value.get('amount_semantics') != 'CURRENT_AVAILABLE_NET_BALANCE' or
+                any(k in value for k in ('available_microusd', 'unsettled_liability_microusd',
+                                        'other_allocations_microusd', 'conversion_source_path',
+                                        'conversion_source_sha256'))):
+            _deny('native wallet provider, amount semantics or currency ambiguity invalid')
         if (value.get('version') != FUNDS_VERSION or value.get('evidence_domain') != auth['evidence_domain']
                 or value.get('authorization_sha256') != auth['_authorization_sha256']
                 or value.get('parent_ledger_sha256') != auth['parent']['ledger_sha256']
                 or value.get('account_id') != auth['account_ids']['deepseek']
                 or value.get('credential_identity') != auth['credential_identities']['deepseek']
-                or value.get('route') != 'deepseek-flash' or value.get('unit') != 'USD'
+                or value.get('route') != 'deepseek-flash' or value.get('unit') != currency
                 or value.get('policy_sha256') != digest(canonical(policy))
                 or value.get('no_unbounded_prior_liability') is not True
                 or value.get('historical_settlement_in_net_balance') is not True
@@ -383,14 +428,15 @@ def _snapshot(auth, path, sha, key, now):
                 or value['expires_epoch'] > value['observed_epoch'] + policy['max_snapshot_age_seconds']
                 or value['expires_epoch'] <= value['observed_epoch']
                 or any(not _integer(value.get(k)) for k in
-                       ('available_microusd', 'unsettled_liability_microusd',
-                        'other_allocations_microusd', 'covered_requests'))):
+                       ('available_' + suffix, 'unsettled_liability_' + suffix,
+                        'other_allocations_' + suffix, 'covered_requests'))):
             _deny('wallet account, settlement, liability or conversion evidence invalid')
-        for name in ('official', 'conversion', 'settlement'):
+        for name in (('official', 'settlement') if currency == 'CNY' else
+                     ('official', 'conversion', 'settlement')):
             if digest(_read(value[name + '_source_path'])) != value[name + '_source_sha256']:
                 _deny('wallet official, currency or settlement source changed')
         if not value['observed_epoch'] <= now < value['expires_epoch']:
-            raise FundingPause('余额证据未生效或已过期；请提供新的可信快照')
+            raise FundingPause('余额证据未生效或已过期；请提供新的可信快照', currency=currency)
         return value
     except (OSError, KeyError, ValueError, TypeError) as exc:
         raise ResourceGateDenied('wallet snapshot malformed or incomplete') from exc
@@ -399,7 +445,7 @@ def _snapshot(auth, path, sha, key, now):
 def _current_funds(auth, ledger, key, now):
     entry = ledger.get('funding')
     if not entry:
-        raise FundingPause('缺少可信余额快照；未预留、未发起请求')
+        raise FundingPause('缺少可信余额快照；未预留、未发起请求', currency=_funding_currency(auth))
     value = _snapshot(auth, entry['path'], entry['sha256'], key, now)
     rows = ledger['requests']
     n = value['covered_requests']
@@ -413,18 +459,21 @@ def _current_funds(auth, ledger, key, now):
 
 def _funding_check(auth, ledger, key, stage, now):
     value = _current_funds(auth, ledger, key, now)
+    currency, suffix = _funding_currency(auth), _funding_suffix(auth)
     name = ('group_or_cross_group' if stage.startswith('group') or
             stage.startswith('aggregate') else 'chunk_or_qualification')
-    upper = auth['deepseek_funding_policy']['unit_upper_bound_microusd'][name]
-    # No refund of mission debits. Only cash already officially reflected in
-    # the net balance is excluded from the post-snapshot cash suffix.
-    suffix = sum(r['wallet_exposure_microusd'] for r in ledger['requests'][value['covered_requests']:]
-                 if r['provider'] == 'deepseek')
-    free = (value['available_microusd'] - value['unsettled_liability_microusd'] -
-            value['other_allocations_microusd'] - suffix)
-    required = upper + auth['deepseek_funding_policy']['safety_margin_microusd']
+    upper = auth['deepseek_funding_policy']['unit_upper_bound_' + suffix][name]
+    # The snapshot is already a net balance. Never subtract settled history.
+    # Retain full exposure only for calls not yet reflected in that snapshot.
+    pending = [r for r in ledger['requests'][value['covered_requests']:] if r['provider'] == 'deepseek']
+    if any(not _integer(r.get('wallet_exposure_' + suffix), 1) for r in pending):
+        _deny('pending wallet exposure currency missing or incompatible')
+    free = (value['available_' + suffix] - value['unsettled_liability_' + suffix] -
+            value['other_allocations_' + suffix] - sum(r['wallet_exposure_' + suffix] for r in pending))
+    required = upper + auth['deepseek_funding_policy']['safety_margin_' + suffix]
     if free < required:
-        raise FundingPause('余额不足；请手动补款并刷新可信证据', required=required, available=free)
+        raise FundingPause('余额不足；请手动补款并刷新可信证据', required=required,
+                           available=free, currency=currency)
     return dict(value, _unit_exposure=upper)
 
 
@@ -533,6 +582,9 @@ def require_active_transport(provider, model):
         _deny('raw provider transport differs from its active resource reservation')
     if os.environ.get('CMH_RESOURCE_MISSION_ID') == NEW_MISSION:
         auth = load_authorization()
+        if provider == 'deepseek' and (not auth.get('deepseek_funding_policy') or
+                                     _funding_currency(auth) != 'CNY'):
+            _deny('Direct transport requires native CNY staged capacity')
         if (active is None or active.ledger_key_path is None or
                 (active.provider, active.model) != (provider, model) or
                 active.authorization_sha256 != auth['_authorization_sha256']):
@@ -717,6 +769,8 @@ def _reserve_validated(auth, env, provider, model, prompt, stage, now, *, offlin
         account = auth['_account']['accounts'][provider]
         exposure = auth['_history'][provider]['cost'] + cost + account['other_reserved_microunits']
         staged = provider == 'deepseek' and auth.get('deepseek_funding_policy')
+        if not offline and provider == 'deepseek' and (not staged or _funding_currency(auth) != 'CNY'):
+            _deny('Direct DeepSeek requires native CNY staged capacity before reservation')
         if (cost > lane['cost_limit_microunits'] or exposure > auth['shared_cost_limits'][provider]
                 or not staged and exposure > account['available_microunits']):
             _deny('independent or shared account capacity exhausted')
@@ -743,7 +797,10 @@ def _reserve_validated(auth, env, provider, model, prompt, stage, now, *, offlin
                'usage_accounting': 'FULL_RESERVATION_RETAINED'}
         if funds is not None:
             row.update(funding_epoch=funds['epoch'], funding_snapshot_sha256=ledger['funding']['sha256'],
-                       wallet_exposure_microusd=funds['_unit_exposure'])
+                       **{'wallet_exposure_' + _funding_suffix(auth): funds['_unit_exposure']})
+            if _funding_currency(auth) == 'CNY':
+                row.update(wallet_currency='CNY', wallet_semantic_type='PROVIDER_CAPACITY',
+                           native_price_identity_sha256=digest(canonical(auth['deepseek_funding_policy'])))
             ledger.pop('funding_pause', None)
         if provider == 'deepseek':
             row['price_microusd_per_million'] = lane.get('price_microusd_per_million')

@@ -91,3 +91,45 @@ inconsistent usage, a non-`unknown` CLI cost basis, or an official estimate
 above the authorized per-call reserve fails closed. This optional policy is
 not present in the current authorization; no model request is authorized by
 the code change or the daily export alone.
+
+### DeepSeek native CNY staged capacity
+
+Direct DeepSeek uses the existing `ONE_PROVIDER_CALL` staged authorization.
+The signed Mission budget and shared risk envelope remain USD; they are not
+claims about the provider wallet. Every DeepSeek reservation must additionally
+pass a native CNY capacity check before a request can be sent. OpenAI capacity
+and the frozen Direct transport are unchanged.
+
+The funding policy selects `currency: CNY`, `safety_margin_microcny`, and
+`unit_upper_bound_microcny` for both existing stage classes. It binds the exact
+`direct_transport_identity` and a `native_price` attestation with provider
+`deepseek`, currency `CNY`, model `deepseek-flash`, and positive integer rates
+`input_cache_miss_microcny_per_million` and `output_microcny_per_million`.
+The signing authority must verify those rates against the existing hash-bound
+pricing source. No USD/CNY conversion or historical average is accepted.
+
+With rates A and B in micro-CNY per million tokens, the exact integer bound is
+`ceil((A*1048576 + max(0, B-A)*90000)/1000000)` micro-CNY per invocation.
+Both stage-class bounds must equal that value. Reasoning is already included
+in completion. Cache discounts do not reduce this bound. Qualification has
+four ordered cases, but the staged gate checks one call at a time; it does not
+require a wallet to prefund four cases or the entire 100-call Mission.
+
+The separately signed snapshot retains the existing version, account,
+credential, source hashes, authorization/policy hashes, epoch, validity period,
+settlement coverage and checkpoint binding. It specifies provider `deepseek`,
+`unit: CNY`, `amount_semantics: CURRENT_AVAILABLE_NET_BALANCE`, and nonnegative
+integer `available_microcny`, `unsettled_liability_microcny`, and
+`other_allocations_microcny`. USD amount/conversion fields are rejected on this
+native path. The official and settlement sources remain mandatory; no FX
+source is needed. Missing, stale, altered or incompatible evidence fails closed.
+
+Only exposure not yet reflected in the snapshot's authenticated settled prefix
+is deducted from its net available balance. Settled history is not deducted
+again. Insufficiency produces the existing funding pause with explicit CNY
+amounts, before consuming a call or attempt. Manual snapshot refresh preserves
+all requests, debits, history, UNKNOWN states and the Mission clock, and does
+not change the Qualification binding. Runtime/model/contract/target identity
+checks continue to apply. No top-up, balance collection or live authorization
+is performed by this feature; current official native pricing and balance
+attestations must still be supplied before live execution.
