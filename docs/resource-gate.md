@@ -134,6 +134,31 @@ checks continue to apply. No top-up, balance collection or live authorization
 is performed by this feature; current official native pricing and balance
 attestations must still be supplied before live execution.
 
+For native CNY execution, the signed funding policy can select
+`no_overdraft_policy: OPERATIONAL_PRE_SEND_SAFETY/v1`. This contract does not
+require an absolute provider promise that an account can never overdraw.
+It omits `provider_no_overdraft` and the `no_overdraft_source_*` fields.
+Pricing and physical-bound source hashes remain mandatory. The native bound
+and exact frozen Direct identity remain bound to the signed authorization.
+The approved margin must equal `(unit_bound_microcny * 10 + 99) // 100`;
+no balance-based adjustment or floating-point rounding is accepted.
+
+Safety is operational: a fresh official net balance must cover the next
+physical invocation plus this margin before an atomic reservation. The frozen
+Direct adapter permits one HTTP attempt with max_tokens=90000, retry=0,
+no redirect replay, repair or continuation. There is no automatic top-up.
+HTTP 402 remains a failed, non-retryable invocation. Missing usage after any
+possibly-sent request remains UNKNOWN, with its full reservation retained;
+UNKNOWN or in-flight accounting blocks all later invocations and refresh.
+Every later invocation revalidates staged capacity. Internal Mission ceilings
+are unchanged, irrespective of wallet size.
+
+Account-owner facts remain separately required: exclusive allocation, bounded
+other allocations and unsettled liability, and authenticated settlement
+coverage. Operational safeguards cannot generate these facts or default them
+to true. The legacy absolute-proof policy is still supported when explicitly
+selected with its original evidence, including on legacy USD paths.
+
 ### OpenAI current subscription availability
 
 OA103 remains the internal Mission-wide call ceiling, not a provider quota

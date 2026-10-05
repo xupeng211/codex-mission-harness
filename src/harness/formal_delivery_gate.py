@@ -27,6 +27,7 @@ LEDGER_VERSION = 'cmh-current-delivery-ledger/v1'
 SOURCE_VERSION = 'exact-unique-utf8-quote/v1'
 CAPACITY_POLICY = 'AUTHORITATIVE_NET_CAPACITY_NO_UNBOUNDED_PRIOR_LIABILITY'
 STAGED_POLICY = 'FIXED_BUDGET_STAGED_NET_WALLET/v1'
+OPERATIONAL_NO_OVERDRAFT = 'OPERATIONAL_PRE_SEND_SAFETY/v1'
 FUNDS_VERSION = 'cmh-staged-wallet-snapshot/v1'
 CATEGORIES = ('input', 'cache', 'output', 'reasoning')
 EVIDENCE_ROOT = Path('/home/xupeng/codex-mission-harness-evidence/autonomous-premerge-20261002')
@@ -489,7 +490,6 @@ def _validate_funding_policy(auth):
     if (policy.get('version') != STAGED_POLICY or policy.get('execution_unit') != 'ONE_PROVIDER_CALL'
             or policy.get('manual_top_up_only') is not True
             or policy.get('provider_enforced_unit_bound') is not True
-            or policy.get('provider_no_overdraft') is not True
             or not _integer(policy.get('max_snapshot_age_seconds'), 1)
             or not _integer(policy.get('safety_margin_' + suffix))
             or set(limits) != {'chunk_or_qualification', 'group_or_cross_group'}
@@ -501,7 +501,21 @@ def _validate_funding_policy(auth):
             _deny('CNY exposure must equal the native physical bound, separate from USD debit')
     elif any(v > auth['providers']['deepseek']['cost_reservation_microunits'] for v in limits.values()):
         _deny('legacy USD bound exceeds mission debit')
-    for name in ('pricing', 'enforced_bound', 'no_overdraft'):
+    operational = policy.get('no_overdraft_policy') == OPERATIONAL_NO_OVERDRAFT
+    if operational:
+        from .deepseek_direct import identity
+        transport = identity()
+        if (not native or transport['max_tokens'] != 90000 or
+                transport['http_attempts'] != 1 or transport['retry'] != 0 or
+                transport['redirect_replay'] != 0 or
+                policy['safety_margin_microcny'] != (_native_cny_bound(policy) * 10 + 99) // 100 or
+                any(name in policy for name in ('provider_no_overdraft',
+                    'no_overdraft_source_path', 'no_overdraft_source_sha256'))):
+            _deny('operational safety requires frozen single-send transport and approved ten-percent margin')
+    elif policy.get('no_overdraft_policy') is not None or policy.get('provider_no_overdraft') is not True:
+        _deny('funding policy must select a supported no-overdraft contract')
+    for name in (('pricing', 'enforced_bound') if operational else
+                 ('pricing', 'enforced_bound', 'no_overdraft')):
         if digest(_read(policy[name + '_source_path'])) != policy[name + '_source_sha256']:
             _deny('official unit financial safety rules missing or changed')
 
