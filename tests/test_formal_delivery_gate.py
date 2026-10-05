@@ -135,6 +135,56 @@ class FormalDeliveryGateTests(unittest.TestCase):
         return gate._reserve_validated(value, self.env, 'openai', 'gpt-5.6-sol', b'fixture',
                                        'qualification-case', self.now, offline=True)
 
+    def test_direct_unknown_attempt_retains_reservation_and_blocks_new_run(self):
+        from harness import deepseek_direct as direct
+        from harness import resource_gate as resources
+        from direct_deepseek_fixture import KEY
+        def reserve(**kwargs):
+            return gate._reserve_validated(self.load(), self.env, 'deepseek', direct.MODEL,
+                                          kwargs['prompt'], kwargs['stage'], self.now, offline=True)
+        with patch.object(resources, 'reserve', side_effect=reserve), \
+             patch.object(gate, 'require_active_transport'), patch.object(gate, 'require_provider_credential'), \
+             patch.object(gate, 'bounded_delivery_timeout', side_effect=lambda n: n), \
+             patch.object(direct, '_bounded_post', side_effect=direct.DirectFailure('REQUEST_TIMEOUT')) as send:
+            with self.assertRaises(direct.DirectFailure):
+                direct.invoke('prompt', KEY, {'type': 'object'}, stage='chunk-000.json')
+            send.assert_called_once()
+            row = json.loads(self.ledger.read_bytes())['requests'][0]
+            self.assertEqual(row['reported_usage'], 'UNKNOWN')
+            self.assertEqual(row['cost_reservation_microunits'], 400000)
+            self.env['CMH_RESOURCE_RUN_ID'] = 'another-run'
+            with self.assertRaises(ResourceGateDenied):
+                direct.invoke('prompt', KEY, {'type': 'object'}, stage='chunk-000.json')
+            self.assertEqual(send.call_count, 1)
+
+    def test_direct_100_call_gate_is_atomic_and_shared_across_run_ids(self):
+        from harness import deepseek_direct as direct, resource_gate as resources
+        from direct_deepseek_fixture import KEY, response
+        lane = self.payload['providers']['deepseek']
+        lane.update(max_new_calls=100, token_limit={k: 1000 for k in gate.CATEGORIES},
+                    cost_limit_microunits=40000000,
+                    price_microusd_per_million={'input_cache_miss': 300000, 'cache_hit': 3000, 'output': 1200000})
+        self.payload.update(max_new_calls=105, shared_max_calls=439)
+        self.publish()
+        def reserve(**kwargs):
+            return gate._reserve_validated(self.load(), self.env, 'deepseek', direct.MODEL,
+                                          kwargs['prompt'], kwargs['stage'], self.now, offline=True)
+        with patch.object(resources, 'reserve', side_effect=reserve), \
+             patch.object(gate, 'require_active_transport'), patch.object(gate, 'require_provider_credential'), \
+             patch.object(gate, 'bounded_delivery_timeout', side_effect=lambda n: n), \
+             patch.object(direct, '_bounded_post', return_value=(200, direct.canonical(response({'findings': []})))) as send:
+            for number in range(100):
+                self.env['CMH_RESOURCE_RUN_ID'] = 'offline-run-' + str(number)
+                direct.invoke('prompt', KEY, {'type': 'object'}, stage='chunk-%03d.json' % number)
+            self.assertEqual(send.call_count, 100)
+            row = json.loads(self.ledger.read_bytes())['requests'][0]
+            self.assertEqual(row['reported_usage']['tokens']['output'], 5)
+            self.assertEqual(row['estimated_cost_microusd'], 9)
+            with self.assertRaises(ResourceGateDenied):
+                direct.invoke('prompt', KEY, {'type': 'object'}, stage='chunk-100.json')
+            self.assertEqual(send.call_count, 100)
+            self.assertEqual(len(json.loads(self.ledger.read_bytes())['requests']), 100)
+
     def test_01_missing_parent(self):
         self.parent.unlink()
         with self.assertRaises(ResourceGateDenied): self.load()

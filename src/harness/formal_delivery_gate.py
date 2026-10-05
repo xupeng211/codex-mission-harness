@@ -33,7 +33,7 @@ EVIDENCE_ROOT = Path('/home/xupeng/codex-mission-harness-evidence/autonomous-pre
 DELIVERY_LEDGER = EVIDENCE_ROOT / 'current-version-delivery-ledger.json'
 HISTORICAL_AUTHORIZATION = (EVIDENCE_ROOT / 'formal-60h-review/authorized-closure-20261003/'
                             'final-dual-review-delivery-20261003/hard-delivery-resource-authorization.json')
-RUNTIME_FILES = ('src/harness/formal_delivery_gate.py', 'src/harness/resource_gate.py',
+RUNTIME_FILES = ('src/harness/deepseek_direct.py', 'src/harness/formal_delivery_gate.py', 'src/harness/resource_gate.py',
                  'src/harness/reviewer_v2_contract.py', 'src/harness/model_qualification.py',
                  'src/harness/model_registry.py', 'src/harness/openai_invocation.py',
                  'src/harness/full_diff_manifest.py', 'src/harness/review_resume.py',

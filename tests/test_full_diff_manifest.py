@@ -260,10 +260,11 @@ class FullDiffTests(unittest.TestCase):
             return full.canonical({'findings': []} if stage == 'chunk' else
                 {'findings': [], 'summary': 'Offline mock reviewed the supplied source completely.',
                  **({'decisions': []} if stage == 'group' else {})})
-        def ds(command, prompt, env, timeout):
+        from direct_deepseek_fixture import envelope
+        def ds(prompt, token, schema, **kwargs):
             result = {'findings': []} if 'Scope=chunk' in prompt else {
                 'findings': [], 'decisions': [], 'summary': 'Offline mock reviewed the supplied source completely.'}
-            return subprocess.CompletedProcess(command, 0, full.canonical({'structured_output': result}), b'')
+            return envelope(result, prompt, schema)
         key = 'offline-fixture-key'
         evidence = Path(self.tmp.name) / 'reviews'
         with (patch.object(openai, 'invoke_codex', side_effect=oa), patch.object(openai, 'preflight'),
@@ -271,7 +272,7 @@ class FullDiffTests(unittest.TestCase):
               patch.object(deepseek, 'validate_qualification_receipt', return_value=qualified['deepseek']),
               patch.object(deepseek.legacy, 'resolve_claude_launcher', return_value=('/bin/true', '/usr/bin:/bin')),
               patch.object(deepseek.legacy, 'read_token_file', return_value=key),
-              patch.object(deepseek.legacy, 'invoke_reviewer', side_effect=ds)):
+              patch.object(deepseek.direct, 'invoke', side_effect=ds)):
             op = openai.run(self.root, self.base, self.head, evidence / 'openai', key,
                 openai.load_registry().role('final_reviewer'), qualification_path='offline-fixture')
             response = deepseek.run(SimpleNamespace(repo=str(self.root), base=self.base, head=self.head,

@@ -10,9 +10,7 @@ import json
 import os
 import re
 import signal
-import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -29,9 +27,10 @@ from harness.reviewer_v2_contract import (  # noqa: E402
 from harness.model_registry import load_registry  # noqa: E402
 from harness.model_qualification import validate_qualification_receipt  # noqa: E402
 from harness import full_diff_manifest as full
-from harness.review_resume import ReviewRun  # noqa: E402
+from harness.review_resume import ReviewRun
+from harness import deepseek_direct as direct  # noqa: E402
 from harness.review_failure_diagnostics import (  # noqa: E402
-    classify_nonzero, cli_wrapper_summary, command_identity, environment_identity, stream_metadata,
+    command_identity, environment_identity, stream_metadata,
 )
 
 VERSION = "cmh-reviewer-v2-deepseek/v2"
@@ -64,7 +63,22 @@ def _stderr_markers(stderr: bytes | str | None) -> dict[str, bool]:
             "rate_limit": bool(re.search(r"\b429\b|rate.limit", value))}
 
 
-def _parse_stage(raw: str, parser, state: dict):
+def _validate_completion_artifact(raw, mission_id=None, prompt=None):
+    from harness.formal_delivery_gate import NEW_MISSION
+    try:
+        value = json.loads(raw)
+    except (ValueError, UnicodeError):
+        return  # Existing parser reports malformed/empty output.
+    formal = (mission_id == NEW_MISSION or os.environ.get("CMH_RESOURCE_MISSION_ID") == NEW_MISSION)
+    if formal or isinstance(value, dict) and "direct_completion" in value:
+        try:
+            schema = CHUNK_SCHEMA if set(value.get("structured_output", {})) == {"findings"} else SYNTHESIS_SCHEMA
+            direct.validate_envelope(raw, schema=schema, prompt=prompt)
+        except direct.DirectFailure:
+            raise ValueError("invalid Direct completion evidence") from None
+
+
+def _parse_stage(raw: str, parser, state: dict, *, prompt=None):
     state["parser_entered"] = True
     state["parser_result"] = "FAIL"
     try:
@@ -75,6 +89,7 @@ def _parse_stage(raw: str, parser, state: dict):
         state["schema_validation_entered"] = True
         state["schema_validation_result"] = "FAIL"
     try:
+        _validate_completion_artifact(raw, prompt=prompt)
         result = parser(raw)
         state["parser_result"] = "PASS"
         state["schema_validation_result"] = "PASS"
@@ -87,12 +102,8 @@ def _parse_stage(raw: str, parser, state: dict):
                 "parser_entered": state["parser_entered"],
                 "schema_validation_entered": state["schema_validation_entered"],
                 "validation_result": "FAIL"}
-            if state.get("stage") == "group":
-                # The model supplied a bad byte reference. The source and all
-                # prior durable stages are still valid, so permit one fresh
-                # model response for this exact stage under ReviewRun's limit.
-                state["resume_allowed"] = True
-                state["resume_policy_reason"] = "bounded source binding retry"
+        state["resume_allowed"] = False
+        state["resume_policy_reason"] = "invalid Direct result cannot trigger automatic resend"
         if not raw.strip():
             category = "EMPTY_OUTPUT"
         else:
@@ -172,57 +183,25 @@ def _invoke(command: list[str], prompt: str, env: dict, timeout: int, token: str
                  schema_validation_reason=None, source_binding_diagnostic=None)
     os.environ["CMH_RESOURCE_STAGE"] = artifact
     try:
-        completed = legacy.invoke_reviewer(command, _bounded(prompt), env, timeout)
-    except subprocess.TimeoutExpired as exc:
+        schema = json.loads(command[command.index("--json-schema") + 1])
+        raw = direct.invoke(_bounded(prompt), token, schema, timeout=timeout, stage=artifact)
+        state.update(exit_code=0, output_sha256=sha256(raw),
+                     finished_at=int(time.time()),
+                     duration_seconds=round(time.monotonic() - started_monotonic, 3),
+                     **stream_metadata(raw, b""))
         if transport_sink is not None:
-            transport_sink(prompt.encode(), legacy._captured_bytes(exc.output),
-                           legacy._captured_bytes(exc.stderr),
-                           secret_echo=legacy._credential_echoed(exc.output, exc.stderr, token))
-        state.update(timeout_at=int(time.time()), finished_at=int(time.time()),
+            transport_sink(prompt.encode(), raw, b"")
+        if persist:
+            legacy.write_private_artifact(evidence_fd, artifact, raw, uuid.uuid4().hex)
+        return raw.decode(), sha256(raw)
+    except direct.DirectFailure as exc:
+        state.update(sanitized_error_class=exc.code, resume_allowed=False,
+                     finished_at=int(time.time()),
                      duration_seconds=round(time.monotonic() - started_monotonic, 3),
-                     stderr_markers=_stderr_markers(exc.stderr),
-                     sanitized_error_class="CHILD_PROCESS_TIMEOUT",
-                     resume_allowed=True, resume_policy_reason="bounded child timeout",
-                     **stream_metadata(exc.output, exc.stderr))
-        raise ReviewStageFailure("CHILD_PROCESS_TIMEOUT", stage) from exc
-    except OSError as exc:
-        state.update(finished_at=int(time.time()),
-                     duration_seconds=round(time.monotonic() - started_monotonic, 3),
-                     sanitized_error_class="LOCAL_LAUNCHER_ERROR",
-                     resume_policy_reason="local launcher failure")
-        raise ReviewStageFailure("LOCAL_LAUNCHER_ERROR", stage) from exc
-    except KeyboardInterrupt:
-        state.update(finished_at=int(time.time()),
-                     duration_seconds=round(time.monotonic() - started_monotonic, 3),
-                     sanitized_error_class="CANCELLED", resume_allowed=True,
-                     resume_policy_reason="runner cancellation")
-        raise
-    state.update(finished_at=int(time.time()), exit_code=completed.returncode,
-                 duration_seconds=round(time.monotonic() - started_monotonic, 3),
-                 signal_if_any=-completed.returncode if completed.returncode < 0 else None,
-                 **stream_metadata(completed.stdout, completed.stderr),
-                 cli_wrapper=cli_wrapper_summary(completed.stdout),
-                 stderr_markers=_stderr_markers(completed.stderr))
-    if transport_sink is not None:
-        transport_sink(prompt.encode(), legacy._captured_bytes(completed.stdout),
-                       legacy._captured_bytes(completed.stderr),
-                       secret_echo=legacy._credential_echoed(completed.stdout, completed.stderr, token))
-    if legacy._credential_echoed(completed.stdout, completed.stderr, token):
-        state.update(sanitized_error_class="AUTH_ERROR", resume_policy_reason="credential echoed")
-        raise ReviewStageFailure("AUTH_ERROR", stage)
-    if completed.returncode:
-        category, markers, allowed, reason = classify_nonzero(
-            completed.stdout, completed.stderr, completed.returncode)
-        state.update(sanitized_error_class=category, sanitized_error_markers=markers,
-                     resume_allowed=allowed, resume_policy_reason=reason)
-        raise ReviewStageFailure(category, stage)
-    raw = legacy._captured_bytes(completed.stdout)
-    if not raw.strip():
-        raise ReviewStageFailure("EMPTY_OUTPUT", stage)
-    if persist:
-        legacy.write_private_artifact(evidence_fd, artifact, raw, uuid.uuid4().hex)
-    state["output_sha256"] = sha256(raw)
-    return raw.decode("utf-8"), sha256(raw)
+                     resume_policy_reason="Direct failure cannot trigger automatic resend")
+        if transport_sink is not None:
+            transport_sink(prompt.encode(), None, exc.code.encode())
+        raise ReviewStageFailure("SCHEMA_VALIDATION_FAILED", stage) from None
 
 
 def _prompt_head(base: str, head: str, diff_hash: str, scope: str) -> str:
@@ -261,7 +240,6 @@ def run(args: argparse.Namespace) -> dict:
     if model.provider != "deepseek":
         raise ValueError("independent reviewer provider is not DeepSeek")
     run = None
-    settings = None
     token = ""
     auth_key = ""
     delivery_context = None
@@ -275,10 +253,12 @@ def run(args: argparse.Namespace) -> dict:
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
     try:
-        executable, safe_path = legacy.resolve_claude_launcher(root, os.environ.get("PATH", ""))
+        executable = "DIRECT_DEEPSEEK_API"
         token = legacy.read_token_file(args.token_file, root)
         if not token:
             raise ValueError("missing DeepSeek credential")
+        if token.encode() in diff:
+            raise ValueError("credential appears in reviewed source; evidence publication blocked")
         auth_key_file = getattr(args, "auth_key_file", None)
         auth_key = legacy.read_token_file(auth_key_file, root) if auth_key_file else token
         if not auth_key:
@@ -298,7 +278,7 @@ def run(args: argparse.Namespace) -> dict:
                     "base_sha": base, "head_sha": head, "diff_hash": diff_hash,
                     "registry_hash": sha256(registry.path.read_bytes()),
                     "runner_hash": sha256(Path(__file__).read_bytes()),
-                    "invocation_hash": sha256(Path(legacy.__file__).read_bytes()),
+                    "invocation_hash": sha256(Path(direct.__file__).read_bytes()),
                     "schema_manifest_hash": sha256(canonical({"chunk": CHUNK_SCHEMA,
                                                              "synthesis": SYNTHESIS_SCHEMA})),
                     "source_binding_contract_authorization_sha256": contract_auth_sha,
@@ -314,18 +294,8 @@ def run(args: argparse.Namespace) -> dict:
         run = ReviewRun(Path(args.evidence), root, identity, stages, legacy, prefix="deepseek-v2-")
         run_id, evidence, evidence_fd = run.state["review_run_id"], run.path, run.fd
         os.environ["CMH_RESOURCE_RUN_ID"] = run_id
-        settings = tempfile.NamedTemporaryFile(mode="w", delete=False)
-        settings.write('{"permissions":{"allow":[],"deny":["Bash","Edit","Write",'
-                       '"Read","Glob","Grep","WebFetch","WebSearch"]}}')
-        settings.close()
-        command = [executable, "--bare", "--restricted", "--print", "--model",
-                   model.model, "--settings", settings.name, "--tools", "",
-                   "--disallowed-tools", "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch",
-                   "--output-format", "json"]
-        env = {"HOME": "/nonexistent", "PATH": safe_path, "LANG": "C.UTF-8",
-               "ANTHROPIC_API_KEY": token, "ANTHROPIC_AUTH_TOKEN": token,
-               "ANTHROPIC_BASE_URL": legacy.ENDPOINT, "CLAUDE_CODE_SIMPLE": "1",
-               **legacy.reviewer_transport_environment()}
+        command = [executable, "--model", model.model]
+        env = {}  # Credentials never enter argv or captured environment metadata.
         chunk_command = command + ["--json-schema", json.dumps(CHUNK_SCHEMA, separators=(",", ":"))]
         synthesis_command = command + ["--json-schema", json.dumps(SYNTHESIS_SCHEMA, separators=(",", ":"))]
         for chunk in chunks:
@@ -342,7 +312,7 @@ def run(args: argparse.Namespace) -> dict:
                                 transport_sink=lambda p, out, err, secret_echo=False:
                                     run.capture_transport(name, p, out, err,
                                                           secret_echo=secret_echo))[0].encode(),
-                lambda data: _parse_stage(data.decode(), parse_chunk, stage_state))
+                lambda data: _parse_stage(data.decode(), parse_chunk, stage_state, prompt=prompt))
             output_hash = sha256(raw_bytes)
             chunk["bound_findings"] = bind_findings(findings, "C", chunk["index"])
             chunk["output_sha256"] = output_hash
@@ -380,7 +350,7 @@ def run(args: argparse.Namespace) -> dict:
                                     run.capture_transport(name, p, out, err,
                                                           secret_echo=secret_echo))[0].encode(),
                 lambda data: _parse_stage(data.decode(), lambda value: parse_synthesis(
-                    value, expected, source=source, structured_evidence=True), stage_state))
+                    value, expected, source=source, structured_evidence=True), stage_state, prompt=prompt))
             output_hash = sha256(raw_bytes)
             group["result"] = result
             # Preserve original C identities for carried P3 and UPHELD blockers;
@@ -418,7 +388,7 @@ def run(args: argparse.Namespace) -> dict:
                                 run.capture_transport("aggregate", p, out, err,
                                                       secret_echo=secret_echo))[0].encode(),
             lambda data: _parse_stage(data.decode(), lambda value: parse_synthesis(
-                value, expected, source=None, structured_evidence=True), stage_state))
+                value, expected, source=None, structured_evidence=True), stage_state, prompt=prompt))
         output_hash = sha256(raw_bytes)
         receipt = {"version": VERSION, "repository": repository,
                    "mission_id": args.mission_id, "base_sha": base, "head_sha": head,
@@ -463,7 +433,7 @@ def run(args: argparse.Namespace) -> dict:
                    "base_sha": base, "head_sha": head, "diff_sha256": diff_hash,
                    "runner_sha256": sha256(Path(__file__).read_bytes()),
                    "registry_sha256": identity["registry_hash"] if run is not None else sha256(registry.path.read_bytes()),
-                   "invocation_sha256": identity["invocation_hash"] if run is not None else sha256(Path(legacy.__file__).read_bytes()),
+                   "invocation_sha256": identity["invocation_hash"] if run is not None else sha256(Path(direct.__file__).read_bytes()),
                    "schema_manifest_sha256": identity["schema_manifest_hash"] if run is not None else sha256(canonical({"chunk": CHUNK_SCHEMA, "synthesis": SYNTHESIS_SCHEMA})),
                    "qualification_receipt_identity": identity["qualification_receipt_identity"] if run is not None else None,
                    "provider": model.provider, "model": model.model,
@@ -522,8 +492,6 @@ def run(args: argparse.Namespace) -> dict:
         reset_review(delivery_context)
         signal.signal(signal.SIGTERM, previous_signals[0])
         signal.signal(signal.SIGINT, previous_signals[1])
-        if settings is not None:
-            Path(settings.name).unlink(missing_ok=True)
         token = ""
         auth_key = ""
         if run is not None:
@@ -534,7 +502,7 @@ def expected_execution(receipt, manifest, qualification_hash, spec):
     return full.execution_identity(manifest, receipt['mission_id'], qualification_hash,
         role='independent_reviewer', provider=spec.provider, model=spec.model, configuration=spec.identity(),
         registry_hash=receipt['registry_sha256'], runner_hash=receipt['runner_sha256'],
-        invocation_hash=sha256(Path(legacy.__file__).read_bytes()),
+        invocation_hash=sha256(Path(direct.__file__).read_bytes()),
         schema_hash=sha256(canonical({'chunk': CHUNK_SCHEMA, 'synthesis': SYNTHESIS_SCHEMA})))
 
 
@@ -627,6 +595,7 @@ def validate(receipt: dict, base: str, head: str, root: Path | None = None,
                 raw = legacy.read_private_artifact(fd, f"{stage}-{record['index']:03d}.json")
                 if sha256(raw) != record["output_sha256"]:
                     raise ValueError("review artifact hash mismatch")
+                _validate_completion_artifact(raw, receipt["mission_id"])
                 if stage == "chunk":
                     if bind_findings(parse_chunk(raw.decode()), "C", record["index"]) != record["bound_findings"]:
                         raise ValueError("chunk artifact differs from receipt")
@@ -637,6 +606,7 @@ def validate(receipt: dict, base: str, head: str, root: Path | None = None,
                                        structured_evidence=True) != record["result"]:
                         raise ValueError("group artifact differs from receipt")
             raw = legacy.read_private_artifact(fd, "aggregate.json")
+            _validate_completion_artifact(raw, receipt["mission_id"])
             if (sha256(raw) != receipt["aggregate_output_sha256"]
                     or parse_synthesis(raw.decode(), _expected(groups), source=None,
                                        structured_evidence=True)

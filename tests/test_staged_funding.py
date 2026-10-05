@@ -302,6 +302,8 @@ class StagedFundingTests(unittest.TestCase):
         from harness.model_qualification import (QualificationEvidence, CASES, _evaluate_cases,
                                                   qualification_prompt)
         from harness.openai_invocation import InvocationResult
+        from harness.model_qualification import _SCHEMA
+        from direct_deepseek_fixture import envelope
         spec = ModelSpec('deepseek', 'deepseek-flash', None)
         self.runtime['models']['deepseek'] = spec.identity()
         self.payload['runtime'] = self.runtime; self.publish()
@@ -317,8 +319,8 @@ class StagedFundingTests(unittest.TestCase):
             evidence.capture_reservation(case.name, reservation.request_id)
             self.settle(reservation)
             if case.name == 'clean':
-                return InvocationResult(json.dumps({'decisions': [], 'findings': [],
-                    'summary': 'The clean source has no blockers after exact review.'}),
+                return InvocationResult(envelope({'decisions': [], 'findings': [],
+                    'summary': 'The clean source has no blockers after exact review.'}, prompt, _SCHEMA).decode(),
                     {'resource_request_id': reservation.request_id})
             raise AssertionError('second case must pause before fake transport')
         with patch.dict(os.environ, self.env, clear=True), patch.object(gate, 'load_authorization', side_effect=lambda: self.load()):
@@ -343,8 +345,8 @@ class StagedFundingTests(unittest.TestCase):
                 'rationale': 'The exact source directly supports this semantic disposition.',
                 'source_quote': 'return a + b' if case.name == 'source_based_dispute' else ''}
                 for i, finding in enumerate(expected_findings(case))]
-            return InvocationResult(json.dumps({'decisions': decisions, 'findings': [],
-                'summary': 'All supplied findings were checked against their exact source.'}),
+            return InvocationResult(envelope({'decisions': decisions, 'findings': [],
+                'summary': 'All supplied findings were checked against their exact source.'}, prompt, _SCHEMA).decode(),
                 {'resource_request_id': reservation.request_id})
         self.refresh(available_microusd=1210000)
         with patch.dict(os.environ, self.env, clear=True), patch.object(gate, 'load_authorization', side_effect=lambda: self.load()):

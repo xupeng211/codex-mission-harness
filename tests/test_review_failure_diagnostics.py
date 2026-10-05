@@ -84,45 +84,28 @@ class DiagnosticTests(unittest.TestCase):
         self.assertTrue(result["stderr_truncated"])
         self.assertEqual(result["stderr_size"], d.STREAM_LIMIT)
 
-    def test_invoke_nonzero_records_hashes_without_parser_or_secret(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            settings = Path(temporary) / "settings.json"
-            settings.write_text("{}")
-            stdout = b'{"is_error":true,"result":"HTTP 429 rate limit"}'
-            stderr = b"transient rate limit"
-            completed = subprocess.CompletedProcess([], 1, stdout, stderr)
-            state = {}
-            with patch.object(runner.legacy, "invoke_reviewer", return_value=completed):
-                with self.assertRaises(runner.ReviewStageFailure) as caught:
-                    runner._invoke(["/bin/claude", "--settings", str(settings)], "prompt",
-                                   {"HOME": "/nonexistent", "ANTHROPIC_API_KEY": "fixture-secret"},
-                                   30, "fixture-secret", stage="group", evidence_fd=0,
-                                   artifact="group-000.json", state=state, persist=False)
-            self.assertEqual(caught.exception.category, "RATE_LIMIT")
-            self.assertTrue(state["resume_allowed"])
-            self.assertEqual(state["stdout_sha256"], d.digest(stdout))
-            self.assertEqual(state["stderr_sha256"], d.digest(stderr))
-            self.assertFalse(state["parser_entered"])
-            self.assertFalse(state["schema_validation_entered"])
-            self.assertNotIn("fixture-secret", json.dumps(state))
+    def test_direct_failure_is_terminal_and_sanitized(self):
+        state = {}
+        with patch.object(runner.direct, "invoke", side_effect=runner.direct.DirectFailure("HTTP_429")):
+            with self.assertRaises(runner.ReviewStageFailure) as caught:
+                runner._invoke(["DIRECT_DEEPSEEK_API", "--json-schema", "{}"], "prompt", {},
+                    30, "fixture-secret", stage="group", evidence_fd=0,
+                    artifact="group-000.json", state=state, persist=False)
+        self.assertEqual(caught.exception.category, "SCHEMA_VALIDATION_FAILED")
+        self.assertFalse(state["resume_allowed"])
+        self.assertEqual(state["sanitized_error_class"], "HTTP_429")
+        self.assertFalse(state["parser_entered"])
+        self.assertNotIn("fixture-secret", json.dumps(state))
 
-    def test_chunk_nonzero_passes_exact_streams_to_private_sink(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            settings = Path(temporary) / "settings.json"
-            settings.write_text("{}")
-            stdout, stderr = b'{"is_error":true}', b"cli failed"
-            completed = subprocess.CompletedProcess([], 1, stdout, stderr)
-            captured = []
-            with patch.object(runner.legacy, "invoke_reviewer", return_value=completed):
-                with self.assertRaises(runner.ReviewStageFailure):
-                    runner._invoke(["/bin/claude", "--settings", str(settings)], "chunk prompt",
-                                   {"HOME": "/nonexistent"}, 30, "fixture-secret",
-                                   stage="chunk", evidence_fd=0, artifact="chunk-001.json",
-                                   state={}, persist=False,
-                                   transport_sink=lambda prompt, out, err, **kwargs:
-                                       captured.append((prompt, out, err, kwargs)))
-            self.assertEqual(captured[0][:3], (b"chunk prompt", stdout, stderr))
-            self.assertFalse(captured[0][3]["secret_echo"])
+    def test_direct_failure_sink_does_not_publish_untrusted_response(self):
+        captured = []
+        with patch.object(runner.direct, "invoke", side_effect=runner.direct.DirectFailure("CREDENTIAL_ECHO")):
+            with self.assertRaises(runner.ReviewStageFailure):
+                runner._invoke(["DIRECT_DEEPSEEK_API", "--json-schema", "{}"], "prompt", {},
+                    30, "fixture-secret", stage="chunk", evidence_fd=0, artifact="chunk-001.json",
+                    state={}, persist=False,
+                    transport_sink=lambda prompt, out, err: captured.append((prompt, out, err)))
+        self.assertEqual(captured, [(b"prompt", None, b"CREDENTIAL_ECHO")])
 
     def test_success_then_parser_and_schema_failure_flags(self):
         state = {"stage": "group"}

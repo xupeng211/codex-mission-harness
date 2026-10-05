@@ -10,10 +10,7 @@ import hmac
 import json
 import os
 import subprocess
-import signal
 import stat
-import time
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -255,6 +252,9 @@ def _evaluate_cases(spec: ModelSpec, invoke: Callable[[ModelSpec, str], str], *,
             record["structured_output_raw"] = raw
             record["structured_output_sha256"] = hashlib.sha256(raw.encode()).hexdigest()
             record["failure_phase"] = "PARSER_OR_SOURCE_BINDING"
+            if mode == "real_provider" and spec.provider == "deepseek":
+                from .deepseek_direct import validate_envelope
+                validate_envelope(raw, schema=_SCHEMA, prompt=prompt)
             bound = parse_synthesis(raw, expected_findings(case), source=case.source.encode())
             record["parsed_result"] = bound
             record["parser_result"] = "PASS"
@@ -332,77 +332,24 @@ def _actual_provider_invoke_unmetered(spec: ModelSpec, prompt: str, *, token: st
     if spec.provider == "deepseek":
         from .formal_delivery_gate import require_provider_credential
         require_provider_credential("deepseek", token.encode() if isinstance(token, str) else b"")
-    with tempfile.TemporaryDirectory(prefix="cmh-model-qualification-") as temporary:
-        root = Path(temporary)
-        schema = root / "schema.json"
-        schema.write_text(json.dumps(_SCHEMA), encoding="utf-8")
-        if spec.provider == "openai":
-            return invoke_openai(prompt, spec, _SCHEMA, timeout=timeout)
-        if spec.provider == "deepseek":
-            if token is None:
-                raise ValueError("DeepSeek qualification token missing")
-            settings = root / "settings.json"
-            settings.write_text('{"permissions":{"allow":[],"deny":["Bash","Edit",'
-                                '"Write","Read","Glob","Grep","WebFetch","WebSearch"]}}')
-            from .model_registry import trusted_claude_launcher
-            executable, safe_path = trusted_claude_launcher()
-            command = [executable, "--bare", "--restricted", "--print", "--model", spec.model,
-                       "--settings", str(settings), "--tools", "", "--disallowed-tools",
-                       "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch", "--output-format", "json",
-                       "--json-schema", json.dumps(_SCHEMA, separators=(",", ":"))]
-            env = {"HOME": "/nonexistent", "PATH": safe_path,
-                   "LANG": "C.UTF-8", "ANTHROPIC_API_KEY": token,
-                   "ANTHROPIC_AUTH_TOKEN": token,
-                   "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
-                   "CLAUDE_CODE_SIMPLE": "1"}
-            with tempfile.TemporaryFile() as input_file, tempfile.TemporaryFile() as output_file, \
-                    tempfile.TemporaryFile() as error_file:
-                input_file.write(prompt.encode("utf-8"))
-                input_file.seek(0)
-                process = subprocess.Popen(command, stdin=input_file, stdout=output_file,
-                                           stderr=error_file, env=env, cwd=root,
-                                           start_new_session=True)
-                deadline = time.monotonic() + timeout
-                try:
-                    while process.poll() is None:
-                        if (output_file.tell() > 128_000 or error_file.tell() > 128_000 or
-                                os.fstat(output_file.fileno()).st_size > 128_000 or
-                                os.fstat(error_file.fileno()).st_size > 128_000):
-                            raise ValueError("DeepSeek qualification output exceeds bound")
-                        if time.monotonic() >= deadline:
-                            raise subprocess.TimeoutExpired(command, timeout)
-                        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
-                    if (os.fstat(output_file.fileno()).st_size > 128_000 or
-                            os.fstat(error_file.fileno()).st_size > 128_000):
-                        raise ValueError("DeepSeek qualification output exceeds bound")
-                except (ValueError, subprocess.TimeoutExpired):
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    process.wait()
-                    if transport_sink is not None:
-                        output_file.seek(0); error_file.seek(0)
-                        transport_sink(output_file.read(128_001), error_file.read(128_001), process.returncode)
-                    raise
-                output_file.seek(0)
-                output = output_file.read(128_001)
-                error_file.seek(0)
-                error = error_file.read(128_001)
-                returncode = process.returncode
-                if transport_sink is not None:
-                    transport_sink(output, error, returncode)
-            if returncode:
-                raise RuntimeError("DeepSeek model qualification provider call failed")
-            try:
-                envelope = json.loads(output)
-                if envelope.get("is_error") or not isinstance(envelope.get("structured_output"), dict):
-                    raise ValueError("provider returned no structured output")
-                return InvocationResult(json.dumps(envelope["structured_output"]),
-                                        {"usage": envelope.get("usage"),
-                                         "cli_reported_cost_usd": envelope.get("total_cost_usd")})
-            except (TypeError, ValueError) as exc:
-                raise RuntimeError("DeepSeek qualification output invalid") from exc
+    if spec.provider == "openai":
+        return invoke_openai(prompt, spec, _SCHEMA, timeout=timeout)
+    if spec.provider == "deepseek":
+        from . import deepseek_direct as direct
+        if token is None:
+            raise ValueError("DeepSeek qualification token missing")
+        try:
+            raw = direct.invoke(prompt, token, _SCHEMA, timeout=timeout)
+        except direct.DirectFailure as exc:
+            if transport_sink is not None:
+                transport_sink(b"", exc.code.encode(), 1)
+            raise RuntimeError("DeepSeek qualification Direct invocation failed") from None
+        if transport_sink is not None:
+            transport_sink(raw, b"", 0)
+        envelope = direct.validate_envelope(raw, schema=_SCHEMA, prompt=prompt)
+        return InvocationResult(raw.decode(), {"usage": envelope["direct_completion"]["usage"],
+                                "provider_route": "DIRECT_DEEPSEEK_API"})
+
     raise ValueError("unsupported provider")
 
 
@@ -422,9 +369,10 @@ def _actual_provider_invoke(spec: ModelSpec, prompt: str, *, token: str | None,
         if isinstance(result, InvocationResult):
             usage = result.evidence.get("usage")
             if isinstance(usage, dict):
-                from .resource_gate import normalize_deepseek_usage
-                reservation.observe(normalize_deepseek_usage(
-                    usage, result.evidence.get("cli_reported_cost_usd")))
+                from .resource_gate import normalize_deepseek_usage, normalize_direct_deepseek_usage
+                reservation.observe(normalize_direct_deepseek_usage(usage)
+                    if result.evidence.get("provider_route") == "DIRECT_DEEPSEEK_API" else
+                    normalize_deepseek_usage(usage, result.evidence.get("cli_reported_cost_usd")))
             return InvocationResult(result.response, dict(result.evidence,
                                                          resource_request_id=reservation.request_id))
         return result
@@ -468,7 +416,7 @@ def qualification_receipt(result: QualificationResult, *, auth_key: str,
                           role: str, registry_path: str | Path | None = None) -> dict:
     """Build an integrity-bound record without storing model responses."""
     from .model_registry import load_registry
-    from . import reviewer_v2_contract, openai_invocation, model_registry, codex, full_diff_manifest
+    from . import reviewer_v2_contract, openai_invocation, model_registry, codex, full_diff_manifest, deepseek_direct
 
     if not result.passed or not isinstance(auth_key, str) or not auth_key:
         raise ValueError("only a complete real-provider qualification can produce a receipt")
@@ -488,7 +436,7 @@ def qualification_receipt(result: QualificationResult, *, auth_key: str,
                "contract_sha256": hashlib.sha256(Path(reviewer_v2_contract.__file__).read_bytes()).hexdigest(),
                "runner_sha256": hashlib.sha256(code.read_bytes()).hexdigest(),
                "cli_runner_sha256": hashlib.sha256(cli.read_bytes()).hexdigest(),
-               "invocation_sha256": hashlib.sha256(Path(openai_invocation.__file__).read_bytes()).hexdigest(),
+               "invocation_sha256": hashlib.sha256((Path(deepseek_direct.__file__) if result.identity["provider"] == "deepseek" else Path(openai_invocation.__file__)).read_bytes()).hexdigest(),
                "builder_runtime_sha256": hashlib.sha256(Path(codex.__file__).read_bytes()).hexdigest(),
                "qualification_schema_sha256": hashlib.sha256(json.dumps(
                    _SCHEMA, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
@@ -513,7 +461,7 @@ def validate_qualification_receipt(path: str | Path, spec: ModelSpec, *, auth_ke
                                    role: str, registry_path: str | Path | None = None) -> dict:
     """Reject stale, incomplete, altered, or different-model qualification."""
     from .model_registry import load_registry
-    from . import reviewer_v2_contract, openai_invocation, model_registry, codex, full_diff_manifest
+    from . import reviewer_v2_contract, openai_invocation, model_registry, codex, full_diff_manifest, deepseek_direct
 
     receipt_path = Path(path)
     if not receipt_path.is_absolute():
@@ -560,7 +508,7 @@ def validate_qualification_receipt(path: str | Path, spec: ModelSpec, *, auth_ke
               "contract_sha256": Path(reviewer_v2_contract.__file__),
               "runner_sha256": Path(__file__),
               "cli_runner_sha256": Path(__file__).resolve().parents[2] / "scripts" / "model_qualification.py",
-              "invocation_sha256": Path(openai_invocation.__file__),
+              "invocation_sha256": Path(deepseek_direct.__file__) if spec.provider == "deepseek" else Path(openai_invocation.__file__),
               "builder_runtime_sha256": Path(codex.__file__),
               "registry_code_sha256": Path(model_registry.__file__)}
     if any(receipt[key] != hashlib.sha256(file.read_bytes()).hexdigest()

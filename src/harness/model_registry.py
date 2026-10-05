@@ -170,7 +170,8 @@ def preflight(spec: ModelSpec, *, token_file: str | Path | None = None,
         if token_file is None:
             raise ValueError("DeepSeek requires an explicit token file")
         token = read_private_token(Path(token_file))
-        trusted_claude_launcher()
+        from .deepseek_direct import identity
+        identity()  # Local transport integrity; no CLI or network probe.
         if probe:
             from .model_qualification import _actual_provider_invoke
             _actual_provider_invoke(spec, 'Return only {"decisions":[]}.', token=token,

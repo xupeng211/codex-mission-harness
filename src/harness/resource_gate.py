@@ -425,6 +425,12 @@ def _conservative_wall_start(auth: dict) -> float:
         raise ResourceGateDenied("original wall-clock start invalid") from exc
 
 
+def normalize_direct_deepseek_usage(usage):
+    """Direct API fields remain distinct from historical Claude session fields."""
+    from .deepseek_direct import normalize_usage
+    return normalize_usage(usage)
+
+
 def normalize_deepseek_usage(usage: dict | None, cli_cost_usd: object = None,
                              model_usage: dict | None = None) -> dict:
     """Keep Claude CLI's disjoint input/cache fields and session cost visible."""
@@ -517,8 +523,8 @@ class Reservation:
                         type(created) is int and created >= 0 and
                         read + created == tokens["cache"] and
                         tokens["reasoning"] <= tokens["output"]):
-                    # Claude CLI input_tokens excludes cache read/creation.
-                    # output_tokens already contains thinking_tokens.
+                    # Normalized input excludes cache hits; completion includes reasoning.
+                    # Reasoning never adds a separate output charge.
                     numerator = ((tokens["input"] + created) * prices["input_cache_miss"] +
                                  tokens["output"] * prices["output"] +
                                  read * prices["cache_hit"])
@@ -529,14 +535,24 @@ class Reservation:
                                       record.get("wallet_exposure_microusd", record["cost_reservation_microunits"])):
                         record["usage_accounting"] = "OVER_RESERVATION_BLOCK_FUTURE_CALLS"
                         record["cost_overage_source"] = "AUTHORIZED_PRICE_ESTIMATE"
+                direct_usage = False
+                if self.reported_usage.get("usage_scope") == "DIRECT_DEEPSEEK_API":
+                    try:
+                        direct_usage = (self.provider == "deepseek" and self.reported_usage ==
+                            normalize_direct_deepseek_usage(self.reported_usage.get("raw_usage_fields")))
+                    except (ValueError, RuntimeError):
+                        pass
+                    if not direct_usage:
+                        record["usage_accounting"] = "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS"
+                # Direct API reports token usage, not a Claude session dollar estimate.
                 cli_cost = self.reported_usage.get("cli_reported_cost_microunits")
-                if prices and isinstance(model_usage, dict) and (
+                if prices and not direct_usage and isinstance(model_usage, dict) and (
                         type(model_usage.get("costUSD")) not in (int, float) or
                         round(model_usage["costUSD"] * 1_000_000) != cli_cost):
                     record["usage_accounting"] = "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS"
-                if prices and (type(cli_cost) is not int or cli_cost < 0):
+                if prices and not direct_usage and (type(cli_cost) is not int or cli_cost < 0):
                     record["usage_accounting"] = "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS"
-                elif prices and cli_cost > record["cost_reservation_microunits"] and (
+                elif prices and not direct_usage and cli_cost > record["cost_reservation_microunits"] and (
                         record["usage_accounting"] != "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS"):
                     if record.get("cost_basis_policy") == (
                             "VERIFIED_OFFICIAL_PRICE_WITH_DISCLOSED_CLI_FALLBACK"):
