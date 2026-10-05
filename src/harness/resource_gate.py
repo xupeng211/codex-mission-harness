@@ -40,6 +40,15 @@ class FundingPause(ResourceGateDenied):
             self.details.update(currency='CNY', semantic_type='PROVIDER_CAPACITY')
 
 
+class SubscriptionPause(FundingPause):
+    """Availability pause, never monetary capacity or a future-call guarantee."""
+    def __init__(self, reason, *, provider_attempted=False):
+        RuntimeError.__init__(self, reason)
+        self.provider_attempted = provider_attempted
+        self.details = {'status': 'PAUSED_SUBSCRIPTION_UNAVAILABLE',
+                        'capacity_kind': 'SUBSCRIPTION_AVAILABILITY', 'reason': reason}
+
+
 _active_reservation: ContextVar[Reservation | None] = ContextVar("cmh_active_resource_reservation", default=None)
 
 
@@ -703,8 +712,11 @@ def model_request(*, provider: str, model: str, prompt: bytes, stage: str,
     token = _active_reservation.set(reservation)
     try:
         yield reservation
-    except BaseException:
+    except BaseException as exc:
         reservation.settle("FAILED")
+        if provider == 'openai' and isinstance(exc, SubscriptionPause) and exc.provider_attempted:
+            from .formal_delivery_gate import record_subscription_block
+            record_subscription_block(reservation)
         raise
     else:
         reservation.settle("RETURNED")

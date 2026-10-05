@@ -581,7 +581,7 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
     except (Exception, KeyboardInterrupt) as exc:
         from harness.resource_gate import FundingPause
         if isinstance(exc, FundingPause):
-            run_state.failure(dict(exc.details, failure_category="PAUSED_AWAITING_MANUAL_FUNDING"), auth_key)
+            run_state.failure(dict(exc.details, failure_category=exc.details["status"]), auth_key)
             raise
         failure = {"status": "BLOCKED", "base_sha": base, "head_sha": head,
                    "mission_id": mission_id, "repository": repository,

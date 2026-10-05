@@ -354,7 +354,7 @@ class ReviewRun:
         return path
 
     def failure(self, failure: dict, auth_key: str | None = None) -> Path:
-        funding = failure.get("failure_category") == "PAUSED_AWAITING_MANUAL_FUNDING"
+        funding = failure.get("failure_category") in {"PAUSED_AWAITING_MANUAL_FUNDING", "PAUSED_SUBSCRIPTION_UNAVAILABLE"}
         failure.pop("integrity_sha256", None)
         failure.pop("auth_hmac_sha256", None)
         attempt = self.state.get("failure_count", 0) + (0 if funding else 1)
@@ -385,7 +385,7 @@ class ReviewRun:
             name = f"failure-{uuid.uuid4().hex}.json"
         self.storage.write_private_artifact(self.fd, name, canonical(failure), uuid.uuid4().hex)
         self.state["failure_count"] = attempt
-        self.state["funding_status"] = "PAUSED_AWAITING_MANUAL_FUNDING" if funding else None
+        self.state["funding_status"] = failure["failure_category"] if funding else None
         self.state["last_failure"] = {"artifact_path": name, "resume_allowed": allowed,
                                       "stage": self.state["next_stage"]}
         _atomic_state(self.fd, self.state)

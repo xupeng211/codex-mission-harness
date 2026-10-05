@@ -168,6 +168,8 @@ def _failure_category(stderr: bytes, stdout: bytes, *, timed_out: bool) -> str:
         return "AUTHENTICATION_FAILURE"
     if re.search(r"model.*(unsupported|not found|unavailable)|unsupported.*model", content):
         return "MODEL_UNAVAILABLE_OR_UNSUPPORTED"
+    if re.search(r"hit.*usage limit|usage[ _]limit.*(?:reached|exceeded)|quota.*(?:exhausted|exceeded)|(?:subscription|membership).*(?:unavailable|expired|inactive)|account capacity blocked|insufficient_quota", content):
+        return "SUBSCRIPTION_UNAVAILABLE"
     if re.search(r"rate.limit|capacity|overload|server.busy", content):
         return "TRANSIENT_CAPACITY"
     if re.search(r"connection|network|timeout|stream|proxy|disconnect", content):
@@ -304,7 +306,7 @@ def _invoke_openai_unmetered(prompt: str, spec: ModelSpec, schema: dict, *, time
                     "failure_markers": _failure_markers(stderr, stdout),
                     **_observed_events(stdout)}
         if timed_out or process.returncode != 0:
-            raise InvocationFailure(_failure_category(stderr, stdout, timed_out=timed_out),
+            raise InvocationFailure(_failure_category(stderr, _event_error_bytes(stdout), timed_out=timed_out),
                                     "canonical Codex invocation did not complete", evidence)
         try:
             events = parse_events(stdout)
@@ -345,9 +347,15 @@ def invoke_openai(prompt: str, spec: ModelSpec, schema: dict, *, timeout: int = 
     require_invocation_spec(spec)
     with model_request(provider="openai", model=spec.model, prompt=prompt.encode(),
                        stage=os.environ.get("CMH_RESOURCE_STAGE", "openai-invocation")) as reservation:
-        result = _invoke_openai_unmetered(prompt, spec, schema, timeout=timeout,
-                                         binary=binary, codex_home=codex_home,
-                                         source_env=source_env,
-                                         transport_sink=transport_sink)
+        try:
+            result = _invoke_openai_unmetered(prompt, spec, schema, timeout=timeout,
+                                             binary=binary, codex_home=codex_home,
+                                             source_env=source_env, transport_sink=transport_sink)
+        except InvocationFailure as exc:
+            if exc.category != 'SUBSCRIPTION_UNAVAILABLE':
+                raise
+            from .resource_gate import SubscriptionPause
+            raise SubscriptionPause('Provider subscription capacity exhausted; refresh availability evidence',
+                                    provider_attempted=True) from None
         reservation.observe(result.evidence.get("usage"))
         return result

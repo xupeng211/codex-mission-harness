@@ -205,6 +205,8 @@ def _load(env, anchor, runtime, now, *, offline=False):
         for name in ('max_new_calls', 'shared_max_calls'):
             if not _integer(auth[name], 1):
                 _deny('delivery logical call limit invalid')
+        if auth.get('openai_availability_policy') is not None:
+            _validate_availability_policy(auth)
         if auth.get('deepseek_funding_policy') is not None:
             _validate_funding_policy(auth)
         account = _signed(auth['account_evidence_path'], auth['account_evidence_sha256'], key)
@@ -229,7 +231,8 @@ def _load(env, anchor, runtime, now, *, offline=False):
                     or lane['model'] != runtime['models'][provider]['model']
                     or lane['cost_unit'] != unit
                     or lane['unknown_policy'] != 'DEBIT_FULL_RESERVATION_STOP_ON_OVERAGE'
-                    or not _integer(item['available_microunits'])
+                    or not (provider == 'openai' and auth.get('openai_availability_policy')) and
+                       not _integer(item.get('available_microunits'))
                     or not _integer(item['other_reserved_microunits'])
                     or not _integer(item['other_calls'])
                     or set(item['other_tokens']) != set(CATEGORIES)
@@ -257,8 +260,9 @@ def _load(env, anchor, runtime, now, *, offline=False):
                                                 'output': 192000, 'reasoning': 128000}}:
                     _deny('DeepSeek Group/Cross-group reservation contract must be preserved')
             exposure = history[provider]['cost'] + item['other_reserved_microunits'] + lane['cost_limit_microunits']
-            wallet_limit = (auth['shared_cost_limits'][provider] if provider == 'deepseek' and
-                            auth.get('deepseek_funding_policy') else item['available_microunits'])
+            wallet_limit = (auth['shared_cost_limits'][provider] if (provider == 'deepseek' and
+                            auth.get('deepseek_funding_policy') or provider == 'openai' and
+                            auth.get('openai_availability_policy')) else item['available_microunits'])
             if exposure > min(wallet_limit, auth['shared_cost_limits'][provider]):
                 _deny('shared account evidence cannot cover the complete approved future envelope')
             if any(history[provider]['tokens'][k] + item['other_tokens'][k] + lane['token_limit'][k] >
@@ -341,6 +345,107 @@ def load_authorization(environment=None):
 
 def authenticate_legacy_signer(key_path):
     _signed(HISTORICAL_AUTHORIZATION, PRODUCTION_ANCHOR.authorization_sha256, _read(key_path))
+
+
+AVAILABILITY_VERSION = 'cmh-openai-subscription-availability/v1'
+
+
+def _validate_availability_policy(auth):
+    from .openai_invocation import CANONICAL_BINARY, CANONICAL_HOME
+    p = auth['openai_availability_policy']
+    if (p.get('version') != AVAILABILITY_VERSION or p.get('provider') != 'openai' or
+            p.get('route') != 'codex_subscription' or p.get('model') != 'gpt-5.6-sol' or
+            p.get('binary') != str(CANONICAL_BINARY) or p.get('codex_home') != str(CANONICAL_HOME) or
+            not _integer(p.get('max_snapshot_age_seconds'), 1)):
+        _deny('subscription availability policy identity invalid')
+
+
+def _availability_snapshot(auth, path, sha, key, now):
+    from .resource_gate import SubscriptionPause
+    value = _signed(path, sha, key)
+    p = auth.get('openai_availability_policy')
+    if not p:
+        _deny('subscription availability policy required')
+    _validate_availability_policy(auth)
+    identities = dict(version=AVAILABILITY_VERSION, evidence_domain=auth['evidence_domain'],
+        provider='openai', route=p['route'], model=p['model'], binary=p['binary'],
+        codex_home=p['codex_home'], account_id=auth['account_ids']['openai'],
+        credential_identity=auth['credential_identities']['openai'],
+        authorization_sha256=auth['_authorization_sha256'], policy_sha256=digest(canonical(p)))
+    if (any(value.get(k) != v for k, v in identities.items()) or
+            not _integer(value.get('epoch'), 1) or
+            not _integer(value.get('observed_epoch')) or not _integer(value.get('expires_epoch')) or
+            not value['observed_epoch'] < value['expires_epoch'] <= value['observed_epoch'] + p['max_snapshot_age_seconds'] or
+            any(type(value.get(k)) is not bool for k in
+                ('subscription_active', 'membership_active', 'known_capacity_blocked'))):
+        _deny('subscription availability evidence identity or validity malformed')
+    if digest(_read(value['source_path'])) != value['source_sha256']:
+        _deny('subscription availability source changed')
+    if (not value['observed_epoch'] <= now < value['expires_epoch'] or
+            not value['subscription_active'] or not value['membership_active'] or value['known_capacity_blocked']):
+        raise SubscriptionPause('current subscription availability is stale or blocked; refresh trusted evidence')
+    return value
+
+
+def _current_availability(auth, ledger, key, now):
+    from .resource_gate import SubscriptionPause
+    entry = ledger.get('openai_availability')
+    if not entry or ledger.get('openai_subscription_block'):
+        raise SubscriptionPause('fresh subscription availability evidence required before send')
+    value = _availability_snapshot(auth, entry['path'], entry['sha256'], key, now)
+    if value['epoch'] != entry['epoch']:
+        _deny('subscription availability epoch mismatch')
+    return value
+
+
+def _refresh_availability_validated(auth, env, path, sha, now, *, offline=False):
+    if auth['evidence_domain'] != ('OFFLINE_TEST' if offline else 'FORMAL'):
+        _deny('synthetic availability cannot authorize production')
+    ledger_path = Path(auth['ledger_path']); key = _read(env['CMH_RESOURCE_GATE_KEY_FILE'])
+    with _locked(ledger_path.with_name(ledger_path.name + '.lock')):
+        if not offline:
+            auth = load_authorization(env); now = time.time()
+        ledger = _verify_child(ledger_path, key, auth)
+        if any(r.get('status') in {'STARTED', 'UNKNOWN'} or r.get('usage_accounting') in
+               {'USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS', 'OVER_RESERVATION_BLOCK_FUTURE_CALLS'} for r in ledger['requests']):
+            _deny('availability refresh cannot reconcile UNKNOWN, in-flight or overage accounting')
+        value = _availability_snapshot(auth, path, sha, key, now)
+        old = ledger.get('openai_availability')
+        if (value.get('previous_snapshot_sha256') != (old['sha256'] if old else None) or
+                value['epoch'] != (old['epoch'] + 1 if old else 1) or
+                value.get('baseline_checkpoint_sha256') != digest(_read(_checkpoint_path(ledger_path))) or
+                old and value['observed_epoch'] < old['observed_epoch']):
+            _deny('availability refresh checkpoint, epoch or history mismatch')
+        ledger['openai_availability'] = dict(path=str(path), sha256=sha, epoch=value['epoch'],
+                                           observed_epoch=value['observed_epoch'])
+        ledger.pop('openai_subscription_block', None)
+        _write_child(ledger_path, ledger, key)
+
+
+def refresh_subscription_availability(path, sha):
+    _refresh_availability_validated(load_authorization(), os.environ, path, sha, time.time())
+
+
+def record_subscription_block(reservation):
+    # Failure consumes its existing reservation, even when usage is UNKNOWN.
+    if reservation.ledger_key_path is None:
+        return
+    path = reservation.ledger; key = _read(reservation.ledger_key_path)
+    with _locked(path.with_name(path.name + '.lock')):
+        ledger = _checked_child(path, key)
+        row = next(r for r in ledger['requests'] if r['request_id'] == reservation.request_id)
+        if row['status'] != 'FAILED' or row['provider'] != 'openai':
+            _deny('subscription failure must bind a settled failed OpenAI attempt')
+        row['failure_class'] = 'SUBSCRIPTION_UNAVAILABLE'
+        ledger['openai_subscription_block'] = dict(request_id=row['request_id'], status='PAUSED_SUBSCRIPTION_UNAVAILABLE')
+        _write_child(path, ledger, key)
+
+
+def _capacity_paused_request(row):
+    return (row.get('provider') == 'openai' and row.get('status') == 'FAILED' and
+            row.get('failure_class') == 'SUBSCRIPTION_UNAVAILABLE' and
+            row.get('reported_usage') != 'UNKNOWN' and
+            row.get('usage_accounting') == 'FULL_RESERVATION_RETAINED')
 
 
 def _funding_currency(auth):
@@ -590,6 +695,8 @@ def require_active_transport(provider, model):
                 active.authorization_sha256 != auth['_authorization_sha256']):
             _deny('raw provider transport requires an active formal delivery reservation')
         ledger = _checked_child(active.ledger, _read(active.ledger_key_path))
+        if provider == 'openai':
+            _current_availability(auth, ledger, _read(active.ledger_key_path), time.time())
         if provider == 'deepseek' and auth.get('deepseek_funding_policy'):
             try:
                 snapshot = _current_funds(auth, ledger, _read(active.ledger_key_path), time.time())
@@ -702,6 +809,14 @@ def _qualification_request(rows, provider, prompt, run_id, authorization_hash=No
     from .model_qualification import CASES, qualification_prompt
     previous = [r for r in rows if r['provider'] == provider and r['stage'] == 'qualification-case'
                 and (authorization_hash is None or r['authorization_sha256'] == authorization_hash)]
+    if any(r['run_id'] != run_id for r in previous):
+        _deny('qualification attempts cannot change run identity after capacity pause')
+    capacity_failures = [r for r in previous if _capacity_paused_request(r)]
+    if provider == 'openai':
+        if (len(capacity_failures) >= 2 or
+                sum(r.get('prompt_sha256') == digest(prompt) for r in previous) >= 2):
+            _deny('bounded Qualification capacity-pause attempt limit reached')
+        previous = [r for r in previous if not _capacity_paused_request(r)]
     if (len(previous) >= len(CASES) or
             any(r['run_id'] != run_id for r in previous) or
             prompt != qualification_prompt(CASES[len(previous)]).encode()):
@@ -772,8 +887,12 @@ def _reserve_validated(auth, env, provider, model, prompt, stage, now, *, offlin
         if not offline and provider == 'deepseek' and (not staged or _funding_currency(auth) != 'CNY'):
             _deny('Direct DeepSeek requires native CNY staged capacity before reservation')
         if (cost > lane['cost_limit_microunits'] or exposure > auth['shared_cost_limits'][provider]
-                or not staged and exposure > account['available_microunits']):
+                or not staged and not (provider == 'openai' and auth.get('openai_availability_policy'))
+                and exposure > account['available_microunits']):
             _deny('independent or shared account capacity exhausted')
+        availability = None
+        if provider == 'openai' and (not offline or auth.get('openai_availability_policy')):
+            availability = _current_availability(auth, ledger, key, now)
         funds = None
         if staged:
             try:
@@ -795,6 +914,9 @@ def _reserve_validated(auth, env, provider, model, prompt, stage, now, *, offlin
                'token_reservation': reservation, 'cost_unit': lane['cost_unit'],
                'cost_reservation_microunits': lane['cost_reservation_microunits'],
                'usage_accounting': 'FULL_RESERVATION_RETAINED'}
+        if availability is not None:
+            row.update(subscription_availability_epoch=availability['epoch'],
+                       subscription_availability_sha256=ledger['openai_availability']['sha256'])
         if funds is not None:
             row.update(funding_epoch=funds['epoch'], funding_snapshot_sha256=ledger['funding']['sha256'],
                        **{'wallet_exposure_' + _funding_suffix(auth): funds['_unit_exposure']})

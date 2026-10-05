@@ -133,3 +133,42 @@ not change the Qualification binding. Runtime/model/contract/target identity
 checks continue to apply. No top-up, balance collection or live authorization
 is performed by this feature; current official native pricing and balance
 attestations must still be supplied before live execution.
+
+### OpenAI current subscription availability
+
+OA103 remains the internal Mission-wide call ceiling, not a provider quota
+unit. A signed `openai_availability_policy` replaces full-future-envelope
+provider capacity checks for OpenAI only. Internal call, token, cost, reasoning
+and wall-clock gates remain independent. No percentages or historical usage
+are converted to future calls; availability promises no number of future calls.
+
+The policy fixes the canonical Codex binary, CODEX_HOME, `codex_subscription`
+route and `gpt-5.6-sol` model. Signed availability evidence binds that policy,
+authorization, account, credential, source hash, evidence domain, monotonic
+epoch and bounded observation/expiry times. It requires boolean
+`subscription_active`, `membership_active` and `known_capacity_blocked` fields.
+Missing, stale, inactive or blocked availability pauses before send; mismatched
+identity or altered evidence fails closed. Every invocation rechecks current
+availability, including immediately before starting Codex. Historical window
+percentages alone cannot authorize execution. Evidence collection is external.
+
+An explicit native subscription/quota exhaustion failure produces
+`PAUSED_SUBSCRIPTION_UNAVAILABLE`, retains the failed attempt and its entire
+reservation, and records a durable block. It is never a successful result;
+there is no automatic retry, account/model switch or API fallback. Generic
+transient rate limits retain their existing classification.
+
+Fresh signed evidence may clear the known availability block only at a legal
+checkpoint, preserving all requests, attempts, debits, UNKNOWN and the Mission
+clock. Refresh does not change Qualification identity. In-flight, UNKNOWN,
+unverified or over-reservation usage still blocks refresh: availability cannot
+reconcile consumption. In particular, a failed Codex turn lacking usage remains
+UNKNOWN and cannot resume merely because subscription availability recovered.
+
+For fully accounted subscription pauses, Qualification retains completed cases
+and archives the failed case artifacts before continuing that same case and
+run. Existing semantic cases and success checks are unchanged; an interrupted
+suite cannot pass. Recovery is bounded to two attempts per case and at most two
+capacity failures overall, with every invocation still debited against OA103.
+Runtime/model/contract/target binding continues to require new Qualification
+when changed. No real quota access or live authorization occurs in tests.

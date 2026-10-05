@@ -139,6 +139,25 @@ class QualificationEvidence:
             os.close(directory_fd)
 
     def capture_reservation(self, case_name: str, request_id: str):
+        previous = self.directory / (case_name + ".reservation.json")
+        if previous.exists():
+            from .resource_gate import _private
+            from . import formal_delivery_gate as gate
+            old_id = json.loads(_private(previous))['request_id']
+            auth = gate.load_authorization()
+            ledger = gate._verify_child(Path(auth['ledger_path']),
+                _private(Path(os.environ['CMH_RESOURCE_GATE_KEY_FILE'])), auth)
+            old = next((r for r in ledger['requests'] if r['request_id'] == old_id), {})
+            if not gate._capacity_paused_request(old) or old_id == request_id:
+                raise ResourceGateDenied('only accounted subscription-pause evidence permits a new case attempt')
+            # Keep failed attempt evidence; never overwrite it or completed cases.
+            for suffix in ('reservation.json', 'stdout', 'stderr', 'transport.json'):
+                source = self.directory / (case_name + '.' + suffix)
+                if source.exists():
+                    _private(source)
+                    archive = self.directory / (case_name + '.capacity-pause-' + old_id + '.' + suffix)
+                    os.link(source, archive, follow_symlinks=False)
+                    source.unlink()
         self._write(case_name + ".reservation.json",
                     json.dumps({"request_id": request_id}, sort_keys=True).encode() + b"\n")
 
@@ -171,6 +190,10 @@ class QualificationEvidence:
                 raise ResourceGateDenied('qualification resume execution identity changed')
             rows = [r for r in ledger['requests'] if r['provider'] == spec.provider and
                     r['stage'] == 'qualification-case' and r['authorization_sha256'] == auth['_authorization_sha256']]
+            if any(r['run_id'] != run_id for r in rows):
+                raise ResourceGateDenied('qualification capacity pause belongs to a different run')
+            if spec.provider == 'openai':
+                rows = [r for r in rows if not gate._capacity_paused_request(r)]
             if any(r['run_id'] != run_id or r.get('status') != 'RETURNED' or
                    r.get('usage_accounting') != 'FULL_RESERVATION_RETAINED' for r in rows):
                 raise ResourceGateDenied('qualification resume cannot reuse failed, unknown or other-run requests')
