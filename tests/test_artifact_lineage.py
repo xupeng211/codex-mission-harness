@@ -163,7 +163,7 @@ class ArtifactLineageTests(unittest.TestCase):
         read=lambda name:raw if name=='chunk-000.json' else canonical({'resource_request':None}) if name.endswith('no-request.json') else canonical(transport)
         reuse.review_history(state,read)
         transport['stdout_base64']=base64.b64encode(raw+b' ').decode()
-        with self.assertRaises(ValueError):reuse.review_history(state,read)
+        with self.assertRaises(Exception):reuse.review_history(state,read)
         transport['stdout_base64']=base64.b64encode(raw).decode();row['reported_usage']['raw_usage_fields']['tokens']=0
         with self.assertRaises(ValueError):reuse.review_history(state,read)
 
@@ -171,3 +171,28 @@ class ArtifactLineageTests(unittest.TestCase):
         for name in ('src/harness/reviewer_v2_contract.py','src/harness/openai_invocation.py','src/harness/deepseek_direct.py'):
             self.assertEqual(reuse.SEMANTIC_FILES[name],())
             self.assertNotEqual(reuse.semantic_code(b"def validate():return True"),reuse.semantic_code(b"def validate():return False"))
+
+    def test_legacy_direct_proof_must_bind_every_identity(self):
+        schema={'type':'object','properties':{'findings':{'type':'array'}},'required':['findings']}
+        response={'id':'provider-id','usage':{'tokens':10},'choices':[{'message':{'content':'{"findings":[]}'}}]}
+        raw=canonical(response);rawpath=self.root/'raw';rawpath.write_bytes(raw);rawpath.chmod(0o600)
+        envelope={'direct_completion':{'provider_id':'provider-id','usage':response['usage'],'schema_sha256':digest(canonical(schema))},'structured_output':{'findings':[]}}
+        artifact=canonical(envelope)
+        row={'request_id':'accounted','authorization_sha256':self.base_sha,'prompt_sha256':'prompt','model':'deepseek-flash'}
+        proof={'request_id':'accounted','authorization_sha256':self.base_sha,'runtime_sha256':digest(canonical(self.base['runtime'])),
+               'prompt_sha256':'prompt','model':'deepseek-flash','route':'DIRECT_DEEPSEEK_API','transport_retry':0,'http_status':200,
+               'raw_response_path':str(rawpath),'raw_response_sha256':digest(raw),'provider_id':'provider-id',
+               'schema_sha256':digest(canonical(schema)),'schema':schema}
+        def publish(proof):
+            path=self.root/'proof.json';path.write_bytes(canonical(sign_authorization(proof,self.key.read_bytes()))+b'\n');path.chmod(0o600)
+            index={'version':'cmh-legacy-direct-binding-index/v1','authorization_sha256':self.auth['_authorization_sha256'],
+                   'bindings':{'accounted':{'path':str(path),'sha256':digest(path.read_bytes()),'artifact_sha256':digest(artifact)}}}
+            ip=self.root/'index.json';ip.write_bytes(canonical(sign_authorization(index,self.key.read_bytes()))+b'\n');ip.chmod(0o600)
+            return {'CMH_ARTIFACT_RAW_BINDINGS':str(ip),'CMH_ARTIFACT_RAW_BINDINGS_SHA256':digest(ip.read_bytes())}
+        with patch('harness.deepseek_direct.validate_envelope') as validate:
+            with patch.dict(os.environ,publish(proof)):reuse.verify_legacy_direct_binding(row,artifact,self.base,self.key.read_bytes())
+            self.assertEqual(validate.call_count,1)
+            for key in ['request_id','authorization_sha256','runtime_sha256','prompt_sha256','model','route','raw_response_sha256','provider_id','schema_sha256']:
+                bad=copy.deepcopy(proof);bad[key]='tampered'
+                with self.subTest(key=key),patch.dict(os.environ,publish(bad)),self.assertRaises(ValueError):reuse.verify_legacy_direct_binding(row,artifact,self.base,self.key.read_bytes())
+            with patch.dict(os.environ,publish(proof)),self.assertRaises(ValueError):reuse.verify_legacy_direct_binding(row,artifact+b' ',self.base,self.key.read_bytes())

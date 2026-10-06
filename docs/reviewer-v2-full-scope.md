@@ -175,3 +175,11 @@ source, manifest, model/configuration and qualification identity remain exact.
 Complete receipts still undergo their lane's full artifact/signature validation.
 Unrelated inherited UNKNOWNs cannot be reused as successful artifacts and keep
 all reservations. They do not erase independent successful predecessor evidence.
+
+For a legacy checkpoint whose repeated attempts left a null request locator, a
+private signed `cmh-legacy-direct-binding-index/v1` may locate the independently
+persisted original Direct HTTP binding. It must bind the exact artifact hash;
+the original binding must independently prove request, origin authority/runtime,
+prompt, model/route, retry=0, schema, HTTP status, Provider response ID, raw hash,
+usage and response content. Neither an unsigned locator nor same-prompt matching
+is sufficient. The historical checkpoint/receipt/request is never rewritten.

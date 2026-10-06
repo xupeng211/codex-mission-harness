@@ -172,4 +172,39 @@ def review_history(state, read_artifact):
                           if d['path'].startswith(name + '-transport-')]
             transports = [t for t in transports if (t.get('resource_request') or {}).get('request_id') == row['request_id']]
             if len(transports) != 1 or base64.b64decode(transports[0]['stdout_base64']) != raw:
-                raise ValueError('reused DeepSeek output differs from original transport')
+                verify_legacy_direct_binding(row, raw, origin, key)
+
+
+def verify_legacy_direct_binding(row, artifact, origin, key):
+    """Null legacy checkpoint metadata requires independent signed HTTP evidence.
+
+    The optional private signed index only locates original immutable bindings;
+    it cannot substitute their original request/auth/runtime/prompt/usage hashes.
+    """
+    from . import formal_delivery_gate as gate, deepseek_direct as direct
+    index = gate._signed(os.environ.get('CMH_ARTIFACT_RAW_BINDINGS'),
+                         os.environ.get('CMH_ARTIFACT_RAW_BINDINGS_SHA256'), key)
+    origin_authority(index['authorization_sha256'])
+    if index.get('version') != 'cmh-legacy-direct-binding-index/v1':
+        raise ValueError('legacy transport index version mismatch')
+    ref = index['bindings'].get(row['request_id'])
+    if not isinstance(ref, dict) or ref['artifact_sha256'] != digest(artifact):
+        raise ValueError('reused Direct artifact has no bound original HTTP proof')
+    proof = gate._signed(ref['path'], ref['sha256'], key)
+    envelope = direct.loads(artifact); completion = envelope['direct_completion']
+    raw = gate._read(proof['raw_response_path'])
+    response = direct.loads(raw)
+    if (proof['request_id'] != row['request_id']
+            or proof['authorization_sha256'] != row['authorization_sha256']
+            or proof['runtime_sha256'] != digest(canonical(origin['runtime']))
+            or proof['prompt_sha256'] != row['prompt_sha256']
+            or proof['model'] != row['model'] or proof['route'] != 'DIRECT_DEEPSEEK_API'
+            or proof['transport_retry'] != 0 or proof['http_status'] != 200
+            or digest(raw) != proof['raw_response_sha256']
+            or proof['provider_id'] != response['id'] or response['id'] != completion['provider_id']
+            or proof['schema_sha256'] != completion['schema_sha256']
+            or digest(canonical(proof['schema'])) != completion['schema_sha256']
+            or response['usage'] != completion['usage']
+            or direct.loads(response['choices'][0]['message']['content']) != envelope['structured_output']):
+        raise ValueError('legacy Direct HTTP identity/response/usage mismatch')
+    direct.validate_envelope(artifact, schema=proof['schema'])
