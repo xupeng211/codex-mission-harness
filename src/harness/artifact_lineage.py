@@ -73,6 +73,8 @@ def origin_authority(origin_sha, auth=None):
             raise ValueError('artifact lineage hash, predecessor or fork mismatch')
         if ledger['requests'][:len(prior['requests'])] != prior['requests']:
             raise ValueError('artifact accounting ancestor changed')
+    if origin.get('diagnostic_probe') is not None:
+        raise ValueError('NON_CANONICAL_DIAGNOSTIC_ONLY cannot be an artifact origin')
     if (origin['mission_id'] != auth['mission_id']
             or origin['targets']['PR2'] != auth['targets']['PR2']
             or origin['credential_identities'] != auth['credential_identities']

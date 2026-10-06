@@ -63,6 +63,9 @@ class ReviewRun:
 
     def __init__(self, evidence: Path, repository_root: Path, identity: dict,
                  stages: list[tuple[str, str]], storage, *, prefix: str):
+        if os.environ.get('CMH_RESOURCE_MISSION_ID') == 'HARNESS_CURRENT_VERSION_DELIVERY':
+            from .formal_delivery_gate import load_authorization, require_review_authority
+            require_review_authority(load_authorization())
         self.storage = storage
         self.evidence, self.parent_fd = storage.open_private_directory(evidence, repository_root)
         self.lock_fd = os.open(".review-v2.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600,

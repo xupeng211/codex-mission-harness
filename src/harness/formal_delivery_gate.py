@@ -40,7 +40,7 @@ REQUEST5_LEDGER_SHA256 = 'bef620a429653dea8d895e2417114db69a04859dba90d28f90af34
 REQUEST5_ROW_SHA256 = '57bf46b218deee3d9c795534f7909e7a40f1fc275f2f458a1456ca01d3c6c901'
 HISTORICAL_AUTHORIZATION = (EVIDENCE_ROOT / 'formal-60h-review/authorized-closure-20261003/'
                             'final-dual-review-delivery-20261003/hard-delivery-resource-authorization.json')
-RUNTIME_FILES = ('src/harness/artifact_lineage.py', 'src/harness/deepseek_direct.py', 'src/harness/formal_delivery_gate.py', 'src/harness/resource_gate.py',
+RUNTIME_FILES = ('src/harness/diagnostic_probe.py', 'src/harness/artifact_lineage.py', 'src/harness/deepseek_direct.py', 'src/harness/formal_delivery_gate.py', 'src/harness/resource_gate.py',
                  'src/harness/reviewer_v2_contract.py', 'src/harness/model_qualification.py',
                  'src/harness/model_registry.py', 'src/harness/openai_invocation.py',
                  'src/harness/full_diff_manifest.py', 'src/harness/review_resume.py',
@@ -304,13 +304,19 @@ def _load(env, anchor, runtime, now, *, offline=False):
                     any(auth['providers'][p]['token_limit'][k] < token_minima[p][k] for k in CATEGORIES)
                     for p in minima):
                 _deny('authorization cannot cover qualification and both complete minimum reviews')
+        if auth.get('diagnostic_probe') is not None:
+            from .diagnostic_probe import validate_scope
+            validate_scope(auth)
+            approval = json.loads(_read(auth['user_approval_path']))
+            if approval.get('diagnostic_probe') != auth['diagnostic_probe']:
+                _deny('diagnostic scope needs exact independent user approval provenance')
         lineage = [auth_hash]
         current = auth
         revision_fields = {'authorization_id', 'approved_at_epoch', 'user_approval_path',
                            'user_approval_sha256', 'runtime', 'targets', 'account_evidence_path',
                            'account_evidence_sha256', 'credential_identities',
                            'previous_authorization_path', 'previous_authorization_sha256',
-                           'child_baseline_checkpoint_sha256'}
+                           'child_baseline_checkpoint_sha256', 'diagnostic_probe'}
         previous = None
         predecessor_child = None
         while any(name in current for name in ('previous_authorization_path',
@@ -851,7 +857,13 @@ def refresh_wallet_snapshot(snapshot_path, snapshot_sha256):
     _refresh_validated(load_authorization(), os.environ, snapshot_path, snapshot_sha256, time.time())
 
 
+def require_review_authority(auth):
+    if auth.get('diagnostic_probe') is not None:
+        _deny('NON_CANONICAL_DIAGNOSTIC_ONLY cannot authorize review or qualification artifacts')
+
+
 def qualification_binding(auth):
+    require_review_authority(auth)
     return {'mission_id': NEW_MISSION, 'authorization_sha256': auth['_authorization_sha256'],
             'parent_ledger_sha256': auth['parent']['ledger_sha256'],
             'runtime_sha256': digest(canonical(auth['runtime']))}
@@ -971,6 +983,7 @@ def bind_review(mission_id, root, base, head, registry_hash, spec, qualification
     if mission_id != NEW_MISSION and os.environ.get('CMH_RESOURCE_MISSION_ID') != NEW_MISSION:
         return None
     auth = load_authorization()
+    require_review_authority(auth)
     validate_qualification_binding(qualification.get('delivery_binding'), auth)
     from .full_diff_manifest import git, read_diff, plan, synthesis_stage_names
     target = next((name for name, item in auth['targets'].items()
@@ -1067,6 +1080,12 @@ def _reserve_validated(auth, env, provider, model, prompt, stage, now, *, offlin
         _deny('synthetic resource context cannot launch a provider')
     if not env.get('CMH_RESOURCE_RUN_ID'):
         _deny('delivery run identity required')
+    from .diagnostic_probe import STAGE as diagnostic_stage, validate_scope, validate_request
+    diagnostic = stage == diagnostic_stage
+    if diagnostic or auth.get('diagnostic_probe') is not None:
+        validate_scope(auth)
+        if not diagnostic:
+            _deny('diagnostic-only authority cannot launch a formal stage')
     lane = auth['providers'][provider]
     if not offline:
         _limits(auth, provider, model)  # Preserve existing price/route and token safety rules.
@@ -1079,7 +1098,7 @@ def _reserve_validated(auth, env, provider, model, prompt, stage, now, *, offlin
             auth = load_authorization(env)  # Recheck time/evidence/identity under the reservation lock.
             lane = auth['providers'][provider]
             reservation = _stage_reservation(lane, provider, stage)
-            if stage != 'qualification-case':
+            if stage != 'qualification-case' and not diagnostic:
                 context = _review_context.get()
                 if not context or context['binding'] != qualification_binding(auth):
                     _deny('review context expired or changed before atomic reservation')
@@ -1087,7 +1106,9 @@ def _reserve_validated(auth, env, provider, model, prompt, stage, now, *, offlin
         ledger = _verify_child(path, key, auth)
         rows = ledger['requests']; prior = [r for r in rows if r['provider'] == provider]
         context = None
-        if not offline:
+        if diagnostic:
+            validate_request(auth, rows, provider, model, prompt, env['CMH_RESOURCE_RUN_ID'])
+        if not offline and not diagnostic:
             if stage == 'qualification-case':
                 _qualification_request(rows, provider, prompt, env['CMH_RESOURCE_RUN_ID'],
                                        auth['_authorization_sha256'])
@@ -1164,6 +1185,13 @@ def _reserve_validated(auth, env, provider, model, prompt, stage, now, *, offlin
         if provider == 'deepseek':
             row['price_microusd_per_million'] = lane.get('price_microusd_per_million')
             row['cost_basis_policy'] = lane.get('cli_cost_policy')
+        if diagnostic:
+            scope = auth['diagnostic_probe']
+            row.update(execution_classification='DIAGNOSTIC_PROBE',
+                       result_authority='NON_CANONICAL_DIAGNOSTIC_ONLY',
+                       diagnostic_id=scope['diagnostic_id'], diagnostic_purpose=scope['purpose'],
+                       schema_sha256=scope['schema_sha256'], model_configuration=scope['model'],
+                       route=scope['route'], harness_logical_retry=0)
         if context is not None:
             row['target'] = context['target']
             row['review_binding'] = context['binding']
@@ -1176,7 +1204,9 @@ def _reserve_validated(auth, env, provider, model, prompt, stage, now, *, offlin
 def reserve_delivery(*, provider, model, prompt, stage, environment=None):
     env = os.environ if environment is None else environment
     auth = load_authorization(env)
-    if stage != 'qualification-case':
+    from .diagnostic_probe import STAGE as diagnostic_stage
+    if stage != 'qualification-case' and stage != diagnostic_stage:
+        require_review_authority(auth)
         context = _review_context.get()
         if (not context or context['binding'] != qualification_binding(auth)
                 or context['provider'] != provider):
