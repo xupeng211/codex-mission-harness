@@ -70,6 +70,7 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
                     failure = json.loads(failure_path.read_text())
                     self.assertEqual(failure["stage"], "group-000")
                     self.assertEqual(failure["sanitized_error_class"], code)
+                    self.assertEqual(failure["failure_category"], "MODEL_TIMEOUT" if code == "REQUEST_TIMEOUT" else "SCHEMA_VALIDATION_FAILED")
                     self.assertFalse(failure["resume_allowed"])
                     self.assertFalse(failure["parser_entered"])
                     self.assertNotIn("fixture-token", failure_path.read_text())

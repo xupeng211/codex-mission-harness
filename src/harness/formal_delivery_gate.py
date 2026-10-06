@@ -35,6 +35,7 @@ EVIDENCE_ROOT = Path('/home/xupeng/codex-mission-harness-evidence/autonomous-pre
 DELIVERY_LEDGER = EVIDENCE_ROOT / 'current-version-delivery-ledger.json'
 CONTINUATION_LEDGER = EVIDENCE_ROOT / 'current-version-delivery-ledger.continuation.json'
 CONTINUATION_VERSION = 'cmh-request5-reserved-unknown-continuation/v1'
+HISTORY_CONTINUATION_VERSION = 'cmh-reserved-history-continuation/v2'
 REQUEST5_LEDGER_SHA256 = 'bef620a429653dea8d895e2417114db69a04859dba90d28f90af34f4eb13f138'
 REQUEST5_ROW_SHA256 = '57bf46b218deee3d9c795534f7909e7a40f1fc275f2f458a1456ca01d3c6c901'
 HISTORICAL_AUTHORIZATION = (EVIDENCE_ROOT / 'formal-60h-review/authorized-closure-20261003/'
@@ -199,10 +200,12 @@ def _load(env, anchor, runtime, now, *, offline=False):
             for item in targets.values():
                 git(root, 'merge-base', '--is-ancestor', item['base'], item['head'])
         ledger = Path(auth['ledger_path'])
+        expected_ledger = (continuation_ledger_path(auth['continuation'])
+                           if auth.get('continuation', {}).get('version') == HISTORY_CONTINUATION_VERSION
+                           else CONTINUATION_LEDGER if auth.get('continuation') else DELIVERY_LEDGER)
         if (str(ledger) != env['CMH_RESOURCE_LEDGER'] or ledger.resolve() != ledger
-                or ledger == Path(parent['ledger_path']) or not offline and
-                    ledger != (CONTINUATION_LEDGER if auth.get('continuation') else DELIVERY_LEDGER)):
-            _deny('delivery must use its fixed shared continuation ledger')
+                or ledger == Path(parent['ledger_path']) or not offline and ledger != expected_ledger):
+            _deny('delivery must use its hash-bound shared continuation ledger')
         for name in ('started_epoch', 'expires_epoch', 'max_wall_clock_seconds'):
             if not _integer(auth[name]):
                 _deny('delivery time contract invalid')
@@ -313,8 +316,9 @@ def _load(env, anchor, runtime, now, *, offline=False):
         while any(name in current for name in ('previous_authorization_path',
                                                'previous_authorization_sha256',
                                                'child_baseline_checkpoint_sha256')):
-            if len(lineage) >= 3:
-                _deny('at most two separately signed identity updates; further work needs human decision')
+            if (len(lineage) >= 256 or len(lineage) >= 3 and
+                    auth.get('continuation', {}).get('version') != HISTORY_CONTINUATION_VERSION):
+                _deny('identity revisions require explicit complete-history continuation')
             previous_hash = current['previous_authorization_sha256']
             if previous_hash in lineage:
                 _deny('authorization lineage cycle')
@@ -324,9 +328,11 @@ def _load(env, anchor, runtime, now, *, offline=False):
                 _deny('each exact identity update requires a fresh independent user approval record')
             permitted_revision_fields = revision_fields
             if current.get('continuation'):
-                if predecessor_child is not None or prior.get('continuation'):
-                    _deny('request5 continuation is one exact separately approved transition')
-                predecessor_child = _continuation_predecessor(current, prior, key, offline=offline)
+                child = _continuation_predecessor(current, prior, key, offline=offline)
+                if predecessor_child is None:
+                    predecessor_child = child
+                elif predecessor_child['requests'][:len(child['requests'])] != child['requests']:
+                    _deny('continuation skipped or rewrote inherited predecessor history')
                 permitted_revision_fields = revision_fields | {'continuation', 'ledger_path'}
             if any(current.get(k) != prior.get(k) for k in set(current) | set(prior)
                    if k not in permitted_revision_fields):
@@ -350,6 +356,8 @@ def _load(env, anchor, runtime, now, *, offline=False):
 def _continuation_predecessor(auth, prior, key, *, offline=False):
     """One narrowly approved historical disposition; never resolves usage."""
     c = auth['continuation']
+    if c.get('version') == HISTORY_CONTINUATION_VERSION:
+        return _history_continuation_predecessor(auth, prior, key, offline=offline)
     path = Path(c['predecessor_ledger_path'])
     if (c.get('version') != CONTINUATION_VERSION or prior.get('continuation')
             or c.get('retain_unknown') is not True or c.get('refund') != 0
@@ -397,8 +405,85 @@ def _continuation_predecessor(auth, prior, key, *, offline=False):
     return child
 
 
+def continuation_ledger_path(disposition):
+    """One successor location per frozen predecessor, preventing ledger forks."""
+    sha = disposition.get('predecessor_ledger_sha256')
+    if not isinstance(sha, str) or not re.fullmatch('[0-9a-f]{64}', sha):
+        _deny('continuation predecessor hash invalid')
+    return EVIDENCE_ROOT / ('current-version-delivery-ledger.continuation-' + sha + '.json')
+
+
+def build_history_continuation(prior, prior_sha, ledger_path, key):
+    """Describe complete signed history; the caller must separately approve/sign it."""
+    path = Path(ledger_path)
+    child = _checked_child(path, key)
+    rows = child['requests']
+    calls = {p: sum(r.get('provider') == p for r in rows) for p in ('deepseek', 'openai')}
+    calls['global'] = len(rows)
+    return dict(version=HISTORY_CONTINUATION_VERSION, predecessor_ledger_path=str(path),
+                predecessor_ledger_sha256=digest(_read(path)),
+                predecessor_checkpoint_sha256=digest(_read(_checkpoint_path(path))),
+                predecessor_authorization_sha256=prior_sha, requests_sha256=digest(canonical(rows)),
+                accounting_sha256=digest(canonical(child)), retain_unknown=True, refund=0,
+                full_reservation_nonrefundable=True, consumed_calls=calls,
+                remaining_call_limits={**{p: prior['providers'][p]['max_new_calls'] - calls[p]
+                                          for p in ('deepseek', 'openai')},
+                                       'global': prior['max_new_calls'] - calls['global']},
+                historical_unknowns=[{'request_id': r['request_id'], 'row_sha256': digest(canonical(r))}
+                                    for r in rows if r.get('reported_usage') == 'UNKNOWN'])
+
+
+def _history_continuation_predecessor(auth, prior, key, *, offline=False):
+    from .resource_gate import _stage_reservation
+    c = auth['continuation']; path = Path(c['predecessor_ledger_path'])
+    if (path != Path(prior['ledger_path']) or Path(auth['ledger_path']) == path
+            or c.get('predecessor_authorization_sha256') != auth['previous_authorization_sha256']
+            or c.get('predecessor_checkpoint_sha256') != auth['child_baseline_checkpoint_sha256']
+            or not offline and Path(auth['ledger_path']) != continuation_ledger_path(c)):
+        _deny('continuation must bind its immediate predecessor and unique successor')
+    if (digest(_read(path)) != c['predecessor_ledger_sha256'] or
+            digest(_read(_checkpoint_path(path))) != c['predecessor_checkpoint_sha256']):
+        _deny('continuation predecessor ledger/checkpoint changed')
+    child = _checked_child(path, key); rows = child['requests']
+    expected = build_history_continuation(prior, auth['previous_authorization_sha256'], path, key)
+    if c != expected or not rows:
+        _deny('continuation complete accounting, explicit UNKNOWN or remaining limits mismatch')
+    if (child.get('version') != LEDGER_VERSION or child.get('mission_id') != NEW_MISSION
+            or child.get('evidence_domain') != auth['evidence_domain']
+            or child.get('parent_ledger_sha256') != auth['parent']['ledger_sha256']
+            or child.get('authorization_sha256') != auth['previous_authorization_sha256']):
+        _deny('continuation predecessor identity mismatch')
+    lineage = {auth['previous_authorization_sha256']}; ancestor = prior
+    while ancestor.get('previous_authorization_sha256'):
+        sha = ancestor['previous_authorization_sha256']
+        if sha in lineage or len(lineage) >= 256:
+            _deny('predecessor authority lineage cycle or excessive depth')
+        lineage.add(sha); ancestor = _signed(ancestor['previous_authorization_path'], sha, key)
+    if len({r.get('request_id') for r in rows}) != len(rows):
+        _deny('duplicate predecessor request')
+    for number, row in enumerate(rows, 1):
+        provider = row.get('provider'); lane = prior['providers'].get(provider)
+        if (not lane or row.get('number') != number or row.get('mission_id') != NEW_MISSION
+                or row.get('authorization_sha256') not in lineage or row.get('model') != lane['model']
+                or row.get('status') not in {'RETURNED', 'FAILED'}
+                or row.get('token_reservation') != _stage_reservation(lane, provider, row.get('stage', ''))
+                or row.get('cost_reservation_microunits') != lane['cost_reservation_microunits']
+                or row.get('cost_unit') != lane['cost_unit']):
+            _deny('predecessor has in-flight, uncovered or incompatible history')
+        if row.get('reported_usage') == 'UNKNOWN':
+            if row.get('usage_accounting') != 'USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS':
+                _deny('historical UNKNOWN lacks classified nonrefundable full reservation')
+        elif row.get('usage_accounting') != 'FULL_RESERVATION_RETAINED':
+            _deny('unsettled or over-reservation predecessor cannot continue')
+    return child
+
+
 def _retained_request5(auth, row):
     c = auth.get('continuation')
+    if c and c.get('version') == HISTORY_CONTINUATION_VERSION:
+        return bool(auth.get('_predecessor_child') and any(
+            ref['request_id'] == row.get('request_id') and ref['row_sha256'] == digest(canonical(row))
+            for ref in c['historical_unknowns']))
     return bool(c and auth.get('_predecessor_child') and row.get('number') == 5
                 and digest(canonical(row)) == c['unknown_row_sha256'])
 
@@ -659,7 +744,8 @@ def _funding_check(auth, ledger, key, stage, now):
     upper = auth['deepseek_funding_policy']['unit_upper_bound_' + suffix][name]
     # The snapshot is already a net balance. Never subtract settled history.
     # Retain full exposure only for calls not yet reflected in that snapshot.
-    pending = [r for r in ledger['requests'][value['covered_requests']:] if r['provider'] == 'deepseek']
+    pending = [r for i, r in enumerate(ledger['requests']) if r['provider'] == 'deepseek'
+               and (i >= value['covered_requests'] or _retained_request5(auth, r))]
     if any(not _integer(r.get('wallet_exposure_' + suffix), 1) for r in pending):
         _deny('pending wallet exposure currency missing or incompatible')
     free = (value['available_' + suffix] - value['unsettled_liability_' + suffix] -
@@ -743,15 +829,8 @@ def _bounded_timeout(auth, now, requested):
         _deny('delivery child timeout must be a positive bounded integer')
     remaining = min(auth['expires_epoch'], auth['started_epoch'] + auth['max_wall_clock_seconds'],
                     auth['_account']['expires_epoch']) - now
-    from .resource_gate import _active_reservation
-    active = _active_reservation.get()
-    if auth.get('deepseek_funding_policy') and active is not None and active.provider == 'deepseek':
-        ledger = _verify_child(Path(auth['ledger_path']), _read(active.ledger_key_path), auth)
-        try:
-            funds = _current_funds(auth, ledger, _read(active.ledger_key_path), now)
-        except FundingPause as exc:
-            raise ResourceGateDenied('funding validity lost after STARTED; retain unknown freeze') from exc
-        remaining = min(remaining, funds['expires_epoch'] - now)
+    # Capacity is checked immediately before send by require_active_transport.
+    # Its snapshot TTL is not the lifetime of an already funded invocation.
     result = min(requested, 900, int(remaining))
     if result < 1:
         _deny('not enough valid time remains to launch a provider subprocess')
@@ -884,7 +963,7 @@ def _verify_child(path, key, auth):
         _deny('empty or unlinked ledger cannot restart delivery accounting')
     rows = ledger['requests']
     if auth.get('continuation') and (not auth.get('_predecessor_child') or
-            rows[:5] != auth['_predecessor_child']['requests']):
+            rows[:len(auth['_predecessor_child']['requests'])] != auth['_predecessor_child']['requests']):
         _deny('continuation cannot modify, truncate or refund inherited history')
     if (not isinstance(rows, list) or any(row.get('number') != i or
             row.get('mission_id') != NEW_MISSION or

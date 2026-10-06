@@ -358,16 +358,32 @@ class StagedFundingTests(unittest.TestCase):
         self.assertEqual(len(self.ledger_value()['requests']), 4)
         self.assertEqual(calls.count(qualification_prompt(CASES[0])), 1)
 
-    def test_32_post_start_expiry_is_not_a_resumable_funding_pause(self):
+    def test_32_post_start_expiry_does_not_shorten_execution_window(self):
         from harness import resource_gate
         reservation = self.reserve_ds()
         token = resource_gate._active_reservation.set(reservation)
         try:
             auth = self.load()
-            with patch.dict(os.environ, self.env, clear=True), self.assertRaises(ResourceGateDenied) as caught:
-                gate._bounded_timeout(auth, 1090, 900)
-            self.assertNotIsInstance(caught.exception, FundingPause)
+            with patch.dict(os.environ, self.env, clear=True):
+                self.assertEqual(gate._bounded_timeout(auth, 1090, 900), 10)
+                self.settle(reservation)
+                with self.assertRaises(FundingPause): gate._reserve_validated(auth, self.env, 'deepseek', 'deepseek-flash', b'next', 'qualification-case', 1090, offline=True)
         finally: resource_gate._active_reservation.reset(token)
+
+    def test_execution_timeout_is_independent_of_snapshot_ttl(self):
+        from harness import resource_gate
+        reservation = self.reserve_ds()
+        token = resource_gate._active_reservation.set(reservation)
+        try:
+            auth = self.load()
+            auth.update(expires_epoch=3000, started_epoch=900, max_wall_clock_seconds=2100)
+            auth['_account']['expires_epoch'] = 3000
+            with patch.dict(os.environ, self.env, clear=True):
+                self.assertEqual(gate._bounded_timeout(auth, 1089, 900), 900)
+                self.assertEqual(gate._bounded_timeout(auth, 1091, 900), 900)
+                self.assertEqual(gate._bounded_timeout(auth, 2993, 900), 7)
+        finally:
+            resource_gate._active_reservation.reset(token)
 
     def test_33_qualification_artifact_tamper_and_missing_progress_reject(self):
         from harness.model_registry import ModelSpec

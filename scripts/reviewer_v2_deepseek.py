@@ -201,7 +201,7 @@ def _invoke(command: list[str], prompt: str, env: dict, timeout: int, token: str
                      resume_policy_reason="Direct failure cannot trigger automatic resend")
         if transport_sink is not None:
             transport_sink(prompt.encode(), None, exc.code.encode())
-        raise ReviewStageFailure("SCHEMA_VALIDATION_FAILED", stage) from None
+        raise ReviewStageFailure("MODEL_TIMEOUT" if exc.code == "REQUEST_TIMEOUT" else "SCHEMA_VALIDATION_FAILED", stage) from None
 
 
 def _prompt_head(base: str, head: str, diff_hash: str, scope: str) -> str:

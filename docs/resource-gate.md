@@ -235,3 +235,21 @@ its full reservation is never refunded. Any changed historical row, another
 UNKNOWN, new unverified usage, in-flight send or overage remains fail-closed.
 The predecessor and old #334 ledger are never rewritten. This is one approved
 transition, not an arbitrary ledger migration or UNKNOWN reconciliation.
+
+### Complete-history continuation and pre-send freshness
+
+A signed `cmh-reserved-history-continuation/v2` disposition binds the immediate
+predecessor authorization, ledger, checkpoint and complete request prefix. It
+explicitly inherits classified historical UNKNOWN rows with full nonrefundable
+reservations. New UNKNOWN and in-flight requests still block further sends.
+Limits, original start/expiry, attempts and all request accounting remain unchanged.
+The successor ledger path is derived from the predecessor ledger hash; a second
+activation cannot overwrite or fork that history. Legacy request5 evidence remains
+valid under its original pinned contract.
+
+Fresh official balance and staged capacity are checked at reservation and again
+immediately before transport. Once authorized, the request uses the canonical
+execution timeout bounded by Mission/account expiry, not the balance snapshot TTL.
+Every subsequent send requires fresh evidence. A possibly-sent timeout still retains
+UNKNOWN and its entire reservation. Historical DeepSeek UNKNOWN wallet exposure
+is retained even when a later net-balance snapshot covers the history prefix.
