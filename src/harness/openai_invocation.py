@@ -97,20 +97,31 @@ def _trusted_ca_path(path: Path, *, directory: bool) -> bool:
         return False
 
 
+def _unique_pairs(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate Codex JSON field")
+        value[key] = item
+    return value
+
+
 def parse_events(raw: bytes) -> dict:
     """Read bounded JSONL and require a real completed Codex turn."""
     if len(raw) > MAX_EVENT_STREAM_BYTES:
         raise ValueError("Codex event stream exceeds bound")
     types = []
     messages = 0
+    events = []
     for line in raw.splitlines():
         try:
-            event = json.loads(line)
+            event = json.loads(line, object_pairs_hook=_unique_pairs)
         except (ValueError, UnicodeError):
             raise ValueError("Codex event stream is not JSONL") from None
         if not isinstance(event, dict) or not isinstance(event.get("type"), str):
             raise ValueError("invalid Codex event")
         kind = event["type"]
+        events.append(event)
         types.append(kind)
         if kind == "item.completed" and isinstance(event.get("item"), dict) and \
                 event["item"].get("type") == "agent_message":
@@ -119,8 +130,114 @@ def parse_events(raw: bytes) -> dict:
             types.count("turn.completed") != 1 or "turn.failed" in types or
             "error" in types or messages < 1 or types[-1] != "turn.completed"):
         raise ValueError("Codex turn lacked a valid terminal completion")
+    thread = events[0].get("thread_id") if types[0] == "thread.started" else None
+    agent = next((e["item"] for e in reversed(events) if e["type"] == "item.completed"
+                  and isinstance(e.get("item"), dict) and e["item"].get("type") == "agent_message"), {})
+    usage = None
+    try:
+        if not isinstance(thread, str) or not thread or not isinstance(agent.get("id"), str):
+            raise ValueError("Codex usage lacks thread/message identity")
+        if types.index("turn.started") <= types.index("thread.started"):
+            raise ValueError("Codex turn order invalid")
+        usage = normalize_openai_usage(events[-1].get("usage"))
+    except ValueError:
+        pass  # Successful output without verifiable usage still settles UNKNOWN.
     return {"event_types": types, "agent_messages": messages,
-            "terminal_completion": True}
+            "terminal_completion": True, "thread_id": thread,
+            "turn_ordinal": 1, "agent_message_id": agent.get("id"), "agent_message_text": agent.get("text"), "usage": usage}
+
+
+def normalize_openai_usage(raw):
+    """Codex exec terminal usage: cached input is part of total input;
+    reasoning is part of output. Missing categories are never inferred as zero.
+    """
+    fields = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
+    if (not isinstance(raw, dict) or any(type(raw.get(k)) is not int or raw[k] < 0 for k in fields)
+            or raw["cached_input_tokens"] > raw["input_tokens"]
+            or raw["reasoning_output_tokens"] > raw["output_tokens"]):
+        raise ValueError("Codex terminal usage is missing or invalid")
+    return {"usage_scope": "CODEX_EXEC_TURN", "raw_usage_fields": raw,
+            "tokens": {"input": raw["input_tokens"] - raw["cached_input_tokens"],
+                       "cache": raw["cached_input_tokens"], "output": raw["output_tokens"],
+                       "reasoning": raw["reasoning_output_tokens"]},
+            "cost_classification": "OBSERVED_UNBILLED"}
+
+
+def _persist_transport(prompt, stdout, stderr, response, spec, command_sha):
+    """Persist before ephemeral cleanup, under the active signed reservation."""
+    from .resource_gate import _active_reservation, canonical, digest, _write_atomic
+    from . import formal_delivery_gate as gate
+    active = _active_reservation.get()
+    if active is None or active.ledger_key_path is None:
+        return None  # Transport-only fixtures/legacy execution cannot certify formal usage.
+    auth = gate.load_authorization()
+    key = gate._read(active.ledger_key_path)
+    row = next((r for r in gate._verify_child(active.ledger, key, auth)["requests"]
+                if r["request_id"] == active.request_id), {})
+    if (row.get("status") != "STARTED" or row.get("prompt_sha256") != digest(prompt)
+            or (row.get("provider"), row.get("model")) != (spec.provider, spec.model)
+            or spec.identity() != auth["runtime"]["models"]["openai"]):
+        raise ValueError("Codex capture differs from active request/runtime/model")
+    parent = active.ledger.parent / "openai-invocations"
+    parent.mkdir(mode=0o700, exist_ok=True)
+    if (parent.is_symlink() or parent.stat().st_uid != os.getuid()
+            or stat.S_IMODE(parent.stat().st_mode) != 0o700):
+        raise ValueError("Codex evidence directory must be private")
+    directory = parent / active.request_id
+    directory.mkdir(mode=0o700)  # Never overwrite an earlier physical attempt.
+    paths = {}
+    for name, raw in (("stdout.jsonl", stdout), ("stderr", stderr), ("response.json", response)):
+        path = directory / name
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+        paths[name] = {"path": str(path), "sha256": digest(raw)}
+    binding = {"request_id": active.request_id, "authorization_sha256": active.authorization_sha256,
+               "runtime_sha256": digest(canonical(auth["runtime"])), "model": spec.identity(),
+               "prompt_sha256": digest(prompt), "command_sha256": command_sha, "files": paths}
+    from .resource_gate import sign_authorization
+    path = directory / "binding.json"
+    _write_atomic(path, sign_authorization(binding, key))
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+    return {"path": str(path), "sha256": digest(path.read_bytes())}
+
+
+def verify_openai_usage(usage, record, auth, key):
+    """Re-read signed raw evidence at settlement; caller claims cannot substitute it."""
+    from . import formal_delivery_gate as gate
+    from .resource_gate import canonical, digest
+    ref = usage["transport_binding"]
+    binding = gate._signed(ref["path"], ref["sha256"], key)
+    if (binding["request_id"] != record["request_id"]
+            or binding["authorization_sha256"] != record["authorization_sha256"]
+            or binding["runtime_sha256"] != digest(canonical(auth["runtime"]))
+            or binding["model"] != auth["runtime"]["models"]["openai"]
+            or binding["model"]["model"] != record["model"]
+            or binding["prompt_sha256"] != record["prompt_sha256"]):
+        raise ValueError("Codex raw evidence request/runtime/model mismatch")
+    if set(binding["files"]) != {"stdout.jsonl", "stderr", "response.json"}:
+        raise ValueError("Codex raw evidence files incomplete")
+    raw = {}
+    for name, file in binding["files"].items():
+        raw[name] = gate._read(file["path"])
+        if digest(raw[name]) != file["sha256"]:
+            raise ValueError("Codex raw evidence hash mismatch")
+    events = parse_events(raw["stdout.jsonl"])
+    if (not isinstance(events["agent_message_text"], str) or
+            json.loads(events["agent_message_text"], object_pairs_hook=_unique_pairs) !=
+            json.loads(raw["response.json"], object_pairs_hook=_unique_pairs)):
+        raise ValueError("Codex terminal message differs from persisted response")
+    expected = events["usage"]
+    if expected is None:
+        raise ValueError("Codex raw evidence contains no verified usage")
+    expected = dict(expected, transport_binding=ref,
+                    thread_id=events["thread_id"], turn_ordinal=events["turn_ordinal"],
+                    agent_message_id=events["agent_message_id"], response_sha256=digest(raw["response.json"]))
+    if usage != expected:
+        raise ValueError("Codex normalized usage or turn/response identity mismatch")
+    return True
 
 
 def _matches_schema(value: object, schema: dict) -> bool:
@@ -291,6 +408,8 @@ def _invoke_openai_unmetered(prompt: str, spec: ModelSpec, schema: dict, *, time
                                      "reasoning_effort": spec.reasoning_effort,
                                      "command_sha256": command_sha,
                                      "io_error_class": type(exc).__name__}) from exc
+        response_bytes = output.read_bytes() if output.is_file() and output.stat().st_size <= MAX_RESPONSE_BYTES else b""
+        persisted = _persist_transport(prompt.encode(), stdout, stderr, response_bytes, spec, command_sha)
         if transport_sink is not None:
             transport_sink(prompt.encode(), stdout, stderr)
         evidence = {"binary": str(binary), "codex_home": str(codex_home),
@@ -313,7 +432,7 @@ def _invoke_openai_unmetered(prompt: str, spec: ModelSpec, schema: dict, *, time
         except ValueError as exc:
             category = _failure_category(stderr, _event_error_bytes(stdout), timed_out=False)
             raise InvocationFailure(category, str(exc), evidence) from exc
-        evidence.update(events)
+        evidence.update({k: v for k, v in events.items() if k != "agent_message_text"})
         if not output.is_file() or output.stat().st_size > MAX_RESPONSE_BYTES:
             raise InvocationFailure("CLI_OR_CONFIG_FAILURE",
                                     "Codex final structured response is missing or oversized", evidence)
@@ -332,6 +451,13 @@ def _invoke_openai_unmetered(prompt: str, spec: ModelSpec, schema: dict, *, time
             raise InvocationFailure("CLI_OR_CONFIG_FAILURE",
                                     "Codex final response does not match requested schema", evidence)
         evidence["response_sha256"] = hashlib.sha256(response.encode()).hexdigest()
+        evidence["transport_binding"] = persisted
+        if events["usage"] is not None and persisted is not None:
+            evidence["usage"] = dict(events["usage"], transport_binding=persisted,
+                thread_id=events["thread_id"], turn_ordinal=events["turn_ordinal"],
+                agent_message_id=events["agent_message_id"], response_sha256=hashlib.sha256(response_bytes).hexdigest())
+        else:
+            evidence["usage"] = None
         evidence["structured_result_present"] = True
         return InvocationResult(response, evidence)
 

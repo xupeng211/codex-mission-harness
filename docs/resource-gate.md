@@ -197,3 +197,19 @@ suite cannot pass. Recovery is bounded to two attempts per case and at most two
 capacity failures overall, with every invocation still debited against OA103.
 Runtime/model/contract/target binding continues to require new Qualification
 when changed. No real quota access or live authorization occurs in tests.
+
+### OpenAI Codex terminal usage
+
+Formal OpenAI execution persists the bounded raw JSONL, stderr, and final
+response before ephemeral cleanup. An HMAC-bound manifest links them to the
+active request, authorization, runtime/model, prompt and command hashes.
+Settlement re-reads these files and verifies the single completed thread/turn,
+agent-message identity and final response against the terminal usage.
+Codex `input_tokens` includes `cached_input_tokens`; the ledger stores disjoint
+input/cache categories. `reasoning_output_tokens` is included in output, never
+charged a second time. All four fields must be explicit nonnegative integers;
+missing or malformed categories remain UNKNOWN and block later requests.
+
+This capture fix does not reconcile prior UNKNOWN usage, refund reservations,
+or introduce a continuation authority. Existing UNKNOWN history still blocks
+refresh and runtime identity updates under the canonical delivery contract.

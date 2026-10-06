@@ -505,6 +505,15 @@ class Reservation:
                                                 record.get("formal_delivery_gate") is True):
                 record["usage_accounting"] = "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS"
             if self.reported_usage is not None:
+                if self.provider == "openai" and (self.reported_usage.get("usage_scope") == "CODEX_EXEC_TURN"
+                        or record.get("evidence_domain") == "FORMAL"):
+                    try:
+                        from .openai_invocation import verify_openai_usage
+                        from .formal_delivery_gate import load_authorization
+                        verify_openai_usage(self.reported_usage, record, load_authorization(),
+                                            _private(self.ledger_key_path))
+                    except (OSError, ValueError, KeyError, TypeError, ResourceGateDenied):
+                        record["usage_accounting"] = "USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS"
                 tokens = self.reported_usage.get("tokens", {})
                 complete = isinstance(tokens, dict) and all(
                     type(tokens.get(k)) is int and tokens[k] >= 0

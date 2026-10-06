@@ -393,7 +393,8 @@ def _actual_provider_invoke(spec: ModelSpec, prompt: str, *, token: str | None,
             usage = result.evidence.get("usage")
             if isinstance(usage, dict):
                 from .resource_gate import normalize_deepseek_usage, normalize_direct_deepseek_usage
-                reservation.observe(normalize_direct_deepseek_usage(usage)
+                reservation.observe(usage if spec.provider == "openai" else
+                    normalize_direct_deepseek_usage(usage)
                     if result.evidence.get("provider_route") == "DIRECT_DEEPSEEK_API" else
                     normalize_deepseek_usage(usage, result.evidence.get("cli_reported_cost_usd")))
             return InvocationResult(result.response, dict(result.evidence,
