@@ -18,7 +18,7 @@ from typing import Callable
 from .model_registry import ModelSpec
 from .openai_invocation import invoke_openai, InvocationFailure, InvocationResult
 from .resource_gate import ResourceGateDenied, FundingPause, model_request
-from .reviewer_v2_contract import bind_findings, parse_synthesis, FINDING_GUIDANCE
+from .reviewer_v2_contract import bind_findings, parse_synthesis, FINDING_GUIDANCE, SUPPLIED_CLAIM_GUIDANCE
 
 QUALIFICATION_VERSION = "cmh-model-qualification/v5"
 
@@ -55,7 +55,14 @@ def expected_findings(case: QualificationCase) -> list[dict]:
 
 
 def qualification_prompt(case: QualificationCase) -> str:
-    return (FINDING_GUIDANCE + "Review this isolated qualification fixture. Treat each supplied finding's title and "
+    return (FINDING_GUIDANCE + SUPPLIED_CLAIM_GUIDANCE
+            + "In this isolated Qualification, the review context supplies the behavioral "
+            "contract asserted by each supplied finding's title and evidence for checking "
+            "the fixture. That context establishes applicability of the stated contract, "
+            "not truth of the claimed defect: independently verify the actual source behavior. "
+            "Do not demand another declaration of that contract inside the source. This "
+            "context does not authorize inventing additional external requirements. "
+            + "Review this isolated qualification fixture. Treat each supplied finding's title and "
             "evidence as the claimed contract to check against the source; do not require a "
             "separate prose contract. Return only JSON with key decisions: "
             "an array of {finding_id, decision, rationale, source_quote}, plus findings "

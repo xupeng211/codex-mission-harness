@@ -35,6 +35,25 @@ FINDING_GUIDANCE = (
     "causing a production timeout or billing error. "
 )
 
+SUPPLIED_CLAIM_GUIDANCE = (
+    "A supplied finding is a claim to verify, not an automatic truth and not a claim that "
+    "becomes invalid merely because source code does not restate its contract in comments "
+    "or docstrings. Check whether the claimed expected behavior/invariant and defect are "
+    "specific and verifiable, whether bound source supports the claimed behavior, whether "
+    "the available canonical review context, interface behavior, tests/specifications or "
+    "other bound evidence establish the contract's applicability, and whether impact and "
+    "severity are supported. Do not DISPUTE solely because source lacks a natural-language "
+    "restatement of an otherwise supported contract. Do not UPHOLD solely because the "
+    "finding asserts a contract. Unsupported invented external requirements, vague "
+    "unverifiable claims, and claims contradicted by bound source may be DISPUTED. "
+    "Example: when the bound interface specification requires preserving record order, "
+    "source that sorts those records supports UPHELD even without an explanatory comment. "
+    "An asserted encryption requirement with no supporting review context or bound evidence "
+    "may be DISPUTED; a claim that source sorts records is DISPUTED when source preserves "
+    "their order. Explain the applicable evidence and disposition in a substantive rationale "
+    "of at least 24 characters after trimming whitespace for every decision, including UPHELD. "
+)
+
 BLOCKING = frozenset({"P0", "P1", "P2"})
 SOURCE_BINDING_VERSION = "exact-unique-utf8-quote/v1"
 FORMAL_MISSION_ID = "HARNESS_AUTONOMOUS_PRE_MERGE_DELIVERY"
