@@ -31,7 +31,7 @@ from harness.model_registry import ModelSpec, load_registry, preflight  # noqa: 
 from harness.model_qualification import validate_qualification_receipt  # noqa: E402
 from harness.openai_invocation import InvocationFailure, invoke_openai  # noqa: E402
 import harness.openai_invocation as invocation_module  # noqa: E402
-from harness.reviewer_v2_contract import (SourceBindingError, bind_findings,  # noqa: E402
+from harness.reviewer_v2_contract import (FINDING_GUIDANCE, SourceBindingError, bind_findings,  # noqa: E402
                                           validate_source_binding, contract_authorization_identity)
 from harness import full_diff_manifest as full
 from harness.review_resume import ReviewRun  # noqa: E402
@@ -143,7 +143,7 @@ def _synthesis_result(raw: bytes) -> dict:
 
 
 def _synthesis_prompt(summaries: list[str], base: str, head: str) -> str:
-    return full.bounded_prompt("FINAL CROSS-GROUP REVIEW. Independently inspect interactions between these "
+    return full.bounded_prompt(FINDING_GUIDANCE + "FINAL CROSS-GROUP REVIEW. Independently inspect interactions between these "
             "bounded source-review summaries. Report any additional cross-group problems. "
             "Existing group blockers are mechanically retained and cannot be removed here. "
             "Reevaluate original disputed findings in disposition_audit for cross-group risks; report a NEW finding if a local dispute is unsound. "
@@ -168,7 +168,7 @@ def invoke_codex(prompt: str, spec: ModelSpec, *, stage: str, timeout: int = 900
 
 def _prompt(kind: str, *, base: str, head: str, diff: bytes, ids: list[dict] | None = None) -> str:
     # Plain text is cheaper for normal diffs; base64 preserves binary patches.
-    introduction = (f"{kind}. You are an independent reviewer of Harness source changes. "
+    introduction = (FINDING_GUIDANCE + f"{kind}. You are an independent reviewer of Harness source changes. "
                     "No tools, filesystem access, or external requests are needed. "
                     "Analyze the supplied exact diff independently. Report every concrete issue, "
                     "using P0/P1/P2 for merge blockers and P3 for minor issues. "

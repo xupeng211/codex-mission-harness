@@ -21,7 +21,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import deepseek_review as legacy  # noqa: E402
 from harness.reviewer_v2_contract import (  # noqa: E402
-    SourceBindingError, bind_findings, canonical, parse_chunk, parse_synthesis, sha256,
+    FINDING_GUIDANCE, SourceBindingError, bind_findings, canonical, parse_chunk, parse_synthesis, sha256,
     validate_bound_result, contract_authorization_identity,
 )
 from harness.model_registry import load_registry  # noqa: E402
@@ -206,7 +206,7 @@ def _invoke(command: list[str], prompt: str, env: dict, timeout: int, token: str
 
 
 def _prompt_head(base: str, head: str, diff_hash: str, scope: str) -> str:
-    return ("Independent restricted code review. Do not use tools or filesystem. "
+    return (FINDING_GUIDANCE + "Independent restricted code review. Do not use tools or filesystem. "
             "Return only schema JSON. Report all P0/P1/P2 findings. "
             f"Base={base} Head={head} DiffSHA256={diff_hash} Scope={scope}\n")
 

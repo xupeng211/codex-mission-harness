@@ -15,6 +15,26 @@ from pathlib import Path
 from .resource_gate import _private
 
 
+# Model-facing clarification of concrete issues; no parser filtering or repair.
+FINDING_GUIDANCE = (
+    "Formal findings at every severity, including P3, must identify a concrete "
+    "correctness, security, reliability, contract, data-integrity, or production-operability "
+    "risk supported by the supplied source and applicable claimed contract. Explain the "
+    "affected behavior, triggering condition, and consequence in the finding evidence. "
+    "Do not invent an input restriction or documentation/type contract. Pure style preferences, "
+    "optional refactors, documentation completeness, optional type hints, defensive validation "
+    "without a demonstrated defect/risk, and speculative maintainability improvements are "
+    "suggestions, not formal findings; omit them from findings. If no concrete issue exists, "
+    "return findings=[]. This applies equally to P1/P2/P3: never suppress a real defect merely "
+    "because it involves types or documentation. "
+    "Non-finding example: an otherwise correct generic addition helper lacking optional "
+    "annotations or docstrings, without a required input restriction or demonstrated risk. "
+    "Formal finding example: a declared numeric-payment contract accepts strings and "
+    "concatenates amounts, producing an incorrect charge. "
+    "Formal finding example: an API documents milliseconds but interprets them as seconds, "
+    "causing a production timeout or billing error. "
+)
+
 BLOCKING = frozenset({"P0", "P1", "P2"})
 SOURCE_BINDING_VERSION = "exact-unique-utf8-quote/v1"
 FORMAL_MISSION_ID = "HARNESS_AUTONOMOUS_PRE_MERGE_DELIVERY"
