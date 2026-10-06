@@ -20,13 +20,13 @@ class DiagnosticScopeTests(unittest.TestCase):
     publish = fixture.FormalDeliveryGateTests.publish
     load = fixture.FormalDeliveryGateTests.load
 
-    def enable(self):
+    def enable(self, effort="high"):
         self.runtime['models']['openai'] = copy.deepcopy(probe.MODEL)
         self.payload['runtime'] = self.runtime
         self.payload.update(qualification_launch_approved=False, full_review_launch_approved=False)
         self.payload['diagnostic_probe'] = {
             'version': probe.VERSION, 'mission': probe.MISSION, 'purpose': probe.PURPOSE,
-            'model': copy.deepcopy(probe.MODEL), 'route': 'codex_subscription',
+            'model': dict(probe.MODEL, reasoning_effort=effort), 'route': 'codex_subscription',
             'max_logical_invocations': 1, 'result_authority': probe.CLASSIFICATION,
             'harness_logical_retry': 0, 'runtime_head': self.runtime['head'],
             'token_ceiling': self.payload['providers']['openai']['token_reservation'],
@@ -170,7 +170,7 @@ class DiagnosticScopeTests(unittest.TestCase):
         with patch.dict(os.environ,self.env),patch.object(gate,'load_authorization',side_effect=self.load), \
              patch.object(resources,'reserve',side_effect=reserve), \
              patch('harness.openai_invocation.invoke_openai',side_effect=fake_invoke) as invoke:
-            with self.assertRaises(InvocationFailure):probe.run_once('fixture',{},transport_sink=lambda *x:captured.append(x))
+            with self.assertRaises(InvocationFailure):probe.run_once('fixture',{},reasoning_effort=self.payload['diagnostic_probe']['model']['reasoning_effort'],transport_sink=lambda *x:captured.append(x))
         invoke.assert_called_once(); self.assertIn(b'Reconnecting',captured[0][1])
         self.assertEqual(json.loads(self.ledger.read_bytes())['requests'][0]['reported_usage'],'UNKNOWN')
 
@@ -184,7 +184,7 @@ class DiagnosticScopeTests(unittest.TestCase):
     def test_schema_mismatch_does_not_reserve(self):
         self.enable()
         with patch.object(gate,'load_authorization',side_effect=self.load):
-            with self.assertRaises(ResourceGateDenied):probe.run_once('fixture',{'changed':True})
+            with self.assertRaises(ResourceGateDenied):probe.run_once('fixture',{'changed':True},reasoning_effort=self.payload['diagnostic_probe']['model']['reasoning_effort'])
         self.assertEqual(json.loads(self.ledger.read_bytes())['requests'],[])
 
     def test_only_noncanonical_result_returned(self):
@@ -193,7 +193,7 @@ class DiagnosticScopeTests(unittest.TestCase):
         with patch.dict(os.environ,self.env),patch.object(gate,'load_authorization',side_effect=self.load), \
              patch.object(resources,'reserve',side_effect=reserve), \
              patch('harness.openai_invocation.invoke_openai',return_value=InvocationResult('{}',{})) as invoke:
-            result=probe.run_once('fixture',{})
+            result=probe.run_once('fixture',{},reasoning_effort=self.payload['diagnostic_probe']['model']['reasoning_effort'])
         self.assertEqual(result['result_authority'],probe.CLASSIFICATION); invoke.assert_called_once()
         self.assertEqual(set(result),{'result_authority','request_id','response','evidence'})
 
@@ -215,3 +215,74 @@ class DiagnosticScopeTests(unittest.TestCase):
         self.assertNotIn('src/harness/formal_delivery_gate.py',artifact_lineage.SEMANTIC_FILES)
         self.assertNotIn('src/harness/review_resume.py',artifact_lineage.SEMANTIC_FILES)
         self.assertEqual(probe.MODEL,ModelSpec('openai','gpt-5.6-sol','high').identity())
+
+
+class MediumDiagnosticScopeTests(DiagnosticScopeTests):
+    """Repeat reservation, history and noncanonical boundaries for medium."""
+    def enable(self, effort="medium"):
+        return super().enable(effort)
+
+    def test_explicit_reasoning_mismatch_before_reservation(self):
+        for authorized, requested in [('medium', 'high'), ('high', 'medium')]:
+            self.enable(authorized)
+            with patch.object(gate, 'load_authorization', side_effect=self.load):
+                with self.assertRaisesRegex(ResourceGateDenied, 'reasoning differs'):
+                    probe.run_once('fixture', {}, reasoning_effort=requested)
+            self.assertEqual(json.loads(self.ledger.read_bytes())['requests'], [])
+
+    def test_missing_or_unsupported_reasoning_fails_closed(self):
+        self.enable()
+        for effort in [None, 'low', 'auto', 'xhigh', '', True, []]:
+            scope=copy.deepcopy(self.payload['diagnostic_probe'])
+            scope['model']['reasoning_effort']=effort
+            with self.subTest(effort=effort), self.assertRaises(ResourceGateDenied):
+                probe.validate_scope(dict(self.payload, diagnostic_probe=scope))
+        scope=copy.deepcopy(self.payload['diagnostic_probe'])
+        del scope['model']['reasoning_effort']
+        with self.assertRaises(ResourceGateDenied):
+            probe.validate_scope(dict(self.payload, diagnostic_probe=scope))
+
+    def test_transport_projection_keeps_signed_formal_runtime_high(self):
+        self.enable(); original=copy.deepcopy(self.payload['runtime']); auth=self.load()
+        self.assertEqual(original['models']['openai'], probe.MODEL)
+        self.assertEqual(auth['_formal_runtime'], original)
+        self.assertEqual(auth['runtime']['models']['openai']['reasoning_effort'], 'medium')
+        self.assertEqual(json.loads(self.auth.read_bytes())['runtime'], original)
+        self.assertEqual(probe.transport_authority(auth), auth)
+        broken=copy.deepcopy(auth); broken['runtime']['models']['openai']['reasoning_effort']='high'
+        with self.assertRaises(ResourceGateDenied):probe.validate_scope(broken)
+        self.payload['_formal_runtime']=original; self.publish()
+        with self.assertRaises(ResourceGateDenied):self.load()
+
+    def test_medium_raw_usage_bound_and_settled_without_adapter_change(self):
+        from harness import openai_invocation as adapter
+        self.enable()
+        raw=canonical({'type':'thread.started','thread_id':'fixture-thread'})+b'\n'
+        raw+=canonical({'type':'turn.started'})+b'\n'
+        raw+=canonical({'type':'item.completed','item':{'id':'message-1','type':'agent_message','text':'{}'}})+b'\n'
+        raw+=canonical({'type':'turn.completed','usage':{'input_tokens':2,'cached_input_tokens':1,
+                     'output_tokens':3,'reasoning_output_tokens':2}})+b'\n'
+        def reserve(**kw):return self.reserve_probe(kw['prompt'],kw['provider'],kw['model'])
+        def invoke(prompt,spec,schema,**kwargs):
+            self.assertEqual(spec.reasoning_effort, 'medium')
+            # A high transport identity cannot bind to a medium reservation.
+            with self.assertRaises(ValueError):
+                adapter._persist_transport(b'fixture',raw,b'',b'{}',ModelSpec(**probe.MODEL),'command')
+            ref=adapter._persist_transport(b'fixture',raw,b'',b'{}',spec,'command')
+            parsed=adapter.parse_events(raw)
+            usage=dict(parsed['usage'],transport_binding=ref,thread_id=parsed['thread_id'],
+                       turn_ordinal=parsed['turn_ordinal'],agent_message_id=parsed['agent_message_id'],
+                       response_sha256=digest(b'{}'))
+            resources._active_reservation.get().observe(usage)
+            return InvocationResult('{}', {'usage':usage})
+        with patch.dict(os.environ,self.env),patch.object(gate,'load_authorization',side_effect=self.load), \
+             patch.object(resources,'reserve',side_effect=reserve), \
+             patch.object(adapter,'invoke_openai',side_effect=invoke) as mocked:
+            result=probe.run_once('fixture',{},reasoning_effort='medium')
+        mocked.assert_called_once()
+        row=json.loads(self.ledger.read_bytes())['requests'][-1]
+        self.assertEqual(row['model_configuration']['reasoning_effort'],'medium')
+        self.assertEqual(row['usage_accounting'],'FULL_RESERVATION_RETAINED')
+        self.assertEqual(row['reported_usage']['tokens'],{'input':1,'cache':1,'output':3,'reasoning':2})
+        self.assertEqual(result['result_authority'],probe.CLASSIFICATION)
+        self.assertEqual(self.payload['runtime']['models']['openai'],probe.MODEL)

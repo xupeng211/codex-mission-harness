@@ -131,6 +131,8 @@ def _load(env, anchor, runtime, now, *, offline=False):
         key = _read(env['CMH_RESOURCE_GATE_KEY_FILE'])
         auth_hash = env['CMH_RESOURCE_AUTH_SHA256']
         auth = _signed(env['CMH_RESOURCE_AUTHORIZATION'], auth_hash, key)
+        if '_formal_runtime' in auth:
+            _deny('derived diagnostic runtime cannot be supplied as signed authority')
         domain = 'OFFLINE_TEST' if offline else 'FORMAL'
         if (auth.get('version') != AUTH_VERSION or auth.get('evidence_domain') != domain
                 or auth.get('approval_source') != 'EXPLICIT_USER_APPROVAL'
@@ -351,8 +353,12 @@ def _load(env, anchor, runtime, now, *, offline=False):
             lineage.append(previous_hash); current = prior
         if auth.get('continuation') and predecessor_child is None:
             _deny('continuation requires an explicit signed predecessor authority')
-        return dict(auth, _authorization_sha256=auth_hash, _history=history, _account=account,
-                    _lineage_sha256=lineage, _previous=previous, _predecessor_child=predecessor_child)
+        validated = dict(auth, _authorization_sha256=auth_hash, _history=history, _account=account,
+                         _lineage_sha256=lineage, _previous=previous, _predecessor_child=predecessor_child)
+        if auth.get('diagnostic_probe') is not None:
+            from .diagnostic_probe import transport_authority
+            return transport_authority(validated)
+        return validated
     except ResourceGateDenied:
         raise
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
