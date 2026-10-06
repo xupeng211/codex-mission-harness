@@ -721,6 +721,53 @@ def _snapshot(auth, path, sha, key, now):
         raise ResourceGateDenied('wallet snapshot malformed or incomplete') from exc
 
 
+def verified_failed_wallet_settlements(auth, rows):
+    """Bound terminal native-cost proofs; never rewrite/refund a ledger row.
+
+    Actual Direct tokens are known. Cache is conservatively priced as cache miss;
+    reasoning is already included in output. This proves a cost upper bound, not
+    an invoice amount. A fresh signed current-net-balance snapshot supplies the
+    settlement coverage; internal USD/token/call debits remain fully retained.
+    """
+    from .deepseek_direct import normalize_usage
+    proofs = []
+    for row in rows:
+        if row.get('status') != 'FAILED' or _retained_request5(auth, row):
+            continue
+        policy = auth.get('deepseek_funding_policy', {})
+        usage = row.get('reported_usage')
+        if (row.get('provider') != 'deepseek' or _funding_currency(auth) != 'CNY'
+                or row.get('model') != 'deepseek-flash'
+                or row.get('usage_accounting') != 'FULL_RESERVATION_RETAINED'
+                or not isinstance(usage, dict)
+                or row.get('native_price_identity_sha256') != digest(canonical(policy))
+                or type(row.get('finished_epoch')) not in (int, float)
+                or type(row.get('started_epoch')) not in (int, float)
+                or not 0 <= row['started_epoch'] <= row['finished_epoch'] < float('inf')):
+            _deny('failed wallet coverage requires verified terminal native usage and price identity')
+        try:
+            normalized = normalize_usage(usage.get('raw_usage_fields'))
+        except (ValueError, RuntimeError, TypeError):
+            _deny('failed wallet coverage has unverifiable Direct usage')
+        if usage != normalized or any(usage['tokens'][k] > row['token_reservation'][k]
+                                     for k in CATEGORIES):
+            _deny('failed wallet usage differs from raw evidence or exceeds reservation')
+        price = policy['native_price']; tokens = usage['tokens']
+        numerator = ((tokens['input'] + tokens['cache']) *
+                     price['input_cache_miss_microcny_per_million'] +
+                     tokens['output'] * price['output_microcny_per_million'])
+        upper = (numerator + 999999) // 1000000
+        if (row.get('wallet_exposure_microcny') != _native_cny_bound(policy)
+                or upper > row['wallet_exposure_microcny']):
+            _deny('failed wallet cost exceeds its retained reservation')
+        proofs.append(dict(request_id=row['request_id'], row_sha256=digest(canonical(row)),
+                           usage_sha256=digest(canonical(usage)), execution_state='FAILED',
+                           native_price_identity_sha256=row['native_price_identity_sha256'],
+                           actual_usage_cost_upper_microcny=upper,
+                           classification='VERIFIED_TOKEN_TARIFF_UPPER_NOT_PROVIDER_BILL'))
+    return proofs
+
+
 def _current_funds(auth, ledger, key, now):
     entry = ledger.get('funding')
     if not entry:
@@ -729,10 +776,23 @@ def _current_funds(auth, ledger, key, now):
     rows = ledger['requests']
     n = value['covered_requests']
     if (entry['epoch'] != value['epoch'] or n > len(rows)
-            or value['covered_prefix_sha256'] != digest(canonical(rows[:n]))
-            or any((r.get('status') != 'RETURNED' or r.get('usage_accounting') != 'FULL_RESERVATION_RETAINED')
-                   and not _retained_request5(auth, r) for r in rows[:n])):
+            or value['covered_prefix_sha256'] != digest(canonical(rows[:n]))):
         _deny('wallet settlement coverage differs from authenticated request prefix')
+    failed = [r for r in rows[:n] if r.get('status') == 'FAILED' and not _retained_request5(auth, r)]
+    if failed:
+        proofs = verified_failed_wallet_settlements(auth, rows[:n])
+        try:
+            evidence = json.loads(_read(value['settlement_source_path']))
+        except (ValueError, OSError):
+            _deny('failed wallet settlement proof is missing or malformed')
+        if evidence.get('verified_failed_wallet_settlements') != proofs:
+            _deny('failed wallet usage, price or cost settlement proof differs')
+    for row in rows[:n]:
+        if (_retained_request5(auth, row) or
+                row.get('status') in {'RETURNED', 'FAILED'} and
+                row.get('usage_accounting') == 'FULL_RESERVATION_RETAINED'):
+            continue
+        _deny('wallet settlement coverage contains unsettled or in-flight request')
     return value
 
 

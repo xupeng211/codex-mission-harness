@@ -253,3 +253,22 @@ execution timeout bounded by Mission/account expiry, not the balance snapshot TT
 Every subsequent send requires fresh evidence. A possibly-sent timeout still retains
 UNKNOWN and its entire reservation. Historical DeepSeek UNKNOWN wallet exposure
 is retained even when a later net-balance snapshot covers the history prefix.
+
+### Terminal failed execution and native wallet coverage
+
+A terminal Direct DeepSeek `FAILED` request can have verified usage. A fresh
+signed current-net-CNY snapshot may cover it without changing its execution
+result or immutable ledger row. Coverage requires the canonical
+`verified_failed_wallet_settlements` proof: exact request/row/usage hashes,
+normalized raw Direct usage, matching native-price identity, and a deterministic
+actual-token cost upper within the original physical reservation. Cache hits
+are conservatively priced as cache misses; output already includes reasoning.
+This upper is not represented as a Provider invoice amount.
+
+The snapshot's hash-bound settlement source must contain these exact proofs.
+Once covered, the actual deducted charge remains reflected in the official net
+balance and the unused pending wallet exposure no longer blocks later calls.
+Internal USD/token/call reservations remain fully debited. `UNKNOWN` is never
+settled this way: only explicitly inherited, hash-bound historical UNKNOWN can
+appear in a covered prefix, and its full native wallet exposure is still
+subtracted. New UNKNOWN and in-flight requests continue to block execution.
