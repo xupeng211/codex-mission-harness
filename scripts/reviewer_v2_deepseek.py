@@ -513,6 +513,7 @@ def validate(receipt: dict, base: str, head: str, root: Path | None = None,
              receipt_path: Path | None = None, mission_id: str | None = None,
              repository: str | None = None, secret: str | None = None,
              registry_path: str | Path | None = None) -> dict:
+    from harness.artifact_lineage import artifact_code_hash, authority_matches, review_history
     required = {"version", "repository", "mission_id", "base_sha", "head_sha", "diff_sha256",
                 "registry_sha256", "runner_sha256",
                 "provider", "model", "reasoning_effort", "chunks", "groups", "aggregate_result",
@@ -529,11 +530,11 @@ def validate(receipt: dict, base: str, head: str, root: Path | None = None,
     if (spec.provider != "deepseek" or receipt["model"] != spec.model
             or receipt["reasoning_effort"] != spec.reasoning_effort
             or receipt["registry_sha256"] != sha256(registry.path.read_bytes())
-            or receipt["runner_sha256"] != sha256(Path(__file__).read_bytes())):
+            or receipt["runner_sha256"] != artifact_code_hash(Path(__file__), receipt['source_binding_contract_authorization_sha256'])):
         raise ValueError("receipt model mismatch")
     if mission_id is not None and receipt["mission_id"] != mission_id:
         raise ValueError("receipt mission mismatch")
-    if receipt["source_binding_contract_authorization_sha256"] != contract_authorization_identity(receipt["mission_id"]):
+    if not authority_matches(receipt["source_binding_contract_authorization_sha256"], receipt["mission_id"]):
         raise ValueError("source binding contract authorization mismatch")
     if repository is not None and receipt["repository"] != repository:
         raise ValueError("receipt repository mismatch")
@@ -593,6 +594,10 @@ def validate(receipt: dict, base: str, head: str, root: Path | None = None,
     if receipt_path is not None:
         _, fd = legacy.open_private_directory(receipt_path.parent, root, create=False)
         try:
+            from harness.formal_delivery_gate import NEW_MISSION
+            if receipt['mission_id'] == NEW_MISSION:
+                state = json.loads(legacy.read_private_artifact(fd, 'state.json'))
+                review_history(state, lambda name: legacy.read_private_artifact(fd, name))
             for record, stage in [(item, "chunk") for item in chunks] + [
                     (item, "group") for item in groups]:
                 raw = legacy.read_private_artifact(fd, f"{stage}-{record['index']:03d}.json")

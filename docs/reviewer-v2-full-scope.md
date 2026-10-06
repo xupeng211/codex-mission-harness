@@ -142,3 +142,36 @@ SHA. If it differs from the reviewed prospective base (as with a GitHub merge
 commit or squash), regenerate the manifest and necessary exact-base review
 evidence. Never edit or re-sign old receipts to change their base. Until then,
 premerge reports explicitly distinguish simulated scope from real main scope.
+
+## Strict continuation artifact reuse
+
+Execution authorization remains exact and current for every new reservation and
+network send. A predecessor artifact does not authorize new spending. Its origin
+hash is retained; it is neither rebound nor resigned as a current artifact.
+
+`artifact_lineage.SEMANTIC_FILES` is the explicit semantic boundary: reviewer
+contract (including finding guidance, schemas and Source Binding), qualification
+fixtures/prompt/evaluation, model registry, both invocation adapters, full diff
+manifest/chunking, builder runtime, both reviewer runners and qualification CLI.
+The semantic digest includes the entire parsed Python AST of these files except
+`validate_qualification_receipt` and the runners' `validate` receipt-provenance
+functions. These validators are always executed from the current trusted runtime;
+their derived-result, signature, parser and Source Binding checks still apply.
+Execution/resource gates, checkpoint bookkeeping and the lineage validator itself
+are execution/provenance code, not model-facing semantic inputs. Their full file
+hashes remain in the signed execution runtime manifest. Changes to model-facing
+code, transport behavior, fixtures, schemas, parsers, contracts or registry reject
+reuse, even if a model name or Git target stays the same.
+
+Reuse requires the artifact authority to be in the authenticated current lineage,
+all intervening signed authority/ledger/checkpoint hashes and unique successor
+paths to match, and every ancestor request prefix to remain byte-identical.
+Each completed stage additionally requires exactly one successful, verified
+original request with matching run, stage and prompt, retained accounting, and
+output equality against the original transport. OpenAI raw usage bindings are
+reverified using their original signed runtime, never the current runtime by
+substitution. Stage prompts are recomputed and validated at normal resume; schemas,
+source, manifest, model/configuration and qualification identity remain exact.
+Complete receipts still undergo their lane's full artifact/signature validation.
+Unrelated inherited UNKNOWNs cannot be reused as successful artifacts and keep
+all reservations. They do not erase independent successful predecessor evidence.

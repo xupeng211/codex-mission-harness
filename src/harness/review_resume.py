@@ -105,6 +105,19 @@ class ReviewRun:
         for _, name, state in sorted(candidates, reverse=True):
             if state.get("invalidated"):
                 continue
+            if state.get("identity") != self.identity and os.environ.get("CMH_RESOURCE_MISSION_ID") == "HARNESS_CURRENT_VERSION_DELIVERY":
+                from .artifact_lineage import reusable_review_identity, review_history
+                try:
+                    reusable_review_identity(state['identity'], self.identity)
+                    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.parent_fd)
+                    try:
+                        review_history(state, lambda path: self.storage.read_private_artifact(fd, path))
+                    finally:
+                        os.close(fd)
+                except (ValueError, KeyError):
+                    pass  # Ineligible state takes the existing invalidation path.
+                else:
+                    self.identity = dict(state['identity'])  # Original provenance is never rewritten.
             if state.get("identity") != self.identity:
                 fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.parent_fd)
                 try:

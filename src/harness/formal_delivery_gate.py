@@ -40,7 +40,7 @@ REQUEST5_LEDGER_SHA256 = 'bef620a429653dea8d895e2417114db69a04859dba90d28f90af34
 REQUEST5_ROW_SHA256 = '57bf46b218deee3d9c795534f7909e7a40f1fc275f2f458a1456ca01d3c6c901'
 HISTORICAL_AUTHORIZATION = (EVIDENCE_ROOT / 'formal-60h-review/authorized-closure-20261003/'
                             'final-dual-review-delivery-20261003/hard-delivery-resource-authorization.json')
-RUNTIME_FILES = ('src/harness/deepseek_direct.py', 'src/harness/formal_delivery_gate.py', 'src/harness/resource_gate.py',
+RUNTIME_FILES = ('src/harness/artifact_lineage.py', 'src/harness/deepseek_direct.py', 'src/harness/formal_delivery_gate.py', 'src/harness/resource_gate.py',
                  'src/harness/reviewer_v2_contract.py', 'src/harness/model_qualification.py',
                  'src/harness/model_registry.py', 'src/harness/openai_invocation.py',
                  'src/harness/full_diff_manifest.py', 'src/harness/review_resume.py',
@@ -858,8 +858,17 @@ def qualification_binding(auth):
 
 
 def validate_qualification_binding(binding, auth):
-    if binding != qualification_binding(auth) or auth['evidence_domain'] != 'FORMAL':
-        _deny('old or synthetic qualification cannot authorize formal delivery')
+    if auth['evidence_domain'] != 'FORMAL':
+        _deny('synthetic qualification cannot authorize formal delivery')
+    if binding != qualification_binding(auth):
+        from .artifact_lineage import origin_authority
+        if not isinstance(binding, dict):
+            _deny('qualification origin binding missing')
+        origin, _ = origin_authority(binding.get('authorization_sha256'), auth)
+        expected = dict(qualification_binding(auth), authorization_sha256=binding['authorization_sha256'],
+                        runtime_sha256=digest(canonical(origin['runtime'])))
+        if binding != expected:
+            _deny('qualification origin identity mismatch')
 
 
 def require_invocation_spec(spec):

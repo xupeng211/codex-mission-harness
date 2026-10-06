@@ -491,6 +491,7 @@ def qualification_receipt(result: QualificationResult, *, auth_key: str,
 def validate_qualification_receipt(path: str | Path, spec: ModelSpec, *, auth_key: str,
                                    role: str, registry_path: str | Path | None = None) -> dict:
     """Reject stale, incomplete, altered, or different-model qualification."""
+    from .artifact_lineage import artifact_code_hash, qualification_history
     from .model_registry import load_registry
     from . import reviewer_v2_contract, openai_invocation, model_registry, codex, full_diff_manifest, deepseek_direct
 
@@ -542,7 +543,11 @@ def validate_qualification_receipt(path: str | Path, spec: ModelSpec, *, auth_ke
               "invocation_sha256": Path(deepseek_direct.__file__) if spec.provider == "deepseek" else Path(openai_invocation.__file__),
               "builder_runtime_sha256": Path(codex.__file__),
               "registry_code_sha256": Path(model_registry.__file__)}
-    if any(receipt[key] != hashlib.sha256(file.read_bytes()).hexdigest()
+    formal = os.environ.get('CMH_RESOURCE_MISSION_ID') == NEW_MISSION
+    if formal:
+        qualification_history(receipt, load_authorization())
+    if any(receipt[key] != (artifact_code_hash(file, receipt['delivery_binding']['authorization_sha256'])
+                            if formal else hashlib.sha256(file.read_bytes()).hexdigest())
            for key, file in hashes.items()):
         raise ValueError("model qualification code or registry changed")
     if receipt["qualification_schema_sha256"] != hashlib.sha256(json.dumps(

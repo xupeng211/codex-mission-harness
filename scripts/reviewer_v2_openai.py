@@ -350,6 +350,7 @@ def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec
              auth_key: str, receipt_path: Path | None = None,
              mission_id: str = "codex-mission-harness",
              registry_path: str | Path | None = None) -> dict:
+    from harness.artifact_lineage import artifact_code_hash, authority_matches, review_history
     if spec.provider != "openai" or not auth_key:
         raise ValueError("invalid OpenAI identity or receipt key")
     repository = secure.repository_identity(
@@ -362,11 +363,10 @@ def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec
             or receipt.get("mission_id") != mission_id
             or receipt.get("repository") != repository
             or receipt.get("registry_sha256") != _sha(registry.path.read_bytes())
-            or receipt.get("runner_sha256") != _sha(Path(__file__).read_bytes())
+            or receipt.get("runner_sha256") != artifact_code_hash(Path(__file__), receipt['source_binding_contract_authorization_sha256'])
             or receipt.get("invocation_sha256") != _sha(Path(invocation_module.__file__).read_bytes())
             or receipt.get("schema_manifest_sha256") != _schema_manifest_sha()
-            or receipt.get("source_binding_contract_authorization_sha256") !=
-               contract_authorization_identity(receipt.get("mission_id"))
+            or not authority_matches(receipt.get("source_binding_contract_authorization_sha256"), receipt.get("mission_id"))
             or receipt.get("base_sha") != base or receipt.get("head_sha") != head):
         raise ValueError("OpenAI receipt model or exact HEAD mismatch")
     unsigned = dict(receipt)
@@ -464,6 +464,10 @@ def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec
     if receipt_path is not None:
         _, directory_fd = secure.open_private_directory(Path(receipt_path).parent, root, create=False)
         try:
+            from harness.formal_delivery_gate import NEW_MISSION
+            if receipt['mission_id'] == NEW_MISSION:
+                state = json.loads(secure.read_private_artifact(directory_fd, 'state.json'))
+                review_history(state, lambda name: secure.read_private_artifact(directory_fd, name))
             for item in [*receipt["chunks"], *receipt["groups"], *synthesis]:
                 kind = ("group" if "chunk_indexes" in item else "synthesis" if "source_groups" in item
                         else "chunk")
