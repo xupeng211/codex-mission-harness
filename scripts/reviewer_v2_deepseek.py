@@ -34,6 +34,7 @@ from harness.review_failure_diagnostics import (  # noqa: E402
 )
 
 VERSION = "cmh-reviewer-v2-deepseek/v2"
+DECISION_RATIONALE_INSTRUCTION = 'Every decision, including UPHELD and DISPUTED, MUST contain a substantive rationale of at least 24 characters after trimming whitespace, explaining why that disposition is supported. Never omit rationale or use empty or template filler text. For UPHELD only source_quote/source_id are empty, not rationale. Example (use the actual required finding_id and source-specific reasoning, not these illustrative values): {"finding_id":"C000F000","decision":"UPHELD","rationale":"The supplied source still permits the invalid input to bypass validation.","source_quote":"","source_id":""}. '
 FAILURE_CATEGORIES = frozenset({
     "CHILD_PROCESS_TIMEOUT", "MODEL_TIMEOUT", "TRANSPORT_ERROR", "AUTH_ERROR",
     "CLI_USAGE_ERROR", "INVALID_ARGUMENT", "RATE_LIMIT", "QUOTA_ERROR",
@@ -328,7 +329,8 @@ def run(args: argparse.Namespace) -> dict:
                       "P0/P1/P2 finding needs exactly one decision keyed by finding_id. "
                       "Output decisions for RequiredFindingIds only; never decide P3 findings. "
                       "Do not invent, omit, or repeat finding_id values. "
-                      "UPHELD preserves the original finding automatically. DISPUTED requires "
+                      + DECISION_RATIONALE_INSTRUCTION
+                      + "UPHELD preserves the original finding automatically. DISPUTED requires "
                       "a specific rationale and source_quote copied exactly from this source. "
                       "For DISPUTED, source_id must equal GroupSourceId and source_quote "
                       "must be a verbatim, uniquely occurring quote in this group source. "
@@ -377,7 +379,8 @@ def run(args: argparse.Namespace) -> dict:
                   "Use empty source_quote/source_id; do not submit quote offsets. "
                   "findings contains only NEW cross-group findings. "
                   "Every blocker needs one decision keyed by finding_id.\n"
-                  "Decide RequiredFindingIds exactly once; no P3 IDs, invented IDs, or repeats.\n"
+                  + DECISION_RATIONALE_INSTRUCTION
+                  + "Decide RequiredFindingIds exactly once; no P3 IDs, invented IDs, or repeats.\n"
                   + f"RequiredFindingIds={json.dumps([item['finding_id'] for item in required])}\n"
                   + f"GroupSummaries={json.dumps(summaries, sort_keys=True)}")
         raw_bytes, result = run.stage("aggregate", "cross-group", prompt.encode(),

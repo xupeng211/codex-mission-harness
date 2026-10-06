@@ -37,6 +37,7 @@ from harness import full_diff_manifest as full
 from harness.review_resume import ReviewRun  # noqa: E402
 
 VERSION = "cmh-reviewer-v2-openai/v2"
+DECISION_RATIONALE_INSTRUCTION = 'Every decision, including UPHELD and DISPUTED, MUST contain a substantive rationale of at least 24 characters after trimming whitespace, explaining why that disposition is supported. Never omit rationale or use empty or template filler text. For UPHELD only source_quote/source_id are empty, not rationale. Example (use the actual required finding_id and source-specific reasoning, not these illustrative values): {"finding_id":"C000F000","decision":"UPHELD","rationale":"The supplied source still permits the invalid input to bypass validation.","source_quote":"","source_id":""}. '
 BLOCKING = frozenset({"P0", "P1", "P2"})
 CHUNK_BYTES = 32000
 GROUP_BYTES = 96000
@@ -175,7 +176,8 @@ def _prompt(kind: str, *, base: str, head: str, diff: bytes, ids: list[dict] | N
     if ids is None:
         introduction += "Return findings only. Do not infer safety from another reviewer. "
     else:
-        introduction += ("For every listed blocker ID return exactly one UPHELD or DISPUTED decision. "
+        introduction += (DECISION_RATIONALE_INSTRUCTION
+                         + "For every listed blocker ID return exactly one UPHELD or DISPUTED decision. "
                          "A DISPUTED decision needs specific reasoning and a verbatim source quote "
                          "from this supplied group diff only. If no exact quote in this group source "
                          "supports a dispute, choose UPHELD. Never quote another group or chunk. "
