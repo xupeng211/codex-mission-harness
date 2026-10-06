@@ -58,6 +58,11 @@ class OpenAIUsageTests(unittest.TestCase):
         def reserve(**kwargs):
             r = self.reserve(kwargs['prompt']); r.execution_allowed = True
             return r
+        original_read = gate._read
+        def read(path):
+            if Path(path) == invoke.CANONICAL_HOME / 'auth.json':
+                return b'OFFLINE-ONLY'  # No host credential is opened, even when it exists.
+            return original_read(path)
         original = invoke.verify_openai_usage
         def verify(usage, row, auth, key):
             if mutate is not None: mutate(usage)
@@ -66,6 +71,7 @@ class OpenAIUsageTests(unittest.TestCase):
              patch.object(gate, 'load_authorization', side_effect=lambda *a: self.load()), \
              patch.object(gate, 'require_active_transport'), \
              patch.object(gate, 'require_provider_credential'), \
+             patch.object(gate, '_read', side_effect=read), \
              patch.object(gate, 'require_invocation_spec'), \
              patch.object(gate, 'bounded_delivery_timeout', side_effect=lambda n:n), \
              patch.object(invoke, 'canonical_environment', return_value={}), \
