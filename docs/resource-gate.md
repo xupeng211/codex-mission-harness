@@ -213,3 +213,25 @@ missing or malformed categories remain UNKNOWN and block later requests.
 This capture fix does not reconcile prior UNKNOWN usage, refund reservations,
 or introduce a continuation authority. Existing UNKNOWN history still blocks
 refresh and runtime identity updates under the canonical delivery contract.
+
+### One approved request #5 continuation
+
+`cmh-request5-reserved-unknown-continuation/v1` permits only the explicitly
+approved frozen five-request predecessor. Production pins its ledger and #5
+row hashes. Its signed checkpoint, authority, complete request prefix, full
+reservations, consumed counts (DS4/OA1/global5), and remaining call ceilings
+(DS96/OA102/global198) must match. No predecessor send may be in flight.
+
+The canonical continuation builder writes a separate fixed ledger containing
+all predecessor requests unchanged. It preserves their usage, status, cost,
+tokens, attempts and durations; the authority inherits the original start,
+expiry, wall-clock and budgets. Old capacity references are archived and fresh
+checkpoint-bound evidence is required. Old Qualification identity cannot be
+reused after the runtime/authority transition.
+
+Only that exact immutable #5 row is exempt from the unresolved-history launch
+block. Its UNKNOWN and unverified accounting never become resolved or zero;
+its full reservation is never refunded. Any changed historical row, another
+UNKNOWN, new unverified usage, in-flight send or overage remains fail-closed.
+The predecessor and old #334 ledger are never rewritten. This is one approved
+transition, not an arbitrary ledger migration or UNKNOWN reconciliation.
