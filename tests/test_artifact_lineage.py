@@ -159,8 +159,8 @@ class ArtifactLineageTests(unittest.TestCase):
         transport={'resource_request':{'request_id':'verified-ds'},'stdout_base64':base64.b64encode(raw).decode()}
         state={'identity':{'provider':'deepseek','source_binding_contract_authorization_sha256':self.base_sha},
                'review_run_id':'run','completed':{'chunk-000':{'artifact_path':'chunk-000.json','artifact_sha256':digest(raw),'output_hash':digest(raw),'input_hash':'prompt'}},
-               'diagnostic_artifacts':[{'path':'chunk-000-transport-test.json'}]}
-        read=lambda name:raw if name=='chunk-000.json' else canonical(transport)
+               'diagnostic_artifacts':[{'path':'chunk-000-transport-test.json'}, {'path':'chunk-000-transport-no-request.json'}]}
+        read=lambda name:raw if name=='chunk-000.json' else canonical({'resource_request':None}) if name.endswith('no-request.json') else canonical(transport)
         reuse.review_history(state,read)
         transport['stdout_base64']=base64.b64encode(raw+b' ').decode()
         with self.assertRaises(ValueError):reuse.review_history(state,read)

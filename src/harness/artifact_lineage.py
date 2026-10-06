@@ -170,6 +170,6 @@ def review_history(state, read_artifact):
                 raise ValueError('reused DeepSeek usage/prompt differs from accounting')
             transports = [json.loads(read_artifact(d['path'])) for d in state['diagnostic_artifacts']
                           if d['path'].startswith(name + '-transport-')]
-            transports = [t for t in transports if t.get('resource_request',{}).get('request_id') == row['request_id']]
+            transports = [t for t in transports if (t.get('resource_request') or {}).get('request_id') == row['request_id']]
             if len(transports) != 1 or base64.b64decode(transports[0]['stdout_base64']) != raw:
                 raise ValueError('reused DeepSeek output differs from original transport')
