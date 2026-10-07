@@ -519,7 +519,7 @@ class FactoryRuntimeTests(unittest.TestCase):
             config = home / "config.toml"
             config.write_text('model="same-model"\n')
             profile = {"provider": "openai", "codex_home": str(home)}
-            with patch("harness.factory_runtime.subprocess.check_output", return_value="codex fixture"), patch.object(FactoryAppServer, "_trusted_executable", return_value=Path("/usr/bin/true")):
+            with patch("harness.factory_runtime.subprocess.check_output", return_value="codex fixture"), patch("harness.factory_runtime.AppServerCodex._trusted_executable", return_value=Path("/usr/bin/true")):
                 before = LocalRuntime().profile_identity(profile)
                 config.write_text('model="same-model"\n[projects."/another/candidate"]\ntrust_level="trusted"\n')
                 after = LocalRuntime().profile_identity(profile)
