@@ -32,7 +32,7 @@ def request(profile, payload, transcript, timeout):
     result = json.loads(raw)
     identity = {"provider": "deepseek", "endpoint": url, "requested_model": profile["model"],
                 "model": result.get("model"), "response_id": result.get("id")}
-    receipt = {"usage": result.get("usage"), "response_id": result.get("id"), "runtime_identity": identity}
+    receipt = {"usage": result.get("usage"), "response_id": result.get("id"), "runtime_identity": identity, "usage_complete": True}
     try:
         if result.get("model") != profile["model"]:
             raise ValueError("DeepSeek returned a different model identity; configure the canonical returned model in a new authorization")

@@ -25,6 +25,7 @@ OpenAI profile 使用官方独立认证目录、`gpt-6.1-sol`；DeepSeek 使用 
 - Harness 原先仅跑本地 CI。新增薄 GitHub adapter 发布专用候选分支、验证 exact SHA、指定 workflows 和实际 jobs；LOCAL_CI 与 HOSTED_CI 明确分开，未配置 hosted 不声称通过。
 - Codex 运行 Python 测试可能生成 bytecode，导致干净小项目产生无关 scope 变更。官方 shell policy 设置禁止意外 bytecode，验收项目保留标准 `.gitignore`；历史 scope failure 保持原记录。
 - Codex 会自动写入项目 trust bookkeeping，原来的整文件 config hash 会让新任务无理由地触发旧任务复审。现在 profile identity 使用排除该 bookkeeping 的语义配置 hash，仍对真实模型配置变化产生新身份；这不是改写旧 receipt。
+- 真实 token cutoff 证明失败 turn 的已观察 usage 可能只覆盖此前完成的响应。现在区分完整 HTTP/turn 结算和部分遥测；部分 telemetry 原样保留，未完成 dispatch 的全额 UNKNOWN reservation 永久保留，不能据此释放预算。
 - 用户入口需要填写内部参数。新增 setup 自动识别项目门禁、私有第二 Provider credential 输入、最近任务选择、简洁中文状态及 delivery/resume/cancel 入口；原 JSON CLI 保持兼容。
 
 ## 故障、恢复和历史

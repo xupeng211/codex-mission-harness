@@ -213,3 +213,28 @@ class DeliveryLimitsTests(unittest.TestCase):
         from harness.factory import observed_usage
         self.assertIsNone(observed_usage({'total': {'inputTokens': 1000, 'outputTokens': 5, 'totalTokens': 1}}))
         self.assertIsNone(observed_usage({'prompt_tokens': 5, 'completion_tokens': 5, 'total_tokens': 1}))
+
+    def test_partial_failed_usage_cannot_settle_unknown_reservation(self):
+        from harness.factory_runtime import RuntimeFailure
+        def failed(transcript):
+            raise RuntimeFailure('connection lost after a previous response', {'input_tokens': 30, 'output_tokens': 10})
+        with self.assertRaises(FactoryBlocked):
+            self.f.operation('feature', 'partial', 'plan', 'developer', {}, {}, True, failed)
+        data = self.f.report('feature')['BUDGET_USED']
+        self.assertEqual(data['observed_tokens'], 40)
+        self.assertEqual(data['partial_usage_runs'], 1)
+        self.assertEqual(data['unknown_token_reservation'], 100)
+        self.assertEqual(data['committed_tokens'], 140)
+        with self.assertRaisesRegex(FactoryBlocked, 'token admission exhausted'):
+            self.paid('next', {'input_tokens': 0, 'output_tokens': 0})
+
+    def test_proven_complete_failed_response_keeps_real_usage_without_guessing(self):
+        from harness.factory_runtime import RuntimeFailure
+        def failed(transcript):
+            raise RuntimeFailure('canonical model identity mismatch after full response', {'input_tokens': 30, 'output_tokens': 10}, usage_complete=True)
+        with self.assertRaises(FactoryBlocked):
+            self.f.operation('feature', 'closed-failure', 'review', 'second_reviewer', {}, {}, True, failed)
+        data = self.f.report('feature')['BUDGET_USED']
+        self.assertEqual(data['observed_tokens'], 40)
+        self.assertEqual(data['partial_usage_runs'], 0)
+        self.assertEqual(data['agent_runs'], 1)

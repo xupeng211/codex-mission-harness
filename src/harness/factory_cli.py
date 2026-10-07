@@ -33,7 +33,7 @@ def readable(result):
         return json.dumps(result, ensure_ascii=False, indent=2)
     budget = result['BUDGET_USED']
     lines = [f"任务：{result['MISSION']}", f"状态：{result['DELIVERY_STATUS']}",
-             f"执行次数：{budget['agent_runs']}/{budget['limit']}；已观察 token：{budget['observed_tokens']}；未知 usage：{budget['unknown_usage_runs']}",
+             f"执行次数：{budget['agent_runs']}/{budget['limit']}；已观察 token：{budget['observed_tokens']}；未知 usage：{budget['unknown_usage_runs'] + budget['partial_usage_runs']}",
              f"未知 token 保留额：{budget['unknown_token_reservation']}；金额：{budget['money']}"]
     if result['DELIVERY_STATUS'] == 'READY_FOR_USER_ACCEPTANCE':
         lines += [f"测试：{result['TEST_RESULT']}；本地 CI：{result['LOCAL_CI']}；GitHub CI：{result['HOSTED_CI']}",

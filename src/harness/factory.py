@@ -473,11 +473,13 @@ class Factory:
             result = invoke(transcript)
             if not isinstance(result, dict):
                 raise ValueError("runtime returned a non-object result")
+            result.setdefault("usage_complete", observed_usage(result.get("usage"), self.config["simulation"]) is not None)
             status = "COMPLETE"
         except Exception as exc:
             result, status = {"error": f"{type(exc).__name__}: {exc}",
                               "usage": getattr(exc, "usage", None),
-                              "runtime_identity": getattr(exc, "identity", None)}, "UNKNOWN"
+                              "runtime_identity": getattr(exc, "identity", None),
+                              "usage_complete": getattr(exc, "usage_complete", False)}, "UNKNOWN"
         raw_paths = [p for p in (transcript, transcript.with_suffix(".stderr")) if p.is_file()]
         result["raw_evidence"] = [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in raw_paths]
         data = encoded({"operation": operation_id, "identity": identity, "input": payload, "result": result}).encode()

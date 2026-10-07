@@ -360,7 +360,7 @@ class LocalRuntime:
                 raise RuntimeFailure(f"DeepSeek transport failed ({proc.returncode}): {error[-2000:]}")
             result = json.loads(output)
             if "error" in result:
-                raise RuntimeFailure(result["error"], result.get("usage"), result.get("runtime_identity"))
+                raise RuntimeFailure(result["error"], result.get("usage"), result.get("runtime_identity"), usage_complete=result.get("usage_complete", False))
             return result
         finally:
             if proc.poll() is None:
@@ -416,6 +416,7 @@ class LocalRuntime:
 
 
 class RuntimeFailure(RuntimeError):
-    def __init__(self, message, usage=None, identity=None):
+    def __init__(self, message, usage=None, identity=None, *, usage_complete=False):
         self.usage, self.identity = usage, identity
+        self.usage_complete = usage_complete
         super().__init__(message)

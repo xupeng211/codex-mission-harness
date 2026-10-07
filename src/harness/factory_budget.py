@@ -41,7 +41,7 @@ def tokens(usage):
 
 def accounting(operations, budget):
     paid = [op for op in operations if op["paid"]]
-    known, unknown = 0, 0
+    known, unknown, partial = 0, 0, 0
     import json
     for op in paid:
         usage = json.loads(op["usage"]) if op["usage"] else None
@@ -50,9 +50,15 @@ def accounting(operations, budget):
             unknown += 1
         else:
             known += count
-    reserve = unknown * budget.get("max_run_tokens", 0)
+            result = json.loads(op["result"]) if op["result"] else {}
+            complete = result.get("usage_complete", op["status"] == "COMPLETE")
+            if complete is not True:
+                partial += 1
+    # Observed partial telemetry is real and retained, but cannot settle an
+    # uncertain dispatch. Keep its full reservation, in addition to observation.
+    reserve = (unknown + partial) * budget.get("max_run_tokens", 0)
     return {"agent_runs": len(paid), "limit": budget["max_agent_runs"],
-            "observed_tokens": known, "unknown_usage_runs": unknown,
+            "observed_tokens": known, "unknown_usage_runs": unknown, "partial_usage_runs": partial,
             "unknown_token_reservation": reserve, "committed_tokens": known + reserve,
             "token_limit": budget.get("max_total_tokens", "LEGACY_NOT_CONFIGURED"),
             "run_token_limit": budget.get("max_run_tokens", "LEGACY_NOT_CONFIGURED"),

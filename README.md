@@ -122,7 +122,7 @@ Setup 默认选择 standard 授权；小任务可在首次 setup 时选择 `--si
 
 这些额度按规划、最多 4/8 个实施任务、双 Provider 全量复审、返工和有限 schema recovery 设计，供系统在任务内自行分配；不是每调用几次就找你确认。一次执行指一个 Codex turn 或一个 DeepSeek 请求，Codex turn 内可能包含多次原生模型/工具交互。Setup 不产生模型费用。
 
-每次 dispatch 之前预留 per-run token capacity。已返回的真实 usage 用于后续 admission；UNKNOWN 永久保留整次额度。调用次数、总时长、返工轮数和预算授权不可自动提高。新配置不能扩大旧任务 authority；历史 12/12 的耗尽任务保持原记录。
+每次 dispatch 之前预留 per-run token capacity。已返回的真实 usage 用于后续 admission；UNKNOWN 永久保留整次额度。失败 turn 的 usage 可能只是已完成响应的部分遥测；它会如实保存，并额外保留未完成执行的完整 reservation，不据此退还额度。调用次数、总时长、返工轮数和预算授权不可自动提高。新配置不能扩大旧任务 authority；历史 12/12 的耗尽任务保持原记录。
 
 Codex 自己的 native rollout budget 限制采样循环，控制器同时检查包含 cached input 的 token 遥测，并有独立进程/时长限制。Token admission 是本地调度上限，Provider 一次已发出的响应在收到 usage 时可能越过阈值；发生这种情况会保留真实超额并停止，不能交付成功。它不是精确美元扣费保证；要求严格金额封顶时，使用 Provider 账户支出限额。Harness 不会自行调整这个外部限额。
 
