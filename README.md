@@ -12,6 +12,8 @@ harness delivery
 
 真实双 Provider、自动返工、恢复及 GitHub CI 验收记录见 [交付验收](docs/PRODUCTION_ACCEPTANCE.md)。`factory-demo` 是免费模拟演示，不能用来证明真实 Provider 可用。
 
+Codex 开发/规划可显式选择 [CLI proxy transport](docs/CLI_PROXY_TRANSPORT.md)，与官方 transport 分开配置。proxy OpenAI reviewer 尚未合格；DeepSeek reviewer 仍直接连接 Provider。developer route 可用不等于完整双 Provider Factory 已重新通过验收。
+
 ## 第一次安装与打开
 
 安装 Python 3.11+、Git、Node.js 和 bubblewrap；GitHub Actions 项目还需要 GitHub CLI (`gh`)。Ubuntu 的系统组件可用 `sudo apt install python3-venv git bubblewrap` 安装。

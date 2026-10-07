@@ -28,7 +28,8 @@ def project_checks(repo):
     raise ValueError("project has no recognized tests; its maintainer must configure real test/CI commands once (config/factory.example.json)")
 
 
-def setup(config_path, repository, token_file, size, codex_home=None, model=None):
+def setup(config_path, repository, token_file, size, codex_home=None, model=None,
+          transport="official", proxy_endpoint=None, proxy_policy_file=None, proxy_provider="cli_proxy_api"):
     repo = repository.resolve(strict=True)
     if Path(git(repo, "rev-parse", "--show-toplevel")).resolve() != repo:
         raise ValueError("choose the project Git root directory")
@@ -56,10 +57,19 @@ def setup(config_path, repository, token_file, size, codex_home=None, model=None
         profile["codex_home"] = str(codex_home.resolve(strict=True))
     if model:
         profile["model"] = model
+    developer = dict(profile, transport={"type": transport})
+    reviewer = dict(profile, transport={"type": "official"})
+    if transport == "cli_proxy":
+        from .factory_proxy import validate_transport, ProxyPolicy
+        developer["transport"].update(endpoint=proxy_endpoint, configured_provider=proxy_provider,
+                                      policy_file=str(proxy_policy_file) if proxy_policy_file else "")
+        ProxyPolicy(validate_transport(developer))
+    elif proxy_endpoint or proxy_policy_file:
+        raise ValueError("proxy options require explicit --transport cli_proxy")
     config = validate_config({"version": 1, "repository": str(repo), "budget": PRESETS[size],
                               "max_rounds": ROUNDS[size], "timeout_seconds": 900,
                               "checks": checks, "ci": ci, "profiles": {
-                                  "developer": profile, "reviewer": profile,
+                                  "developer": developer, "reviewer": reviewer,
                                   "second_reviewer": {"provider": "deepseek", "model": "deepseek-flash",
                                                       "token_file": str(token_file), "max_output_tokens": 4096}}})
     workflows = sorted(p.name for p in (repo / ".github/workflows").glob("*.y*ml"))
@@ -83,4 +93,4 @@ def setup(config_path, repository, token_file, size, codex_home=None, model=None
     return {"SETUP": "CONFIGURED", "REPOSITORY": str(repo), "CONFIG": str(config_path.absolute()),
             "BUDGET": config["budget"], "MODEL_INFERENCE_CALLS": 0,
             "NEXT": 'harness submit "describe the feature"',
-            "NOTE": "Configuration is not provider qualification. Use codex login for official OpenAI access; each mission verifies runtime identity."}
+            "NOTE": "Configuration is not provider qualification. CLI proxy supports developer/planner only; OpenAI reviewer remains official, DeepSeek remains direct. Each mission verifies runtime identity."}

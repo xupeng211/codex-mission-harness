@@ -12,11 +12,13 @@ import uuid
 import sys
 import urllib.request
 import urllib.parse
+import tempfile
 from pathlib import Path
 
 from .codex import AppServerCodex
 from .model_registry import read_private_token
 from .sandbox import project_gate_invocation, preflight_project_gate, SAFE_PATH
+from .factory_proxy import validate_transport, ProxyPolicy, ProxyRelay, digest as route_digest
 
 
 VENDOR = Path(__file__).parent / "vendor" / "codex"
@@ -82,6 +84,9 @@ class FactoryAppServer(AppServerCodex):
         self.profile, self.read_only = profile, read_only
         self.reviewer = reviewer
         self.runtime_identity = None
+        self.transport = validate_transport(profile, reviewer)
+        self._proxy_relay = None
+        self._proxy_home = None
         # Built-in OpenAI ignores configured retry overrides. A fresh official
         # provider entry uses native authentication/endpoint selection while
         # disabling ambiguous request replay and transport fallback.
@@ -91,8 +96,23 @@ class FactoryAppServer(AppServerCodex):
         self.transcript, self._transcript_bytes = transcript, 0
         self._response_timeout = timeout
         self._end_time = time.monotonic() + timeout
-        home = self._codex_home(profile.get("codex_home"))
+        home = None
+        self._source_home = str(Path(profile.get("codex_home") or Path.home()/".codex"))
+        if self.transport["type"] == "cli_proxy":
+            secrets_root = Path(self.transport["policy_file"]).parent
+            if secrets_root.is_relative_to(cwd) or cwd.is_relative_to(secrets_root):
+                raise ValueError("proxy authentication directory must remain outside the candidate")
+            # Neither the user's OAuth nor a bearer token is handed to Codex.
+            # A private run-local home contains only an observer capability;
+            # the actual proxy credential stays in the controller process.
+            self._proxy_home = tempfile.TemporaryDirectory(prefix="cmh-proxy-home-")
+            home = self._proxy_home.name
+            self._transport_provider = "cmh_cli_proxy_" + uuid.uuid4().hex
+        else:
+            home = self._codex_home(profile.get("codex_home"))
+            self._source_home = home
         executable = self._trusted_executable("codex", str(cwd))
+        self._native_identity = {"executable": str(executable), "launcher_sha256": hashlib.sha256(executable.read_bytes()).hexdigest()}
         watchdog = self._trusted_executable("timeout", str(cwd))
         rules = {str(root): "deny" for root in denied_roots if not (read_only and root in cwd.parents)}
         if not read_only:
@@ -104,6 +124,9 @@ class FactoryAppServer(AppServerCodex):
         installed_runtime = executable.parent.parent if executable.name == "codex.js" and (executable.parent.parent / "package.json").is_file() else executable.parent
         rules[str(installed_runtime)] = "read"
         rules[home] = "deny"
+        if self.transport["type"] == "cli_proxy":
+            rules[self._source_home] = "deny"
+            rules[str(Path(self.transport["policy_file"]).parent)] = "deny"
         # The Git database belongs to the controller, not to coding agents.
         rules[str(cwd / ".git")] = "read"
         # A read-only lane starts with minimal runtime + the exact repository,
@@ -128,6 +151,7 @@ class FactoryAppServer(AppServerCodex):
                      "-c", "project_root_markers=[]",
                      "-c", "mcp_servers={}",
                      "-c", "plugins={}",
+                     "-c", 'shell_environment_policy.filters.CODEX_HOME="exclude"',
                      "-c", 'shell_environment_policy.set.PYTHONDONTWRITEBYTECODE="1"']
         if token_limit:
             # Native Codex budget stops its own sampling loop. Controller also
@@ -174,22 +198,50 @@ class FactoryAppServer(AppServerCodex):
             disabled_entries.append(json.dumps(name) + "={enabled=false," + transport_key + "=" + json.dumps(settings[transport_key]) + "}")
         overrides.extend(["-c", "mcp_servers={" + ",".join(disabled_entries) + "}"])
         overrides.extend(["-c", "plugins={" + ",".join(json.dumps(name) + "={enabled=false}" for name in disabled_plugins) + "}"])
-        with transcript.with_suffix(".stderr").open("xb") as stderr:
-            # GNU coreutils supplies a wall-clock watchdog independent of this
-            # controller's lifetime; a crashed client cannot leave an unbounded
-            # paid Codex loop. Unknown dispatch remains charged and unreplayed.
-            self.proc = subprocess.Popen([str(watchdog), "--signal=TERM", "--kill-after=5", str(timeout),
-                                          str(executable), *overrides, "app-server", "--stdio"],
-                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=stderr,
-                                     text=True, bufsize=1, cwd=cwd, start_new_session=True,
-                                     env=self._app_server_environment(str(executable), str(cwd), codex_home=home))
+        if self.transport["type"] == "cli_proxy":
+            try:
+                self._proxy_relay = ProxyRelay(profile, transcript, timeout, token_limit)
+                # This exact table has no inherited fields and no real API key.
+                provider = {"name": "Explicit CLI Proxy", "base_url": self._proxy_relay.base_url,
+                            "wire_api": "responses", "requires_openai_auth": False,
+                            "experimental_bearer_token": self._proxy_relay.nonce,
+                            "request_max_retries": 0, "stream_max_retries": 0,
+                            "supports_websockets": False}
+                # TOML is generated without putting credentials in command args.
+                (Path(home) / "config.toml").write_text("[model_providers." + self._transport_provider + "]\n" +
+                    "\n".join(k + "=" + json.dumps(v) for k,v in provider.items()) + "\n")
+                (Path(home) / "config.toml").chmod(0o600)
+                index = next(i for i,x in enumerate(overrides) if x.startswith("model_providers." + self._transport_provider + "="))
+                # Avoid merging the official-auth table into the proxy table.
+                del overrides[index-1:index+1]
+            except BaseException:
+                self.close()
+                raise
+        try:
+            with transcript.with_suffix(".stderr").open("xb") as stderr:
+                # GNU coreutils supplies a wall-clock watchdog independent of
+                # this controller; unknown dispatch stays charged/unreplayed.
+                environment = self._app_server_environment(str(executable), str(cwd), codex_home=home)
+                if self.transport["type"] == "cli_proxy":
+                    # Codex talks only to the local observer. Upstream network
+                    # routing belongs to the explicit dedicated proxy config.
+                    environment = {k:v for k,v in environment.items() if k.lower() not in {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}}
+                    environment["NO_PROXY"] = "127.0.0.1,localhost,::1"
+                self.proc = subprocess.Popen([str(watchdog), "--signal=TERM", "--kill-after=5", str(timeout),
+                                             str(executable), *overrides, "app-server", "--stdio"],
+                                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                             stderr=stderr, text=True, bufsize=1, cwd=cwd, start_new_session=True,
+                                             env=environment)
+        except BaseException:
+            self.close()
+            raise
         self.seq = 0
         self._pending_messages = []
         self._reader_thread = None
         try:
-            self._request("initialize", {"clientInfo": {"name": "software-delivery-factory", "version": "1"},
-                                         "capabilities": {"experimentalApi": True}})
+            initialized = self._request("initialize", {"clientInfo": {"name": "software-delivery-factory", "version": "1"},
+                                                        "capabilities": {"experimentalApi": True}})
+            self._native_identity["reported_server"] = initialized.get("userAgent")
             self.proc.stdin.write(json.dumps({"method": "initialized", "params": {}}) + "\n")
             self.proc.stdin.flush()
         except BaseException:
@@ -200,6 +252,9 @@ class FactoryAppServer(AppServerCodex):
         return self._end_time
 
     def _observe_wire_line(self, line):
+        if getattr(self, "_proxy_relay", None):
+            # config/read and native diagnostics can echo the capability.
+            line = line.replace(self._proxy_relay.nonce, "[REDACTED]")
         data = line.encode()
         self._transcript_bytes += len(data)
         if self._transcript_bytes > 16 * 1024 * 1024:
@@ -224,8 +279,18 @@ class FactoryAppServer(AppServerCodex):
         result = super()._request(method, params)
         if method == "thread/start":
             self.runtime_identity = {"model": result.get("model"), "provider": "openai", "transport_provider": result.get("modelProvider"),
-                                     "transport": {"official_auth": True, "request_max_retries": 0, "stream_max_retries": 0, "supports_websockets": False},
+                                     "transport": {"route_type": self.transport["type"], "official_auth": self.transport["type"] == "official", "request_max_retries": 0, "stream_max_retries": 0, "supports_websockets": False},
                                      "effort": result.get("reasoningEffort"), "profile": self.profile}
+            self.runtime_identity["native_runtime"] = self._native_identity
+            if self._proxy_relay:
+                route = {**self.transport, "route_type": "cli_proxy", "requested_model": self.MODEL, "auth_source": self._proxy_relay.policy.policy["credential_file"],
+                         "runtime": self._proxy_relay.policy.identity}
+                self.runtime_identity.update(route_identity=route, qualification_identity=route_digest(route),
+                                             upstream_provider_identity="NOT_PROVABLE", reported_model=None)
+            else:
+                route = {"route_type": "official", "configured_provider": "openai", "auth_source": str(Path(self._source_home)/"auth.json"),
+                         "endpoint_selection": "native_official_auth"}
+                self.runtime_identity.update(route_identity=route, qualification_identity=route_digest(route))
             if result.get("modelProvider") != self._transport_provider or not result.get("model"):
                 raise RuntimeError("Codex runtime provider/model identity is unproven")
             if self.MODEL and result["model"] != self.MODEL:
@@ -274,9 +339,19 @@ class FactoryAppServer(AppServerCodex):
                 and i.get("phase") in (None, "final_answer")]
         if not text:
             raise RuntimeError("completed Codex turn has no structured final result")
+        receipt = None
+        if getattr(self, "_proxy_relay", None):
+            self._proxy_relay.collect_telemetry()
+            receipt = self._proxy_relay.receipt()
+            self.usage = self._proxy_relay.usage()
+            self.runtime_identity["physical_accounting"] = receipt
+            self.runtime_identity["reported_model"] = self.MODEL if receipt["usage_complete"] else None
+            if not receipt["usage_complete"]:
+                raise RuntimeFailure("explicit proxy result/usage identity is uncertain; no replay", self.usage, self.runtime_identity)
         return {"output": json.loads(text[-1]), "usage": self.usage,
                 "thread_id": thread_id, "turn_id": turn_id,
-                "runtime_identity": self.runtime_identity, "model_routing": routed}
+                "runtime_identity": self.runtime_identity, "model_routing": routed,
+                **({"physical_accounting": receipt, "usage_complete": receipt["usage_complete"]} if receipt else {})}
 
     def close(self):
         proc = getattr(self, "proc", None)
@@ -286,6 +361,17 @@ class FactoryAppServer(AppServerCodex):
             except ProcessLookupError:
                 pass
         super().close()
+        relay = getattr(self, "_proxy_relay", None)
+        if relay:
+            relay.close()
+            error = self.transcript.with_suffix(".stderr")
+            if error.exists():
+                error.write_bytes(error.read_bytes().replace(relay.nonce.encode(), b"[REDACTED]"))
+            self._proxy_relay = None
+        home = getattr(self, "_proxy_home", None)
+        if home:
+            home.cleanup()
+            self._proxy_home = None
 
 
 class LocalRuntime:
@@ -308,8 +394,14 @@ class LocalRuntime:
     def profile_identity(self, profile):
         identity = {"configured": profile}
         if profile["provider"] == "openai":
-            home = Path(AppServerCodex._codex_home(profile.get("codex_home")))
-            selected = [home / "config.toml"]
+            transport = validate_transport(profile)
+            if transport["type"] == "cli_proxy":
+                policy = ProxyPolicy(transport)
+                route = {**transport, "route_type": "cli_proxy", "auth_source": policy.policy["credential_file"], "requested_model": profile["model"], "runtime": policy.identity}
+                identity["route_identity"] = route
+                identity["qualification_identity"] = route_digest(route)
+            home = Path(AppServerCodex._codex_home(profile.get("codex_home"))) if transport["type"] == "official" else None
+            selected = [home / "config.toml"] if home else []
             if profile.get("codex_profile"):
                 selected.append(home / (profile["codex_profile"] + ".config.toml"))
             # Codex writes project trust bookkeeping when opening a new
@@ -324,13 +416,16 @@ class LocalRuntime:
                     configs[path.name] = hashlib.sha256(canonical).hexdigest()
                 else:
                     configs[path.name] = None
-            identity["codex_config_hashes"] = configs
+            identity["codex_config_hashes"] = configs if transport["type"] == "official" else {}
+            if transport["type"] == "official":
+                identity["route_identity"] = {"route_type": "official", "configured_provider": "openai", "auth_source": str(home/"auth.json"), "endpoint_selection": "native_official_auth"}
             binary = AppServerCodex._trusted_executable("codex")
+            identity["native_runtime"] = {"executable": str(binary), "launcher_sha256": hashlib.sha256(binary.read_bytes()).hexdigest()}
             identity["runtime_version"] = subprocess.check_output([str(binary), "--version"], timeout=10, text=True).strip()
         else:
             identity["route"] = "https://api.deepseek.com/chat/completions"
         identity["adapter_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-        dependencies = ["codex.py"] if profile["provider"] == "openai" else ["factory_http.py", "model_registry.py"]
+        dependencies = ["codex.py", "factory_proxy.py"] if profile["provider"] == "openai" else ["factory_http.py", "model_registry.py"]
         identity["transport_hashes"] = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in dependencies}
         return identity
 
@@ -342,6 +437,17 @@ class LocalRuntime:
             schema = REVIEW_SCHEMA if role == "review" else PLAN_SCHEMA if role == "plan" else WORK_SCHEMA
             return server.execute(json.dumps(payload, ensure_ascii=False), schema)
         except Exception as exc:
+            if server._proxy_relay:
+                try:
+                    server._proxy_relay.collect_telemetry()
+                except Exception:
+                    pass  # Unknown telemetry cannot settle the reservation.
+                server.usage = server._proxy_relay.usage()
+                if server.runtime_identity is not None:
+                    server.runtime_identity["physical_accounting"] = server._proxy_relay.receipt()
+                # Never include upstream error bodies, credentials or transport
+                # exception reprs in a receipt for a proxy failure.
+                raise RuntimeFailure("explicit CLI proxy run failed; no retry or fallback", server.usage, server.runtime_identity) from exc
             raise RuntimeFailure(str(exc), server.usage, server.runtime_identity) from exc
         finally:
             server.close()

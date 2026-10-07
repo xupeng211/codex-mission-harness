@@ -145,11 +145,16 @@ def validate_config(raw: dict) -> dict:
     if not isinstance(profiles, dict) or set(profiles) != expected:
         raise ValueError("profiles must define the required execution lanes")
     for lane, profile in profiles.items():
-        if not isinstance(profile, dict) or set(profile) - {"provider", "model", "effort", "codex_profile", "codex_home", "token_file", "max_output_tokens"}:
+        if not isinstance(profile, dict) or set(profile) - {"provider", "model", "effort", "codex_profile", "codex_home", "token_file", "max_output_tokens", "transport"}:
             raise ValueError("invalid lane profile")
         expected_provider = "deepseek" if lane == "second_reviewer" else "openai"
         if profile.get("provider") != expected_provider:
             raise ValueError("independent review requires genuinely different providers")
+        if expected_provider == "openai":
+            from .factory_proxy import validate_transport
+            validate_transport(profile, reviewer=lane == "reviewer")
+        elif "transport" in profile:
+            raise ValueError("DeepSeek reviewer remains a direct official provider; transport override forbidden")
         for field in ("model", "codex_profile"):
             if field in profile and (not isinstance(profile[field], str) or not re.fullmatch(r"[A-Za-z0-9_.:-]+", profile[field])):
                 raise ValueError(f"invalid {field}")
@@ -277,6 +282,8 @@ class Factory:
         self.runtime = runtime or LocalRuntime()
         if bool(self.runtime.simulation) != self.config["simulation"]:
             raise ValueError("fixture/live runtime does not match operator policy")
+        if hasattr(self.runtime, "resource_policy"):
+            self.runtime.resource_policy = self.config["budget"]
         self.profile_identities = {lane: self.runtime.profile_identity(profile) if hasattr(self.runtime, "profile_identity") else {"configured": profile, "fixture": True}
                                    for lane, profile in self.config["profiles"].items()}
         requested_root = Path(root).absolute()
@@ -486,7 +493,7 @@ class Factory:
                               "usage": getattr(exc, "usage", None),
                               "runtime_identity": getattr(exc, "identity", None),
                               "usage_complete": getattr(exc, "usage_complete", False)}, "UNKNOWN"
-        raw_paths = [p for p in (transcript, transcript.with_suffix(".stderr")) if p.is_file()]
+        raw_paths = [p for p in (transcript, transcript.with_suffix(".stderr"), transcript.with_suffix(".proxy.jsonl")) if p.is_file()]
         result["raw_evidence"] = [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in raw_paths]
         data = encoded({"operation": operation_id, "identity": identity, "input": payload, "result": result}).encode()
         with evidence.open("xb") as stream:
