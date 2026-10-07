@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
+import shutil
+import stat
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from .policy import SENSITIVE
+from .model_registry import load_registry
+from .model_qualification import require_builder_qualification
 
 
 @dataclass(frozen=True)
@@ -26,21 +32,43 @@ class CodexAdapter(Protocol):
 
 class AppServerCodex:
     """Thin JSON-RPC adapter for the locally installed App Server; protocol stays here."""
+    MODEL = "gpt-5.6-sol"
+    REASONING_EFFORT = "high"
+
     RESPONSE_TIMEOUT_SECONDS = 300.0
     MAX_PENDING_MESSAGES = 256
 
     def __init__(self, executable: str = "codex", *,
-                 forbidden_actions: tuple[str, ...] = (), worktree: str | None = None):
+                 forbidden_actions: tuple[str, ...] = (), worktree: str | None = None,
+                 builder_qualification: str | Path | None = None,
+                 builder_auth_key_file: str | Path | None = None):
         # Both the mission deny-list and its validated worktree are immutable
         # constructor inputs. A later caller may verify them, but may not bind
         # either authority boundary from turn-supplied data.
         if worktree is None:
             raise ValueError("Codex mission worktree must be constructor-bound")
+        require_builder_qualification(builder_qualification, builder_auth_key_file)
+        builder = load_registry().role("builder")
+        self.MODEL = builder.model
+        self.REASONING_EFFORT = builder.reasoning_effort
         self._forbidden_actions = self._effective_policy(forbidden_actions)
         self._configured_forbidden_actions = self._effective_policy(forbidden_actions)
         self._policy_cwd = self._canonical_worktree(worktree)
-        self.proc = subprocess.Popen([executable, "app-server", "--stdio"], stdin=subprocess.PIPE,
-                                     stdout=subprocess.PIPE, text=True, bufsize=1)
+        self._permissions_profile = f"cmh_delegated_{uuid.uuid4().hex}"
+        codex_home = self._codex_home()
+        trusted_executable = self._trusted_executable(executable, self._policy_cwd)
+        app_server_argv = [str(trusted_executable), "-c", f'model="{self.MODEL}"',
+                           "-c", f'model_reasoning_effort="{self.REASONING_EFFORT}"',
+                           "-c", 'default_permissions=":workspace"',
+                           *self._permissions_profile_overrides(codex_home, self._permissions_profile),
+                           "app-server", "--stdio"]
+        self.proc = subprocess.Popen(app_server_argv, stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, text=True, bufsize=1,
+                                     cwd=self._policy_cwd,
+                                     env=self._app_server_environment(
+                                         str(trusted_executable), self._policy_cwd,
+                                         codex_home=codex_home,
+                                     ))
         self.seq = 0
         self._pending_messages: list[dict] = []
         self._reader_queue: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -48,10 +76,242 @@ class AppServerCodex:
         try:
             self._request("initialize", {
                 "clientInfo": {"name": "codex-mission-harness", "version": "0.1"},
+                "capabilities": {"experimentalApi": True},
             })
         except Exception:
             self.close()
             raise
+
+    @staticmethod
+    def _trusted_executable(executable: str, forbidden_root: str | None = None) -> Path:
+        """Resolve a launcher only when its file and path are trusted.
+
+        The launcher runs before the App Server sandbox exists, with the
+        authenticated ``CODEX_HOME`` in its environment.  A path supplied by
+        a mission therefore must never select a candidate-controlled file.
+        Keep the lexical path check as well as the resolved target check so a
+        symlink placed in the mission worktree cannot escape this boundary.
+        """
+        resolved_name = shutil.which(executable, path=os.environ.get("PATH", os.defpath))
+        if not resolved_name:
+            raise RuntimeError("trusted Codex App Server launcher is unavailable")
+        try:
+            lexical = Path(resolved_name).absolute()
+            target = lexical.resolve(strict=True)
+            root = Path(forbidden_root).resolve(strict=True) if forbidden_root else None
+        except (OSError, RuntimeError) as exc:
+            raise RuntimeError("trusted Codex App Server launcher is unavailable") from exc
+        for candidate in (lexical, target):
+            if root is not None:
+                try:
+                    candidate.relative_to(root)
+                except ValueError:
+                    pass
+                else:
+                    raise RuntimeError("Codex App Server launcher cannot be inside the mission worktree")
+
+        owners = {0, os.getuid()} if hasattr(os, "getuid") else {0}
+        for ancestor in (lexical.parent, *lexical.parent.parents):
+            try:
+                source = ancestor.lstat()
+            except OSError as exc:
+                raise RuntimeError("trusted Codex App Server launcher is unavailable") from exc
+            source_mode = stat.S_IMODE(source.st_mode)
+            private_group_write = (source.st_gid == source.st_uid
+                                   and source_mode & 0o020
+                                   and not source_mode & 0o002)
+            if (not stat.S_ISDIR(source.st_mode) or source.st_uid not in owners
+                    or (source_mode & 0o022 and not private_group_write)):
+                raise RuntimeError("trusted Codex App Server launcher is not owner-controlled")
+        try:
+            info = target.lstat()
+        except OSError as exc:
+            raise RuntimeError("trusted Codex App Server launcher is unavailable") from exc
+        # A user-owned npm launcher is commonly group-writable by the user's
+        # private primary group.  Allow that case, while rejecting writes by a
+        # different group or by others.
+        group_write_is_private = info.st_gid == info.st_uid
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid not in owners
+                or not (stat.S_IMODE(info.st_mode) & 0o111)
+                or stat.S_IMODE(info.st_mode) & 0o002
+                or (stat.S_IMODE(info.st_mode) & 0o020 and not group_write_is_private)):
+            raise RuntimeError("trusted Codex App Server launcher is not owner-controlled")
+
+        for ancestor in (target.parent, *target.parent.parents):
+            try:
+                directory = ancestor.lstat()
+            except OSError as exc:
+                raise RuntimeError("trusted Codex App Server launcher is unavailable") from exc
+            directory_mode = stat.S_IMODE(directory.st_mode)
+            private_group_write = (directory.st_gid == directory.st_uid
+                                   and directory_mode & 0o020
+                                   and not directory_mode & 0o002)
+            if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid not in owners
+                    or (directory_mode & 0o022 and not private_group_write)):
+                raise RuntimeError("trusted Codex App Server launcher is not owner-controlled")
+        return target
+
+    @staticmethod
+    def _trusted_environment_path(executable: str, forbidden_root: str | None = None) -> str:
+        """Return a PATH made only from owner-controlled executable directories.
+
+        The App Server is a controller child, so it must not inherit a caller
+        PATH that can select repository-controlled launchers.  Keep the
+        resolved executable's directory when it is trusted, then add the
+        standard system directories needed by Codex's child tools.
+        """
+        owners = {0, os.getuid()} if hasattr(os, "getuid") else {0}
+        candidates: list[Path] = []
+        candidates.append(AppServerCodex._trusted_executable(executable, forbidden_root).parent)
+        candidates.extend(Path(entry) for entry in (
+            "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin",
+            "/sbin", "/bin",
+        ))
+        trusted: list[str] = []
+        for directory in candidates:
+            try:
+                resolved = directory.resolve(strict=True)
+            except OSError:
+                continue
+            if not resolved.is_dir() or str(resolved) in trusted:
+                continue
+            if forbidden_root is not None:
+                try:
+                    resolved.relative_to(Path(forbidden_root).resolve(strict=True))
+                except ValueError:
+                    pass
+                else:
+                    continue
+            safe = True
+            for ancestor in (resolved, *resolved.parents):
+                try:
+                    info = ancestor.stat()
+                except OSError:
+                    safe = False
+                    break
+                directory_mode = stat.S_IMODE(info.st_mode)
+                private_group_write = (info.st_gid == info.st_uid
+                                       and directory_mode & 0o020
+                                       and not directory_mode & 0o002)
+                if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in owners
+                        or (directory_mode & 0o022 and not private_group_write)):
+                    safe = False
+                    break
+            if safe:
+                trusted.append(str(resolved))
+        if not trusted:
+            raise RuntimeError("trusted Codex App Server PATH is unavailable")
+        return os.pathsep.join(trusted)
+
+    @staticmethod
+    def _codex_home(raw_home: str | None = None) -> str:
+        """Select the authenticated Codex home without inheriting a broad HOME."""
+        raw = raw_home if raw_home is not None else os.environ.get("CODEX_HOME")
+        if raw:
+            candidate = Path(raw)
+            if not candidate.is_absolute():
+                raise RuntimeError("CODEX_HOME must be an absolute path")
+        else:
+            candidate = Path.home() / ".codex"
+        try:
+            lexical = candidate.absolute()
+            resolved = lexical.resolve(strict=True)
+            if lexical != resolved:
+                raise RuntimeError("Codex authentication home must not contain symlinks")
+            uid = os.getuid() if hasattr(os, "getuid") else resolved.lstat().st_uid
+            owners = {0, uid}
+            parts = lexical.parts
+            current = Path(parts[0])
+            for index, component in enumerate(parts):
+                if index == 0:
+                    current = Path(component)
+                else:
+                    current /= component
+                info = current.lstat()
+                mode = stat.S_IMODE(info.st_mode)
+                ancestor = index < len(parts) - 1
+                sticky_shared = ancestor and bool(info.st_mode & stat.S_ISVTX) and bool(mode & 0o022)
+                if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                        or info.st_uid not in (owners if ancestor else {uid})
+                        or (mode & 0o022 and not sticky_shared)):
+                    raise RuntimeError("Codex authentication home is not owner-controlled")
+        except OSError as exc:
+            raise RuntimeError("Codex authentication home is unavailable") from exc
+        except RuntimeError:
+            raise
+        return str(resolved)
+
+    @classmethod
+    def _app_server_environment(cls, executable: str, forbidden_root: str | None = None,
+                                *, codex_home: str | None = None) -> dict[str, str]:
+        """Build the App Server's explicit environment allowlist.
+
+        Authentication is carried by the deliberately selected ``CODEX_HOME``
+        directory.  Proxy and CA settings are retained for the service request,
+        while controller credentials, SSH agents, and arbitrary execution
+        controls are excluded from the child environment.
+        """
+        code_home = codex_home or cls._codex_home()
+        environment = {
+            "PATH": cls._trusted_environment_path(executable, forbidden_root),
+            "HOME": "/nonexistent",
+            "CODEX_HOME": code_home,
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+            "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+            "NO_COLOR": "1",
+        }
+        for name in (
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+            "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+        ):
+            value = os.environ.get(name)
+            if value:
+                environment[name] = value
+        # These variables point at system-managed CA material rather than
+        # carrying credentials.  Ignore non-absolute or user-writable paths.
+        for name in (
+            "CODEX_CA_CERTIFICATE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO",
+            "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "SSL_CERT_DIR", "SSL_CERT_FILE",
+        ):
+            value = os.environ.get(name, "")
+            if not value:
+                continue
+            paths = value.split(os.pathsep) if name == "SSL_CERT_DIR" else [value]
+            safe = True
+            for raw_path in paths:
+                path = Path(raw_path)
+                try:
+                    info = path.lstat()
+                except OSError:
+                    safe = False
+                    break
+                expected = stat.S_ISDIR(info.st_mode) if name == "SSL_CERT_DIR" else stat.S_ISREG(info.st_mode)
+                if (not path.is_absolute() or stat.S_ISLNK(info.st_mode)
+                        or not expected or info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022):
+                    safe = False
+                    break
+            if safe:
+                environment[name] = value
+        return environment
+
+    @staticmethod
+    def _permissions_profile_overrides(codex_home: str, profile: str) -> list[str]:
+        """Define a per-process workspace profile that cannot read Codex auth.
+
+        The inline TOML table keeps the absolute path in a value, so paths with
+        dots are not misparsed as config-key separators.  No config file is
+        written into the authenticated CODEX_HOME.
+        """
+        if (not Path(codex_home).is_absolute()
+                or not profile.startswith("cmh_delegated_")
+                or not profile.replace("_", "").isalnum()):
+            raise RuntimeError("Codex delegated permission profile is invalid")
+        filesystem = "{" + json.dumps(codex_home) + ' = "deny"}'
+        return [
+            "-c", f'permissions.{profile}.extends=":workspace"',
+            "-c", f"permissions.{profile}.filesystem={filesystem}",
+            "-c", f"permissions.{profile}.network.enabled=false",
+        ]
 
     def set_policy(self, forbidden_actions: tuple[str, ...], cwd: str) -> None:
         """Verify constructor-bound mission controls before a turn is started.
@@ -107,26 +367,27 @@ class AppServerCodex:
             raise RuntimeError("Codex caller cwd differs from the bound mission worktree")
         return {
             "approvalPolicy": "never",
-            "sandboxPolicy": {
-                "type": "workspaceWrite",
-                "writableRoots": [root],
-                "networkAccess": False,
-            },
+            "permissions": getattr(self, "_permissions_profile", "cmh_delegated"),
         }
 
     def _thread_policy_params(self, cwd: str) -> dict:
         """Express the turn sandbox equivalently in thread start/resume schema."""
         policy = self._policy_params(cwd)
-        root = policy["sandboxPolicy"]["writableRoots"][0]
+        root = self._policy_cwd
         return {
             "cwd": root,
+            "model": self.MODEL,
             "approvalPolicy": policy["approvalPolicy"],
-            "sandbox": "workspace-write",
+            "permissions": policy["permissions"],
             "developerInstructions": self._authority_instructions(root),
             "config": {
-                "sandbox_workspace_write": {
-                    "writable_roots": [root],
-                    "network_access": False,
+                # The App Server needs CODEX_HOME to authenticate, but its
+                # delegated shell commands must not inherit the path to that
+                # credential directory. The named permission profile above
+                # separately denies filesystem reads under CODEX_HOME.
+                "shell_environment_policy": {
+                    "filters": {"CODEX_HOME": "exclude"},
+                    "ignore_default_excludes": False,
                 },
             },
         }
@@ -194,6 +455,9 @@ class AppServerCodex:
         if line == "":
             self.close()
             raise RuntimeError("Codex App Server exited before sending a response")
+        observer = getattr(self, "_observe_wire_line", None)
+        if callable(observer):
+            observer(line)
         try:
             message = json.loads(line)
         except json.JSONDecodeError as exc:
@@ -341,10 +605,21 @@ class AppServerCodex:
         else:
             params = dict(policy)
             result = self._request("thread/start", params)
-        return result["thread"]["id"]
+        thread = result.get("thread") if isinstance(result, dict) else None
+        active = result.get("activePermissionProfile") if isinstance(result, dict) else None
+        if (not isinstance(active, dict)
+                or active.get("id") != policy["permissions"]):
+            raise RuntimeError("Codex App Server did not activate the delegated filesystem profile")
+        if not isinstance(thread, dict):
+            raise RuntimeError("Codex App Server returned an invalid thread identity")
+        thread_id = thread.get("id")
+        if not isinstance(thread_id, str) or not thread_id:
+            raise RuntimeError("Codex App Server returned an invalid thread identity")
+        return thread_id
 
     def turn(self, thread_id: str, prompt: str, cwd: str) -> Turn:
-        params = {"threadId": thread_id, "input": [{"type": "text", "text": prompt}], "cwd": cwd}
+        params = {"threadId": thread_id, "input": [{"type": "text", "text": prompt}],
+                  "cwd": cwd, "model": self.MODEL, "effort": self.REASONING_EFFORT}
         params.update(self._policy_params(cwd))
         result = self._request("turn/start", params)
         turn_id = result["turn"]["id"]

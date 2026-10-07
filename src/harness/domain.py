@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import PurePosixPath
 from typing import Any, Mapping
 
 
@@ -54,6 +55,10 @@ class MissionSpec:
     merge_policy: str = "owner_approval"
     post_merge_gates: tuple[str, ...] = ()
     forbidden_actions: tuple[str, ...] = ()
+    # New FootballPrediction missions provide a tracked scope contract. None
+    # remains readable for legacy v1 journals, but REVIEW fails closed without it.
+    # Scope is explicit, never an inferred broad allow-list.
+    mission_scope_file: str | None = None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "MissionSpec":
@@ -74,6 +79,16 @@ class MissionSpec:
         adapter = data.get("adapter", "footballprediction")
         if not isinstance(adapter, str) or adapter not in {"footballprediction", "simulation"}:
             raise ValueError("adapter must be exactly footballprediction or simulation")
+        if adapter == "footballprediction" and data.get("post_merge_gates"):
+            raise ValueError("footballprediction post_merge_gates are unsupported; use the canonical Production Gate")
+        scope = data.get("mission_scope_file")
+        if scope is not None and not isinstance(scope, str):
+            raise ValueError("mission_scope_file must be a string when provided")
+        if adapter == "footballprediction" and scope is not None:
+            path = PurePosixPath(scope) if isinstance(scope, str) and scope else None
+            if (path is None or path.is_absolute() or "\\" in scope
+                    or any(part in {"", ".", ".."} for part in scope.split("/"))):
+                raise ValueError("footballprediction mission_scope_file must be a safe relative path")
         if data.get("merge_policy", "owner_approval") not in {"owner_approval", "auto"}:
             raise ValueError("merge_policy must be exactly owner_approval or auto")
         for field in ("mission_id", "repository", "objective"):

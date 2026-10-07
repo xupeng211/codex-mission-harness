@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "budget": {
+    "max_agent_runs": 35,
+    "max_total_tokens": 8400000,
+    "max_run_tokens": 240000,
+    "max_wall_seconds": 21600
+  },
+  "max_rounds": 5,
+  "timeout_seconds": 900,
+  "independent_review_required": true,
+  "max_review_bytes": 1048576,
+  "max_context_bytes": 2097152,
+  "checks": [["make", "verify"]],
+  "ci": [["make", "lint"]],
+  "profiles": {
+    "developer": {"provider": "openai"},
+    "reviewer": {"provider": "openai"},
+    "second_reviewer": {
+      "provider": "deepseek",
+      "model": "deepseek-flash",
+      "token_file": "/absolute/path/to/owner-only-deepseek-token"
+    }
+  }
+}

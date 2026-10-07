@@ -5,12 +5,20 @@ import hashlib
 import os
 import re
 import sqlite3
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .domain import InvalidTransition, MissionSpec, Observation, State, TERMINAL, ALLOWED
 from .policy import Decision, SENSITIVE, decide
+
+# One initial review plus two fresh transport retries is the complete bounded
+# review budget. The backoff is persisted with the mission so a restart cannot
+# turn a transport outage into an unbounded request loop.
+MAX_REVIEW_ATTEMPTS_PER_HEAD = 3
+MAX_REVIEW_RETRIES_PER_HEAD = MAX_REVIEW_ATTEMPTS_PER_HEAD - 1
+REVIEW_RETRY_BACKOFF_SECONDS = (30.0, 90.0)
 
 
 def now() -> str:
@@ -21,7 +29,7 @@ class Journal:
     """SQLite is a journal/cache: Git, GitHub and project gates remain canonical truth."""
 
     def __init__(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(
@@ -29,15 +37,23 @@ class Journal:
             PRAGMA foreign_keys=ON;
             CREATE TABLE IF NOT EXISTS missions (
               mission_id TEXT PRIMARY KEY, spec_json TEXT NOT NULL, repo TEXT NOT NULL,
-              base_sha TEXT, branch TEXT, worktree TEXT, current_head TEXT, codex_thread_id TEXT,
+              base_sha TEXT, branch TEXT, worktree TEXT, origin_repo TEXT,
+              current_head TEXT, codex_thread_id TEXT,
               codex_turn_id TEXT, codex_turn_state TEXT, codex_turn_pid INTEGER,
               codex_turn_start_ticks TEXT, codex_turn_source_state TEXT,
               codex_turn_source_head TEXT,
               current_state TEXT NOT NULL, pending_gate TEXT, completed_gates_json TEXT NOT NULL DEFAULT '{}',
               ci_state TEXT, approval_state TEXT NOT NULL DEFAULT 'NONE', terminal_state TEXT,
               merge_claim_head TEXT,
+              merge_claim_pr_number INTEGER,
+              merge_claim_pr_repo TEXT,
+              merge_claim_pr_base_sha TEXT,
+              merge_invocation_started INTEGER NOT NULL DEFAULT 0,
               merge_claim_pid INTEGER,
               merge_claim_start_ticks TEXT,
+              pr_number INTEGER, pr_repo TEXT, pr_base_sha TEXT,
+              merge_sha TEXT, main_sha TEXT, tree_sha TEXT,
+              review_retry_after REAL,
               created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS events (
               seq INTEGER PRIMARY KEY AUTOINCREMENT, mission_id TEXT NOT NULL, kind TEXT NOT NULL,
@@ -54,7 +70,9 @@ class Journal:
               created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS approvals (
               id INTEGER PRIMARY KEY AUTOINCREMENT, mission_id TEXT NOT NULL, action TEXT NOT NULL,
-              decision TEXT NOT NULL, reason TEXT, head_sha TEXT, spec_sha256 TEXT, created_at TEXT NOT NULL);
+              decision TEXT NOT NULL, reason TEXT, head_sha TEXT, pr_number INTEGER, pr_repo TEXT,
+              pr_base_sha TEXT,
+              spec_sha256 TEXT, created_at TEXT NOT NULL);
             CREATE UNIQUE INDEX IF NOT EXISTS one_active_job_per_gate
               ON jobs(mission_id,name) WHERE state IN ('STARTING','RUNNING');
             """
@@ -70,31 +88,54 @@ class Journal:
             self.db.execute("ALTER TABLE approvals ADD COLUMN head_sha TEXT")
         if "spec_sha256" not in approval_columns:
             self.db.execute("ALTER TABLE approvals ADD COLUMN spec_sha256 TEXT")
+        if "pr_number" not in approval_columns:
+            self.db.execute("ALTER TABLE approvals ADD COLUMN pr_number INTEGER")
+        if "pr_repo" not in approval_columns:
+            self.db.execute("ALTER TABLE approvals ADD COLUMN pr_repo TEXT")
         mission_columns = {row[1] for row in self.db.execute("PRAGMA table_info(missions)")}
         for name, definition in (("codex_turn_id", "TEXT"), ("codex_turn_state", "TEXT"),
                                  ("codex_turn_pid", "INTEGER"), ("codex_turn_start_ticks", "TEXT"),
                                  ("codex_turn_source_state", "TEXT"),
-                                 ("codex_turn_source_head", "TEXT")):
+                                 ("codex_turn_source_head", "TEXT"),
+                                 ("review_retry_after", "REAL")):
             if name not in mission_columns:
                 self.db.execute(f"ALTER TABLE missions ADD COLUMN {name} {definition}")
         mission_columns = {row[1] for row in self.db.execute("PRAGMA table_info(missions)")}
         if "merge_claim_head" not in mission_columns:
             self.db.execute("ALTER TABLE missions ADD COLUMN merge_claim_head TEXT")
-        for name, definition in (("merge_claim_pid", "INTEGER"), ("merge_claim_start_ticks", "TEXT")):
+        for name, definition in (("merge_claim_pr_number", "INTEGER"), ("merge_claim_pr_repo", "TEXT"),
+                                 ("merge_claim_pr_base_sha", "TEXT"),
+                                 ("merge_invocation_started", "INTEGER NOT NULL DEFAULT 0"),
+                                 ("merge_claim_pid", "INTEGER"), ("merge_claim_start_ticks", "TEXT")):
             if name not in mission_columns:
                 self.db.execute(f"ALTER TABLE missions ADD COLUMN {name} {definition}")
+        mission_columns = {row[1] for row in self.db.execute("PRAGMA table_info(missions)")}
+        for name, definition in (("pr_number", "INTEGER"), ("pr_repo", "TEXT"),
+                                 ("pr_base_sha", "TEXT"), ("merge_sha", "TEXT"),
+                                 ("main_sha", "TEXT"), ("tree_sha", "TEXT"),
+                                 ("origin_repo", "TEXT")):
+            if name not in mission_columns:
+                self.db.execute(f"ALTER TABLE missions ADD COLUMN {name} {definition}")
+        approval_columns = {row[1] for row in self.db.execute("PRAGMA table_info(approvals)")}
+        if "pr_base_sha" not in approval_columns:
+            self.db.execute("ALTER TABLE approvals ADD COLUMN pr_base_sha TEXT")
         self.db.commit()
 
     def create(self, spec: MissionSpec, *, worktree: str | None = None,
-               base_sha: str | None = None, branch: str | None = None) -> None:
+               base_sha: str | None = None, branch: str | None = None,
+               origin_repo: str | None = None) -> None:
+        if spec.adapter == "footballprediction" and (
+                not isinstance(origin_repo, str) or
+                re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", origin_repo) is None):
+            raise ValueError("production mission requires a pinned GitHub repository identity")
         stamp = now()
         try:
             self.db.execute("BEGIN IMMEDIATE")
             self.db.execute(
-                "INSERT INTO missions(mission_id,spec_json,repo,base_sha,branch,worktree,current_state,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO missions(mission_id,spec_json,repo,base_sha,branch,worktree,origin_repo,current_state,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (spec.mission_id, json.dumps(spec.__dict__), spec.repository, base_sha, branch,
-                 worktree, State.CREATED, stamp, stamp),
+                 worktree, origin_repo, State.CREATED, stamp, stamp),
             )
             self.event(spec.mission_id, "mission_created", {"schema_version": spec.schema_version})
             self.db.commit()
@@ -183,6 +224,63 @@ class Journal:
             self.db.rollback()
             raise
 
+    def complete_merge(self, mission_id: str, reviewed_head: str, *,
+                       pr_number: int, pr_repo: str, pr_base_sha: str,
+                       merge_sha: str | None,
+                       reason: str) -> None:
+        """Atomically publish merge evidence and leave MERGE.
+
+        Keeping the claim until this transaction prevents a crash between
+        recording the external result and advancing the state from making a
+        second merge invocation appear safe.
+        """
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT current_state,current_head,merge_claim_head,merge_claim_pr_number,"
+                "merge_claim_pr_repo,merge_claim_pr_base_sha,pr_base_sha FROM missions WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(mission_id)
+            if (not isinstance(pr_base_sha, str)
+                    or re.fullmatch(r"[0-9a-fA-F]{40}", pr_base_sha) is None):
+                raise InvalidTransition("merge completion requires an exact PR base SHA")
+            if (State(row["current_state"]) != State.MERGE
+                    or row["current_head"] != reviewed_head
+                    or row["merge_claim_head"] != reviewed_head
+                    or row["merge_claim_pr_number"] != pr_number
+                    or row["merge_claim_pr_repo"] != pr_repo
+                    or row["merge_claim_pr_base_sha"] != pr_base_sha.lower()
+                    or row["pr_base_sha"] != pr_base_sha.lower()):
+                raise InvalidTransition("merge completion lost its exact claim or PR identity")
+            changed = self.db.execute(
+                "UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,review_retry_after=NULL,"
+                "pr_number=?,pr_repo=?,merge_sha=?,merge_claim_head=NULL,"
+                "merge_claim_pr_number=NULL,merge_claim_pr_repo=NULL,merge_claim_pr_base_sha=NULL,"
+                "merge_invocation_started=0,"
+                "merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? "
+                "WHERE mission_id=? AND current_state=? AND current_head=? AND merge_claim_head=? "
+                "AND merge_claim_pr_number=? AND merge_claim_pr_repo=? AND merge_claim_pr_base_sha=?",
+                (State.POST_MERGE, pr_number, pr_repo, merge_sha, now(), mission_id,
+                 State.MERGE, reviewed_head, reviewed_head, pr_number, pr_repo, pr_base_sha.lower()),
+            ).rowcount
+            if changed != 1:
+                raise InvalidTransition("merge completion lost its exact state snapshot")
+            self.event(mission_id, "merge_completed", {
+                "reviewed_head": reviewed_head, "pr_number": pr_number,
+                "pr_repo": pr_repo, "pr_base_sha": pr_base_sha,
+                "merge_sha": merge_sha,
+            })
+            self.event(mission_id, "state_transition", {
+                "from": State.MERGE, "to": State.POST_MERGE,
+                "head": reviewed_head, "reason": reason,
+            })
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+
     def update(self, mission_id: str, **fields: Any) -> None:
         if not fields:
             return
@@ -227,15 +325,255 @@ class Journal:
             self.db.rollback()
             raise
 
+    def retire_terminal_gate_job(self, mission_id: str, job_id: str) -> bool:
+        """Consume a replayable terminal gate row after its result is reconciled."""
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            changed = self.db.execute(
+                "UPDATE jobs SET state='CONSUMED' WHERE job_id=? AND mission_id=? "
+                "AND state IN ('EXITED','LOST') AND name NOT LIKE 'review:%'",
+                (job_id, mission_id),
+            ).rowcount
+            self.db.commit()
+            return changed == 1
+        except Exception:
+            self.db.rollback()
+            raise
+
     def gate_passed_at_head(self, mission_id: str, gate: str, head: str) -> bool:
         gates = json.loads(self.mission(mission_id)["completed_gates_json"])
         return isinstance(gates, dict) and gates.get(gate) == head
+
+    def bind_pr_identity(self, mission_id: str, head: str, pr_number: int,
+                         pr_repo: str, pr_base_sha: str) -> bool:
+        """Persist CI's PR identity only for the current exact CI snapshot."""
+        if (not isinstance(pr_number, int) or pr_number <= 0 or not isinstance(pr_repo, str)
+                or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", pr_repo) is None
+                or not isinstance(pr_base_sha, str)
+                or re.fullmatch(r"[0-9a-fA-F]{40}", pr_base_sha) is None):
+            return False
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT current_state,current_head,pr_number,pr_repo,pr_base_sha,merge_claim_head,origin_repo "
+                "FROM missions WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()
+            if (row is None or State(row["current_state"]) not in {State.CI, State.MERGE}
+                    or row["current_head"] != head
+                    or row["pr_number"] not in {None, pr_number}
+                    or (row["origin_repo"] is not None and row["origin_repo"] != pr_repo)
+                    or row["pr_repo"] not in {None, pr_repo}
+                    or row["pr_base_sha"] not in {None, pr_base_sha.lower()}
+                    or (State(row["current_state"]) == State.MERGE and row["merge_claim_head"] is not None)):
+                self.db.commit()
+                return False
+            changed = self.db.execute(
+                "UPDATE missions SET pr_number=?,pr_repo=?,pr_base_sha=?,updated_at=? WHERE mission_id=? "
+                "AND current_state=? AND current_head=? AND (pr_number IS NULL OR pr_number=?) "
+                "AND (pr_repo IS NULL OR pr_repo=?) AND (pr_base_sha IS NULL OR pr_base_sha=?) "
+                "AND merge_claim_head IS NULL",
+                (pr_number, pr_repo, pr_base_sha.lower(), now(), mission_id,
+                 State(row["current_state"]), head, pr_number, pr_repo, pr_base_sha.lower()),
+            ).rowcount
+            if changed == 1:
+                self.event(mission_id, "pr_identity_bound", {
+                    "head": head, "pr": pr_number, "repo": pr_repo,
+                    "base_sha": pr_base_sha.lower(),
+                })
+            self.db.commit()
+            return changed == 1
+        except Exception:
+            self.db.rollback()
+            raise
 
     def record_receipt(self, mission_id: str, reviewer: str, head: str, result: str, artifact: str | None = None) -> None:
         self.db.execute("INSERT INTO receipts(mission_id,reviewer,head_sha,result,artifact_path,created_at) VALUES(?,?,?,?,?,?)",
                         (mission_id, reviewer, head, result, artifact, now()))
         self.event(mission_id, "review_result", {"reviewer": reviewer, "head": head, "result": result})
         self.db.commit()
+
+    def complete_review_job(self, mission_id: str, job_id: str, reviewer: str,
+                            head: str, result: str, artifact: str | None,
+                            evidence: str, *, retry: bool = False) -> bool:
+        """Consume one exited review job and publish its result atomically.
+
+        Process polling and review receipt publication used to be separate
+        commits.  A second controller could observe the exited job in that
+        window and launch a duplicate reviewer.  This CAS consumes the exact
+        terminal job together with the receipt, pending-gate cleanup and state
+        decision.  A crashed consumer leaves the job terminal and therefore
+        safely replayable; the first successful CAS wins.
+        """
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            mission = self.db.execute(
+                "SELECT current_state,current_head,pending_gate FROM missions WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()
+            job = self.db.execute(
+                "SELECT name,launch_head,state FROM jobs WHERE job_id=? AND mission_id=?",
+                (job_id, mission_id),
+            ).fetchone()
+            if (mission is None or job is None
+                    or State(mission["current_state"]) != State.REVIEW
+                    or mission["current_head"] != head
+                    or mission["pending_gate"] != f"review:{reviewer}"
+                    or job["name"] != f"review:{reviewer}"
+                    or job["launch_head"] != head
+                    or job["state"] not in {"EXITED", "LOST"}):
+                self.db.commit()
+                return False
+
+            retry_exhausted = False
+            retry_after = None
+            retries_used = 0
+            if retry:
+                retry_rows = self.db.execute(
+                    "SELECT payload_json FROM events WHERE mission_id=? AND kind='review_retry_required'",
+                    (mission_id,),
+                ).fetchall()
+                retries_used = 0
+                for retry_row in retry_rows:
+                    try:
+                        retry_payload = json.loads(retry_row["payload_json"])
+                    except (TypeError, json.JSONDecodeError):
+                        retries_used = MAX_REVIEW_RETRIES_PER_HEAD
+                        break
+                    if not isinstance(retry_payload, dict):
+                        retries_used = MAX_REVIEW_RETRIES_PER_HEAD
+                        break
+                    if (retry_payload.get("reviewer") == reviewer
+                            and retry_payload.get("head") == head):
+                        retries_used += 1
+                if retries_used >= MAX_REVIEW_RETRIES_PER_HEAD:
+                    retry = False
+                    retry_exhausted = True
+                    result = "BLOCKED_EXTERNAL"
+                    evidence = (
+                        f"{evidence}; automatic review retries exhausted "
+                        f"({MAX_REVIEW_RETRIES_PER_HEAD} retry per reviewer and exact HEAD)"
+                    )
+                else:
+                    retry_number = retries_used + 1
+                    retry_after = time.time() + REVIEW_RETRY_BACKOFF_SECONDS[retry_number - 1]
+                    changed = self.db.execute(
+                        "UPDATE jobs SET state='CONSUMED',ended_at=COALESCE(ended_at,?) "
+                        "WHERE job_id=? AND mission_id=? AND state IN ('EXITED','LOST')",
+                        (now(), job_id, mission_id),
+                    ).rowcount
+                    if changed != 1:
+                        self.db.commit()
+                        return False
+                    self.db.execute(
+                        "UPDATE missions SET pending_gate=NULL,review_retry_after=?,updated_at=? WHERE mission_id=? "
+                        "AND current_state=? AND current_head=? AND pending_gate=?",
+                        (retry_after, now(), mission_id, State.REVIEW, head, f"review:{reviewer}"),
+                    )
+                    self.event(mission_id, "review_retry_required", {
+                        "job_id": job_id, "reviewer": reviewer, "head": head,
+                        "artifact": artifact, "evidence": evidence,
+                        "retry_number": retry_number,
+                        "max_retries": MAX_REVIEW_RETRIES_PER_HEAD,
+                        "backoff_seconds": REVIEW_RETRY_BACKOFF_SECONDS[retry_number - 1],
+                        "retry_after": retry_after,
+                    })
+                    self.db.commit()
+                    return True
+
+            changed = self.db.execute(
+                "UPDATE jobs SET state='CONSUMED',ended_at=COALESCE(ended_at,?) "
+                "WHERE job_id=? AND mission_id=? AND state IN ('EXITED','LOST')",
+                (now(), job_id, mission_id),
+            ).rowcount
+            if changed != 1:
+                self.db.commit()
+                return False
+            if retry_exhausted:
+                self.event(mission_id, "review_retry_limit_exhausted", {
+                    "job_id": job_id, "reviewer": reviewer, "head": head,
+                    "retries_used": retries_used,
+                })
+            self.db.execute(
+                "INSERT INTO receipts(mission_id,reviewer,head_sha,result,artifact_path,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (mission_id, reviewer, head, result, artifact, now()),
+            )
+            target = None
+            if result == "FAIL":
+                target = State.IMPLEMENT
+            elif result == "BLOCKED_EXTERNAL":
+                target = State.BLOCKED_EXTERNAL
+            elif result != "PASS":
+                target = State.BLOCKED_EXTERNAL
+            self.db.execute(
+                "UPDATE missions SET pending_gate=NULL,review_retry_after=NULL,current_state=COALESCE(?,current_state),"
+                "terminal_state=CASE WHEN ? IS NULL THEN terminal_state WHEN ? IN (?,?) THEN ? ELSE NULL END,"
+                "updated_at=? WHERE mission_id=? AND current_state=? AND current_head=? "
+                "AND pending_gate=?",
+                (target, target, target, State.BLOCKED_EXTERNAL, State.FAILED_FATAL,
+                 target, now(), mission_id, State.REVIEW, head, f"review:{reviewer}"),
+            )
+            self.event(mission_id, "review_result", {
+                "reviewer": reviewer, "head": head, "result": result,
+                "job_id": job_id, "artifact": artifact, "evidence": evidence,
+            })
+            if target is not None:
+                self.event(mission_id, "state_transition", {
+                    "from": State.REVIEW, "to": target, "head": head,
+                    "reason": evidence,
+                })
+            self.db.commit()
+            return True
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def retire_unactionable_review_job(self, mission_id: str, job_id: str,
+                                       current_head: str) -> bool:
+        """Retire a terminal review whose HEAD or pending gate is no longer current."""
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            mission = self.db.execute(
+                "SELECT current_state,current_head,pending_gate FROM missions WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()
+            job = self.db.execute(
+                "SELECT name,launch_head,state FROM jobs WHERE job_id=? AND mission_id=?",
+                (job_id, mission_id),
+            ).fetchone()
+            if (mission is None or job is None or mission["current_head"] != current_head
+                    or not str(job["name"]).startswith("review:")
+                    or job["state"] not in {"EXITED", "LOST"}):
+                self.db.commit()
+                return False
+            actionable = (
+                State(mission["current_state"]) == State.REVIEW
+                and mission["pending_gate"] == job["name"]
+                and job["launch_head"] == current_head
+            )
+            if actionable:
+                self.db.commit()
+                return False
+            changed = self.db.execute(
+                "UPDATE jobs SET state='CONSUMED',ended_at=COALESCE(ended_at,?) "
+                "WHERE job_id=? AND mission_id=? AND state IN ('EXITED','LOST')",
+                (now(), job_id, mission_id),
+            ).rowcount
+            if changed == 1:
+                self.event(mission_id, "review_result_stale", {
+                    "job_id": job_id,
+                    "reviewer": str(job["name"]).split(":", 1)[1],
+                    "launch_head": job["launch_head"],
+                    "current_head": current_head,
+                    "mission_state": mission["current_state"],
+                    "pending_gate": mission["pending_gate"],
+                })
+            self.db.commit()
+            return changed == 1
+        except Exception:
+            self.db.rollback()
+            raise
 
     def invalidate_reviews(self, mission_id: str, current_head: str) -> int:
         try:
@@ -296,7 +634,7 @@ class Journal:
             invalidated = self.db.execute("UPDATE receipts SET invalidated=1 WHERE mission_id=? AND head_sha<>? AND invalidated=0",
                                           (mission_id, head)).rowcount
             if source == State.PASS:
-                changed = self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',merge_claim_head=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=? AND current_state=? AND current_head=?",
+                changed = self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,review_retry_after=NULL,ci_state=NULL,approval_state='NONE',pr_number=NULL,pr_repo=NULL,pr_base_sha=NULL,merge_sha=NULL,main_sha=NULL,tree_sha=NULL,merge_claim_head=NULL,merge_claim_pr_number=NULL,merge_claim_pr_repo=NULL,merge_claim_pr_base_sha=NULL,merge_invocation_started=0,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=? AND current_state=? AND current_head=?",
                                           (State.TEST, now(), mission_id, source, head)).rowcount
                 if changed != 1:
                     raise InvalidTransition("PASS reopen lost its reconciled source snapshot")
@@ -307,7 +645,7 @@ class Journal:
                 # claim. Preserve it until canonical merge status and the
                 # recorded owner identity prove that retrying is safe.
                 changed = self.db.execute(
-                    "UPDATE missions SET terminal_state=NULL,pending_gate=NULL,ci_state=NULL,"
+                    "UPDATE missions SET terminal_state=NULL,pending_gate=NULL,review_retry_after=NULL,ci_state=NULL,"
                     "approval_state='NONE',updated_at=? WHERE mission_id=? "
                     "AND current_state=? AND current_head=? AND merge_claim_head=?",
                     (now(), mission_id, source, head, row["merge_claim_head"]),
@@ -318,7 +656,7 @@ class Journal:
                     "claim_head": row["merge_claim_head"], "current_head": head,
                 })
             elif source in {State.REVIEW, State.CI, State.MERGE, State.WAITING_APPROVAL, State.POST_MERGE, State.DELIVER}:
-                changed = self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,ci_state=NULL,approval_state='NONE',merge_claim_head=NULL,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=? AND current_state=? AND current_head=?",
+                changed = self.db.execute("UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,review_retry_after=NULL,ci_state=NULL,approval_state='NONE',pr_number=NULL,pr_repo=NULL,pr_base_sha=NULL,merge_sha=NULL,main_sha=NULL,tree_sha=NULL,merge_claim_head=NULL,merge_claim_pr_number=NULL,merge_claim_pr_repo=NULL,merge_claim_pr_base_sha=NULL,merge_invocation_started=0,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? WHERE mission_id=? AND current_state=? AND current_head=?",
                                           (State.TEST, now(), mission_id, source, head)).rowcount
                 if changed != 1:
                     raise InvalidTransition("state rewind lost its reconciled source snapshot")
@@ -342,6 +680,16 @@ class Journal:
         ).fetchall()
         return {row[0] for row in rows}
 
+    def latest_review_artifacts(self, mission_id: str, head: str) -> dict[str, str]:
+        rows = self.db.execute(
+            "SELECT reviewer,artifact_path FROM receipts WHERE mission_id=? AND head_sha=? "
+            "AND result='PASS' AND invalidated=0 AND artifact_path IS NOT NULL "
+            "AND id=(SELECT MAX(latest.id) FROM receipts AS latest WHERE latest.mission_id=receipts.mission_id "
+            "AND latest.head_sha=receipts.head_sha AND latest.reviewer=receipts.reviewer)",
+            (mission_id, head),
+        ).fetchall()
+        return {str(row["reviewer"]): str(row["artifact_path"]) for row in rows}
+
     def approve(self, mission_id: str, action: str, reason: str = "", observed_head: str | None = None) -> None:
         if observed_head is None:
             raise RuntimeError("approval requires an explicitly observed canonical HEAD")
@@ -362,13 +710,17 @@ class Journal:
                 raise RuntimeError("observed canonical HEAD differs from journal HEAD")
             if (State(mission["current_state"]) != State.WAITING_APPROVAL or
                     mission["approval_state"] != "PENDING" or
-                    mission["pending_gate"] != f"owner-{action}"):
+                    mission["pending_gate"] != f"owner-{action}" or
+                    (action == "merge" and (mission["pr_number"] is None or mission["pr_repo"] is None
+                                             or not isinstance(mission["pr_base_sha"], str)
+                                             or re.fullmatch(r"[0-9a-fA-F]{40}", mission["pr_base_sha"]) is None))):
                 raise RuntimeError(f"mission is not waiting for approval of action: {action}")
             spec_digest = self._spec_digest(mission_id)
             self.db.execute(
-                "INSERT INTO approvals(mission_id,action,decision,reason,head_sha,spec_sha256,created_at) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (mission_id, action, "APPROVED", reason, head, spec_digest, now()),
+                "INSERT INTO approvals(mission_id,action,decision,reason,head_sha,pr_number,pr_repo,pr_base_sha,spec_sha256,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (mission_id, action, "APPROVED", reason, head, mission["pr_number"],
+                 mission["pr_repo"], mission["pr_base_sha"], spec_digest, now()),
             )
             changed = self.db.execute(
                 "UPDATE missions SET approval_state='APPROVED',updated_at=? "
@@ -394,10 +746,17 @@ class Journal:
                 decide(action, spec.merge_policy) != Decision.OWNER_APPROVAL_REQUIRED or
                 mission["current_head"] != head):
             return False
+        if (action == "merge" and (not isinstance(mission["pr_base_sha"], str)
+                                   or re.fullmatch(r"[0-9a-fA-F]{40}", mission["pr_base_sha"]) is None)):
+            return False
         row = self.db.execute(
-            "SELECT decision,spec_sha256 FROM approvals WHERE mission_id=? AND action=? AND head_sha=? "
+            "SELECT decision,spec_sha256,pr_number,pr_repo,pr_base_sha FROM approvals WHERE mission_id=? AND action=? AND head_sha=? "
             "ORDER BY id DESC LIMIT 1", (mission_id, action, head)).fetchone()
-        return row is not None and row[0] == "APPROVED" and row[1] == self._spec_digest(mission_id)
+        return (row is not None and row[0] == "APPROVED" and row[1] == self._spec_digest(mission_id)
+                and (action != "merge" or (row[2] == mission["pr_number"]
+                                             and row[3] == mission["pr_repo"]
+                                             and isinstance(row[4], str)
+                                             and row[4].lower() == mission["pr_base_sha"].lower())))
 
     def claim_codex_turn(self, mission_id: str, owner_pid: int | None = None,
                          owner_start_ticks: str | None = None) -> str:
@@ -664,25 +1023,80 @@ class Journal:
             raise RuntimeError("cannot claim merge without an owner start-time identity")
         try:
             self.db.execute("BEGIN IMMEDIATE")
-            row = self.db.execute("SELECT current_state,current_head,merge_claim_head FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
+            row = self.db.execute("SELECT current_state,current_head,merge_claim_head,pr_number,pr_repo,pr_base_sha FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
             if row is None:
                 raise KeyError(mission_id)
-            if State(row["current_state"]) != State.MERGE or row["current_head"] != head or row["merge_claim_head"] is not None:
+            if (State(row["current_state"]) != State.MERGE or row["current_head"] != head
+                    or row["merge_claim_head"] is not None or row["pr_number"] is None or not row["pr_repo"]
+                    or not isinstance(row["pr_base_sha"], str)
+                    or re.fullmatch(r"[0-9a-fA-F]{40}", row["pr_base_sha"]) is None):
                 self.db.commit()
                 return False
             changed = self.db.execute(
-                "UPDATE missions SET merge_claim_head=?,merge_claim_pid=?,"
+                "UPDATE missions SET merge_claim_head=?,merge_claim_pr_number=?,merge_claim_pr_repo=?,merge_claim_pr_base_sha=?,"
+                "merge_invocation_started=0,merge_claim_pid=?,"
                 "merge_claim_start_ticks=?,updated_at=? WHERE mission_id=? "
-                "AND current_state=? AND current_head=? AND merge_claim_head IS NULL",
-                (head, owner_pid, owner_start_ticks, now(), mission_id, State.MERGE, head),
+                "AND current_state=? AND current_head=? AND merge_claim_head IS NULL "
+                "AND pr_number=? AND pr_repo=? AND pr_base_sha=?",
+                (head, row["pr_number"], row["pr_repo"], row["pr_base_sha"].lower(),
+                 owner_pid, owner_start_ticks, now(), mission_id, State.MERGE, head,
+                 row["pr_number"], row["pr_repo"], row["pr_base_sha"].lower()),
             ).rowcount
             if changed != 1:
                 self.db.commit()
                 return False
-            self.event(mission_id, "merge_claimed", {"head": head, "owner_pid": owner_pid,
+            self.event(mission_id, "merge_claimed", {"head": head, "pr": row["pr_number"],
+                                                      "repo": row["pr_repo"],
+                                                      "pr_base_sha": row["pr_base_sha"].lower(),
+                                                      "owner_pid": owner_pid,
                                                       "owner_start_ticks": owner_start_ticks})
             self.db.commit()
             return True
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def mark_merge_invocation_started(self, mission_id: str, claim_head: str,
+                                      owner_pid: int, owner_start_ticks: str) -> bool:
+        """Durably mark the point after which an external merge may have started."""
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT current_state,current_head,merge_claim_head,merge_claim_pid,"
+                "merge_claim_start_ticks,merge_claim_pr_number,merge_claim_pr_repo,"
+                "merge_claim_pr_base_sha,pr_base_sha,"
+                "merge_invocation_started FROM missions WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()
+            if (row is None or State(row["current_state"]) != State.MERGE
+                    or row["current_head"] != claim_head or row["merge_claim_head"] != claim_head
+                    or row["merge_claim_pid"] != owner_pid
+                    or row["merge_claim_start_ticks"] != owner_start_ticks
+                    or not isinstance(row["merge_claim_pr_base_sha"], str)
+                    or re.fullmatch(r"[0-9a-fA-F]{40}", row["merge_claim_pr_base_sha"]) is None
+                    or row["merge_claim_pr_base_sha"] != row["pr_base_sha"]):
+                self.db.commit()
+                return False
+            status, ticks = self._proc_identity(owner_pid)
+            if status != "PRESENT" or ticks != owner_start_ticks:
+                self.db.commit()
+                return False
+            changed = self.db.execute(
+                "UPDATE missions SET merge_invocation_started=1,updated_at=? WHERE mission_id=? "
+                "AND current_state=? AND current_head=? AND merge_claim_head=? "
+                "AND merge_claim_pid=? AND merge_claim_start_ticks=? AND merge_invocation_started=0",
+                (now(), mission_id, State.MERGE, claim_head, claim_head, owner_pid, owner_start_ticks),
+            ).rowcount
+            if changed == 1:
+                self.event(mission_id, "merge_invocation_started", {
+                    "head": claim_head, "pr": row["merge_claim_pr_number"],
+                    "repo": row["merge_claim_pr_repo"],
+                    "pr_base_sha": row["merge_claim_pr_base_sha"],
+                    "owner_pid": owner_pid,
+                    "owner_start_ticks": owner_start_ticks,
+                })
+            self.db.commit()
+            return changed == 1
         except Exception:
             self.db.rollback()
             raise
@@ -701,7 +1115,9 @@ class Journal:
         try:
             self.db.execute("BEGIN IMMEDIATE")
             row = self.db.execute(
-                "SELECT current_state,current_head,merge_claim_head,merge_claim_pid,merge_claim_start_ticks "
+                "SELECT current_state,current_head,merge_claim_head,merge_claim_pid,merge_claim_start_ticks,"
+                "merge_claim_pr_number,merge_claim_pr_repo,merge_claim_pr_base_sha,pr_base_sha,"
+                "merge_invocation_started "
                 "FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
             if row is None:
                 raise KeyError(mission_id)
@@ -709,6 +1125,16 @@ class Journal:
                     row["merge_claim_head"] != claim_head):
                 self.db.commit()
                 return "NO_CLAIM"
+            claim_pr = row["merge_claim_pr_number"]
+            claim_repo = row["merge_claim_pr_repo"]
+            if (not isinstance(claim_pr, int) or claim_pr <= 0 or
+                    not isinstance(claim_repo, str) or
+                    re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", claim_repo) is None or
+                    not isinstance(row["merge_claim_pr_base_sha"], str) or
+                    re.fullmatch(r"[0-9a-fA-F]{40}", row["merge_claim_pr_base_sha"]) is None or
+                    row["merge_claim_pr_base_sha"] != row["pr_base_sha"]):
+                self.db.commit()
+                return "UNKNOWN"
             pid, start_ticks = row["merge_claim_pid"], row["merge_claim_start_ticks"]
             if not isinstance(pid, int) or not start_ticks:
                 self.db.commit()
@@ -755,7 +1181,8 @@ class Journal:
             self.db.execute("BEGIN IMMEDIATE")
             row = self.db.execute(
                 "SELECT current_state,current_head,merge_claim_head,merge_claim_pid,"
-                "merge_claim_start_ticks FROM missions WHERE mission_id=?",
+                "merge_claim_start_ticks,merge_claim_pr_base_sha,pr_base_sha,"
+                "merge_invocation_started FROM missions WHERE mission_id=?",
                 (mission_id,),
             ).fetchone()
             if row is None:
@@ -763,9 +1190,15 @@ class Journal:
             if (State(row["current_state"]) != State.MERGE or
                     row["merge_claim_head"] != claim_head or
                     row["merge_claim_pid"] != recovery_pid or
-                    row["merge_claim_start_ticks"] != recovery_start_ticks):
+                    row["merge_claim_start_ticks"] != recovery_start_ticks or
+                    not isinstance(row["merge_claim_pr_base_sha"], str) or
+                    re.fullmatch(r"[0-9a-fA-F]{40}", row["merge_claim_pr_base_sha"]) is None or
+                    row["merge_claim_pr_base_sha"] != row["pr_base_sha"]):
                 self.db.commit()
                 return "NO_CLAIM"
+            if row["merge_invocation_started"]:
+                self.db.commit()
+                return "INVOCATION_STARTED"
             owner_status, observed_ticks = self._proc_identity(recovery_pid)
             if owner_status == "UNKNOWN":
                 self.db.commit()
@@ -776,9 +1209,9 @@ class Journal:
             current_head = row["current_head"]
             if current_head != claim_head:
                 changed = self.db.execute(
-                    "UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,"
-                    "ci_state=NULL,approval_state='NONE',merge_claim_head=NULL,"
-                    "merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? "
+                    "UPDATE missions SET current_state=?,terminal_state=NULL,pending_gate=NULL,review_retry_after=NULL,"
+                    "ci_state=NULL,approval_state='NONE',pr_number=NULL,pr_repo=NULL,pr_base_sha=NULL,merge_sha=NULL,main_sha=NULL,tree_sha=NULL,merge_claim_head=NULL,"
+                    "merge_claim_pr_number=NULL,merge_claim_pr_repo=NULL,merge_claim_pr_base_sha=NULL,merge_invocation_started=0,merge_claim_pid=NULL,merge_claim_start_ticks=NULL,updated_at=? "
                     "WHERE mission_id=? AND current_state=? AND current_head IS ? "
                     "AND merge_claim_head=? AND merge_claim_pid=? "
                     "AND merge_claim_start_ticks=?",
@@ -809,7 +1242,6 @@ class Journal:
         except Exception:
             self.db.rollback()
             raise
-
 
     def status(self, mission_id: str) -> Observation:
         row = self.mission(mission_id)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from .adapters import FootballPredictionAdapter, SimulatedAdapter
@@ -11,6 +12,13 @@ from .isolation import WorktreeManager, run as git_run
 from .journal import Journal
 from .process import ProcessSupervisor
 from .supervisor import Supervisor
+
+
+def validate_builder_qualification(receipt_path: Path | None,
+                                   auth_key_file: Path | None) -> None:
+    """Require a distinct live builder certificate before starting App Server."""
+    from .model_qualification import require_builder_qualification
+    require_builder_qualification(receipt_path, auth_key_file)
 
 
 def load_spec(path: Path) -> MissionSpec:
@@ -39,14 +47,21 @@ def approval_head(journal: Journal, spec: MissionSpec, row) -> str:
 
 
 def build(root: Path, adapter_name: str = "footballprediction", codex=None,
-          forbidden_actions: tuple[str, ...] = (), worktree: str | None = None) -> Supervisor:
+          forbidden_actions: tuple[str, ...] = (), worktree: str | None = None,
+          builder_qualification: Path | None = None,
+          builder_auth_key_file: Path | None = None) -> Supervisor:
     journal = Journal(root / "data" / "harness.sqlite")
     if adapter_name == "simulation":
         adapter, selected_codex = SimulatedAdapter(), (codex or FixtureCodex())
     elif adapter_name == "footballprediction":
+        if codex is None:
+            validate_builder_qualification(builder_qualification, builder_auth_key_file)
         codex_args = {"forbidden_actions": forbidden_actions}
         if worktree is not None:
             codex_args["worktree"] = worktree
+        if codex is None:
+            codex_args["builder_qualification"] = builder_qualification
+            codex_args["builder_auth_key_file"] = builder_auth_key_file
         adapter, selected_codex = FootballPredictionAdapter(), (codex or AppServerCodex(**codex_args))
     else:
         raise ValueError("adapter must be exactly footballprediction or simulation")
@@ -62,14 +77,28 @@ def describe(supervisor: Supervisor, mission_id: str) -> None:
 
 
 def main() -> None:
+    from .factory_cli import COMMANDS, main as factory_main
+    argv = sys.argv[1:]
+    legacy = "--legacy" in argv or "--root" in argv
+    if not legacy and (not argv or argv[0] in COMMANDS or argv[0] in ("-h", "--help")):
+        factory_main(argv or ["--help"])
+        return
     parser = argparse.ArgumentParser(prog="harness")
     parser.add_argument("--root", type=Path, default=Path.cwd())
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run"); run.add_argument("mission", type=Path)
+    run.add_argument("--legacy", action="store_true", help="explicitly opt into deprecated v1 execution")
+    run.add_argument("--builder-qualification", type=Path)
+    run.add_argument("--builder-auth-key-file", type=Path)
     status = sub.add_parser("status"); status.add_argument("mission_id")
     resume = sub.add_parser("resume"); resume.add_argument("mission", type=Path)
+    resume.add_argument("--legacy", action="store_true", help="explicitly opt into deprecated v1 execution")
+    resume.add_argument("--builder-qualification", type=Path)
+    resume.add_argument("--builder-auth-key-file", type=Path)
     approve = sub.add_parser("approve"); approve.add_argument("mission_id"); approve.add_argument("--action", required=True); approve.add_argument("--reason", default="")
     args = parser.parse_args()
+    if args.command in ("run", "resume") and not args.legacy:
+        parser.error("v1 execution is deprecated; new product requests use 'harness submit'. Historical execution requires --legacy")
     if args.command == "status":
         # status is read-only and deliberately does not start Codex.
         journal = Journal(args.root / "data" / "harness.sqlite")
@@ -97,6 +126,9 @@ def main() -> None:
     supplied_spec = load_spec(args.mission)
     journal = Journal(args.root / "data" / "harness.sqlite")
     spec, exists = reconcile_supplied_spec(journal, supplied_spec)
+    if spec.adapter != "simulation" and spec.merge_policy != "owner_approval":
+        raise ValueError("live legacy missions require explicit owner approval; automatic merge is disabled")
+    print("DEPRECATED_PATH=V1_REVIEWER_ORCHESTRATION; new missions use harness submit", file=sys.stderr)
     worktrees = WorktreeManager()
     if exists:
         existing = journal.mission(spec.mission_id)
@@ -107,6 +139,8 @@ def main() -> None:
         )
     supervisor = build(
         args.root, spec.adapter, forbidden_actions=spec.forbidden_actions, worktree=tree.path,
+        builder_qualification=args.builder_qualification,
+        builder_auth_key_file=args.builder_auth_key_file,
     )
     try:
         if not exists:

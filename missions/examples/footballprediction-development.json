@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "mission_id": "replace-with-a-bounded-mission-id",
+  "repository": "/absolute/path/to/FootballPrediction",
+  "objective": "Describe one bounded development task; do not authorize provider or production activity.",
+  "adapter": "footballprediction",
+  "required_gates": ["verify-targeted", "verify-pr", "agent-preflight"],
+  "reviews": ["codex", "deepseek"],
+  "merge_policy": "owner_approval",
+  "post_merge_gates": [],
+  "forbidden_actions": ["live_provider_request", "quota_consumption", "live_authorization", "prepared_candidate_consumption", "production_provider_traffic"],
+  "mission_scope_file": "docs/agentic/missions/replace-with-a-bounded-mission-id.json"
+}

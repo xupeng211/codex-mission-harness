@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import json
+import signal
+import stat
 import subprocess
 import sys
 import uuid
@@ -9,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .journal import Journal, now
+from .sandbox import SAFE_PATH, SandboxUnavailable, preflight_project_gate, project_gate_invocation
 
 
 BOOTSTRAP = """import json, os, sys
@@ -44,6 +47,19 @@ def proc_start_ticks(pid: int) -> str | None:
     return ticks if status == "PRESENT" else None
 
 
+def owned_group_quiescent(pgid: int | None) -> bool:
+    """Only a missing recorded process group proves retry is safe."""
+    if not isinstance(pgid, int) or pgid <= 0:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 @dataclass(frozen=True)
 class JobResult:
     job_id: str
@@ -60,14 +76,84 @@ class ProcessSupervisor:
         self._children: dict[str, subprocess.Popen[bytes]] = {}
         self.launcher_pid = os.getpid()
         self.launcher_start_ticks = proc_start_ticks(self.launcher_pid)
-        log_root.mkdir(parents=True, exist_ok=True)
+        self._secure_log_root()
 
-    def start(self, mission_id: str, name: str, argv: list[str], cwd: str, env: dict[str, str], launch_head: str) -> str:
+    def _secure_log_root(self) -> None:
+        self.log_root = Path(self.log_root).absolute()
+        self._check_log_ancestors()
+        self.log_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._check_log_ancestors()
+        try:
+            info = self.log_root.lstat()
+        except OSError as exc:
+            raise RuntimeError("process log directory is unavailable") from exc
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                or (hasattr(os, "getuid") and info.st_uid != os.getuid())):
+            raise RuntimeError("process log directory must be an owned real directory")
+        try:
+            os.chmod(self.log_root, 0o700)
+            secured = self.log_root.lstat()
+        except OSError as exc:
+            raise RuntimeError("process log directory could not be secured") from exc
+        if stat.S_IMODE(secured.st_mode) & 0o077:
+            raise RuntimeError("process log directory is not private")
+        self.log_root = self.log_root.resolve(strict=True)
+
+    def _check_log_ancestors(self) -> None:
+        """Reject ancestors another user can replace or redirect."""
+        uid = os.getuid()
+        for parent in self.log_root.parents:
+            if not parent.exists() and not parent.is_symlink():
+                continue
+            info = parent.lstat()
+            mode = stat.S_IMODE(info.st_mode)
+            root_sticky = info.st_uid == 0 and bool(mode & stat.S_ISVTX)
+            if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                    or info.st_uid not in (0, uid)
+                    or ((mode & 0o022) and not root_sticky)):
+                raise RuntimeError(f"process log ancestor is unsafe: {parent}")
+
+    @staticmethod
+    def _open_private_log(path: Path):
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            raise RuntimeError("private process logs require no-follow file creation")
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow
+                 | getattr(os, "O_CLOEXEC", 0))
+        fd = os.open(path, flags, 0o600)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode)
+                    or (hasattr(os, "getuid") and info.st_uid != os.getuid())):
+                raise RuntimeError("process log file is not an owned regular file")
+            os.fchmod(fd, 0o600)
+            if stat.S_IMODE(os.fstat(fd).st_mode) & 0o077:
+                raise RuntimeError("process log file is not private")
+            return os.fdopen(fd, "wb")
+        except Exception:
+            os.close(fd)
+            path.unlink(missing_ok=True)
+            raise
+
+    def start(self, mission_id: str, name: str, argv: list[str], cwd: str, env: dict[str, str],
+              launch_head: str, sandbox_profile: str | None = None,
+              inherit_environment: bool = True) -> str:
         if self.launcher_start_ticks is None:
             raise RuntimeError("cannot reserve a gate without launcher process identity")
         job_id = uuid.uuid4().hex
         lease = uuid.uuid4().hex
         out, err = self.log_root / f"{job_id}.out", self.log_root / f"{job_id}.err"
+        child_env = ({**os.environ, **env} if inherit_environment else dict(env))
+        bootstrap_env = None if inherit_environment else {
+            "PATH": SAFE_PATH, "HOME": "/nonexistent", "LANG": "C.UTF-8",
+        }
+        if sandbox_profile is not None:
+            if sandbox_profile != "project-gate":
+                raise ValueError(f"unsupported process sandbox profile: {sandbox_profile}")
+            invocation = project_gate_invocation(argv, cwd, env, self.log_root, job_id)
+            preflight_project_gate(invocation)
+            argv, cwd, child_env = invocation.argv, invocation.cwd, invocation.env
+            bootstrap_env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
         # Reserve before spawning: concurrent supervisors observe the same durable job, never launch twice.
         try:
             self.journal.db.execute("BEGIN IMMEDIATE")
@@ -86,11 +172,18 @@ class ProcessSupervisor:
             self.journal.db.rollback()
             raise
         try:
-            with out.open("wb") as stdout, err.open("wb") as stderr:
+            stdout_log = self._open_private_log(out)
+            try:
+                stderr_log = self._open_private_log(err)
+            except Exception:
+                stdout_log.close()
+                out.unlink(missing_ok=True)
+                raise
+            with stdout_log as stdout, stderr_log as stderr:
                 # The bootstrap cannot run the gate until its PID has been journaled. If
                 # this controller dies before publication its stdin closes and no gate runs.
                 proc = subprocess.Popen([sys.executable, "-c", BOOTSTRAP], stdin=subprocess.PIPE, stdout=stdout, stderr=stderr,
-                                        start_new_session=True)
+                                        start_new_session=True, env=bootstrap_env)
         except Exception as exc:
             try:
                 changed = self.journal.db.execute(
@@ -157,8 +250,7 @@ class ProcessSupervisor:
                 raise
             raise
         assert proc.stdin is not None
-        payload = json.dumps({"argv": argv, "cwd": cwd,
-                              "env": {**os.environ, **env}}).encode()
+        payload = json.dumps({"argv": argv, "cwd": cwd, "env": child_env}).encode()
         try:
             written = proc.stdin.write(payload)
             if written != len(payload):
@@ -175,20 +267,28 @@ class ProcessSupervisor:
             # RUNNING lease so neither this controller nor a restart can wait
             # forever on a bootstrap that will receive no further input.
             try:
-                proc.terminate()
+                if (proc_start_ticks(proc.pid) == child_start_ticks
+                        and os.getpgid(proc.pid) == pgid):
+                    os.killpg(pgid, signal.SIGTERM)
             except OSError:
                 pass
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 try:
-                    proc.kill()
+                    if (proc_start_ticks(proc.pid) == child_start_ticks
+                            and os.getpgid(proc.pid) == pgid):
+                        os.killpg(pgid, signal.SIGKILL)
                     proc.wait(timeout=5)
                 except (OSError, subprocess.TimeoutExpired):
                     pass
             except OSError:
                 pass
             self._children.pop(job_id, None)
+            if not owned_group_quiescent(pgid):
+                # A released wrapper may have left a provider child alive.
+                # Keep the durable RUNNING lease so retry cannot overlap it.
+                raise RuntimeError("released process group is not quiescent") from exc
             try:
                 self.journal.db.execute("BEGIN IMMEDIATE")
                 changed = self.journal.db.execute(
@@ -213,9 +313,18 @@ class ProcessSupervisor:
         return job_id
 
     def poll(self, mission_id: str) -> list[JobResult]:
-        rows = self.journal.db.execute("SELECT * FROM jobs WHERE mission_id=? AND state IN ('STARTING','RUNNING')", (mission_id,)).fetchall()
+        rows = self.journal.db.execute(
+            "SELECT * FROM jobs WHERE mission_id=? AND "
+            "state IN ('STARTING','RUNNING','EXITED','LOST')",
+            (mission_id,),
+        ).fetchall()
         results = []
         for row in rows:
+            # All terminal jobs remain visible until the supervisor has
+            # published or safely retired their exact-head result.
+            if row["state"] in {"EXITED", "LOST"}:
+                results.append(JobResult(row["job_id"], row["state"], row["exit_code"], row["launch_head"]))
+                continue
             if row["state"] == "STARTING":
                 # Only the recorded launcher may publish a PID. A dead launcher means the
                 # bootstrap was never released, so retrying is safe and deterministic.
@@ -248,6 +357,9 @@ class ProcessSupervisor:
                 if code is None:
                     results.append(JobResult(row["job_id"], "RUNNING", None, row["launch_head"]))
                     continue
+                if not owned_group_quiescent(row["pgid"]):
+                    results.append(JobResult(row["job_id"], "RUNNING", None, row["launch_head"]))
+                    continue
                 self._children.pop(row["job_id"], None)
                 state = "EXITED"
                 changed = self.journal.db.execute(
@@ -270,6 +382,9 @@ class ProcessSupervisor:
                 results.append(JobResult(row["job_id"], "RUNNING", None, row["launch_head"]))
                 continue
             if ticks is not None and process_status == "PRESENT" and current == ticks:
+                results.append(JobResult(row["job_id"], "RUNNING", None, row["launch_head"]))
+                continue
+            if not owned_group_quiescent(row["pgid"]):
                 results.append(JobResult(row["job_id"], "RUNNING", None, row["launch_head"]))
                 continue
             # waitpid works for children; /proc absence after a restart is a safe, explicit LOST state.

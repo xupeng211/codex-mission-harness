@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+import inspect
+import json
+import math
+import os
+import re
+import stat
 import subprocess
+import time
+import uuid
 from pathlib import Path
 
-from .adapters import GateResult, SimulatedAdapter
+from .adapters import GateResult, ReviewFailureClassification, SimulatedAdapter
 from .codex import CodexAdapter
 from .domain import MissionSpec, State, TERMINAL
 from .isolation import docker_env
 from .journal import Journal
 from .policy import Decision, decide, permitted
 from .process import ProcessSupervisor
+from .sandbox import SandboxUnavailable
 
 
 class Supervisor:
@@ -20,7 +29,10 @@ class Supervisor:
     def create(self, spec: MissionSpec, worktree: str, base_sha: str, branch: str) -> None:
         # Mission identity and its isolation metadata are one journal record;
         # a restart can never observe a half-created mission.
-        self.journal.create(spec, worktree=worktree, base_sha=base_sha, branch=branch)
+        origin_repo = (self.adapter._repo_from_origin(spec.repository)
+                       if spec.adapter == "footballprediction" else None)
+        self.journal.create(spec, worktree=worktree, base_sha=base_sha,
+                            branch=branch, origin_repo=origin_repo)
 
     def _merge_owner(self) -> tuple[int, str]:
         """Return this controller's pid/start-time identity for durable claims."""
@@ -29,18 +41,73 @@ class Supervisor:
             raise RuntimeError("cannot execute merge without controller start-time identity")
         return self.process.launcher_pid, start_ticks
 
+    @staticmethod
+    def _review_retryable_failure(result, reviewed: GateResult) -> bool:
+        """Retry only explicitly retryable typed failures from a trusted adapter.
+
+        Reviewer stdout/stderr and receipt contents are untrusted and are never
+        inspected here for retry signals. The adapter may set this field only
+        after classifying structured terminal provider/transport evidence.
+        Findings, malformed receipts, and policy/auth failures remain terminal.
+        """
+        if (reviewed.status != "BLOCKED_EXTERNAL" or reviewed.artifact is not None
+                or result.state not in {"EXITED", "LOST"}):
+            return False
+        return (isinstance(reviewed.failure_classification, ReviewFailureClassification)
+                and reviewed.failure_classification.retryable)
+
+    @staticmethod
+    def _review_attempt_id(argv_json: str, fallback: str) -> str:
+        """Read the run identity that was durably bound into the reviewer argv."""
+        try:
+            argv = json.loads(argv_json)
+            index = argv.index("--run-id")
+            candidate = argv[index + 1]
+        except (TypeError, ValueError, IndexError, json.JSONDecodeError):
+            return fallback
+        return candidate if isinstance(candidate, str) and re.fullmatch(r"[0-9a-f]{32}", candidate) else fallback
+
+    @staticmethod
+    def _invoke_pr_adapter(method, worktree: str, head: str,
+                           pr_number: int | None, pr_repo: str | None,
+                           base_sha: str | None = None,
+                           pr_base_sha: str | None = None):
+        """Support legacy and current signatures without positional-arity guesses."""
+        parameters = inspect.signature(method).parameters
+        positional = [worktree, head]
+        keywords = {}
+        accepts_extra_keywords = any(p.kind == inspect.Parameter.VAR_KEYWORD
+                                     for p in parameters.values())
+        for name, value in (("pr_number", pr_number), ("pr_repo", pr_repo),
+                            ("base_sha", base_sha), ("pr_base_sha", pr_base_sha)):
+            parameter = parameters.get(name)
+            if parameter is not None and parameter.kind == inspect.Parameter.POSITIONAL_ONLY:
+                positional.append(value)
+            elif parameter is not None or accepts_extra_keywords:
+                keywords[name] = value
+        return method(*positional, **keywords)
+
+    @staticmethod
+    def _invoke_gate_argv(method, gate: str, **context):
+        parameters = inspect.signature(method).parameters
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+            return method(gate, **context)
+        accepted = {name: value for name, value in context.items() if name in parameters}
+        return method(gate, **accepted)
+
     def _codex_checkpoint_ready(self, mission_id: str, worktree: str, *,
                                 expected_state: State, expected_head: str | None) -> bool:
         """Require production Codex turns to leave only committed source state."""
         if isinstance(self.adapter, SimulatedAdapter):
             return True
         try:
-            dirty = subprocess.run(
-                ["git", "-C", worktree, "status", "--porcelain=v1",
-                 "--untracked-files=all"],
-                text=True, capture_output=True, check=False,
+            self.adapter._assert_safe_local_git_config(
+                worktree, self.adapter._trusted_subprocess_environment())
+            dirty = self.adapter._call(
+                ["git", "-c", "core.fsmonitor=false", "-C", worktree,
+                 "status", "--porcelain=v1", "--untracked-files=all"], cwd=worktree,
             )
-        except OSError as exc:
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
             self.journal.transition(
                 mission_id, State.BLOCKED_EXTERNAL,
                 f"cannot inspect Codex worktree checkpoint: {exc}",
@@ -87,6 +154,11 @@ class Supervisor:
             if current != snapshot["current_head"]:
                 self.journal.reconcile_head(mission_id, current)
                 snapshot = self.journal.mission(mission_id)
+            if (result.state in {"EXITED", "LOST"}
+                    and self.journal.retire_unactionable_review_job(
+                        mission_id, result.job_id, current,
+                    )):
+                continue
             if result.launch_head != current:
                 if result.state == "EXITED" and result.exit_code != 0:
                     kind = "gate_failure_stale"
@@ -102,14 +174,92 @@ class Supervisor:
                     "current_head": current,
                     "exit_code": result.exit_code,
                 })
+                self.journal.db.commit()
+                self.journal.retire_terminal_gate_job(mission_id, result.job_id)
+                continue
+            job = self.journal.db.execute(
+                "SELECT name,stdout_path,stderr_path,argv_json FROM jobs WHERE job_id=?",
+                (result.job_id,),
+            ).fetchone()
+            if job and str(job["name"]).startswith("review:"):
+                reviewer = str(job["name"]).split(":", 1)[1]
+                spec = self.journal.spec(mission_id)
+                scope = spec.mission_scope_file
+                if result.state in {"EXITED", "LOST"}:
+                    try:
+                        if not scope:
+                            raise ValueError("FootballPrediction review requires mission_scope_file")
+                        if isinstance(self.adapter, SimulatedAdapter):
+                            review_root = Path(snapshot["worktree"]).resolve()
+                            scope_path = review_root / scope
+                        else:
+                            context_factory = getattr(self.adapter, "review_context_worktree", None)
+                            scope_validator = getattr(self.adapter, "review_scope_file", None)
+                            if not callable(context_factory) or not callable(scope_validator):
+                                raise ValueError("canonical immutable review context is unavailable")
+                            review_root = context_factory(snapshot["worktree"], mission_id, current)
+                            scope_path = scope_validator(review_root, current, scope)
+                        evidence_dir = self.adapter.review_evidence_dir(
+                            snapshot["worktree"], mission_id, reviewer, current,
+                        )
+                        reviewed = self.adapter.review_result(
+                            reviewer, worktree=str(review_root), base=snapshot["base_sha"], head=current,
+                            mission_id=mission_id, scope_file=str(scope_path),
+                            stdout_path=job["stdout_path"], evidence_dir=str(evidence_dir),
+                            attempt_id=self._review_attempt_id(job["argv_json"], result.job_id),
+                            terminal_status=result.state, exit_code=result.exit_code,
+                            stderr_path=job["stderr_path"],
+                        )
+                    except Exception as exc:
+                        reviewed = GateResult(
+                            "BLOCKED_EXTERNAL", f"canonical review receipt validation failed: {exc}",
+                        )
+                    if reviewed.status == "BLOCKED_EXTERNAL":
+                        retryable = self._review_retryable_failure(result, reviewed)
+                        # ProcessSupervisor publishes a terminal result only
+                        # after the owned process group is quiescent.  That
+                        # makes a transport retry safe; malformed receipts or
+                        # policy/authentication failures remain terminal.
+                        self.journal.complete_review_job(
+                            mission_id, result.job_id, reviewer, current,
+                            "RETRY" if retryable else "BLOCKED_EXTERNAL",
+                            reviewed.artifact, reviewed.evidence or
+                            "canonical review writer exited without a durable receipt",
+                            retry=retryable,
+                        )
+                        continue
+                    details = reviewed.data if isinstance(reviewed.data, dict) else {}
+                    reason = reviewed.evidence
+                    if reviewed.status == "FAIL":
+                        reason = "canonical review findings: " + json.dumps({
+                            "reviewer": reviewer, "head": current,
+                            "findings": details.get("findings", []),
+                            "evidence": reviewed.evidence,
+                        }, sort_keys=True)
+                    consumed = self.journal.complete_review_job(
+                        mission_id, result.job_id, reviewer, current, reviewed.status,
+                        reviewed.artifact, reason,
+                    )
+                    if consumed and reviewed.status == "FAIL":
+                        # The atomic journal method already moved the mission
+                        # to IMPLEMENT; no second transition can race it.
+                        pass
+                    continue
+            if (result.state in {"EXITED", "LOST"} and
+                    (not job or State(snapshot["current_state"]) != State.TEST
+                     or snapshot["pending_gate"] != job["name"])):
+                self.journal.retire_terminal_gate_job(mission_id, result.job_id)
                 continue
             if result.state == "EXITED" and result.exit_code == 0:
                 pending = snapshot["pending_gate"]
                 if pending:
                     self.journal.complete_gate(mission_id, pending, current)
+                self.journal.retire_terminal_gate_job(mission_id, result.job_id)
             elif result.state == "LOST":
                 # Canonical validation commands are idempotent: resume retries an unobserved outcome.
                 self.journal.event(mission_id, "process_retry_required", {"job_id": result.job_id})
+                self.journal.update(mission_id, pending_gate=None)
+                self.journal.retire_terminal_gate_job(mission_id, result.job_id)
             elif result.state == "EXITED" and result.exit_code != 0:
                 pending = snapshot["pending_gate"]
                 if pending and State(snapshot["current_state"]) == State.TEST:
@@ -125,12 +275,14 @@ class Supervisor:
                         f"owned process {result.state}: {result.exit_code}",
                         snapshot,
                     )
+                self.journal.retire_terminal_gate_job(mission_id, result.job_id)
             else:
                 reconcile_transition(
                     State.FAILED_FATAL,
                     f"owned process {result.state}: {result.exit_code}",
                     snapshot,
                 )
+                self.journal.retire_terminal_gate_job(mission_id, result.job_id)
 
     def _agent_turn(self, mission_id: str, prompt: str, forbidden_actions: tuple[str, ...]) -> bool:
         owner_pid, owner_start_ticks = self._merge_owner()
@@ -231,10 +383,48 @@ class Supervisor:
                 expected_state=state, expected_head=expected_head,
             )
 
+        if (spec.adapter == "footballprediction" and state not in TERMINAL
+                and state in {State.CI, State.MERGE, State.WAITING_APPROVAL, State.POST_MERGE}):
+            try:
+                current_origin = self.adapter._repo_from_origin(row["worktree"])
+            except Exception:
+                current_origin = None
+            if not row["origin_repo"] or current_origin != row["origin_repo"]:
+                advance(State.BLOCKED_EXTERNAL,
+                        "GitHub origin differs from the pinned mission repository")
+                return State.BLOCKED_EXTERNAL
+
         def finish_merge(result: GateResult) -> State:
             """Classify merge outcomes without treating provider failure as policy denial."""
             if result.status == "PASS":
-                advance(State.POST_MERGE, result.evidence)
+                data = result.data if isinstance(result.data, dict) else {}
+                identity = self.journal.mission(mission_id)
+                expected_pr = identity["merge_claim_pr_number"] or identity["pr_number"]
+                expected_repo = identity["merge_claim_pr_repo"] or identity["pr_repo"]
+                expected_pr_base = identity["merge_claim_pr_base_sha"] or identity["pr_base_sha"]
+                if not data.get("pr") or not data.get("merge_sha"):
+                    if not isinstance(self.adapter, SimulatedAdapter):
+                        advance(State.BLOCKED_EXTERNAL, "merge PASS omitted PR or merge SHA")
+                        return State.BLOCKED_EXTERNAL
+                elif (not isinstance(data.get("pr"), int) or isinstance(data.get("pr"), bool)
+                      or data.get("pr") != expected_pr or data.get("repo") != expected_repo
+                      or data.get("pr_base_sha") != expected_pr_base):
+                    advance(State.BLOCKED_EXTERNAL, "merge PASS changed the durable PR/reviewed-base identity")
+                    return State.BLOCKED_EXTERNAL
+                merge_sha = data.get("merge_sha")
+                if merge_sha is not None and (not isinstance(merge_sha, str)
+                        or len(merge_sha) != 40 or any(ch not in "0123456789abcdef" for ch in merge_sha.lower())):
+                    advance(State.BLOCKED_EXTERNAL, "merge PASS omitted a valid full merge SHA")
+                    return State.BLOCKED_EXTERNAL
+                if not expected_pr or not expected_repo:
+                    advance(State.BLOCKED_EXTERNAL, "merge claim has no durable PR identity")
+                    return State.BLOCKED_EXTERNAL
+                self.journal.complete_merge(
+                    mission_id, expected_head, pr_number=expected_pr,
+                    pr_repo=expected_repo, pr_base_sha=expected_pr_base,
+                    merge_sha=merge_sha,
+                    reason=result.evidence,
+                )
             elif result.status == "BLOCKED_POLICY":
                 advance(State.BLOCKED_POLICY, result.evidence)
             else:
@@ -245,14 +435,62 @@ class Supervisor:
             return State(self.journal.mission(mission_id)["current_state"])
 
         def execute_claimed_merge(worktree: str, head: str) -> State:
-            """Execute once after a durable claim; unknown exceptions never permit retry."""
+            """Execute once after a durable claim; unknown outcomes remain reconcilable."""
+            def reconcile_unknown(reason: str) -> State:
+                # Publish the uncertainty before querying canonical GitHub
+                # state.  A controller death during this query leaves an
+                # armed claim that a fresh controller can reconcile, but can
+                # never safely re-invoke the merge.
+                self.journal.update(mission_id, pending_gate="merge-outcome-unknown")
+                try:
+                    status = self._invoke_pr_adapter(
+                        self.adapter.merge_status, worktree, head,
+                        self.journal.mission(mission_id)["merge_claim_pr_number"],
+                        self.journal.mission(mission_id)["merge_claim_pr_repo"],
+                        pr_base_sha=self.journal.mission(mission_id)["merge_claim_pr_base_sha"],
+                    )
+                except Exception as exc:
+                    self.journal.event(mission_id, "merge_reconcile_pending",
+                                       {"head": head, "reason": reason, "error": str(exc)})
+                    self.journal.db.commit()
+                    return State.MERGE
+                if status.status == "PASS":
+                    return finish_merge(status)
+                self.journal.event(mission_id, "merge_reconcile_pending",
+                                   {"head": head, "reason": status.evidence or reason})
+                self.journal.db.commit()
+                return State.MERGE
+
             try:
-                result = self.adapter.merge(worktree, head)
-            except Exception as exc:
-                result = GateResult(
-                    "BLOCKED_EXTERNAL",
-                    f"merge execution outcome is unknown after exception: {exc}",
+                identity = self.journal.mission(mission_id)
+                claimed_pr = identity["merge_claim_pr_number"]
+                claimed_repo = identity["merge_claim_pr_repo"]
+                owner_pid, owner_ticks = self._merge_owner()
+                # Re-check the exact live recovery lease immediately before
+                # the irreversible adapter call. mark_merge_invocation_started
+                # repeats the owner/HEAD check while atomically arming the
+                # one-shot invocation, closing any race after this assertion.
+                retry_safety = self.journal.confirm_merge_retry_safe(
+                    mission_id, head, owner_pid, owner_ticks,
                 )
+                if retry_safety != "RETRY_SAFE":
+                    return State(self.journal.mission(mission_id)["current_state"])
+                if not self.journal.mark_merge_invocation_started(
+                        mission_id, head, owner_pid, owner_ticks):
+                    return State(self.journal.mission(mission_id)["current_state"])
+                result = self._invoke_pr_adapter(
+                    self.adapter.merge, worktree, head, claimed_pr, claimed_repo,
+                    pr_base_sha=identity["merge_claim_pr_base_sha"],
+                )
+            except Exception as exc:
+                self.journal.event(mission_id, "merge_outcome_unknown", {"head": head, "error": str(exc)})
+                self.journal.db.commit()
+                return reconcile_unknown(f"merge invocation failed: {exc}")
+            if result.status == "BLOCKED_EXTERNAL":
+                self.journal.event(mission_id, "merge_outcome_unknown", {"head": head, "error": result.evidence})
+                self.journal.db.commit()
+                return reconcile_unknown(result.evidence or "merge outcome is ambiguous after invocation")
+            self.journal.update(mission_id, pending_gate=None)
             return finish_merge(result)
 
         if state in TERMINAL:
@@ -267,8 +505,16 @@ class Supervisor:
             if not permitted("source_edit", spec.forbidden_actions):
                 advance(State.BLOCKED_POLICY, "mission forbids source_edit")
                 return State.BLOCKED_POLICY
-            if self._agent_turn(mission_id,
-                                f"Continue mission objective: {spec.objective}. Inspect actual gates; do not declare terminal state from prose.",
+            prompt = f"Continue mission objective: {spec.objective}. Inspect actual gates; do not declare terminal state from prose."
+            repair_context = self._async_review_repair_context(mission_id, expected_head)
+            if repair_context:
+                prompt += (
+                    "\n\nA canonical asynchronous review failed for this exact HEAD. "
+                    "Treat the following JSON as reviewer evidence to verify against source, "
+                    "then repair the confirmed findings and preserve the mission safety policy:\n"
+                    + repair_context
+                )
+            if self._agent_turn(mission_id, prompt,
                                 spec.forbidden_actions):
                 self.journal.transition_after_codex_turn(
                     mission_id, State.TEST, "primary turn completed",
@@ -281,11 +527,68 @@ class Supervisor:
                     advance(State.BLOCKED_POLICY, f"mission forbids gate:{gate}")
                     return State.BLOCKED_POLICY
                 if not self.journal.gate_passed_at_head(mission_id, gate, row["current_head"]):
+                    gate_env = {}
+                    prepare = getattr(self.adapter, "prepare_gate", None)
+                    if callable(prepare) and not isinstance(self.adapter, SimulatedAdapter):
+                        try:
+                            prepared = prepare(
+                                gate, worktree=row["worktree"], base=row["base_sha"],
+                                head=row["current_head"], mission_id=mission_id,
+                                scope_file=str((Path(row["worktree"]) / spec.mission_scope_file).resolve())
+                                if spec.mission_scope_file else "",
+                            )
+                        except Exception as exc:
+                            prepared = GateResult("BLOCKED_EXTERNAL", f"canonical gate input preparation failed: {exc}")
+                        if prepared.status == "PENDING":
+                            self.journal.update(mission_id, pending_gate=gate, ci_state="PENDING")
+                            return state
+                        if prepared.status == "BLOCKED_EXTERNAL":
+                            details = prepared.data if isinstance(prepared.data, dict) else {}
+                            if details.get("retryable"):
+                                self.journal.update(mission_id, pending_gate=gate, ci_state="PENDING")
+                                return state
+                            advance(State.BLOCKED_EXTERNAL, prepared.evidence)
+                            return State.BLOCKED_EXTERNAL
+                        if prepared.status != "PASS":
+                            advance(State.BLOCKED_EXTERNAL, prepared.evidence or "gate input preparation failed")
+                            return State.BLOCKED_EXTERNAL
+                        gate_env = (prepared.data or {}).get("env", {}) if isinstance(prepared.data, dict) else {}
                     self.journal.update(mission_id, pending_gate=gate)
-                    self.process.start(mission_id, gate, self.adapter.gate_argv(gate), row["worktree"], docker_env(mission_id), row["current_head"])
+                    env = docker_env(mission_id)
+                    if isinstance(gate_env, dict):
+                        env.update({str(key): str(value) for key, value in gate_env.items()})
+                    try:
+                        self.process.start(
+                            mission_id, gate,
+                            self._invoke_gate_argv(self.adapter.gate_argv, gate,
+                                worktree=row["worktree"], base=row["base_sha"],
+                                head=row["current_head"], mission_id=mission_id,
+                                scope_file=spec.mission_scope_file or "",
+                            ),
+                            row["worktree"], env, row["current_head"],
+                            sandbox_profile=(None if isinstance(self.adapter, SimulatedAdapter)
+                                            else "project-gate"),
+                        )
+                    except SandboxUnavailable as exc:
+                        advance(State.BLOCKED_EXTERNAL, f"candidate gate isolation unavailable: {exc}")
+                        return State.BLOCKED_EXTERNAL
                     return state
             advance(State.REVIEW, "local canonical gates pass")
         elif state == State.REVIEW:
+            retry_after = row["review_retry_after"]
+            if retry_after is not None:
+                try:
+                    retry_after = float(retry_after)
+                except (TypeError, ValueError):
+                    self.journal.update(mission_id, review_retry_after=None)
+                    retry_after = None
+                if retry_after is not None and retry_after > time.time():
+                    # A durable transport backoff survives a controller
+                    # restart and prevents an outage from becoming a hot loop.
+                    return state
+                if retry_after is not None:
+                    self.journal.update(mission_id, review_retry_after=None)
+                    row = self.journal.mission(mission_id)
             head = row["current_head"]
             valid = self.journal.valid_reviews(mission_id, head)
             for reviewer in spec.reviews:
@@ -293,6 +596,60 @@ class Supervisor:
                     if not permitted(f"review:{reviewer}", spec.forbidden_actions):
                         advance(State.BLOCKED_POLICY, f"mission forbids review:{reviewer}")
                         return State.BLOCKED_POLICY
+                    if not isinstance(self.adapter, SimulatedAdapter):
+                        if not spec.mission_scope_file:
+                            advance(State.BLOCKED_EXTERNAL, "FootballPrediction review requires mission_scope_file")
+                            return State.BLOCKED_EXTERNAL
+                        try:
+                            context_factory = getattr(self.adapter, "review_context_worktree", None)
+                            scope_validator = getattr(self.adapter, "review_scope_file", None)
+                            if not callable(context_factory) or not callable(scope_validator):
+                                raise ValueError("canonical immutable review context is unavailable")
+                            review_root = context_factory(row["worktree"], mission_id, head)
+                            scope = scope_validator(review_root, head, spec.mission_scope_file)
+                        except Exception as exc:
+                            advance(State.BLOCKED_EXTERNAL, f"mission scope contract is unavailable at reviewed HEAD: {exc}")
+                            return State.BLOCKED_EXTERNAL
+                        preflight = self.adapter.review_preflight(str(review_root), row["base_sha"], head)
+                        if preflight.status != "PASS":
+                            advance(State.BLOCKED_EXTERNAL, preflight.evidence)
+                            return State.BLOCKED_EXTERNAL
+                        try:
+                            evidence = self.adapter.review_evidence_dir(
+                                row["worktree"], mission_id, reviewer, head,
+                            )
+                            evidence.mkdir(mode=0o700, parents=True, exist_ok=True)
+                            for private_dir in (evidence.parents[2], evidence.parents[1],
+                                                evidence.parents[0], evidence):
+                                if private_dir.is_symlink():
+                                    raise RuntimeError(f"review evidence directory is a symlink: {private_dir}")
+                                private_dir.chmod(0o700)
+                                info = private_dir.lstat()
+                                if ((hasattr(os, "getuid") and info.st_uid != os.getuid())
+                                        or stat.S_IMODE(info.st_mode) & 0o077):
+                                    raise RuntimeError(f"review evidence directory is not private: {private_dir}")
+                            argv = self.adapter.review_argv(
+                                reviewer, worktree=str(review_root), base=row["base_sha"], head=head,
+                                mission_id=mission_id, scope_file=str(scope), evidence_dir=str(evidence),
+                                attempt_id=uuid.uuid4().hex,
+                            )
+                            reviewer_env = self.adapter.review_environment(
+                                reviewer, worktree=str(review_root), base=row["base_sha"],
+                            )
+                            self.journal.update(
+                                mission_id, pending_gate=f"review:{reviewer}",
+                                review_retry_after=None,
+                            )
+                            self.process.start(
+                                mission_id, f"review:{reviewer}", argv,
+                                str(review_root), reviewer_env, head,
+                                inherit_environment=False,
+                            )
+                        except Exception as exc:
+                            advance(State.BLOCKED_EXTERNAL,
+                                    f"canonical reviewer could not start safely: {exc}")
+                            return State.BLOCKED_EXTERNAL
+                        return state
                     result: GateResult = self.adapter.review(reviewer, head)
                     self.journal.record_receipt(mission_id, reviewer, head, result.status)
                     if result.status == "BLOCKED_EXTERNAL":
@@ -319,7 +676,38 @@ class Supervisor:
                     return state
             advance(State.CI, "all exact-head reviews pass")
         elif state == State.CI:
-            result = self.adapter.ci(row["worktree"], row["current_head"])
+            result = self._invoke_pr_adapter(
+                self.adapter.ci, row["worktree"], row["current_head"],
+                row["pr_number"], row["pr_repo"], row["base_sha"], row["pr_base_sha"],
+            )
+            facts = result.data if isinstance(result.data, dict) else {}
+            if result.status == "BLOCKED_EXTERNAL" and facts.get("retryable"):
+                self.journal.update(mission_id, pending_gate="github-ci", ci_state="PENDING")
+                return state
+            if (not isinstance(result.data, dict)
+                    and not isinstance(self.adapter, SimulatedAdapter)
+                    and result.status in {"PASS", "PENDING", "FAIL"}):
+                advance(State.BLOCKED_EXTERNAL, "canonical CI returned malformed PR identity evidence")
+                return State.BLOCKED_EXTERNAL
+            if (not isinstance(self.adapter, SimulatedAdapter)
+                    and result.status != "BLOCKED_EXTERNAL"
+                    and ("pr_number" not in facts or "pr_repo" not in facts)):
+                advance(State.BLOCKED_EXTERNAL, "canonical CI omitted durable PR identity evidence")
+                return State.BLOCKED_EXTERNAL
+            if "pr_number" in facts or "pr_repo" in facts:
+                pr_number, pr_repo = facts.get("pr_number"), facts.get("pr_repo")
+                pr_base_sha = facts.get("pr_base_sha")
+                if (not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0
+                        or not isinstance(pr_repo, str)
+                        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", pr_repo) is None
+                        or not isinstance(pr_base_sha, str)
+                        or re.fullmatch(r"[0-9a-fA-F]{40}", pr_base_sha) is None):
+                    advance(State.BLOCKED_EXTERNAL, "canonical CI returned invalid durable PR identity")
+                    return State.BLOCKED_EXTERNAL
+                if not self.journal.bind_pr_identity(
+                        mission_id, row["current_head"], pr_number, pr_repo, pr_base_sha):
+                    advance(State.BLOCKED_EXTERNAL, "CI PR identity changed or lost its exact source snapshot")
+                    return State.BLOCKED_EXTERNAL
             if result.status == "PASS":
                 self.journal.update(mission_id, pending_gate=None, ci_state=None)
                 advance(State.MERGE, "canonical CI pass")
@@ -335,7 +723,11 @@ class Supervisor:
                         expected_state=state, expected_head=expected_head,
                     )
             elif result.status == "BLOCKED_EXTERNAL":
-                advance(State.BLOCKED_EXTERNAL, result.evidence)
+                details = result.data if isinstance(result.data, dict) else {}
+                if details.get("retryable"):
+                    self.journal.update(mission_id, pending_gate="github-ci", ci_state="PENDING")
+                else:
+                    advance(State.BLOCKED_EXTERNAL, result.evidence)
             else:
                 self.journal.update(mission_id, pending_gate="github-ci", ci_state=result.status)
         elif state == State.MERGE:
@@ -346,91 +738,211 @@ class Supervisor:
             if self.adapter.exact_head(row["worktree"]) != row["current_head"]:
                 self.reconcile(mission_id)
                 return State(self.journal.mission(mission_id)["current_state"])
+            if row["pr_number"] is None:
+                pr = self.adapter.discover_pr(row["worktree"], row["current_head"])
+                if pr.status != "PASS":
+                    if isinstance(pr.data, dict) and pr.data.get("retryable"):
+                        self.journal.update(mission_id, pending_gate="pr-discovery", ci_state="PENDING")
+                        return state
+                    advance(State.BLOCKED_EXTERNAL, pr.evidence)
+                    return State.BLOCKED_EXTERNAL
+                facts = pr.data if isinstance(pr.data, dict) else {}
+                pr_number, pr_repo = facts.get("number"), facts.get("repo")
+                if (not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0
+                        or not isinstance(pr_repo, str)
+                        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", pr_repo) is None):
+                    advance(State.BLOCKED_EXTERNAL,
+                            "PR discovery returned an invalid durable PR identity")
+                    return State.BLOCKED_EXTERNAL
+                pr_base_sha = facts.get("base_sha")
+                if (not isinstance(pr_base_sha, str)
+                        or re.fullmatch(r"[0-9a-fA-F]{40}", pr_base_sha) is None
+                        or not self.journal.bind_pr_identity(
+                            mission_id, row["current_head"], pr_number, pr_repo, pr_base_sha)):
+                    advance(State.BLOCKED_EXTERNAL, "PR discovery omitted or changed exact base SHA")
+                    return State.BLOCKED_EXTERNAL
+                row = self.journal.mission(mission_id)
             if row["merge_claim_head"] is not None:
                 claim_head = row["merge_claim_head"]
                 owner_pid, owner_start_ticks = self._merge_owner()
                 recovery = self.journal.claim_merge_recovery(
                     mission_id, claim_head, owner_pid, owner_start_ticks,
                 )
+                resume_owned_pending_ci = False
+                resume_owned_ambiguous = False
                 if recovery == "ACTIVE":
-                    # Status observed while the original owner is still alive
-                    # can become stale before reclaim and authorize a duplicate
-                    # merge. Never query status until the dead claim is frozen
-                    # under this recovery controller's durable identity.
-                    return State.MERGE
+                    # The same still-running controller may resume its own
+                    # uninvoked claim after pre-merge CI returned PENDING.
+                    # Every other live claim remains strictly non-stealable.
+                    if (row["merge_claim_pid"] == owner_pid
+                            and row["merge_claim_start_ticks"] == owner_start_ticks
+                            and row["merge_invocation_started"] == 0
+                            and row["pending_gate"] == "pre-merge-ci"
+                            and claim_head == row["current_head"]):
+                        resume_owned_pending_ci = True
+                        row = self.journal.mission(mission_id)
+                    elif (row["merge_claim_pid"] == owner_pid
+                          and row["merge_claim_start_ticks"] == owner_start_ticks
+                          and row["merge_invocation_started"] == 1
+                          and row["pending_gate"] == "merge-outcome-unknown"
+                          and claim_head == row["current_head"]):
+                        resume_owned_ambiguous = True
+                    else:
+                        return State.MERGE
                 if recovery == "UNKNOWN":
                     advance(State.BLOCKED_EXTERNAL, "merge claim owner identity is unavailable")
                     return State.BLOCKED_EXTERNAL
-                if recovery != "RECOVERY_CLAIMED":
+                if not (resume_owned_pending_ci or resume_owned_ambiguous) and recovery != "RECOVERY_CLAIMED":
                     return State(self.journal.mission(mission_id)["current_state"])
-                status = self.adapter.merge_status(row["worktree"], claim_head)
-                if status.status == "PASS":
-                    if claim_head != row["current_head"]:
-                        advance(
-                            State.BLOCKED_EXTERNAL,
-                            "merge completed for a stale claimed HEAD after canonical HEAD drift",
-                        )
+                if not resume_owned_pending_ci:
+                    row = self.journal.mission(mission_id)
+                    invocation_uncertain = (bool(row["merge_invocation_started"])
+                                            or row["pending_gate"] == "merge-outcome-unknown")
+                    if invocation_uncertain:
+                        try:
+                            status = self._invoke_pr_adapter(
+                                self.adapter.merge_status, row["worktree"], claim_head,
+                                row["merge_claim_pr_number"], row["merge_claim_pr_repo"],
+                                pr_base_sha=row["merge_claim_pr_base_sha"],
+                            )
+                        except Exception as exc:
+                            self.journal.update(mission_id, pending_gate="merge-outcome-unknown")
+                            return State.MERGE
+                        if status.status == "PASS":
+                            if claim_head != row["current_head"]:
+                                advance(State.BLOCKED_EXTERNAL,
+                                        "merge completed for a stale claimed HEAD after canonical HEAD drift")
+                                return State.BLOCKED_EXTERNAL
+                            return finish_merge(status)
+                        self.journal.update(mission_id, pending_gate="merge-outcome-unknown")
+                        return State.MERGE
+                    retry = self.journal.confirm_merge_retry_safe(
+                        mission_id, claim_head, owner_pid, owner_start_ticks,
+                    )
+                    if retry == "UNKNOWN":
+                        advance(State.BLOCKED_EXTERNAL, "merge recovery identity is unavailable")
                         return State.BLOCKED_EXTERNAL
-                    advance(State.POST_MERGE, "canonical merge already completed")
-                    return State.POST_MERGE
-                if status.status != "NOT_STARTED":
-                    advance(State.BLOCKED_EXTERNAL, status.evidence)
-                    return State.BLOCKED_EXTERNAL
-                retry = self.journal.confirm_merge_retry_safe(
-                    mission_id, claim_head, owner_pid, owner_start_ticks,
-                )
-                if retry == "UNKNOWN":
-                    advance(State.BLOCKED_EXTERNAL, "merge recovery identity is unavailable")
-                    return State.BLOCKED_EXTERNAL
-                if retry == "REWOUND_HEAD_DRIFT":
-                    # Post-owner-death canonical status proved the stale merge
-                    # never started. The recovery lease must atomically rewind
-                    # to TEST before any new merge claim is possible.
-                    reclaimed = self.journal.mission(mission_id)
-                    if (State(reclaimed["current_state"]) != State.TEST or
-                            reclaimed["merge_claim_head"] is not None):
-                        advance(
-                            State.BLOCKED_EXTERNAL,
-                            "merge claim drift reclaim did not durably rewind to TEST",
-                        )
-                        return State.BLOCKED_EXTERNAL
-                    return State(reclaimed["current_state"])
-                if retry != "RETRY_SAFE":
-                    return State(self.journal.mission(mission_id)["current_state"])
-                # The post-death NOT_STARTED observation is now bound to the
-                # one live recovery lease, so no other controller can race a
-                # second external invocation for this exact claim.
-                return execute_claimed_merge(row["worktree"], claim_head)
+                    if retry == "REWOUND_HEAD_DRIFT":
+                        # The durable invocation phase proved the stale merge was
+                        # never invoked. Rewind before any new merge claim.
+                        reclaimed = self.journal.mission(mission_id)
+                        if (State(reclaimed["current_state"]) != State.TEST or
+                                reclaimed["merge_claim_head"] is not None):
+                            advance(
+                                State.BLOCKED_EXTERNAL,
+                                "merge claim drift reclaim did not durably rewind to TEST",
+                            )
+                            return State.BLOCKED_EXTERNAL
+                        return State(reclaimed["current_state"])
+                    if retry != "RETRY_SAFE":
+                        return State(self.journal.mission(mission_id)["current_state"])
+                    self.journal.update(mission_id, pending_gate=None)
+            technical = self._invoke_pr_adapter(
+                self.adapter.ci, row["worktree"], row["current_head"],
+                row["pr_number"], row["pr_repo"], row["base_sha"], row["pr_base_sha"],
+            )
+            if technical.status == "PENDING":
+                self.journal.update(mission_id, pending_gate="pre-merge-ci", ci_state="PENDING")
+                return state
+            if technical.status == "BLOCKED_EXTERNAL" and isinstance(technical.data, dict) and technical.data.get("retryable"):
+                self.journal.update(mission_id, pending_gate="pre-merge-ci", ci_state="PENDING")
+                return state
+            if technical.status != "PASS":
+                advance(State.BLOCKED_EXTERNAL, technical.evidence or "pre-merge canonical CI recheck failed")
+                return State.BLOCKED_EXTERNAL
+
+            # Owner approval is a boundary, not a reporting detail.  Do not
+            # invoke any target-controlled merge-readiness/preflight command
+            # until the durable approval for this exact PR identity and HEAD
+            # exists.  A waiting mission is resumed here after approval and
+            # only then evaluates the canonical target gate.
             decision = decide("merge", spec.merge_policy)
             if decision == Decision.OWNER_APPROVAL_REQUIRED:
                 if not self.journal.approved(mission_id, "merge", row["current_head"]):
+                    if row["merge_claim_head"] is not None:
+                        advance(State.BLOCKED_EXTERNAL,
+                                "recovered unstarted merge claim has no current owner approval")
+                        return State.BLOCKED_EXTERNAL
                     self.journal.update(mission_id, approval_state="PENDING", pending_gate="owner-merge")
                     advance(State.WAITING_APPROVAL, "owner merge approval required")
                     return State.WAITING_APPROVAL
                 self.journal.update(mission_id, approval_state="APPROVED", pending_gate=None)
+            elif decision != Decision.AUTO_CONTINUE:
+                advance(State.BLOCKED_POLICY, "unknown merge policy decision; fail closed")
+                return State.BLOCKED_POLICY
+
+            if not isinstance(self.adapter, SimulatedAdapter):
+                merge_ready = getattr(self.adapter, "merge_ready", None)
+                if not callable(merge_ready) or not spec.mission_scope_file:
+                    advance(State.BLOCKED_EXTERNAL, "target project canonical merge-readiness gate is unavailable")
+                    return State.BLOCKED_EXTERNAL
+                artifacts = self.journal.latest_review_artifacts(mission_id, row["current_head"])
+                try:
+                    context_factory = getattr(self.adapter, "review_context_worktree", None)
+                    scope_validator = getattr(self.adapter, "review_scope_file", None)
+                    if not callable(context_factory) or not callable(scope_validator):
+                        raise ValueError("canonical immutable review context is unavailable")
+                    review_root = context_factory(row["worktree"], mission_id, row["current_head"])
+                    scope_file = scope_validator(review_root, row["current_head"], spec.mission_scope_file)
+                    readiness = merge_ready(
+                        worktree=str(review_root), base=row["base_sha"], head=row["current_head"],
+                        mission_id=mission_id,
+                        scope_file=str(scope_file),
+                        pr_number=row["pr_number"], pr_repo=row["pr_repo"],
+                        pr_base_sha=row["pr_base_sha"],
+                        receipts=artifacts, ci_status="PASS",
+                    )
+                except Exception as exc:
+                    readiness = GateResult("BLOCKED_EXTERNAL", f"canonical merge-readiness invocation failed: {exc}")
+                if readiness.status != "PASS":
+                    advance(State.BLOCKED_EXTERNAL, readiness.evidence or "canonical merge-readiness rejected merge")
+                    return State.BLOCKED_EXTERNAL
+            if row["merge_claim_head"] is None:
                 owner_pid, owner_start_ticks = self._merge_owner()
                 if not self.journal.claim_merge(mission_id, row["current_head"], owner_pid, owner_start_ticks):
                     return State.MERGE
-                execute_claimed_merge(row["worktree"], row["current_head"])
-            else:
-                if decision != Decision.AUTO_CONTINUE:
-                    advance(State.BLOCKED_POLICY, "unknown merge policy decision; fail closed")
-                    return State.BLOCKED_POLICY
-                owner_pid, owner_start_ticks = self._merge_owner()
-                if not self.journal.claim_merge(mission_id, row["current_head"], owner_pid, owner_start_ticks):
-                    return State.MERGE
-                execute_claimed_merge(row["worktree"], row["current_head"])
+            execute_claimed_merge(row["worktree"], row["current_head"])
         elif state == State.WAITING_APPROVAL:
             if self.journal.approved(mission_id, "merge", row["current_head"]):
                 advance(State.MERGE, "persisted owner merge approval")
             else:
                 return state
         elif state == State.POST_MERGE:
-            for gate in spec.post_merge_gates:
-                result = self.adapter.post_merge(gate, row["current_head"])
-                if result.status != "PASS":
-                    advance(State.BLOCKED_EXTERNAL, result.evidence)
+            if not isinstance(self.adapter, SimulatedAdapter) and (not row["merge_sha"] or not row["pr_number"] or not row["pr_repo"]):
+                advance(State.BLOCKED_EXTERNAL, "post-merge requires durable PR and merge SHA")
+                return State.BLOCKED_EXTERNAL
+            if not isinstance(self.adapter, SimulatedAdapter) and row["merge_sha"] and row["pr_number"]:
+                production = self.adapter.post_merge(
+                    row["worktree"], row["merge_sha"], row["pr_number"], row["pr_repo"], row["branch"], row["base_sha"],
+                )
+                if production.status == "PENDING":
+                    self.journal.update(mission_id, pending_gate="production-gate", ci_state="PENDING")
+                    return state
+                if production.status != "PASS":
+                    advance(State.BLOCKED_EXTERNAL, production.evidence)
                     return State.BLOCKED_EXTERNAL
+                facts = production.data if isinstance(production.data, dict) else {}
+                main_sha, tree_sha = facts.get("main_sha"), facts.get("tree_sha")
+                observed_merge_sha = facts.get("ci_head_sha")
+                full_sha = lambda value: (isinstance(value, str)
+                                          and re.fullmatch(r"[0-9a-fA-F]{40}", value) is not None)
+                if (not isinstance(production.data, dict)
+                        or not full_sha(observed_merge_sha)
+                        or observed_merge_sha.lower() != str(row["merge_sha"]).lower()
+                        or not full_sha(main_sha) or not full_sha(tree_sha)):
+                    advance(State.BLOCKED_EXTERNAL,
+                            "Production Gate PASS omitted exact merge-SHA or full main/tree truth")
+                    return State.BLOCKED_EXTERNAL
+                self.journal.update(mission_id, main_sha=main_sha.lower(), tree_sha=tree_sha.lower(),
+                                    pending_gate=None, ci_state=None)
+            # Legacy simulation gates remain a test seam only. Production is
+            # governed by the exact merge-SHA Production Gate above.
+            if isinstance(self.adapter, SimulatedAdapter):
+                for gate in spec.post_merge_gates:
+                    result = self.adapter.post_merge(gate, row["current_head"])
+                    if result.status != "PASS":
+                        advance(State.BLOCKED_EXTERNAL, result.evidence)
+                        return State.BLOCKED_EXTERNAL
             observed = self.adapter.exact_head(row["worktree"])
             if observed != row["current_head"]:
                 self.journal.reconcile_head(mission_id, observed)
@@ -451,15 +963,29 @@ class Supervisor:
             row = self.journal.mission(mission_id)
             active_turn = row["codex_turn_state"] == "RUNNING"
             pending_review = after == State.REVIEW and str(row["pending_gate"] or "").startswith("review:")
+            review_backoff = (after == State.REVIEW and row["review_retry_after"] is not None
+                              and float(row["review_retry_after"]) > time.time())
+            pending_production = after == State.POST_MERGE and row["pending_gate"] == "production-gate"
+            pending_external_gate = (after == State.TEST and row["pending_gate"] in spec.required_gates
+                                     and row["ci_state"] == "PENDING")
             if after in TERMINAL or after in {State.BLOCKED_EXTERNAL, State.BLOCKED_POLICY} or self.journal.status(mission_id).background_jobs or (
                     before.state == after and after in {State.CI, State.MERGE, State.WAITING_APPROVAL}
-                    ) or pending_review or (before.state == after and after in {State.IMPLEMENT, State.REVIEW, State.CI}
+                    ) or pending_review or review_backoff or pending_production or pending_external_gate or (before.state == after and after in {State.IMPLEMENT, State.REVIEW, State.CI}
                                             and active_turn):
                 return after
         raise RuntimeError("supervisor progress limit reached")
 
-    def run_until_terminal(self, mission_id: str, spec: MissionSpec, limit: int = 100) -> State:
+    def run_until_terminal(self, mission_id: str, spec: MissionSpec, limit: int = 100,
+                           poll_interval: float = 5.0) -> State:
         """Keep this controller alive long enough to journal owned child exits."""
+        try:
+            valid_poll_interval = (not isinstance(poll_interval, bool)
+                                   and isinstance(poll_interval, (int, float))
+                                   and math.isfinite(poll_interval) and poll_interval > 0)
+        except (OverflowError, TypeError):
+            valid_poll_interval = False
+        if not valid_poll_interval:
+            raise ValueError("poll_interval must be a finite positive number")
         for _ in range(limit):
             state = self.run_until_wait(mission_id, spec)
             if state in TERMINAL or state in {State.WAITING_APPROVAL, State.BLOCKED_EXTERNAL, State.BLOCKED_POLICY}:
@@ -478,9 +1004,64 @@ class Supervisor:
                 return state
             if state == State.REVIEW and str(self.journal.mission(mission_id)["pending_gate"] or "").startswith("review:"):
                 return state
-            if state in {State.CI, State.MERGE}:
+            row = self.journal.mission(mission_id)
+            if state == State.REVIEW and row["review_retry_after"] is not None:
+                remaining = float(row["review_retry_after"]) - time.time()
+                if remaining > 0:
+                    time.sleep(min(poll_interval, remaining))
+                    continue
+            pending_ci = ((state == State.CI and row["pending_gate"] == "github-ci")
+                          or (state == State.MERGE and row["pending_gate"] == "pre-merge-ci"))
+            pending_production = (state == State.POST_MERGE
+                                  and row["pending_gate"] == "production-gate")
+            pending_pr_discovery = (state == State.MERGE
+                                    and row["pending_gate"] == "pr-discovery")
+            pending_external_gate = (state == State.TEST and row["pending_gate"] in spec.required_gates
+                                     and row["ci_state"] == "PENDING")
+            if pending_ci or pending_production or pending_external_gate or pending_pr_discovery:
+                time.sleep(poll_interval)
+                continue
+            if state in {State.CI, State.MERGE, State.POST_MERGE}:
                 return state
+        row = self.journal.mission(mission_id)
+        if ((State(row["current_state"]) == State.CI and row["pending_gate"] == "github-ci")
+                or (State(row["current_state"]) == State.REVIEW
+                    and row["review_retry_after"] is not None
+                    and float(row["review_retry_after"]) > time.time())
+                or (State(row["current_state"]) == State.MERGE and row["pending_gate"] == "pre-merge-ci")
+                or (State(row["current_state"]) == State.POST_MERGE
+                    and row["pending_gate"] == "production-gate")
+                or (State(row["current_state"]) == State.MERGE
+                    and row["pending_gate"] == "pr-discovery")
+                or (State(row["current_state"]) == State.TEST
+                    and row["pending_gate"] in spec.required_gates
+                    and row["ci_state"] == "PENDING")):
+            return State(row["current_state"])
         raise RuntimeError("supervisor terminal progress limit reached")
 
     def collect_jobs(self, mission_id: str) -> None:
         self.reconcile(mission_id)
+
+    def _async_review_repair_context(self, mission_id: str, head: str | None) -> str:
+        row = self.journal.db.execute(
+            "SELECT payload_json FROM events WHERE mission_id=? AND kind='state_transition' "
+            "ORDER BY seq DESC LIMIT 1",
+            (mission_id,),
+        ).fetchone()
+        if row is None:
+            return ""
+        try:
+            payload = json.loads(row["payload_json"])
+            if (payload.get("from") != State.REVIEW or payload.get("to") != State.IMPLEMENT
+                    or payload.get("head") != head):
+                return ""
+            reason = payload.get("reason", "")
+            marker = "canonical review findings: "
+            if not isinstance(reason, str) or not reason.startswith(marker):
+                return ""
+            details = json.loads(reason[len(marker):])
+            if not isinstance(details, dict) or details.get("head") != head:
+                return ""
+            return json.dumps(details, sort_keys=True, indent=2)
+        except (TypeError, json.JSONDecodeError):
+            return ""
