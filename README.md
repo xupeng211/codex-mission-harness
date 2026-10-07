@@ -139,6 +139,8 @@ Codex 自己的 native rollout budget 限制采样循环，控制器同时检查
 - `CANCELLED`：取消请求已生效，旧账本保持不变。
 - `WAITING_PRODUCT_DECISION`：真正涉及产品方向的歧义，需要你做产品决定；普通技术选择由系统处理。
 
+执行命令只有交付 READY 才返回退出码 0；停止或 UNKNOWN 返回 1。`status` / `delivery` 是只读查询，正常读取返回 0；配置错误返回 2。
+
 遇到停止状态，把 `harness delivery --json` 的报告交给维护者即可；不需要阅读内部架构文档。Provider 登录失效、模型访问权、GitHub 权限或账户限额，需要账户持有人处理。
 
 ## 边界与历史

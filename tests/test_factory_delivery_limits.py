@@ -115,9 +115,14 @@ class DeliveryLimitsTests(unittest.TestCase):
             simulation = False
         state = self.root / 'cli-state'
         with patch('harness.factory.LocalRuntime', Runtime):
-            for command in (['submit', 'Add average', '--mission-id', 'cli-feature'], ['status'], ['delivery'], ['resume'], ['cancel'], ['resume']):
+            for command in (['submit', 'Add average', '--mission-id', 'cli-feature'], ['status'], ['delivery'], ['resume'], ['cancel'], ['status'], ['resume']):
                 with patch('sys.stdout', io.StringIO()) as output, patch('sys.stderr', io.StringIO()):
-                    main(command + ['--state-dir', str(state), '--config', str(config), '--json'])
+                    if command == ['resume'] and (state / 'control/cli-feature.cancel').exists():
+                        with self.assertRaises(SystemExit) as stopped:
+                            main(command + ['--state-dir', str(state), '--config', str(config), '--json'])
+                        self.assertEqual(stopped.exception.code, 1)
+                    else:
+                        main(command + ['--state-dir', str(state), '--config', str(config), '--json'])
                 result = json.loads(output.getvalue())
                 self.assertEqual(result['MISSION'], 'cli-feature')
             self.assertEqual(result['DELIVERY_STATUS'], 'CANCELLED')
