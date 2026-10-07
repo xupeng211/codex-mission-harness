@@ -136,12 +136,27 @@ class FactoryAppServer(AppServerCodex):
             if config_file.is_file():
                 source_config = tomllib.loads(config_file.read_text())
                 validate_openai_route(source_config)
-                for name in source_config.get("mcp_servers", {}):
-                    self.disabled_mcp[name] = {"enabled": False}
+                for name, server_config in source_config.get("mcp_servers", {}).items():
+                    # Codex filters untrusted project transports before CLI
+                    # overrides. An enabled=false-only override then has no
+                    # transport and fails deserialization even while disabled.
+                    # Keep an inert, valid transport of the same kind; never
+                    # copy credentials, args or environment into our override.
+                    if "command" in server_config:
+                        transport = {"command": "/bin/false"}
+                    elif "url" in server_config:
+                        transport = {"url": "http://127.0.0.1:1/disabled-mcp"}
+                    else:
+                        raise ValueError("configured MCP server has no valid transport")
+                    self.disabled_mcp[name] = {"enabled": False, **transport}
                 for name in source_config.get("plugins", {}):
                     disabled_plugins.add(name)
-        for table, names in (("mcp_servers", self.disabled_mcp), ("plugins", disabled_plugins)):
-            overrides.extend(["-c", table + "={" + ",".join(json.dumps(name) + "={enabled=false}" for name in names) + "}"])
+        disabled_entries = []
+        for name, settings in self.disabled_mcp.items():
+            transport_key = "command" if "command" in settings else "url"
+            disabled_entries.append(json.dumps(name) + "={enabled=false," + transport_key + "=" + json.dumps(settings[transport_key]) + "}")
+        overrides.extend(["-c", "mcp_servers={" + ",".join(disabled_entries) + "}"])
+        overrides.extend(["-c", "plugins={" + ",".join(json.dumps(name) + "={enabled=false}" for name in disabled_plugins) + "}"])
         with transcript.with_suffix(".stderr").open("xb") as stderr:
             # GNU coreutils supplies a wall-clock watchdog independent of this
             # controller's lifetime; a crashed client cannot leave an unbounded

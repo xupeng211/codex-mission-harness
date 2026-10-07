@@ -78,6 +78,22 @@ class NativeProtocolTests(unittest.TestCase):
         self.assertFalse(effective.get("features", {}).get("hooks"))
         self.assertFalse(marker.exists())
 
+    def test_untrusted_parent_mcp_layers_remain_disabled_with_valid_transports(self):
+        marker = self.root / "parent-mcp-must-not-run"
+        parent_config = self.root / ".codex"
+        parent_config.mkdir()
+        (parent_config / "config.toml").write_text(
+            '[mcp_servers.parent_stdio]\ncommand="/bin/sh"\n'
+            'args=["-c", "touch ' + str(marker) + '"]\n'
+            '[mcp_servers.parent_http]\nurl="http://127.0.0.1:1/mcp"\n'
+        )
+        server = self.server(False)
+        effective = server._request("config/read", {"includeLayers": False})["config"]
+        for name in ("parent_stdio", "parent_http"):
+            self.assertFalse(effective["mcp_servers"][name]["enabled"])
+        self.assertFalse(marker.exists())
+        self.assertFalse(any(e.get("method") == "turn/started" for e in server.events))
+
     def test_existing_bubblewrap_gate_runs_exact_commit_and_denies_source_mutation(self):
         target = self.factory.target(self.spec, self.cwd)
         result = LocalRuntime().gate(["python3", "-c", "from score import add; assert add(2,3)==5"], self.cwd,
