@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from .adapters import FootballPredictionAdapter, SimulatedAdapter
@@ -76,18 +77,26 @@ def describe(supervisor: Supervisor, mission_id: str) -> None:
 
 
 def main() -> None:
+    from .factory_cli import COMMANDS, main as factory_main
+    if len(sys.argv) > 1 and sys.argv[1] in COMMANDS:
+        factory_main(sys.argv[1:])
+        return
     parser = argparse.ArgumentParser(prog="harness")
     parser.add_argument("--root", type=Path, default=Path.cwd())
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run"); run.add_argument("mission", type=Path)
+    run.add_argument("--legacy", action="store_true", help="explicitly opt into deprecated v1 execution")
     run.add_argument("--builder-qualification", type=Path)
     run.add_argument("--builder-auth-key-file", type=Path)
     status = sub.add_parser("status"); status.add_argument("mission_id")
     resume = sub.add_parser("resume"); resume.add_argument("mission", type=Path)
+    resume.add_argument("--legacy", action="store_true", help="explicitly opt into deprecated v1 execution")
     resume.add_argument("--builder-qualification", type=Path)
     resume.add_argument("--builder-auth-key-file", type=Path)
     approve = sub.add_parser("approve"); approve.add_argument("mission_id"); approve.add_argument("--action", required=True); approve.add_argument("--reason", default="")
     args = parser.parse_args()
+    if args.command in ("run", "resume") and not args.legacy:
+        parser.error("v1 execution is deprecated; new product requests use 'harness submit'. Historical execution requires --legacy")
     if args.command == "status":
         # status is read-only and deliberately does not start Codex.
         journal = Journal(args.root / "data" / "harness.sqlite")
@@ -115,6 +124,9 @@ def main() -> None:
     supplied_spec = load_spec(args.mission)
     journal = Journal(args.root / "data" / "harness.sqlite")
     spec, exists = reconcile_supplied_spec(journal, supplied_spec)
+    if spec.adapter != "simulation" and spec.merge_policy != "owner_approval":
+        raise ValueError("live legacy missions require explicit owner approval; automatic merge is disabled")
+    print("DEPRECATED_PATH=V1_REVIEWER_ORCHESTRATION; new missions use harness submit", file=sys.stderr)
     worktrees = WorktreeManager()
     if exists:
         existing = journal.mission(spec.mission_id)

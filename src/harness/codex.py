@@ -204,9 +204,9 @@ class AppServerCodex:
         return os.pathsep.join(trusted)
 
     @staticmethod
-    def _codex_home() -> str:
+    def _codex_home(raw_home: str | None = None) -> str:
         """Select the authenticated Codex home without inheriting a broad HOME."""
-        raw = os.environ.get("CODEX_HOME")
+        raw = raw_home if raw_home is not None else os.environ.get("CODEX_HOME")
         if raw:
             candidate = Path(raw)
             if not candidate.is_absolute():
@@ -455,6 +455,9 @@ class AppServerCodex:
         if line == "":
             self.close()
             raise RuntimeError("Codex App Server exited before sending a response")
+        observer = getattr(self, "_observe_wire_line", None)
+        if callable(observer):
+            observer(line)
         try:
             message = json.loads(line)
         except json.JSONDecodeError as exc:

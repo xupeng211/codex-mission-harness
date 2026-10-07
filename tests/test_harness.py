@@ -2508,7 +2508,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
             self.assertEqual(kwargs["worktree"], tree.path)
             raise RuntimeError("stop after constructor boundary assertion")
 
-        argv = ["harness", "--root", self.tmp.name, "run", str(mission)]
+        argv = ["harness", "--root", self.tmp.name, "run", str(mission), "--legacy"]
         with patch.object(sys, "argv", argv), \
                 patch("harness.cli.WorktreeManager.ensure", side_effect=ensure), \
                 patch("harness.cli.build", side_effect=stop_after_build), \
