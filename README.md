@@ -39,7 +39,7 @@ python3 -m pip install --index-url https://pypi.org/simple -e .
 codex login
 ```
 
-登录方式和安装说明以 [官方 Codex CLI 文档](https://developers.openai.com/codex/cli/) 为准。Harness 强制使用官方 OpenAI endpoint，不把代理服务或第二个 OpenAI agent 当作独立 Provider。
+登录方式和安装说明以 [官方 Codex CLI 文档](https://developers.openai.com/codex/cli/) 为准。OpenAI reviewer 使用官方 OpenAI route，DeepSeek reviewer 使用官方直连。规划、开发和返工可显式使用 CLI proxy；[Hybrid Factory 配置](docs/HYBRID_FACTORY.md) 使用独立官方认证目录，不覆盖日常 Codex 配置。
 
 从 DeepSeek 账户获得 API key，然后告诉 Harness 你的项目目录：
 

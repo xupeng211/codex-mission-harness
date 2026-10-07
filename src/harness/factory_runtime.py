@@ -41,6 +41,12 @@ def validate_openai_route(config):
             raise ValueError("OpenAI route is not an official endpoint; independent provider identity is unproven")
 
 
+def official_route_identity(profile, home):
+    return {"route_type": "official", "configured_provider": "openai", "auth_source": str(Path(home)/"auth.json"),
+            "codex_home": str(home), "requested_model": profile.get("model"),
+            "endpoint_selection": "native_official_auth"}
+
+
 def obj(properties: dict) -> dict:
     return {"type": "object", "properties": properties, "required": list(properties),
             "additionalProperties": False}
@@ -288,9 +294,10 @@ class FactoryAppServer(AppServerCodex):
                 self.runtime_identity.update(route_identity=route, qualification_identity=route_digest(route),
                                              upstream_provider_identity="NOT_PROVABLE", reported_model=None)
             else:
-                route = {"route_type": "official", "configured_provider": "openai", "auth_source": str(Path(self._source_home)/"auth.json"),
-                         "endpoint_selection": "native_official_auth"}
-                self.runtime_identity.update(route_identity=route, qualification_identity=route_digest(route))
+                route = official_route_identity(self.profile, self._source_home)
+                self.runtime_identity.update(route_identity=route, qualification_identity=route_digest({"route": route, "profile": self.profile, "runtime": self._native_identity}),
+                                             requested_model=self.MODEL, reported_model=result.get("model"),
+                                             model_identity_source="official_app_server_thread_model_and_reroute_events")
             if result.get("modelProvider") != self._transport_provider or not result.get("model"):
                 raise RuntimeError("Codex runtime provider/model identity is unproven")
             if self.MODEL and result["model"] != self.MODEL:
@@ -325,6 +332,7 @@ class FactoryAppServer(AppServerCodex):
         routed = [e["params"] for e in self.events if e.get("method") == "model/rerouted" and e.get("params", {}).get("threadId") == thread_id]
         if self.MODEL and any(e.get("toModel") != self.MODEL for e in routed):
             raise RuntimeError("explicit configured model was rerouted; exact model identity changed")
+        self.runtime_identity.update(thread_id=thread_id, turn_id=turn_id, model_routing=routed)
         items = {i["id"]: i for i in completed.get("items", []) if "id" in i}
         for event in self.events:
             p = event.get("params", {})
@@ -418,12 +426,17 @@ class LocalRuntime:
                     configs[path.name] = None
             identity["codex_config_hashes"] = configs if transport["type"] == "official" else {}
             if transport["type"] == "official":
-                identity["route_identity"] = {"route_type": "official", "configured_provider": "openai", "auth_source": str(home/"auth.json"), "endpoint_selection": "native_official_auth"}
+                identity["route_identity"] = official_route_identity(profile, home)
+                identity["qualification_identity"] = route_digest({"route": identity["route_identity"], "profile": profile})
             binary = AppServerCodex._trusted_executable("codex")
             identity["native_runtime"] = {"executable": str(binary), "launcher_sha256": hashlib.sha256(binary.read_bytes()).hexdigest()}
             identity["runtime_version"] = subprocess.check_output([str(binary), "--version"], timeout=10, text=True).strip()
         else:
             identity["route"] = "https://api.deepseek.com/chat/completions"
+            route = {"route_type": "direct", "configured_provider": "deepseek", "endpoint": identity["route"],
+                     "auth_source": profile["token_file"], "requested_model": profile["model"]}
+            identity["route_identity"] = route
+            identity["qualification_identity"] = route_digest(route)
         identity["adapter_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         dependencies = ["codex.py", "factory_proxy.py"] if profile["provider"] == "openai" else ["factory_http.py", "model_registry.py"]
         identity["transport_hashes"] = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in dependencies}

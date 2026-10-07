@@ -153,8 +153,8 @@ def validate_config(raw: dict) -> dict:
         if expected_provider == "openai":
             from .factory_proxy import validate_transport
             validate_transport(profile, reviewer=lane == "reviewer")
-        elif "transport" in profile:
-            raise ValueError("DeepSeek reviewer remains a direct official provider; transport override forbidden")
+        elif profile.get("transport", {"type": "direct"}) != {"type": "direct"}:
+            raise ValueError("DeepSeek reviewer remains a direct official provider; endpoint override forbidden")
         for field in ("model", "codex_profile"):
             if field in profile and (not isinstance(profile[field], str) or not re.fullmatch(r"[A-Za-z0-9_.:-]+", profile[field])):
                 raise ValueError(f"invalid {field}")

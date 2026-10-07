@@ -19,6 +19,8 @@
     "second_reviewer": {
       "provider": "deepseek",
       "model": "deepseek-flash",
+      "transport": {"type": "direct"},
+      "max_output_tokens": 16384,
       "token_file": "/absolute/path/to/owner-only-deepseek-token"
     }
   }

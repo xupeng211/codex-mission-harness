@@ -71,6 +71,12 @@ class NativeProtocolTests(unittest.TestCase):
         self.assertEqual(transport["stream_max_retries"], 0)
         self.assertFalse(transport["supports_websockets"])
         self.assertFalse(transport.get("base_url"))
+        identity = server.runtime_identity
+        self.assertEqual(identity["route_identity"]["codex_home"], str(self.auth))
+        self.assertEqual(identity["route_identity"]["requested_model"], "offline-protocol-no-inference")
+        self.assertEqual(identity["reported_model"], "offline-protocol-no-inference")
+        self.assertEqual(identity["model_identity_source"], "official_app_server_thread_model_and_reroute_events")
+        self.assertEqual(len(identity["qualification_identity"]), 64)
         for feature in ("unbounded_connection_retries", "responses_websockets", "responses_websockets_v2"):
             self.assertFalse(effective["features"][feature])
         self.assertEqual(server.runtime_identity["transport_provider"], server._transport_provider)

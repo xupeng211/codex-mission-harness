@@ -29,7 +29,8 @@ def project_checks(repo):
 
 
 def setup(config_path, repository, token_file, size, codex_home=None, model=None,
-          transport="official", proxy_endpoint=None, proxy_policy_file=None, proxy_provider="cli_proxy_api"):
+          transport="official", proxy_endpoint=None, proxy_policy_file=None, proxy_provider="cli_proxy_api",
+          reviewer_codex_home=None, deepseek_max_output_tokens=16384):
     repo = repository.resolve(strict=True)
     if Path(git(repo, "rev-parse", "--show-toplevel")).resolve() != repo:
         raise ValueError("choose the project Git root directory")
@@ -59,7 +60,11 @@ def setup(config_path, repository, token_file, size, codex_home=None, model=None
         profile["model"] = model
     developer = dict(profile, transport={"type": transport})
     reviewer = dict(profile, transport={"type": "official"})
+    if reviewer_codex_home:
+        from .codex import AppServerCodex
+        reviewer["codex_home"] = AppServerCodex._codex_home(str(reviewer_codex_home.resolve(strict=True)))
     if transport == "cli_proxy":
+        developer.pop("codex_home", None)
         from .factory_proxy import validate_transport, ProxyPolicy
         developer["transport"].update(endpoint=proxy_endpoint, configured_provider=proxy_provider,
                                       policy_file=str(proxy_policy_file) if proxy_policy_file else "")
@@ -71,7 +76,8 @@ def setup(config_path, repository, token_file, size, codex_home=None, model=None
                               "checks": checks, "ci": ci, "profiles": {
                                   "developer": developer, "reviewer": reviewer,
                                   "second_reviewer": {"provider": "deepseek", "model": "deepseek-flash",
-                                                      "token_file": str(token_file), "max_output_tokens": 4096}}})
+                                                      "transport": {"type": "direct"}, "token_file": str(token_file),
+                                                      "max_output_tokens": deepseek_max_output_tokens}}})
     workflows = sorted(p.name for p in (repo / ".github/workflows").glob("*.y*ml"))
     if workflows:
         try:

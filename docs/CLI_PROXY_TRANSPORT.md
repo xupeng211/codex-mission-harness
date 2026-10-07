@@ -3,7 +3,8 @@
 Factory supports `official` and `cli_proxy` as separate, explicit transports for
 Codex planning/development. Existing profiles without `transport` remain official;
 there is no automatic inheritance of the user's selected Codex provider and no
-fallback between endpoints. DeepSeek review stays directly on
+fallback between endpoints. For the complete lane configuration and separate official
+reviewer authentication, see [HYBRID_FACTORY.md](HYBRID_FACTORY.md). DeepSeek review stays directly on
 `https://api.deepseek.com/chat/completions`.
 
 CLI proxy OpenAI review is **not qualified**. A proxy's model directory, response

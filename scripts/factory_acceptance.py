@@ -42,6 +42,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--mission-id", default="real-factory-acceptance")
     args = parser.parse_args()
     args.output.mkdir(mode=0o700, parents=True, exist_ok=False)
     repo = args.output / "source"
@@ -79,7 +80,7 @@ jobs:
     factory = Factory(args.output / "state", config, InjectedRuntime(),
                       progress=lambda m, s: print(f"{m}: {s}", flush=True))
     try:
-        mission = factory.submit({"version": 2, "mission_id": "real-factory-acceptance", "repository": str(repo),
+        mission = factory.submit({"version": 2, "mission_id": args.mission_id, "repository": str(repo),
             "objective": "Add average(values) for numeric lists/tuples of ANY size. Empty input returns 0. Preserve fractions and negative results and existing add. Include regression tests. Use exactly one implementation task.",
             "scope": ["score.py", "tests/**"], "acceptance": ["arbitrary numeric collection sizes work", "empty input returns zero", "fractions and negatives preserved", "existing add unchanged"]})
         result = factory.run(mission)
