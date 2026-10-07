@@ -21,6 +21,7 @@ from pathlib import Path
 
 from .factory_runtime import LocalRuntime, official_rubric, VENDOR
 from .sandbox import SAFE_PATH
+from .factory_budget import accounting
 
 
 READY = "READY_FOR_USER_ACCEPTANCE"
@@ -55,6 +56,9 @@ def observed_usage(value, simulation=False):
     if contract is None or any(type(fields[k]) is not int or fields[k] < 0 for k in contract):
         return None
     if any(type(v) is not int or v < 0 for k, v in fields.items() if "token" in k.lower() and not isinstance(v, dict)):
+        return None
+    from .factory_budget import tokens
+    if tokens(value) is None:
         return None
     return value
 
@@ -97,7 +101,7 @@ def bounded_int(value, name, lower, upper):
 def validate_config(raw: dict) -> dict:
     """Operator policy is separate from the customer's product requirement."""
     allowed = {"version", "simulation", "budget", "max_rounds", "timeout_seconds", "checks", "ci",
-               "profiles", "independent_review_required", "max_review_bytes", "max_context_bytes"}
+               "profiles", "independent_review_required", "max_review_bytes", "max_context_bytes", "repository", "hosted_ci"}
     if not isinstance(raw, dict) or set(raw) - allowed or type(raw.get("version")) is not int or raw.get("version") != 1:
         raise ValueError("invalid factory configuration")
     config = json.loads(encoded(raw))
@@ -107,8 +111,17 @@ def validate_config(raw: dict) -> dict:
         if type(config[key]) is not bool:
             raise ValueError(f"{key} must be boolean")
     budget = config.get("budget")
-    if not isinstance(budget, dict) or set(budget) != {"max_agent_runs"}:
-        raise ValueError("budget authority must specify max_agent_runs; monetary usage remains UNKNOWN")
+    if not isinstance(budget, dict) or "max_agent_runs" not in budget or set(budget) - {"max_agent_runs", "max_total_tokens", "max_run_tokens", "max_wall_seconds"}:
+        raise ValueError("invalid mission resource authority; monetary usage remains UNKNOWN")
+    if ("max_total_tokens" in budget) != ("max_run_tokens" in budget):
+        raise ValueError("total and per-run token authority must be specified together")
+    for name, upper in (("max_total_tokens", 100_000_000), ("max_run_tokens", 2_000_000), ("max_wall_seconds", 86400)):
+        if name in budget:
+            bounded_int(budget[name], name, 1, upper)
+    if budget.get("max_run_tokens", 0) > budget.get("max_total_tokens", 0):
+        raise ValueError("per-run token reservation exceeds mission token authority")
+    if "repository" in config and (not isinstance(config["repository"], str) or not Path(config["repository"]).is_absolute()):
+        raise ValueError("configured project must be an absolute repository path")
     bounded_int(budget["max_agent_runs"], "max_agent_runs", 1, 100)
     for key, default, low, high in [("max_rounds", 3, 1, 10), ("timeout_seconds", 900, 1, 3600),
                                    ("max_review_bytes", 1024 * 1024, 1, 8 * 1024 * 1024),
@@ -121,6 +134,12 @@ def validate_config(raw: dict) -> dict:
         for command in commands:
             if not isinstance(command, list) or not command or any(not isinstance(x, str) or not x or "\0" in x for x in command):
                 raise ValueError(f"invalid {kind} argv")
+    if "hosted_ci" in config:
+        hosted = config["hosted_ci"]
+        if not isinstance(hosted, dict) or set(hosted) != {"repository", "workflows"} or not isinstance(hosted["repository"], str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", hosted["repository"]):
+            raise ValueError("hosted CI requires an explicit GitHub owner/repository")
+        if not isinstance(hosted["workflows"], list) or not hosted["workflows"] or len(set(hosted["workflows"])) != len(hosted["workflows"]) or any(not isinstance(w, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+\.ya?ml", w) for w in hosted["workflows"]):
+            raise ValueError("hosted CI requires exact workflow filenames")
     profiles = config.get("profiles")
     expected = {"developer", "reviewer", "second_reviewer"} if config["independent_review_required"] else {"developer", "reviewer"}
     if not isinstance(profiles, dict) or set(profiles) != expected:
@@ -148,7 +167,7 @@ def validate_config(raw: dict) -> dict:
 def policy_identity(config):
     # Switching one profile changes only that lane's evidence key. Budgets,
     # provider independence, timeouts and test policy remain immutable.
-    return {key: value for key, value in config.items() if key != "profiles"}
+    return {key: value for key, value in config.items() if key not in ("profiles", "repository")}
 
 
 def validate_mission(raw):
@@ -368,7 +387,7 @@ class Factory:
             cwd.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             git(Path(spec["repository"]), "clone", "--no-local", "--no-hardlinks", "--no-checkout", "--", spec["repository"], str(cwd))
             git(cwd, "remote", "remove", "origin")
-            git(cwd, "checkout", "--detach", spec["base"])
+            git(cwd, "checkout", "-b", f"factory/{mission}", spec["base"])
             self.state(mission, "PLAN")
         if cwd.resolve() != cwd or not (cwd / ".git").is_dir() or (cwd / ".git").is_symlink():
             raise FactoryBlocked("UNKNOWN", "candidate isolation identity is invalid")
@@ -402,6 +421,11 @@ class Factory:
                 raise FactoryBlocked("BLOCKED_SCOPE", "committed mission scope authority changed during implementation")
             target["mission_scope_file"] = scope_file
             target["scope_blob"] = baseline
+        if "hosted_ci" in self.config:
+            for workflow in self.config["hosted_ci"]["workflows"]:
+                path = ".github/workflows/" + workflow
+                if git(cwd, "rev-parse", spec["base"] + ":" + path) != git(cwd, "rev-parse", head + ":" + path):
+                    raise FactoryBlocked("BLOCKED_SCOPE", "authorized hosted workflow was changed; its success cannot certify this task")
         return target
 
     def checkpoint(self, spec, cwd):
@@ -423,8 +447,18 @@ class Factory:
         evidence_dir = private_dir(self.root / "evidence" / mission)
         evidence = evidence_dir / f"{operation_id}.json"
         transcript = evidence_dir / f"{operation_id}.raw"
+        if self.cancel_requested(mission):
+            raise FactoryBlocked("CANCELLED", "user cancelled; completed evidence and all reservations are retained")
         try:
             self.db.execute("BEGIN IMMEDIATE")
+            budget = self.config["budget"]
+            operations = self.db.execute("SELECT * FROM operations WHERE mission=?", (mission,)).fetchall()
+            resources = accounting(operations, budget)
+            started = self.db.execute("SELECT MIN(at) FROM events WHERE mission=? AND kind='submitted'", (mission,)).fetchone()[0]
+            if "max_wall_seconds" in budget and time.time() - started >= budget["max_wall_seconds"]:
+                raise FactoryBlocked("BLOCKED_BUDGET", "authorized mission wall-clock exhausted")
+            if paid and "max_total_tokens" in budget and resources["committed_tokens"] + budget["max_run_tokens"] > budget["max_total_tokens"]:
+                raise FactoryBlocked("BLOCKED_BUDGET", "token admission exhausted; UNKNOWN reservations are permanent")
             used = self.db.execute("SELECT COUNT(*) FROM operations WHERE mission=? AND paid=1", (mission,)).fetchone()[0]
             if paid and used >= self.config["budget"]["max_agent_runs"]:
                 raise FactoryBlocked("BLOCKED_BUDGET", "authorized agent-run budget exhausted; failures and UNKNOWN remain charged")
@@ -458,6 +492,12 @@ class Factory:
                          encoded(usage) if usage is not None else None, time.time(), operation_id))
         self.event(mission, "completed", {"operation": operation_id, "status": status, "evidence": str(evidence)})
         self.db.commit()
+        if paid and "max_run_tokens" in self.config["budget"]:
+            from .factory_budget import tokens
+            if (tokens(usage) or 0) > self.config["budget"]["max_run_tokens"]:
+                raise FactoryBlocked("BLOCKED_BUDGET", "run token allowance exceeded; telemetry retained, no further dispatch")
+        if self.cancel_requested(mission):
+            raise FactoryBlocked("CANCELLED", "user cancelled; in-flight usage may remain UNKNOWN and is never refunded")
         if status != "COMPLETE":
             raise FactoryBlocked("UNKNOWN", f"{stage} failed; retained raw evidence and consumed run reservation: {result['error']}")
         return result
@@ -480,7 +520,7 @@ class Factory:
         key = digest({"stage": stage, "round": round_, "profile": self.profile_identities[lane], "payload": payload})
         return self.operation(spec["mission_id"], key, stage, lane, identity, payload, True,
                               lambda transcript: self.runtime.agent(stage, profile, cwd, payload, transcript,
-                                                                    self.config["timeout_seconds"],
+                                                                    self.operation_timeout(spec["mission_id"]),
                                                                     [self.root, Path(spec["repository"])]))
 
     def review_context(self, spec, cwd, target, lane):
@@ -499,9 +539,10 @@ class Factory:
     def review(self, spec, cwd, target, lane):
         profile = self.config["profiles"][lane]
         review_cwd = self.review_context(spec, cwd, target, lane)
+        from .factory_runtime import REVIEW_SCHEMA
         payload = {"objective": spec["objective"], "acceptance": spec["acceptance"], "constraints": spec["constraints"],
-                   "target": target, "review_root": str(review_cwd),
-                   "instruction": "Review the ENTIRE base..head diff and surrounding repository code using the official rubric. Return the official JSON schema. Do not modify code.",
+                   "target": target, "review_root": str(review_cwd), "required_output_schema": REVIEW_SCHEMA,
+                   "instruction": "Review the ENTIRE base..head diff and surrounding repository code using the official rubric. Return JSON matching required_output_schema. Every absolute_file_path must be under review_root, NOT target.repository; source lines must overlap this diff. Do not modify code.",
                    "diff": git(review_cwd, "diff", "--no-ext-diff", "--no-textconv", "--binary", "--no-renames", target["base"], target["head"], "--")}
         if lane == "second_reviewer":
             if "GIT binary patch" in payload["diff"]:
@@ -528,11 +569,11 @@ class Factory:
         key = digest(identity)
         if lane == "reviewer":
             invoke = lambda transcript: self.runtime.agent("review", profile, review_cwd, payload, transcript,
-                                                           self.config["timeout_seconds"],
+                                                           self.operation_timeout(spec["mission_id"]),
                                                            [self.root, Path(spec["repository"])] )
         else:
             invoke = lambda transcript: self.runtime.second_review(profile, review_cwd, payload, transcript,
-                                                                   self.config["timeout_seconds"])
+                                                                   self.operation_timeout(spec["mission_id"]))
         # Only a PROVEN completed result can get one fresh formatting/source
         # validation attempt. Dispatch uncertainty is never retried by operation().
         for attempt in range(2):
@@ -560,12 +601,43 @@ class Factory:
             payload = {"command": command, "target": target, "round": round_}
             key = digest({"kind": kind, "index": index, **payload})
             result = self.operation(spec["mission_id"], key, kind, "local", {"target": target}, payload, False,
-                                    lambda transcript: self.runtime.gate(command, cwd, target, transcript, self.config["timeout_seconds"]))
+                                    lambda transcript: self.runtime.gate(command, cwd, target, transcript, self.operation_timeout(spec["mission_id"])))
             if result.get("status") not in ("PASS", "FAIL") or type(result.get("exit_code")) is not int or (result["status"] == "PASS") != (result["exit_code"] == 0):
                 raise FactoryBlocked("UNKNOWN", "test/CI command lacks a proven exit status")
             if self.target(spec, cwd) != target:
                 raise FactoryBlocked("UNKNOWN", "test/CI changed the reviewed target")
             results.append({**result, "evidence_key": key})
+        if kind == "ci" and "hosted_ci" in self.config:
+            policy = self.config["hosted_ci"]
+            branch = f"factory/{spec['mission_id']}-{target['head'][:12]}"
+            payload = {"target": target, "policy": policy, "branch": branch,
+                       "runner_sha256": hashlib.sha256(Path(__file__).with_name("factory_hosted.py").read_bytes()).hexdigest()}
+            key = digest({"kind": "hosted_ci", **payload})
+            result = self.operation(spec["mission_id"], key, "hosted_ci", "github", payload, payload, False,
+                       lambda transcript: self.runtime.hosted_ci(policy, cwd, target, branch, transcript, self.operation_timeout(spec["mission_id"])))
+            if result.get("status") not in ("PASS", "FAIL") or result.get("target") != target:
+                raise FactoryBlocked("UNKNOWN", "hosted CI has no exact-target proven result")
+            try:
+                if result["repository"] != policy["repository"] or result["branch"] != branch or result["MERGE_PERFORMED"] is not False or set(result["runs"]) != set(policy["workflows"]):
+                    raise ValueError("hosted identity/workflow mismatch")
+                all_success = True
+                for workflow_runs in result["runs"].values():
+                    if not workflow_runs:
+                        raise ValueError("hosted workflow evidence missing")
+                    for run in workflow_runs:
+                        if type(run["databaseId"]) is not int or run["databaseId"] <= 0 or run["headSha"] != target["head"] or run["event"] != "push" or run["status"] != "completed" or run["url"] != f"https://github.com/{policy['repository']}/actions/runs/{run['databaseId']}":
+                            raise ValueError("hosted run is not an exact completed GitHub push check")
+                        jobs = result["jobs"][str(run["databaseId"])]
+                        if not jobs or any(j["status"] != "completed" for j in jobs):
+                            raise ValueError("hosted matrix/job evidence missing or incomplete")
+                        all_success &= run["conclusion"] == "success" and all(j["conclusion"] == "success" for j in jobs)
+                if (result["status"] == "PASS") != all_success:
+                    raise ValueError("hosted verdict contradicts run/job evidence")
+            except (KeyError, TypeError, ValueError) as exc:
+                raise FactoryBlocked("UNKNOWN", f"hosted evidence validation failed: {exc}") from exc
+            if self.target(spec, cwd) != target:
+                raise FactoryBlocked("UNKNOWN", "hosted CI candidate HEAD/tree changed")
+            results.append({**result, "evidence_key": key, "department": "hosted_ci"})
         return results
 
     def report(self, mission):
@@ -594,8 +666,6 @@ class Factory:
                 status, reason = exc.status, exc.reason
             except Exception as exc:
                 status, reason = "UNKNOWN", str(exc)
-        used = sum(op["paid"] for op in operations)
-        unknown = sum(op["paid"] and op["usage"] is None for op in operations)
         return {"MISSION": mission, "DELIVERY_STATUS": status,
                 "IMPLEMENTED": delivery.get("implemented", "UNKNOWN"),
                 "TEST_RESULT": delivery.get("tests", "UNKNOWN") if status == READY else "UNKNOWN",
@@ -603,13 +673,37 @@ class Factory:
                 "REVIEW_RESULT": delivery.get("reviews", "UNKNOWN") if status == READY else "UNKNOWN",
                 "BLOCKERS_REMAINING": [] if status == READY else [reason or status],
                 "KNOWN_RISKS": delivery.get("risks", []),
-                "BUDGET_USED": {"agent_runs": used, "limit": self.config["budget"]["max_agent_runs"],
-                                "unknown_usage_runs": unknown, "money": "UNKNOWN" if not self.config["simulation"] else "FIXTURE_NO_PROVIDER_COST"},
+                "BUDGET_USED": {**accounting(operations, self.config["budget"]),
+                                "money": "UNKNOWN" if not self.config["simulation"] else "FIXTURE_NO_PROVIDER_COST"},
+                "LOCAL_CI": delivery.get("ci", "UNKNOWN") if status == READY else "UNKNOWN",
+                "HOSTED_CI": delivery.get("hosted_ci", "NOT_CONFIGURED") if status == READY else "UNKNOWN" if "hosted_ci" in self.config else "NOT_CONFIGURED",
                 "TARGET_HEAD": delivery.get("target", {}).get("head", "UNKNOWN"),
                 "EXACT_TARGET": delivery.get("target", "UNKNOWN"),
                 "DELIVERY_EVIDENCE": [op["evidence"] for op in operations if op["evidence"]],
-                "CANDIDATE": row["candidate"], "SIMULATION": self.config["simulation"],
+                "CANDIDATE": row["candidate"], "CANDIDATE_BRANCH": f"factory/{mission}", "SIMULATION": self.config["simulation"],
                 "HUMAN_APPROVAL_REQUIRED": ["merge", "release"], "MERGE_PERFORMED": False}
+
+    def cancel_requested(self, mission):
+        return (self.root / "control" / f"{mission}.cancel").is_file()
+
+    def cancel(self, mission):
+        self.row(mission)
+        path = self.root / "control" / f"{mission}.cancel"
+        with path.open("a") as stream:
+            stream.flush()
+            os.fsync(stream.fileno())
+        self.event(mission, "cancel_requested", {"authority": "user"})
+        self.db.commit()
+        return {"MISSION": mission, "CANCELLATION": "REQUESTED", "DISPATCH_REPLAY": False,
+                "NOTE": "Current process is stopped by the controller; reservations are retained."}
+
+    def operation_timeout(self, mission):
+        timeout = self.config["timeout_seconds"]
+        limit = self.config["budget"].get("max_wall_seconds")
+        if limit:
+            started = self.db.execute("SELECT MIN(at) FROM events WHERE mission=? AND kind='submitted'", (mission,)).fetchone()[0]
+            timeout = min(timeout, max(1, int(limit - (time.time() - started))))
+        return timeout
 
     def run(self, mission):
         self.row(mission)
@@ -619,10 +713,26 @@ class Factory:
                 fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return {**self.report(mission), "DELIVERY_STATUS": "RUNNING", "BLOCKERS_REMAINING": ["another controller owns this mission"]}
-            return self._run(mission)
+            import threading
+            stopped = threading.Event()
+            def watch_cancel():
+                while not stopped.wait(0.2):
+                    if self.cancel_requested(mission) and hasattr(self.runtime, "cancel"):
+                        self.runtime.cancel()
+            if hasattr(self.runtime, "resource_policy"):
+                self.runtime.resource_policy = self.config["budget"]
+            watcher = threading.Thread(target=watch_cancel, daemon=True)
+            watcher.start()
+            try:
+                return self._run(mission)
+            finally:
+                stopped.set()
+                watcher.join(timeout=1)
 
     def _run(self, mission):
         try:
+            if self.cancel_requested(mission):
+                raise FactoryBlocked("CANCELLED", "user cancelled; no dispatch or resume is authorized")
             spec, cwd = self.prepare(mission)
             row = self.row(mission)
             uncertain = self.db.execute("SELECT id FROM operations WHERE mission=? AND status IN ('RUNNING','UNKNOWN') LIMIT 1", (mission,)).fetchone()
@@ -664,6 +774,10 @@ class Factory:
                 raise FactoryBlocked("WAITING_PRODUCT_DECISION", "; ".join(plan["decisions_required"]))
             if not 1 <= len(plan["tasks"]) <= 8:
                 raise FactoryBlocked("UNKNOWN", "technical lead task count is outside the bounded contract")
+            if row["round"] == 0 and "max_total_tokens" in self.config["budget"]:
+                remaining = self.config["budget"]["max_agent_runs"] - self.db.execute("SELECT COUNT(*) FROM operations WHERE mission=? AND paid=1", (mission,)).fetchone()[0]
+                if len(plan["tasks"]) + (2 if self.config["independent_review_required"] else 1) > remaining:
+                    raise FactoryBlocked("BLOCKED_BUDGET", "plan cannot fit implementation and independent review in authorized remaining runs")
             feedback = []
             if row["round"]:
                 previous = self.db.execute("SELECT payload FROM events WHERE mission=? AND kind='rework' ORDER BY sequence DESC LIMIT 1", (mission,)).fetchone()
@@ -708,7 +822,7 @@ class Factory:
                     if self.target(spec, cwd) != target:
                         raise FactoryBlocked("UNKNOWN", "final delivery target changed after gates")
                     delivery = {"target": target, "implemented": work["summary"], "risks": work["known_risks"],
-                                "tests": "PASS", "ci": "PASS", "reviews": reviews,
+                                "tests": "PASS", "ci": "PASS", "hosted_ci": "PASS" if "hosted_ci" in self.config else "NOT_CONFIGURED", "reviews": reviews,
                                 "evidence_keys": [op[0] for op in self.db.execute("SELECT key FROM operations WHERE mission=? AND status='COMPLETE'", (mission,))]}
                     self.event(mission, "delivery", delivery)
                     self.state(mission, READY)

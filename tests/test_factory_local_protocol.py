@@ -61,6 +61,11 @@ class NativeProtocolTests(unittest.TestCase):
         self.assertEqual(result, {"source": "READABLE", "auth": "DENIED", "controller": "DENIED", "original": "DENIED",
                                   "edit": "WRITABLE", "git": "DENIED", "external": "DENIED"})
 
+    def test_native_shell_disables_incidental_python_bytecode(self):
+        server = self.server(False)
+        result = self.exec(server, "import os,json;print(json.dumps({'bytecode':os.environ.get('PYTHONDONTWRITEBYTECODE')}))")
+        self.assertEqual(result, {"bytecode": "1"})
+
     def test_reviewer_official_permissions_deny_code_edits(self):
         server = self.server(True)
         paths = {"source": str(self.cwd / "score.py"), "auth": str(self.auth / "private-sentinel"),

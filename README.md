@@ -1,113 +1,150 @@
 # AI Software Delivery Factory
 
-你描述产品需求，工厂负责规划、开发、测试、独立审核和自动返工，最后交回可验收的候选版本。你不需要给每个 Agent 写下一条 Prompt。
+你说需求，Harness 自己规划、用官方 Codex 开发、运行测试和 CI、安排 OpenAI 与 DeepSeek 独立审核、处理 finding、自动返工，最后交回可信的候选版本。最终合并和发布需要你单独批准。
 
-Harness 管需求、权限、预算、证据和交付门禁；**官方 Codex 管编程、调试和审核智能**。最终 merge / release 始终由人明确批准，工厂没有自动合并或发布执行器。
-
-## 先体验：不需要 API key，不产生 Provider 费用
-
-需要 Python 3.11+、Git。Linux 上真实执行还需要 Codex CLI 和 bubblewrap。
+支持 Linux、Python 3.11–3.14，以及有真实测试命令的 Git 项目。首次配置后，日常只需三个入口：
 
 ```bash
+harness submit "增加功能 X，保持现有功能正常"
+harness status
+harness delivery
+```
+
+真实双 Provider、自动返工、恢复及 GitHub CI 验收记录见 [交付验收](docs/PRODUCTION_ACCEPTANCE.md)。`factory-demo` 是免费模拟演示，不能用来证明真实 Provider 可用。
+
+## 第一次安装与打开
+
+安装 Python 3.11+、Git、Node.js 和 bubblewrap；GitHub Actions 项目还需要 GitHub CLI (`gh`)。Ubuntu 的系统组件可用 `sudo apt install python3-venv git bubblewrap` 安装。
+
+```bash
+npm install -g @openai/codex
+git clone --branch feat/factory-production-acceptance https://github.com/xupeng211/codex-mission-harness.git
+cd codex-mission-harness
 python3 -m venv .venv
-.venv/bin/python -m pip install -e .
 source .venv/bin/activate
-harness factory-demo
+python3 -m pip install -e .
 ```
 
-不安装也可以运行：
+已有本仓库时可以从虚拟环境步骤开始；该 GitHub 仓库为私有仓库，需要有访问权限并先完成 `gh auth login`。
+
+以后打开新的终端时，进入这个目录，执行 `source .venv/bin/activate`，就可以使用 `harness`。
+
+## 一次性登录、配置项目
+
+先通过官方 Codex 登录 OpenAI：
 
 ```bash
-PYTHONPATH=src python3 -m harness.cli factory-demo
+codex login
 ```
 
-演示会创建临时小项目，实现 `average(values)`，运行真实 Python 测试和本地 CI 检查。fixture reviewer 发现遗漏的整数除法 bug，工厂自动修复并补回归测试，然后重新测试、重新审核。最终输出包含：
+登录方式和安装说明以 [官方 Codex CLI 文档](https://developers.openai.com/codex/cli/) 为准。Harness 强制使用官方 OpenAI endpoint，不把代理服务或第二个 OpenAI agent 当作独立 Provider。
 
-```text
-DELIVERY_STATUS=READY_FOR_USER_ACCEPTANCE
-TEST_RESULT=PASS
-CI_RESULT=PASS
-MERGE_PERFORMED=false
-SIMULATION=true
-```
-
-完整 JSON 给出源码目录、目标 commit、证据文件和 `acceptance-report.json` 的位置。fixture 审核明确标记为模拟，不是正式 OpenAI / DeepSeek receipt。
-
-## 一次性配置真实项目
-
-项目负责人完成一次配置，日常使用者之后只提交需求：
+从 DeepSeek 账户获得 API key，然后告诉 Harness 你的项目目录：
 
 ```bash
-mkdir -p ~/.config/codex-factory
-cp config/factory.example.json ~/.config/codex-factory/config.json
-chmod 600 ~/.config/codex-factory/config.json
+harness setup --repository /你的项目完整路径
 ```
 
-在配置中设置项目已有的测试、CI 命令，以及 DeepSeek token 文件的绝对路径。token 文件必须属于当前用户，权限 `0600`。示例面向 FootballPrediction；其他项目使用自己的验证命令。工厂不会降低、删掉或自动改写这些门禁。
+第一次会隐藏输入 DeepSeek key，并将它存为只有当前用户可读的文件。Harness 不购买额度，不更改账户支出限额。项目必须是 Git 仓库；系统自动识别 `make verify`、Python unittest 或 pytest 等现有测试。项目依赖需要先按项目自己的安装说明准备好。无法识别的项目，由维护者一次性设置 [配置示例](config/factory.example.json) 中的测试命令；日常用户不用选测试、调 Agent 或写 reviewer prompt。
 
-OpenAI 的 `model` / `codex_profile` 可以省略，由官方 Codex 配置选择，也可以为 developer / reviewer 各自配置。需要选择单独认证目录时，在对应 profile 加入 `"codex_home": "/absolute/private/codex/home"`；该目录必须属于当前用户且不可被其他用户写入。工厂不会修改你的认证文件或全局模型配置。
+已经有私有 token 文件时可用 `--deepseek-token-file /绝对路径`；文件须为当前用户所有、权限 `0600`。已有独立官方 Codex 认证目录时可用 `--codex-home /绝对路径`，无需改动原来的 Codex 配置。
+
+已有 GitHub Actions 的项目先安装 `gh` 并运行 `gh auth login`。Setup 自动识别 GitHub origin 和工作流。任务会将候选版本推送到 `factory/...` 专用分支，等待对应 exact commit 的所有配置工作流和 matrix jobs 完成；不会修改 main、合并 PR 或发布。用于验收的工作流在任务内不可被改弱。没有 GitHub Actions 的本地项目，交付会明确显示 `GitHub CI：NOT_CONFIGURED`，不会拿本地 CI 冒充 hosted CI。
 
 ```bash
 harness factory-doctor
 ```
 
-预算单位是 **Agent 执行次数**：示例最多 12 次、最多 3 轮开发/返工，每次有超时。一次执行指一个官方 Codex turn 或一个 DeepSeek 请求，不等于底层模型请求次数，也不是美元金额上限。Codex turn 内的工具/模型循环有时间上限；未登记的 native subagent 扇出默认关闭。技术负责人、实施任务和审核使用独立官方线程。
+Doctor 检查本地配置，不产生 inference 费用，也不声称已经验证模型访问权。真实任务另行记录 Provider、模型、profile 和结果证据。
 
-真实 usage 仅按 Provider 遥测保存；缺失 usage、费用金额保持 `UNKNOWN`，失败执行不退还 reservation。需要严格金额上限时，同时配置 Provider 账户支出限额。本项目不会推测 Codex 订阅价格，也不继承或扩大 PR2 / PR4 的历史预算。
-
-## 日常使用：提交需求，然后等交付
+## 提交需求，查看进度和交付
 
 ```bash
-harness submit \
-  --repository /absolute/path/to/FootballPrediction \
-  --request '增加功能 X。满足 A/B/C，不改变现有生产行为。' \
-  --mission-id football-feature-x \
-  --acceptance '现有回归测试继续通过' \
-  --constraint '禁止生产流量、quota 消耗和 Stage D'
+harness submit "给计算模块增加平均值功能。空输入返回 0，保留小数，不影响加法。"
+harness status
+harness delivery
 ```
 
-可用 `--scope 'src/**' --scope 'tests/**'` 限定修改范围。项目已有已提交的 mission contract 时，传 `--mission-scope-file docs/agentic/missions/task.json`；工厂固定原始 Git blob，并只读交给项目验证器。
+提交后会自动运行。原项目保留原分支和文件，开发在独立 clone 的候选分支中进行。多个任务都有自动生成的任务编号；省略编号时，`status`、`delivery`、`resume` 和 `cancel` 选择最近提交的任务。要查看其他任务，附上它的编号。
 
-工厂在**独立 clone**里工作，原仓库、原分支、历史 ledger 和 evidence 不受任务执行影响。多个实施任务由独立 Codex 线程顺序执行；测试、CI 和 reviewer findings 自动触发返工。
+`PLAN / IMPLEMENT / TEST / CI / REVIEW / REWORK` 表示系统正在规划、开发、测试、跑 CI、审核或修复。`READY_FOR_USER_ACCEPTANCE` 表示候选版本已经通过配置要求的门禁，可以由你验收；不是已经合并或上线。
 
-关闭终端后：
+交付界面给出候选源码目录、exact commit、测试、两家审核、资源使用和证据入口。需要完整记录时：
 
 ```bash
-harness factory-status football-feature-x
-harness factory-resume football-feature-x
+harness delivery --json
 ```
 
-恢复复用已完成、哈希验证通过的证据。已登记请求的结果未知时停止为 `UNKNOWN`，不会偷偷重复付费请求。状态查询也验证 HEAD、scope 和 evidence；旧 READY 不会掩盖后来改动的源码或缺失的证据。
+高级用法保留：`submit --repository ... --request ... --acceptance ... --constraint ... --scope ...`。不同项目可用独立 `--config` 和 `--state-dir`，不需要用户自己建分支或安排 agent。
 
-交付 JSON 包括 `IMPLEMENTED`、`TEST_RESULT`、`CI_RESULT`、`REVIEW_RESULT`、`BLOCKERS_REMAINING`、`KNOWN_RISKS`、`BUDGET_USED`、`TARGET_HEAD` 和 `DELIVERY_EVIDENCE`。`CI_RESULT` 指配置中的本地 CI 命令，**不代表已经通过 GitHub hosted checks**。
+## 关闭终端、中断和取消
 
-验收后，可以记录对 exact HEAD 的明确批准：
+中断后重新打开 Harness：
 
 ```bash
-harness factory-approve football-feature-x \
-  --action merge --head <TARGET_HEAD> --reason '已验收，批准这个版本'
+harness status
+harness resume
 ```
 
-该命令只记录批准，不执行 merge。发布和最终合并仍由现有人工流程完成。模拟任务不能获得真实 merge / release 批准。
+系统复用已经完成且校验通过的证据，不会重新执行已完成的模型调用。控制器崩溃后，独立 watchdog 仍限制正在运行的子进程。
 
-## 当前边界
+如果请求已登记但无法证明最终结果，状态为 `UNKNOWN`，任务和 reservation 保留；`resume` 不会盲目重发。它表示系统没有足够证据继续，并不表示代码通过。普通测试失败和 reviewer findings 会自动返工；不要不断复制下一条 prompt。
 
-普通测试失败、CI 命令失败、review findings 自动返工。重大产品歧义返回 `WAITING_PRODUCT_DECISION`；预算、返工次数、容量或安全边界不足返回明确 blocker。格式/source reference 校验失败时，只有已经证明完成的审核允许一次新的、有预算登记的恢复尝试；未知 dispatch 不会重发。
-
-OpenAI 审核复用官方 review rubric 和 App Server structured turn。DeepSeek 使用独立 HTTPS API 和相同官方 rubric，拿不到 OpenAI 结论。两个 lane 审核整个 `base..head` diff。容量不足停止，不切 chunk、不截断、不假装全量审核成功。
-
-目前支持本地 Linux、配置好的项目门禁和双 Provider 审核。DeepSeek 发送有容量上限的完整 tracked 文本源码上下文；大型仓库、二进制变更、变更的 submodule 明确停止。暂不自动 push、创建 PR、运行 hosted CI 或部署。live gates 中源码和 Git metadata 只读；构建产物应使用项目已有临时目录配置。认证、模型访问权和项目依赖需要在运行环境中就绪。
-
-迁移验证使用本地/fixture、真实 Codex 零 inference 协议/权限检查、真实 bubblewrap 执行和全量治理测试。**尚未声明真实双 Provider 审核达到生产级。**
-
-## 历史兼容
-
-Reviewer V2 的 chunk/group/synthesis、固定 group 合约和旧 qualification 执行路径退出新任务流程。旧代码保留在显式 deprecated 路径，供历史兼容与治理回归验证；旧 receipts、ledger、UNKNOWN 不迁移、不改写、不退款。
-
-旧 v1 `run` / `resume` 必须显式加 `--legacy`，live legacy 也禁止 `merge_policy=auto`。新任务使用 `submit`，或 version 2 mission 的 `factory-run`，无需 Reviewer V2 builder certificate。
-
-[架构与迁移理由](docs/FACTORY_ARCHITECTURE.md) · [验证与验收证据](docs/FACTORY_VALIDATION.md)
+停止一个任务：
 
 ```bash
-make verify
+harness cancel
 ```
+
+取消会停止当前受控进程，保留所有证据和已发生/未知的费用记录；被取消的任务不能继续付费运行。`Ctrl+C` 也会中断当前执行，但任务账本仍保留。新需求使用新的 `submit`，不会改写旧任务。
+
+## 怎么批准最终 merge
+
+先验收 `harness delivery` 显示的候选版本，再显式记录批准：
+
+```bash
+harness approve 任务编号 --action merge --head 交付显示的完整commit --reason "已验收，批准这个版本"
+```
+
+该命令重新校验目标和证据，只记录对这个 exact HEAD 的批准。最终合并由项目现有人工合并流程执行。Harness 没有自动 merge/release 执行器，模拟任务不能获得正式批准。
+
+## 怎么看资源使用和预算
+
+`status` 和 `delivery` 显示执行次数、已观察的 token、未知 usage 及其永久保留额。金额没有真实遥测时明确为 `UNKNOWN`；不猜订阅价格，不把失败算成免费，不回填历史 UNKNOWN。
+
+Setup 默认选择 standard 授权；小任务可在首次 setup 时选择 `--size small`，较大项目可选 `--size large`：
+
+| 授权 | 最多执行次数 | 每次 token admission | 总 token admission | 最多开发/返工轮数 | 总时长 |
+|---|---:|---:|---:|---:|---:|
+| small | 16 | 180,000 | 2,880,000 | 3 | 2 小时 |
+| standard | 35 | 240,000 | 8,400,000 | 5 | 6 小时 |
+| large | 54 | 300,000 | 16,200,000 | 7 | 12 小时 |
+
+这些额度按规划、最多 4/8 个实施任务、双 Provider 全量复审、返工和有限 schema recovery 设计，供系统在任务内自行分配；不是每调用几次就找你确认。一次执行指一个 Codex turn 或一个 DeepSeek 请求，Codex turn 内可能包含多次原生模型/工具交互。Setup 不产生模型费用。
+
+每次 dispatch 之前预留 per-run token capacity。已返回的真实 usage 用于后续 admission；UNKNOWN 永久保留整次额度。调用次数、总时长、返工轮数和预算授权不可自动提高。新配置不能扩大旧任务 authority；历史 12/12 的耗尽任务保持原记录。
+
+Codex 自己的 native rollout budget 限制采样循环，控制器同时检查包含 cached input 的 token 遥测，并有独立进程/时长限制。Token admission 是本地调度上限，Provider 一次已发出的响应在收到 usage 时可能越过阈值；发生这种情况会保留真实超额并停止，不能交付成功。它不是精确美元扣费保证；要求严格金额封顶时，使用 Provider 账户支出限额。Harness 不会自行调整这个外部限额。
+
+## 出错时最少要理解什么
+
+只需看状态和原因：
+
+- `READY_FOR_USER_ACCEPTANCE`：可以验收候选版本，还没有合并。
+- `UNKNOWN`：证据或请求结果不明确，没有 PASS，也不会重复付费请求。
+- `BLOCKED_BUDGET / BLOCKED_LIMIT`：授权额度或返工次数耗尽，系统已停止。
+- `BLOCKED_SCOPE`：变更超出授权范围、目标/工作流不符或上下文太大，系统已停止。
+- `CANCELLED`：取消请求已生效，旧账本保持不变。
+- `WAITING_PRODUCT_DECISION`：真正涉及产品方向的歧义，需要你做产品决定；普通技术选择由系统处理。
+
+遇到停止状态，把 `harness delivery --json` 的报告交给维护者即可；不需要阅读内部架构文档。Provider 登录失效、模型访问权、GitHub 权限或账户限额，需要账户持有人处理。
+
+## 边界与历史
+
+双审核使用不同 Provider、不同线程/checkout，不交换彼此结论。审核覆盖完整 `base..head` diff。大型源码上下文、二进制变更和变更的 submodule 不能通过当前独立文本审核时，明确停止，不截断或假装通过。live tests 的源码/Git metadata 为只读；依赖或构建产物需要项目支持临时目录。
+
+Reviewer V2 的 chunk/group/synthesis 和旧 qualification 路径已 deprecated；只用于历史读取和兼容回归。旧 ledger、receipts、UNKNOWN 和 support artifacts 不迁移、不删除、不退款。旧 v1 `run/resume` 需显式 `--legacy`，禁止自动合并。新项目不需要了解旧平台。
+
+[架构说明](docs/FACTORY_ARCHITECTURE.md) · [历史迁移验证](docs/FACTORY_VALIDATION.md)
+
+维护者的本地验证：`make verify`。真实验收脚本 `scripts/factory_acceptance.py` 必须显式提供新输出目录和配置，CI/unit tests 不会发起付费模型调用。

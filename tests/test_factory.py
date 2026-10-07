@@ -513,6 +513,20 @@ class FactoryRuntimeTests(unittest.TestCase):
                 server._read_message()
             self.assertEqual(server.transcript.read_text(), ' malformed JSON }\n')
 
+    def test_native_project_trust_bookkeeping_does_not_change_model_profile_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            config = home / "config.toml"
+            config.write_text('model="same-model"\n')
+            profile = {"provider": "openai", "codex_home": str(home)}
+            with patch("harness.factory_runtime.subprocess.check_output", return_value="codex fixture"), patch.object(FactoryAppServer, "_trusted_executable", return_value=Path("/usr/bin/true")):
+                before = LocalRuntime().profile_identity(profile)
+                config.write_text('model="same-model"\n[projects."/another/candidate"]\ntrust_level="trusted"\n')
+                after = LocalRuntime().profile_identity(profile)
+                self.assertEqual(before, after)
+                config.write_text('model="new-model"\n')
+                self.assertNotEqual(before, LocalRuntime().profile_identity(profile))
+
     def test_official_rubric_is_unmodified_with_pinned_provenance(self):
         self.assertIn("# Review guidelines:", official_rubric())
         self.assertIn("overall_correctness", official_rubric())
@@ -529,8 +543,13 @@ class FactoryRuntimeTests(unittest.TestCase):
                     "choices": [{"finish_reason": "stop", "message": {"content": json.dumps({"findings": []})}}]}
             def response():
                 return io.BytesIO(json.dumps(body).encode())
-            with patch("urllib.request.urlopen", side_effect=lambda *a, **k: response()) as transport:
-                result = LocalRuntime().second_review(profile, root, {"diff": "full diff", "target": {}}, root / "review.raw", 30)
+            from harness.factory_http import request
+            from unittest.mock import Mock
+            opener = Mock()
+            opener.open.side_effect = lambda *a, **k: response()
+            with patch("urllib.request.build_opener", return_value=opener):
+                transport = opener.open
+                result = request(profile, {"diff": "full diff", "target": {}}, root / "review.raw", 30)
             self.assertEqual(result["usage"], body["usage"])
             sent = json.loads(transport.call_args.args[0].data)
             self.assertIn("# Review guidelines:", sent["messages"][0]["content"])
@@ -538,8 +557,12 @@ class FactoryRuntimeTests(unittest.TestCase):
             for field, value in (("model", "another-model"), ("choices", [{"finish_reason": "length", "message": {"content": "{}"}}])):
                 changed = copy.deepcopy(body)
                 changed[field] = value
-                with patch("urllib.request.urlopen", return_value=io.BytesIO(json.dumps(changed).encode())), self.assertRaises(RuntimeError):
-                    LocalRuntime().second_review(profile, root, {}, root / "bad.raw", 30)
+                opener.open.side_effect = None
+                opener.open.return_value = io.BytesIO(json.dumps(changed).encode())
+                with patch("urllib.request.build_opener", return_value=opener):
+                    failed = request(profile, {}, root / "bad.raw", 30)
+                self.assertIn("error", failed)
+                self.assertEqual(failed["usage"], body["usage"])
 
     def test_cli_demo_runs_customer_acceptance_without_credentials_or_provider_calls(self):
         with tempfile.TemporaryDirectory() as temporary, patch("urllib.request.urlopen", side_effect=AssertionError("no provider traffic")):

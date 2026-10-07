@@ -9,6 +9,7 @@ import subprocess
 import time
 import tomllib
 import uuid
+import sys
 import urllib.request
 import urllib.parse
 from pathlib import Path
@@ -70,13 +71,14 @@ class FactoryAppServer(AppServerCodex):
     """
 
     def __init__(self, profile: dict, cwd: Path, transcript: Path, timeout: int,
-                 denied_roots: list[Path], read_only: bool, reviewer: bool = False):
+                 denied_roots: list[Path], read_only: bool, reviewer: bool = False, token_limit: int | None = None):
         self._policy_cwd = self._canonical_worktree(str(cwd))
         self._forbidden_actions = self._effective_policy(("release",))
         self._configured_forbidden_actions = self._forbidden_actions
         self._permissions_profile = f"cmh_delegated_{uuid.uuid4().hex}"
         self.MODEL = profile.get("model")
         self.REASONING_EFFORT = profile.get("effort")
+        self.token_limit = token_limit
         self.profile, self.read_only = profile, read_only
         self.reviewer = reviewer
         self.runtime_identity = None
@@ -117,7 +119,14 @@ class FactoryAppServer(AppServerCodex):
                      # parent traversal would probe private factory directories.
                      "-c", "project_root_markers=[]",
                      "-c", "mcp_servers={}",
-                     "-c", "plugins={}"]
+                     "-c", "plugins={}",
+                     "-c", 'shell_environment_policy.set.PYTHONDONTWRITEBYTECODE="1"']
+        if token_limit:
+            # Native Codex budget stops its own sampling loop. Controller also
+            # checks unweighted telemetry, including cached input tokens.
+            overrides.extend(["-c", "features.rollout_budget=" + json.dumps(
+                {"enabled": True, "limit_tokens": token_limit, "reminder_at_remaining_tokens": ([max(1, token_limit // 4)] if token_limit > 1 else []),
+                 "sampling_token_weight": 1.0, "prefill_token_weight": 1.0}).replace(': ', '=')])
         if profile.get("codex_profile"):
             overrides = ["--profile", profile["codex_profile"], *overrides]
         if self.MODEL:
@@ -198,6 +207,9 @@ class FactoryAppServer(AppServerCodex):
         self.events.append(message)
         if message.get("method") == "thread/tokenUsage/updated":
             self.usage = message.get("params", {}).get("tokenUsage")
+            from .factory_budget import tokens
+            if self.token_limit and (tokens(self.usage) or 0) > self.token_limit:
+                raise RuntimeFailure("Codex token telemetry exceeded run allowance", self.usage, self.runtime_identity)
         return message
 
     def _request(self, method, params):
@@ -272,6 +284,18 @@ class LocalRuntime:
 
     simulation = False
 
+    def __init__(self):
+        self.resource_policy = {}
+        self.current_process = None
+
+    def cancel(self):
+        proc = self.current_process
+        if proc is not None and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
     def profile_identity(self, profile):
         identity = {"configured": profile}
         if profile["provider"] == "openai":
@@ -279,18 +303,32 @@ class LocalRuntime:
             selected = [home / "config.toml"]
             if profile.get("codex_profile"):
                 selected.append(home / (profile["codex_profile"] + ".config.toml"))
-            identity["codex_config_hashes"] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-                                                if p.exists() else None for p in selected}
+            # Codex writes project trust bookkeeping when opening a new
+            # checkout. That is not a model/profile change and must not
+            # silently invalidate prior reviews on every subsequent task.
+            configs = {}
+            for path in selected:
+                if path.exists():
+                    semantic = tomllib.loads(path.read_text())
+                    semantic.pop("projects", None)
+                    canonical = json.dumps(semantic, sort_keys=True, separators=(",", ":")).encode()
+                    configs[path.name] = hashlib.sha256(canonical).hexdigest()
+                else:
+                    configs[path.name] = None
+            identity["codex_config_hashes"] = configs
             binary = AppServerCodex._trusted_executable("codex")
             identity["runtime_version"] = subprocess.check_output([str(binary), "--version"], timeout=10, text=True).strip()
         else:
             identity["route"] = "https://api.deepseek.com/chat/completions"
         identity["adapter_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        dependencies = ["codex.py"] if profile["provider"] == "openai" else ["factory_http.py", "model_registry.py"]
+        identity["transport_hashes"] = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in dependencies}
         return identity
 
     def agent(self, role, profile, cwd, payload, transcript, timeout, denied_roots):
         server = FactoryAppServer(profile, cwd, transcript, timeout, denied_roots,
-                                  role in ("plan", "review"), role == "review")
+                                  role in ("plan", "review"), role == "review", self.resource_policy.get("max_run_tokens"))
+        self.current_process = server.proc
         try:
             schema = REVIEW_SCHEMA if role == "review" else PLAN_SCHEMA if role == "plan" else WORK_SCHEMA
             return server.execute(json.dumps(payload, ensure_ascii=False), schema)
@@ -298,29 +336,60 @@ class LocalRuntime:
             raise RuntimeFailure(str(exc), server.usage, server.runtime_identity) from exc
         finally:
             server.close()
+            self.current_process = None
 
     def second_review(self, profile, cwd, payload, transcript, timeout):
-        token = read_private_token(Path(profile["token_file"]))
-        body = {"model": profile["model"], "messages": [
-            {"role": "system", "content": official_rubric()},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-            "response_format": {"type": "json_object"}, "max_tokens": profile.get("max_output_tokens", 8192)}
-        request = urllib.request.Request("https://api.deepseek.com/chat/completions",
-                                         data=json.dumps(body).encode(), method="POST",
-                                         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read(2 * 1024 * 1024 + 1)
-        if len(raw) > 2 * 1024 * 1024:
-            raise RuntimeError("DeepSeek response limit exceeded")
-        transcript.write_bytes(raw)
-        result = json.loads(raw)
-        if result.get("model") != profile["model"]:
-            raise RuntimeError("DeepSeek returned a different model identity")
-        choice = result["choices"][0]
-        if choice.get("finish_reason") != "stop":
-            raise RuntimeError("DeepSeek review was truncated or incomplete")
-        return {"output": json.loads(choice["message"]["content"]),
-                "usage": result.get("usage"), "response_id": result.get("id")}
+        # A separate bounded process makes cancellation, controller death and
+        # total wall-clock independent of socket per-read timeout behavior.
+        watchdog = AppServerCodex._trusted_executable("timeout", str(cwd))
+        env = {"PATH": SAFE_PATH, "HOME": "/nonexistent", "LANG": "C.UTF-8",
+               "PYTHONPATH": str(Path(__file__).resolve().parent.parent)}
+        for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
+                    "https_proxy", "http_proxy", "all_proxy", "no_proxy"):
+            if key in os.environ:
+                env[key] = os.environ[key]
+        proc = subprocess.Popen([str(watchdog), "--signal=TERM", "--kill-after=5", str(timeout),
+                                 sys.executable, "-m", "harness.factory_http"],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, cwd=cwd, env=env, start_new_session=True)
+        self.current_process = proc
+        try:
+            output, error = proc.communicate(json.dumps({"profile": profile, "payload": payload,
+                                                         "transcript": str(transcript), "timeout": timeout}), timeout=timeout + 6)
+            if proc.returncode:
+                raise RuntimeFailure(f"DeepSeek transport failed ({proc.returncode}): {error[-2000:]}")
+            result = json.loads(output)
+            if "error" in result:
+                raise RuntimeFailure(result["error"], result.get("usage"), result.get("runtime_identity"))
+            return result
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+            self.current_process = None
+
+    def hosted_ci(self, policy, cwd, target, branch, transcript, timeout):
+        watchdog = AppServerCodex._trusted_executable("timeout", str(cwd))
+        env = {"PATH": SAFE_PATH, "HOME": str(Path.home()), "LANG": "C.UTF-8",
+               "PYTHONPATH": str(Path(__file__).resolve().parent.parent)}
+        for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "all_proxy", "no_proxy"):
+            if key in os.environ:
+                env[key] = os.environ[key]
+        proc = subprocess.Popen([str(watchdog), "--signal=TERM", "--kill-after=5", str(timeout),
+                                 sys.executable, "-m", "harness.factory_hosted"], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd, env=env, start_new_session=True)
+        self.current_process = proc
+        try:
+            output, error = proc.communicate(json.dumps({"policy": policy, "cwd": str(cwd), "target": target,
+                                "branch": branch, "transcript": str(transcript), "timeout": timeout}), timeout=timeout + 6)
+            if proc.returncode:
+                raise RuntimeFailure(f"hosted CI transport failed ({proc.returncode}): {error[-2000:]}")
+            return json.loads(output)
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+            self.current_process = None
 
     def gate(self, command, cwd, target, transcript, timeout):
         environment = {"BASE_REF": target["base"], "HEAD_REF": target["head"]}
@@ -333,12 +402,15 @@ class LocalRuntime:
         with transcript.open("xb") as log:
             proc = subprocess.Popen(invocation.argv, cwd=invocation.cwd, env=invocation.env,
                                     stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            self.current_process = proc
             try:
                 code = proc.wait(timeout=timeout)
             except BaseException:
                 os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
                 raise
+            finally:
+                self.current_process = None
         return {"status": "PASS" if code == 0 else "FAIL", "exit_code": code,
                 "log": transcript.read_text(errors="replace")[-64000:]}
 
