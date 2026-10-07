@@ -26,6 +26,8 @@ OpenAI profile 使用官方独立认证目录、`gpt-6.1-sol`；DeepSeek 使用 
 - Codex 运行 Python 测试可能生成 bytecode，导致干净小项目产生无关 scope 变更。官方 shell policy 设置禁止意外 bytecode，验收项目保留标准 `.gitignore`；历史 scope failure 保持原记录。
 - Codex 会自动写入项目 trust bookkeeping，原来的整文件 config hash 会让新任务无理由地触发旧任务复审。现在 profile identity 使用排除该 bookkeeping 的语义配置 hash，仍对真实模型配置变化产生新身份；这不是改写旧 receipt。
 - 真实 token cutoff 证明失败 turn 的已观察 usage 可能只覆盖此前完成的响应。现在区分完整 HTTP/turn 结算和部分遥测；部分 telemetry 原样保留，未完成 dispatch 的全额 UNKNOWN reservation 永久保留，不能据此释放预算。
+- 候选发布先于 review，因此新增 workflow 也不能绕过冻结的 CI policy。所有 `.github/workflows/` 变更都在 push 前停止，不能靠新增自动发布工作流绕过人类 authority。
+- 未提交源码原先会被 clone 默默忽略。现在在付费之前拒绝不稳定的源版本，并禁止 Git 的可选 index 刷新写入；默认 help 指向新工厂，显式 legacy resume 仍走兼容入口。
 - 用户入口需要填写内部参数。新增 setup 自动识别项目门禁、私有第二 Provider credential 输入、最近任务选择、简洁中文状态及 delivery/resume/cancel 入口；原 JSON CLI 保持兼容。
 
 ## 故障、恢复和历史
@@ -41,3 +43,7 @@ OpenAI profile 使用官方独立认证目录、`gpt-6.1-sol`；DeepSeek 使用 
 仓库 Actions 在 Python 3.11/3.12/3.13/3.14 上运行 editable install、完整测试/compile checks、wheel build、独立 venv wheel install 和 installed CLI E2E。最终 run URL 和 exact code HEAD 记录在最终报告。Acceptance 项目的每轮 Actions 是另外的托管记录，不能代替 Harness 自身 CI。
 
 尚未通过的步骤不能在最终报告写成 PASS。真实的剩余限制包括：Linux、本地已有依赖、完整文本上下文容量、官方账户访问权、UNKNOWN 不可盲目重发、token admission 非精确美元扣费保证、最终合并/发布必须人工单独批准。
+
+## 官方运行器的未知请求边界
+
+[官方配置参考](https://developers.openai.com/codex/config-reference/) 给出 HTTP/SSE 默认重试。官方源码 `model-provider-info` 的 built-in catalog 不接受 OpenAI provider 参数覆盖，因此工厂使用每次新建的原生 Provider entry，`name=OpenAI`、`requires_openai_auth=true`、`wire_api=responses`，不设置自定义 endpoint/auth。官方运行器根据真实登录模式选官方 endpoint；request/stream retries、unbounded retries、WebSocket 及 fallback 均关闭。native 零 inference 测试验证生效配置和实际 thread provider；`final-no-retry-factory/` 保存此最终 transport 下重新执行的真实完整闭环。Provider receipt 记录 authentic provider 与实际 transport id，不把 alias 当作新的独立 Provider。明确的 401 认证拒绝可以由官方认证刷新处理；不允许对未知 inference 重新 dispatch。

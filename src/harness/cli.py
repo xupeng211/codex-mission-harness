@@ -78,8 +78,10 @@ def describe(supervisor: Supervisor, mission_id: str) -> None:
 
 def main() -> None:
     from .factory_cli import COMMANDS, main as factory_main
-    if len(sys.argv) > 1 and sys.argv[1] in COMMANDS:
-        factory_main(sys.argv[1:])
+    argv = sys.argv[1:]
+    legacy = "--legacy" in argv or "--root" in argv
+    if not legacy and (not argv or argv[0] in COMMANDS or argv[0] in ("-h", "--help")):
+        factory_main(argv or ["--help"])
         return
     parser = argparse.ArgumentParser(prog="harness")
     parser.add_argument("--root", type=Path, default=Path.cwd())

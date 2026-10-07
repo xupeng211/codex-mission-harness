@@ -61,6 +61,21 @@ class NativeProtocolTests(unittest.TestCase):
         self.assertEqual(result, {"source": "READABLE", "auth": "DENIED", "controller": "DENIED", "original": "DENIED",
                                   "edit": "WRITABLE", "git": "DENIED", "external": "DENIED"})
 
+    def test_native_official_transport_disables_ambiguous_retries(self):
+        server = self.server(True)
+        effective = server._request("config/read", {"includeLayers": False})["config"]
+        transport = effective["model_providers"][server._transport_provider]
+        self.assertEqual(transport["name"], "OpenAI")
+        self.assertTrue(transport["requires_openai_auth"])
+        self.assertEqual(transport["request_max_retries"], 0)
+        self.assertEqual(transport["stream_max_retries"], 0)
+        self.assertFalse(transport["supports_websockets"])
+        self.assertFalse(transport.get("base_url"))
+        for feature in ("unbounded_connection_retries", "responses_websockets", "responses_websockets_v2"):
+            self.assertFalse(effective["features"][feature])
+        self.assertEqual(server.runtime_identity["transport_provider"], server._transport_provider)
+        self.assertFalse(any(e.get("method") == "turn/started" for e in server.events))
+
     def test_native_shell_disables_incidental_python_bytecode(self):
         server = self.server(False)
         result = self.exec(server, "import os,json;print(json.dumps({'bytecode':os.environ.get('PYTHONDONTWRITEBYTECODE')}))")

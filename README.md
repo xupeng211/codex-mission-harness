@@ -22,7 +22,7 @@ git clone --branch feat/factory-production-acceptance https://github.com/xupeng2
 cd codex-mission-harness
 python3 -m venv .venv
 source .venv/bin/activate
-python3 -m pip install -e .
+python3 -m pip install --index-url https://pypi.org/simple -e .
 ```
 
 已有本仓库时可以从虚拟环境步骤开始；该 GitHub 仓库为私有仓库，需要有访问权限并先完成 `gh auth login`。
@@ -45,11 +45,11 @@ codex login
 harness setup --repository /你的项目完整路径
 ```
 
-第一次会隐藏输入 DeepSeek key，并将它存为只有当前用户可读的文件。Harness 不购买额度，不更改账户支出限额。项目必须是 Git 仓库；系统自动识别 `make verify`、Python unittest 或 pytest 等现有测试。项目依赖需要先按项目自己的安装说明准备好。无法识别的项目，由维护者一次性设置 [配置示例](config/factory.example.json) 中的测试命令；日常用户不用选测试、调 Agent 或写 reviewer prompt。
+第一次会隐藏输入 DeepSeek key，并将它存为只有当前用户可读的文件。Harness 不购买额度，不更改账户支出限额。项目必须是已有已保存版本的 Git 仓库。有未保存的源码改动时，会在付费调用之前停止，避免悄悄遗漏你的代码；首次由维护者保存项目版本后即可提交，Harness 不覆盖或替你提交原目录。系统自动识别 `make verify`、Python unittest 或 pytest 等现有测试。项目依赖需要先按项目自己的安装说明准备好。无法识别的项目，由维护者一次性设置 [配置示例](config/factory.example.json) 中的测试命令；日常用户不用选测试、调 Agent 或写 reviewer prompt。
 
 已经有私有 token 文件时可用 `--deepseek-token-file /绝对路径`；文件须为当前用户所有、权限 `0600`。已有独立官方 Codex 认证目录时可用 `--codex-home /绝对路径`，无需改动原来的 Codex 配置。
 
-已有 GitHub Actions 的项目先安装 `gh` 并运行 `gh auth login`。Setup 自动识别 GitHub origin 和工作流。任务会将候选版本推送到 `factory/...` 专用分支，等待对应 exact commit 的所有配置工作流和 matrix jobs 完成；不会修改 main、合并 PR 或发布。用于验收的工作流在任务内不可被改弱。没有 GitHub Actions 的本地项目，交付会明确显示 `GitHub CI：NOT_CONFIGURED`，不会拿本地 CI 冒充 hosted CI。
+已有 GitHub Actions 的项目先安装 `gh` 并运行 `gh auth login`。Setup 自动识别 GitHub origin 和工作流。任务会将候选版本推送到 `factory/...` 专用分支，等待对应 exact commit 的所有配置工作流和 matrix jobs 完成；不会修改 main、合并 PR 或发布。Hosted CI 应使用项目负责人已授权、不会在 `factory/...` 分支自动发布的测试工作流。候选任务不能修改或新增 GitHub workflow 再自行执行；CI policy 变更需要单独授权的验证方式。本次真实验收工作流只做测试，使用只读 token。没有 GitHub Actions 的本地项目，交付会明确显示 `GitHub CI：NOT_CONFIGURED`，不会拿本地 CI 冒充 hosted CI。
 
 ```bash
 harness factory-doctor
@@ -87,6 +87,8 @@ harness resume
 ```
 
 系统复用已经完成且校验通过的证据，不会重新执行已完成的模型调用。控制器崩溃后，独立 watchdog 仍限制正在运行的子进程。
+
+官方运行器使用独立的官方 OpenAI transport 配置：HTTP/SSE 自动重试、无限连接重试和 WebSocket fallback 均关闭；登录被明确拒绝后的官方认证刷新不属于未知 inference 重发。
 
 如果请求已登记但无法证明最终结果，状态为 `UNKNOWN`，任务和 reservation 保留；`resume` 不会盲目重发。它表示系统没有足够证据继续，并不表示代码通过。普通测试失败和 reviewer findings 会自动返工；不要不断复制下一条 prompt。
 

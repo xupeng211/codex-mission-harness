@@ -82,6 +82,10 @@ class FactoryAppServer(AppServerCodex):
         self.profile, self.read_only = profile, read_only
         self.reviewer = reviewer
         self.runtime_identity = None
+        # Built-in OpenAI ignores configured retry overrides. A fresh official
+        # provider entry uses native authentication/endpoint selection while
+        # disabling ambiguous request replay and transport fallback.
+        self._transport_provider = "cmh_openai_" + uuid.uuid4().hex
         self.events: list[dict] = []
         self.usage = None
         self.transcript, self._transcript_bytes = transcript, 0
@@ -109,7 +113,11 @@ class FactoryAppServer(AppServerCodex):
                      "-c", f"permissions.{self._permissions_profile}.filesystem=" +
                      "{" + ",".join(f"{json.dumps(k)}={json.dumps(v)}" for k, v in rules.items()) + "}",
                      "-c", f"permissions.{self._permissions_profile}.network.enabled=false",
-                     "-c", "model_provider=\"openai\"",
+                     "-c", "model_provider=" + json.dumps(self._transport_provider),
+                     "-c", "model_providers." + self._transport_provider + '={name="OpenAI",wire_api="responses",requires_openai_auth=true,request_max_retries=0,stream_max_retries=0,supports_websockets=false}',
+                     "-c", "features.unbounded_connection_retries=false",
+                     "-c", "features.responses_websockets=false",
+                     "-c", "features.responses_websockets_v2=false",
                      "-c", "web_search=\"disabled\"",
                      "-c", "features.multi_agent=false",
                      "-c", "features.multi_agent_v2=false",
@@ -215,9 +223,10 @@ class FactoryAppServer(AppServerCodex):
     def _request(self, method, params):
         result = super()._request(method, params)
         if method == "thread/start":
-            self.runtime_identity = {"model": result.get("model"), "provider": result.get("modelProvider"),
+            self.runtime_identity = {"model": result.get("model"), "provider": "openai", "transport_provider": result.get("modelProvider"),
+                                     "transport": {"official_auth": True, "request_max_retries": 0, "stream_max_retries": 0, "supports_websockets": False},
                                      "effort": result.get("reasoningEffort"), "profile": self.profile}
-            if result.get("modelProvider") != "openai" or not result.get("model"):
+            if result.get("modelProvider") != self._transport_provider or not result.get("model"):
                 raise RuntimeError("Codex runtime provider/model identity is unproven")
             if self.MODEL and result["model"] != self.MODEL:
                 raise RuntimeError("Codex runtime selected a different configured model")
@@ -227,7 +236,7 @@ class FactoryAppServer(AppServerCodex):
         params = super()._thread_policy_params(cwd)
         if self.MODEL is None:
             params.pop("model")
-        params["modelProvider"] = "openai"
+        params["modelProvider"] = self._transport_provider
         params["ephemeral"] = True
         if self.reviewer:
             params["baseInstructions"] = official_rubric()

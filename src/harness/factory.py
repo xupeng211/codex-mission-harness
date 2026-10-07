@@ -84,7 +84,7 @@ def private_dir(path: Path) -> Path:
 def git(repo: Path, *args: str) -> str:
     env = {"PATH": SAFE_PATH, "HOME": "/nonexistent", "LANG": "C.UTF-8",
            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
-           "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1"}
+           "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_OPTIONAL_LOCKS": "0"}
     data = subprocess.check_output(["git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
                                     "-c", "core.quotePath=false",
                                     "-c", "core.fsmonitor=false", "-C", str(repo), *args],
@@ -181,6 +181,8 @@ def validate_mission(raw):
     if Path(git(repo, "rev-parse", "--show-toplevel")).resolve() != repo:
         raise ValueError("repository must be a Git root")
     mission["repository"] = str(repo)
+    if git(repo, "status", "--porcelain", "--untracked-files=all"):
+        raise ValueError("原项目有未保存到 Git 的改动；请由项目维护者保存版本后再提交。原文件未被修改，也没有发起模型调用。")
     if not isinstance(mission.get("objective"), str) or not mission["objective"].strip():
         raise ValueError("a product request is required")
     for key, default in [("acceptance", []), ("constraints", []), ("scope", ["**"])]:
@@ -422,6 +424,10 @@ class Factory:
             target["mission_scope_file"] = scope_file
             target["scope_blob"] = baseline
         if "hosted_ci" in self.config:
+            # Publication happens before review. An agent must not be able to
+            # add a privileged workflow that executes merely on candidate push.
+            if any(path.startswith(".github/workflows/") for path in files):
+                raise FactoryBlocked("BLOCKED_SCOPE", "candidate changes GitHub workflows; an independently authorized CI policy is required before publication")
             for workflow in self.config["hosted_ci"]["workflows"]:
                 path = ".github/workflows/" + workflow
                 if git(cwd, "rev-parse", spec["base"] + ":" + path) != git(cwd, "rev-parse", head + ":" + path):
@@ -653,6 +659,8 @@ class Factory:
             try:
                 if self.target(json.loads(row["spec"]), Path(row["candidate"])) != delivery.get("target"):
                     raise FactoryBlocked("UNKNOWN", "delivery HEAD/tree/scope changed after verification")
+                if not delivery.get("target", {}).get("files") or not isinstance(delivery.get("implemented"), str) or not delivery["implemented"].strip():
+                    raise FactoryBlocked("UNKNOWN", "delivery implementation/change evidence is missing")
                 expected_lanes = {"reviewer", "second_reviewer"} if self.config["independent_review_required"] else {"reviewer"}
                 if {r["lane"] for r in delivery.get("reviews", [])} != expected_lanes:
                     raise FactoryBlocked("UNKNOWN", "required independent reviewer evidence is missing")
@@ -800,11 +808,13 @@ class Factory:
                 outputs = []
                 for assignment in assignments:
                     output = self.agent(spec, cwd, stage, round_, assignment).get("output")
-                    if not isinstance(output, dict) or set(output) != {"summary", "known_risks"} or not isinstance(output["summary"], str) or not isinstance(output["known_risks"], list) or any(not isinstance(r, str) for r in output["known_risks"]):
+                    if not isinstance(output, dict) or set(output) != {"summary", "known_risks"} or not isinstance(output["summary"], str) or not output["summary"].strip() or not isinstance(output["known_risks"], list) or any(not isinstance(r, str) for r in output["known_risks"]):
                         raise FactoryBlocked("UNKNOWN", "implementation result is missing or malformed")
                     outputs.append(output)
                 work = {"summary": "\n".join(o["summary"] for o in outputs), "known_risks": [risk for o in outputs for risk in o["known_risks"]]}
                 target = self.checkpoint(spec, cwd)
+                if not target["files"]:
+                    raise FactoryBlocked("UNKNOWN", "implementation produced no candidate changes or acceptance tests; no delivery was asserted")
                 self.state(mission, "TEST")
                 tests = self.gates(spec, cwd, target, "checks", round_)
                 self.state(mission, "CI")

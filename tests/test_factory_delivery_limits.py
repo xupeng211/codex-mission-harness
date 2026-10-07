@@ -238,3 +238,56 @@ class DeliveryLimitsTests(unittest.TestCase):
         self.assertEqual(data['observed_tokens'], 40)
         self.assertEqual(data['partial_usage_runs'], 0)
         self.assertEqual(data['agent_runs'], 1)
+
+    def test_default_help_opens_factory_and_explicit_legacy_resume_stays_compatible(self):
+        from harness.cli import main as entrypoint
+        with patch('sys.argv', ['harness', '--help']), patch('sys.stdout', io.StringIO()) as output, self.assertRaises(SystemExit) as stopped:
+            entrypoint()
+        self.assertEqual(stopped.exception.code, 0)
+        for name in ('setup', 'submit', 'delivery', 'cancel'):
+            self.assertIn(name, output.getvalue())
+        with patch('sys.argv', ['harness', 'resume', 'old-mission.json', '--legacy']), patch('harness.cli.load_spec', side_effect=RuntimeError('legacy selected')), patch('harness.factory_cli.main') as factory_entry:
+            with self.assertRaisesRegex(RuntimeError, 'legacy selected'):
+                entrypoint()
+            factory_entry.assert_not_called()
+
+    def test_dirty_source_is_not_silently_replaced_by_older_committed_version(self):
+        path = self.repo / 'score.py'
+        content = 'def add(a,b):\n    return a+b+1  # unsaved user work\n'
+        path.write_text(content)
+        with self.assertRaisesRegex(ValueError, '未保存到 Git'):
+            self.f.submit({'version': 2, 'mission_id': 'dirty-source', 'repository': str(self.repo), 'objective': 'Add a feature'})
+        self.assertEqual(path.read_text(), content)
+        self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM missions WHERE id='dirty-source'").fetchone()[0], 0)
+        self.assertEqual(self.f.db.execute('SELECT COUNT(*) FROM operations').fetchone()[0], 0)
+
+    def test_new_privileged_workflow_cannot_execute_before_human_review(self):
+        factory = self.hosted_factory(lambda result: None)
+        spec, cwd = factory.prepare('hosted')
+        (cwd / '.github/workflows/unapproved-release.yml').write_text('name: Release\non: [push]\npermissions: write-all\n')
+        with self.assertRaises(FactoryBlocked) as error:
+            factory.checkpoint(spec, cwd)
+        self.assertEqual(error.exception.status, 'BLOCKED_SCOPE')
+        self.assertEqual(factory.db.execute("SELECT COUNT(*) FROM operations WHERE stage='hosted_ci'").fetchone()[0], 0)
+
+    def test_noop_implementation_cannot_claim_requirement_delivery(self):
+        original = self.f.runtime.agent
+        def agent(role, *args):
+            if role == 'implement':
+                return {'output': {'summary': 'Done', 'known_risks': []}, 'usage': {'fixture_provider_calls': 0}}
+            return original(role, *args)
+        with patch.object(self.f.runtime, 'agent', side_effect=agent):
+            report = self.f.run('feature')
+        self.assertEqual(report['DELIVERY_STATUS'], 'UNKNOWN')
+        self.assertEqual(report['BUDGET_USED']['agent_runs'], 2)
+        self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM operations WHERE stage='review'").fetchone()[0], 0)
+
+    def test_empty_implementation_summary_is_missing_evidence(self):
+        original = self.f.runtime.agent
+        def agent(role, *args):
+            result = original(role, *args)
+            if role == 'implement':
+                result['output']['summary'] = '   '
+            return result
+        with patch.object(self.f.runtime, 'agent', side_effect=agent):
+            self.assertEqual(self.f.run('feature')['DELIVERY_STATUS'], 'UNKNOWN')
