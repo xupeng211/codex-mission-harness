@@ -12,6 +12,8 @@ harness delivery
 
 真实双 Provider、自动返工、恢复及 GitHub CI 验收记录见 [交付验收](docs/PRODUCTION_ACCEPTANCE.md)。`factory-demo` 是免费模拟演示，不能用来证明真实 Provider 可用。
 
+Codex 开发/规划可显式选择 [CLI proxy transport](docs/CLI_PROXY_TRANSPORT.md)，与官方 transport 分开配置。proxy OpenAI reviewer 尚未合格；DeepSeek reviewer 仍直接连接 Provider。developer route 可用不等于完整双 Provider Factory 已重新通过验收。
+
 ## 第一次安装与打开
 
 安装 Python 3.11+、Git、Node.js 和 bubblewrap；GitHub Actions 项目还需要 GitHub CLI (`gh`)。Ubuntu 的系统组件可用 `sudo apt install python3-venv git bubblewrap` 安装。
@@ -37,7 +39,7 @@ python3 -m pip install --index-url https://pypi.org/simple -e .
 codex login
 ```
 
-登录方式和安装说明以 [官方 Codex CLI 文档](https://developers.openai.com/codex/cli/) 为准。Harness 强制使用官方 OpenAI endpoint，不把代理服务或第二个 OpenAI agent 当作独立 Provider。
+登录方式和安装说明以 [官方 Codex CLI 文档](https://developers.openai.com/codex/cli/) 为准。OpenAI reviewer 使用官方 OpenAI route，DeepSeek reviewer 使用官方直连。规划、开发和返工可显式使用 CLI proxy；[Hybrid Factory 配置](docs/HYBRID_FACTORY.md) 使用独立官方认证目录，不覆盖日常 Codex 配置。
 
 从 DeepSeek 账户获得 API key，然后告诉 Harness 你的项目目录：
 

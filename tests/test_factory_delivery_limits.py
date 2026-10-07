@@ -131,6 +131,25 @@ class DeliveryLimitsTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'redirect rejected'):
             NoRedirect().redirect_request(None, None, None, None, None, None)
 
+    def test_hybrid_setup_selects_isolated_official_home_and_bounded_direct_review(self):
+        token = self.root / 'hybrid-token'
+        token.write_text('fake-key')
+        token.chmod(0o600)
+        home = self.root / 'official-home'
+        home.mkdir(mode=0o700)
+        config = self.root / 'hybrid/config.json'
+        with patch('harness.factory_setup.shutil.which', return_value='/usr/bin/true'), patch('harness.factory_proxy.ProxyPolicy'), patch('sys.stdout', io.StringIO()):
+            main(['setup', '--repository', str(self.repo), '--deepseek-token-file', str(token), '--config', str(config),
+                  '--model', 'gpt-6.1-sol', '--transport', 'cli_proxy', '--proxy-endpoint', 'http://127.0.0.1:18317/v1',
+                  '--proxy-policy-file', str(self.root/'private-policy.json'), '--reviewer-codex-home', str(home), '--json'])
+        lanes = json.loads(config.read_text())['profiles']
+        self.assertNotIn('codex_home', lanes['developer'])
+        self.assertEqual(lanes['developer']['transport']['type'], 'cli_proxy')
+        self.assertEqual(lanes['reviewer']['codex_home'], str(home))
+        self.assertEqual(lanes['reviewer']['transport'], {'type': 'official'})
+        self.assertEqual(lanes['second_reviewer']['transport'], {'type': 'direct'})
+        self.assertEqual(lanes['second_reviewer']['max_output_tokens'], 16384)
+
     def test_completed_malformed_deepseek_keeps_usage_for_charged_validation(self):
         token = self.root / 'token'
         token.write_text('fake-key')
@@ -141,7 +160,7 @@ class DeliveryLimitsTests(unittest.TestCase):
         opener = Mock()
         opener.open.return_value = io.BytesIO(json.dumps(body).encode())
         with patch('urllib.request.build_opener', return_value=opener):
-            result = request({'model': 'deepseek-flash', 'token_file': str(token)}, {}, self.root / 'raw', 1)
+            result = request({'provider': 'deepseek', 'model': 'deepseek-flash', 'token_file': str(token)}, {}, self.root / 'raw', 1)
         self.assertEqual(result['usage'], body['usage'])
         self.assertEqual(result['output'], 'not JSON')
         self.assertEqual(result['runtime_identity']['model'], 'deepseek-flash')

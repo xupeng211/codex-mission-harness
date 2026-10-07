@@ -70,7 +70,13 @@ def main(argv=None):
     onboarding.add_argument("--deepseek-token-file", type=Path)
     onboarding.add_argument("--size", choices=list(PRESETS), default="standard")
     onboarding.add_argument("--codex-home", type=Path)
+    onboarding.add_argument("--reviewer-codex-home", type=Path)
+    onboarding.add_argument("--deepseek-max-output-tokens", type=int, default=16384)
     onboarding.add_argument("--model")
+    onboarding.add_argument("--transport", choices=["official", "cli_proxy"], default="official")
+    onboarding.add_argument("--proxy-endpoint")
+    onboarding.add_argument("--proxy-policy-file", type=Path)
+    onboarding.add_argument("--proxy-provider", default="cli_proxy_api")
     approve = sub.add_parser("factory-approve", aliases=["approve"], help="Record explicit human approval; never execute merge/release")
     approve.add_argument("mission_id")
     approve.add_argument("--action", choices=["merge", "release"], required=True)
@@ -89,7 +95,9 @@ def main(argv=None):
     args.command = {"status": "factory-status", "delivery": "factory-status", "resume": "factory-resume", "approve": "factory-approve"}.get(args.command, args.command)
     try:
         if args.command == "setup":
-            result = setup(args.config, args.repository, args.deepseek_token_file, args.size, args.codex_home, args.model)
+            result = setup(args.config, args.repository, args.deepseek_token_file, args.size, args.codex_home, args.model,
+                           args.transport, args.proxy_endpoint, args.proxy_policy_file, args.proxy_provider,
+                           args.reviewer_codex_home, args.deepseek_max_output_tokens)
         elif args.command == "factory-demo":
             root = args.output or Path(tempfile.mkdtemp(prefix="codex-factory-demo-")) / "acceptance"
             result = demo(root)

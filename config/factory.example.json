@@ -14,11 +14,13 @@
   "checks": [["make", "verify"]],
   "ci": [["make", "lint"]],
   "profiles": {
-    "developer": {"provider": "openai"},
-    "reviewer": {"provider": "openai"},
+    "developer": {"provider": "openai", "transport": {"type": "official"}},
+    "reviewer": {"provider": "openai", "transport": {"type": "official"}},
     "second_reviewer": {
       "provider": "deepseek",
       "model": "deepseek-flash",
+      "transport": {"type": "direct"},
+      "max_output_tokens": 16384,
       "token_file": "/absolute/path/to/owner-only-deepseek-token"
     }
   }

@@ -153,6 +153,50 @@ class FactoryAcceptanceTests(unittest.TestCase):
         self.assertEqual(current["TARGET_HEAD"], report["TARGET_HEAD"])
         self.assertEqual(self.runtime.calls, [])
 
+    def test_hybrid_official_home_change_only_refreshes_that_lane_after_restart(self):
+        config = copy.deepcopy(self.config)
+        config["profiles"]["developer"]["transport"] = {"type": "cli_proxy", "endpoint": "http://127.0.0.1:18317/v1",
+            "configured_provider": "cli_proxy_api", "policy_file": "/fixture/private-policy.json"}
+        config["profiles"]["reviewer"].update(transport={"type": "official"}, codex_home="/fixture/official-home-a")
+        config["profiles"]["second_reviewer"]["transport"] = {"type": "direct"}
+        self.reopen(config)
+        first = self.ready()
+        original_receipts = {r["id"]: Path(r["evidence"]).read_bytes() for r in self.factory.db.execute("SELECT * FROM operations")}
+        changed = copy.deepcopy(config)
+        changed["profiles"]["reviewer"]["codex_home"] = "/fixture/official-home-b"
+        self.reopen(changed)
+        second = self.ready()
+        self.assertEqual([(c["role"], c["provider"]) for c in self.runtime.calls], [("review", "openai")])
+        self.assertEqual(first["REVIEW_RESULT"][1], second["REVIEW_RESULT"][1])
+        for row in self.factory.db.execute("SELECT * FROM operations"):
+            if row["id"] in original_receipts:
+                self.assertEqual(Path(row["evidence"]).read_bytes(), original_receipts[row["id"]])
+
+    def test_hybrid_official_reviewer_failure_is_unknown_without_proxy_replay(self):
+        config = copy.deepcopy(self.config)
+        config["budget"].update(max_run_tokens=100, max_total_tokens=1200)
+        config["profiles"]["developer"]["transport"] = {"type": "cli_proxy", "endpoint": "http://127.0.0.1:18317/v1",
+            "configured_provider": "cli_proxy_api", "policy_file": "/fixture/private-policy.json"}
+        config["profiles"]["reviewer"]["transport"] = {"type": "official"}
+        self.factory.close()
+        self.runtime = AcceptanceRuntime()
+        self.factory = Factory(self.root / "hybrid-failure-state", config, self.runtime)
+        self.factory.submit(self.spec)
+        original = self.runtime.agent
+        def fail_reviewer(role, *args):
+            if role == "review":
+                raise RuntimeFailure("official access denied", {"input_tokens": 2, "output_tokens": 1})
+            return original(role, *args)
+        with patch.object(self.runtime, "agent", side_effect=fail_reviewer) as dispatch:
+            result = self.factory.run("feature")
+            self.assertEqual(result["DELIVERY_STATUS"], "UNKNOWN")
+            count = dispatch.call_count
+            self.factory.run("feature")
+            self.assertEqual(dispatch.call_count, count)
+        self.assertEqual(result["BUDGET_USED"]["partial_usage_runs"], 1)
+        self.assertEqual(result["BUDGET_USED"]["unknown_token_reservation"], 100)
+        self.assertEqual(self.factory.db.execute("SELECT COUNT(*) FROM operations WHERE lane='second_reviewer'").fetchone()[0], 0)
+
     def test_deepseek_model_switch_preserves_openai_review(self):
         first = self.ready()
         config = copy.deepcopy(self.config)
@@ -551,6 +595,9 @@ class FactoryRuntimeTests(unittest.TestCase):
                 transport = opener.open
                 result = request(profile, {"diff": "full diff", "target": {}}, root / "review.raw", 30)
             self.assertEqual(result["usage"], body["usage"])
+            self.assertEqual(result["runtime_identity"]["route_identity"]["route_type"], "direct")
+            self.assertEqual(result["runtime_identity"]["reported_model"], "deepseek-chat")
+            self.assertEqual(len(result["runtime_identity"]["qualification_identity"]), 64)
             sent = json.loads(transport.call_args.args[0].data)
             self.assertIn("# Review guidelines:", sent["messages"][0]["content"])
             self.assertNotIn(token.read_text(), (root / "review.raw").read_text())
@@ -563,6 +610,15 @@ class FactoryRuntimeTests(unittest.TestCase):
                     failed = request(profile, {}, root / "bad.raw", 30)
                 self.assertIn("error", failed)
                 self.assertEqual(failed["usage"], body["usage"])
+            changed = {**body, "usage": None}
+            opener.open.return_value = io.BytesIO(json.dumps(changed).encode())
+            with patch("urllib.request.build_opener", return_value=opener):
+                missing_usage = request(profile, {}, root / "missing-usage.raw", 30)
+            self.assertIn("error", missing_usage)
+            self.assertFalse(missing_usage["usage_complete"])
+            with patch("urllib.request.build_opener") as no_dispatch, self.assertRaises(ValueError):
+                request({**profile, "transport": {"type": "cli_proxy"}}, {}, root / "no-dispatch.raw", 30)
+            no_dispatch.assert_not_called()
 
     def test_cli_demo_runs_customer_acceptance_without_credentials_or_provider_calls(self):
         with tempfile.TemporaryDirectory() as temporary, patch("urllib.request.urlopen", side_effect=AssertionError("no provider traffic")):
