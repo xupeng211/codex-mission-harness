@@ -124,10 +124,46 @@ def docker_gate(argv):
             if len(args) < 2:
                 return False
             args = args[2:]
-        return bool(args and args[0] in {"exec", "run", "up", "down", "build", "restart", "start", "stop", "logs", "ps"}
-                    and not {"--help", "-h"} & set(args[1:]))
-    return name == "docker" and bool(args and args[0] in {"exec", "run", "build", "pull", "push", "start", "stop", "restart", "logs", "ps"}
-                                    and not {"--help", "-h"} & set(args[1:]))
+        operations = {"exec", "run", "up", "down", "build", "restart", "start", "stop", "logs", "ps"}
+    elif name == "docker":
+        operations = {"exec", "run", "build", "pull", "push", "start", "stop", "restart", "logs", "ps"}
+    else:
+        return False
+    if not args or args[0] not in operations:
+        return False
+    if not {"--help", "-h"} & set(args[1:]):
+        return True
+    if args[0] not in {"run", "exec"}:
+        return False
+    # run/exec stop parsing client flags at IMAGE / CONTAINER / SERVICE.
+    # Help after that boundary belongs to the container program. Interpret
+    # only common flags here; unknown option arity remains unverified.
+    switches = {"-d", "--detach", "--interactive"}
+    values = {"-e", "--env", "-u", "--user", "-w", "--workdir"}
+    if name == "docker-compose":
+        switches |= {"-T", "--no-TTY"}
+    else:
+        switches |= {"-i", "-t", "--tty"}
+    if args[0] == "run":
+        switches |= {"--rm"}
+        values |= {"--name", "--entrypoint", "-v", "--volume"}
+    elif name == "docker-compose":
+        values |= {"--index"}
+    index = 1
+    while index < len(args):
+        token = args[index]
+        if token in {"--help", "-h"}:
+            return False
+        if token == "--" or not token.startswith("-"):
+            return True
+        flag, separator, _ = token.partition("=")
+        if flag in switches and not separator:
+            index += 1
+        elif flag in values:
+            index += 1 if separator else 2
+        else:
+            return False
+    return False
 
 
 def make_docker_dependency(text, argv):

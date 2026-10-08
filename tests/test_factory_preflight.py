@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import shlex
 import subprocess
 import tempfile
 import time
@@ -14,7 +15,7 @@ from unittest.mock import Mock, patch
 from harness.factory import Factory, FactoryBlocked, READY, git, validate_config
 from harness.factory_budget import planning_limits
 from harness.factory_fixture import AcceptanceRuntime, fixture_config
-from harness.factory_preflight import CONFIG_BYTES, MAKE_BYTES, committed_text, inspect_prepaid, make_docker_dependency, text_capacity, workflow_push
+from harness.factory_preflight import CONFIG_BYTES, MAKE_BYTES, committed_text, docker_gate, inspect_prepaid, make_docker_dependency, text_capacity, workflow_push
 from harness.factory_runtime import FactoryAppServer, LocalRuntime, RuntimeFailure
 
 
@@ -228,6 +229,12 @@ class PrepaidPreflightTests(unittest.TestCase):
         report = self.assert_zero_dispatch(self.factory())
         self.assertTrue(any(x["level"] == "HARD_BLOCKER" and "Docker-dependent" in x["detail"] for x in report["PREPAID_PREFLIGHT"]["findings"]))
 
+    def test_container_program_help_blocks_before_any_paid_reservation(self):
+        self.config["checks"] = [["bash", "-lc", "docker compose exec -T dev python3 -h"]]
+        report = self.assert_zero_dispatch(self.factory())
+        self.assertTrue(any(x["level"] == "HARD_BLOCKER" and "Docker-dependent" in x["detail"]
+                            for x in report["PREPAID_PREFLIGHT"]["findings"]))
+
     def test_repository_docker_wrappers_and_help_are_not_daemon_proof(self):
         for command in (["./docker", "run", "fixture"], ["tools/docker", "run", "fixture"],
                         ["docker", "run", "--help"], ["docker", "run", "--rm", "--help"],
@@ -431,6 +438,55 @@ class PrepaidPreflightTests(unittest.TestCase):
         self.assertEqual(report["BUDGET_USED"]["observed_tokens"], 32003)
         self.assertEqual(report["BUDGET_USED"]["unknown_token_reservation"], 240000)
         self.assertEqual(f.report("feature")["BUDGET_USED"], report["BUDGET_USED"])
+
+
+class DockerHelpBoundaryTests(unittest.TestCase):
+    def test_client_help_and_container_help_across_direct_shell_and_make_gates(self):
+        cases = (
+            ("docker --help", False),
+            ("docker run --help", False),
+            ("docker compose --help", False),
+            ("docker compose exec --help", False),
+            ("docker run --rm image tool --help", True),
+            ("docker compose exec -T dev python3 -h", True),
+            ("docker compose exec -T dev python3 --help", True),
+            ("docker run --rm --help", False),
+            ("docker run --name fixture --help", False),
+            ("docker run --name fixture image tool --help", True),
+            ("docker compose exec --index 2 --help", False),
+            ("docker compose exec --index 2 dev python3 --help", True),
+            ("docker run --name=fixture image tool --help", True),
+            ("docker run -- image tool --help", True),
+            ("docker exec -i container python3 --help", True),
+            ("docker compose run --rm dev python3 --help", True),
+        )
+        spec = {"repository": "/unused", "base": "unused", "mission_id": "help-boundary"}
+        for script, required in cases:
+            with self.subTest(script=script):
+                command = shlex.split(script)
+                body = "verify:\n\t" + script + "\n"
+                self.assertEqual(docker_gate(command), required)
+                self.assertEqual(make_docker_dependency(body, ["make", "verify"]), required)
+                for gate in (command, ["bash", "-lc", script], ["make", "verify"]):
+                    config = {"simulation": True, "independent_review_required": False,
+                              "checks": [gate], "ci": []}
+                    with patch("harness.factory_preflight.shutil.which", return_value="/usr/bin/fixture"), \
+                         patch("harness.factory_preflight.committed_text", return_value=body):
+                        report = inspect_prepaid(spec, config)
+                    self.assertEqual(report["status"], "HARD_BLOCKER" if required else "NO_KNOWN_HARD_BLOCKER")
+                    self.assertEqual(any(x["level"] == "HARD_BLOCKER" and "Docker-dependent" in x["detail"]
+                                         for x in report["findings"]), required)
+
+    def test_unknown_option_arity_does_not_guess_help_boundary(self):
+        for script in ("docker run --unknown value --help", "docker compose exec --unknown value --help"):
+            with self.subTest(script=script):
+                self.assertFalse(docker_gate(shlex.split(script)))
+                config = {"simulation": True, "independent_review_required": False,
+                          "checks": [["bash", "-lc", script]], "ci": []}
+                report = inspect_prepaid({"repository": "/unused", "base": "unused"}, config)
+                self.assertEqual(report["status"], "NO_KNOWN_HARD_BLOCKER")
+                self.assertTrue(any(x["check"] == "checks[0]" and x["level"] == "UNVERIFIED"
+                                    for x in report["findings"]))
 
 
 class WorkflowTriggerTests(unittest.TestCase):
