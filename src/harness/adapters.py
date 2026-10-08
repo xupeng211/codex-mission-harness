@@ -45,10 +45,6 @@ class FootballPredictionAdapter:
         "schemas/agentic/codex_review_result.schema.json", "schemas/agentic/codex_review_receipt.schema.json",
         "schemas/agentic/independent_review_result.schema.json", "schemas/agentic/independent_review_receipt.schema.json",
     )
-    REVIEWER_PROVENANCE = {
-        "codex": ("gpt-5.6-sol", "high"),
-        "deepseek": ("deepseek-flash", None),
-    }
 
     @staticmethod
     def _safe_mission_id(mission_id: str) -> str:
@@ -723,7 +719,8 @@ class FootballPredictionAdapter:
         model = policy.get("model")
         reasoning = policy.get("reasoning_effort")
         if (not isinstance(codex_binary, str) or not Path(codex_binary).is_absolute()
-                or model != "gpt-5.6-sol" or reasoning != "high"):
+                or not isinstance(model, str) or re.fullmatch(r"[A-Za-z0-9_.:-]+", model) is None
+                or reasoning not in {"low", "medium", "high", "xhigh"}):
             raise RuntimeError("trusted Codex reviewer executable or model provenance is invalid")
         return {
             "codex_home": self._validate_canonical_codex_home(policy.get("codex_home"), worktree=worktree),
@@ -1145,11 +1142,12 @@ class FootballPredictionAdapter:
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
             pass
 
-        model, reasoning = self.REVIEWER_PROVENANCE.get(reviewer, ("unknown", None))
+        # A receiptless failure cannot establish an executed model. At most
+        # record a successfully resolved current policy; never revive old pins.
+        model, reasoning = "unknown", None
         codex_home: str | None = None
         codex_binary: str | None = None
         if reviewer == "codex":
-            model, reasoning = "gpt-5.6-sol", "high"
             if not contract_failure:
                 try:
                     policy = self._canonical_codex_reviewer_policy(worktree=worktree, base=base)
@@ -1631,7 +1629,7 @@ class FootballPredictionAdapter:
 
     def merge_ready(self, *, worktree: str, base: str, head: str, mission_id: str,
                     scope_file: str, pr_number: int, pr_repo: str, pr_base_sha: str,
-                    receipts: dict[str, str], ci_status: str) -> GateResult:
+                    receipts: dict[str, str], ci_status: str, use_project_policy: bool = False) -> GateResult:
         """Delegate the final merge-readiness decision to the target project."""
         codex_receipt = receipts.get("codex")
         deepseek_receipt = receipts.get("deepseek")
@@ -1717,8 +1715,9 @@ class FootballPredictionAdapter:
         protected_invariants = "PASS" if local_verdict == "PASS" else "UNKNOWN"
         forbidden_side_effects = "NO" if local_verdict == "PASS" else "UNKNOWN"
         required_pr_governance = "UNKNOWN"
-        argv += ["--selected-backend", "codex" if codex_receipt else "deepseek",
-                "--pr", str(pr_number), "--remote-ci-status", ci_status,
+        if not use_project_policy:
+            argv += ["--selected-backend", "codex" if codex_receipt else "deepseek"]
+        argv += ["--pr", str(pr_number), "--remote-ci-status", ci_status,
                 "--protected-invariants", protected_invariants,
                 "--forbidden-side-effects", forbidden_side_effects,
                 "--required-pr-governance", required_pr_governance, "--json"]

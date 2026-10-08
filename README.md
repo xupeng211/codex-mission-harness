@@ -1,5 +1,8 @@
 # AI Software Delivery Factory
 
+FootballPrediction 的显式项目合同模式见 [阶段 1 合同适配](docs/FACTORY_FOOTBALLPREDICTION_CONTRACT.md)。
+它仅完成离线合同接入，fixture 成功不代表真实业务交付；Docker 与 PR CI 尚待后续阶段。
+
 你说需求，Harness 自己规划、用官方 Codex 开发、运行测试和 CI、安排 OpenAI 与 DeepSeek 独立审核、处理 finding、自动返工，最后交回可信的候选版本。最终合并和发布需要你单独批准。
 
 支持 Linux、Python 3.11–3.14，以及有真实测试命令的 Git 项目。首次配置后，日常只需三个入口：

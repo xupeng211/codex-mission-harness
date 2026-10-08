@@ -323,7 +323,20 @@ def inspect_prepaid(spec, config):
     findings = []
     def add(level, check, detail, **values):
         findings.append({"level": level, "check": check, "detail": detail, **values})
-    if config["independent_review_required"]:
+    if config.get("project_contract") == "footballprediction":
+        from .adapters import FootballPredictionAdapter
+        # Canonical tool-based review does not serialize the whole repository.
+        # Check admission identity only; future diff and receipts remain unknown.
+        for path in FootballPredictionAdapter.REVIEW_CONTRACT_PATHS:
+            try:
+                entry = _read_git(repo, "ls-tree", commit, "--", path)
+                if not entry.startswith(("100644 blob ", "100755 blob ")):
+                    add("HARD_BLOCKER", "project_contract", "canonical policy source missing or unsupported", path=path)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                add("UNVERIFIED", "project_contract", "canonical baseline source cannot be inspected", path=path)
+        add("UNVERIFIED", "independent_context", "canonical reviewer reads exact diff and relevant source; full-repository prompt capacity is not the contract")
+        add("UNVERIFIED", "project_final_gate", "live PR/CI final gate is deferred to phase 2; no live READY is available")
+    elif config["independent_review_required"]:
         try:
             capacity = text_capacity(repo, commit, config["max_context_bytes"])
             if capacity["text_bytes_lower_bound"] > capacity["limit_bytes"]:

@@ -22,6 +22,8 @@ from pathlib import Path
 from .factory_runtime import LocalRuntime, official_rubric, VENDOR
 from .sandbox import SAFE_PATH
 from .factory_budget import accounting, planning_limits
+from .factory_project import (PROJECT, OFFLINE_PASS, LANES, BACKENDS, approved_scope,
+                              materialize_scope, scope_binding, review_manifest)
 
 
 READY = "READY_FOR_USER_ACCEPTANCE"
@@ -84,7 +86,8 @@ def private_dir(path: Path) -> Path:
 def git(repo: Path, *args: str) -> str:
     env = {"PATH": SAFE_PATH, "HOME": "/nonexistent", "LANG": "C.UTF-8",
            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
-           "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_OPTIONAL_LOCKS": "0"}
+           "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_OPTIONAL_LOCKS": "0",
+           "GIT_NO_LAZY_FETCH": "1", "GIT_LITERAL_PATHSPECS": "1"}
     data = subprocess.check_output(["git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
                                     "-c", "core.quotePath=false",
                                     "-c", "core.fsmonitor=false", "-C", str(repo), *args],
@@ -101,7 +104,7 @@ def bounded_int(value, name, lower, upper):
 def validate_config(raw: dict) -> dict:
     """Operator policy is separate from the customer's product requirement."""
     allowed = {"version", "simulation", "budget", "max_rounds", "timeout_seconds", "checks", "ci",
-               "profiles", "independent_review_required", "max_review_bytes", "max_context_bytes", "repository", "hosted_ci"}
+               "profiles", "independent_review_required", "max_review_bytes", "max_context_bytes", "repository", "hosted_ci", "project_contract"}
     if not isinstance(raw, dict) or set(raw) - allowed or type(raw.get("version")) is not int or raw.get("version") != 1:
         raise ValueError("invalid factory configuration")
     config = json.loads(encoded(raw))
@@ -110,6 +113,11 @@ def validate_config(raw: dict) -> dict:
     for key in ("simulation", "independent_review_required"):
         if type(config[key]) is not bool:
             raise ValueError(f"{key} must be boolean")
+    if "project_contract" in config:
+        if config["project_contract"] != PROJECT or not config["independent_review_required"]:
+            raise ValueError("project mode is explicit and retains both independent reviewers")
+        if "hosted_ci" in config:
+            raise ValueError("project PR/CI integration is deferred to phase 2; push CI is incompatible")
     budget = config.get("budget")
     if not isinstance(budget, dict) or "max_agent_runs" not in budget or set(budget) - {"max_agent_runs", "max_total_tokens", "max_run_tokens", "max_wall_seconds"}:
         raise ValueError("invalid mission resource authority; monetary usage remains UNKNOWN")
@@ -176,7 +184,7 @@ def policy_identity(config):
 
 
 def validate_mission(raw):
-    keys = {"version", "mission_id", "repository", "objective", "acceptance", "constraints", "scope", "base", "mission_scope_file"}
+    keys = {"version", "mission_id", "repository", "objective", "acceptance", "constraints", "scope", "base", "mission_scope_file", "approved_mission_scope"}
     if not isinstance(raw, dict) or set(raw) - keys or type(raw.get("version")) is not int or raw.get("version") != 2:
         raise ValueError("factory missions require version 2")
     mission = json.loads(encoded(raw))
@@ -200,11 +208,17 @@ def validate_mission(raw):
     if not isinstance(base, str) or base.startswith("-") or "\0" in base:
         raise ValueError("invalid base")
     mission["base"] = git(repo, "rev-parse", "--verify", base + "^{commit}")
+    if "approved_mission_scope" in mission:
+        approval = approved_scope(mission)
+        if mission.get("mission_scope_file", approval["path"]) != approval["path"]:
+            raise ValueError("mission scope reference conflicts with approval")
+        mission["mission_scope_file"] = approval["path"]
     if "mission_scope_file" in mission:
         scope_file = mission["mission_scope_file"]
         if not isinstance(scope_file, str) or Path(scope_file).is_absolute() or ".." in Path(scope_file).parts or not scope_file:
             raise ValueError("mission_scope_file must be a tracked relative path")
-        git(repo, "cat-file", "-e", mission["base"] + ":" + scope_file)
+        if "approved_mission_scope" not in mission:
+            git(repo, "cat-file", "-e", mission["base"] + ":" + scope_file)
     return mission
 
 
@@ -284,8 +298,9 @@ class Factory:
             raise ValueError("fixture/live runtime does not match operator policy")
         if hasattr(self.runtime, "resource_policy"):
             self.runtime.resource_policy = self.config["budget"]
+        self.project = self.config.get("project_contract") == PROJECT
         self.profile_identities = {lane: self.runtime.profile_identity(profile) if hasattr(self.runtime, "profile_identity") else {"configured": profile, "fixture": True}
-                                   for lane, profile in self.config["profiles"].items()}
+                                   for lane, profile in self.config["profiles"].items() if not self.project or lane == "developer"}
         requested_root = Path(root).absolute()
         metadata = [parent / ".git" for parent in (requested_root, *requested_root.parents)]
         if any(p.is_file() or p.is_symlink() or ((p / "HEAD").is_file() and (p / "config").is_file()) for p in metadata):
@@ -368,6 +383,10 @@ class Factory:
 
     def submit(self, raw):
         spec = validate_mission(raw)
+        if self.project:
+            approved_scope(spec)
+        elif "approved_mission_scope" in spec:
+            raise ValueError("Controller scope approval requires explicit project_contract mode")
         mission = spec["mission_id"]
         repository = Path(spec["repository"])
         if self.root == repository or repository in self.root.parents:
@@ -379,6 +398,10 @@ class Factory:
             self.row(mission)
             return mission
         candidate = self.root / "candidates" / mission
+        if self.project:
+            # The existing adapter places trusted-base worktrees next to the
+            # candidate. Independent Factory clones need independent parents.
+            candidate = candidate / "source"
         if candidate.exists():
             raise ValueError("unowned candidate path already exists")
         self.db.execute("INSERT INTO missions(id,spec,policy,status,candidate) VALUES(?,?,?,?,?)",
@@ -397,6 +420,9 @@ class Factory:
             git(Path(spec["repository"]), "clone", "--no-local", "--no-hardlinks", "--no-checkout", "--", spec["repository"], str(cwd))
             git(cwd, "remote", "remove", "origin")
             git(cwd, "checkout", "-b", f"factory/{mission}", spec["base"])
+            if self.project:
+                materialize_scope(spec, cwd, git)
+                self.runtime.project_policy(spec, cwd, [spec["mission_scope_file"]])
             self.state(mission, "PLAN")
         if cwd.resolve() != cwd or not (cwd / ".git").is_dir() or (cwd / ".git").is_symlink():
             raise FactoryBlocked("UNKNOWN", "candidate isolation identity is invalid")
@@ -423,7 +449,14 @@ class Factory:
         target = {"repository": spec["repository"], "base": spec["base"], "head": head,
                 "commit": head, "tree": git(cwd, "rev-parse", "HEAD^{tree}"),
                 "scope": spec["scope"], "files": files, "diff_sha256": hashlib.sha256(diff.encode()).hexdigest()}
-        if spec.get("mission_scope_file"):
+        if self.project:
+            try:
+                target.update(scope_binding(spec, cwd, head, git))
+                target["review_range"] = review_manifest(cwd, target, git)
+                target["project_policy"] = self.runtime.project_policy(spec, cwd, files)
+            except (ValueError, OSError, UnicodeError, subprocess.SubprocessError) as exc:
+                raise FactoryBlocked("BLOCKED_SCOPE", str(exc)) from exc
+        elif spec.get("mission_scope_file"):
             scope_file = spec["mission_scope_file"]
             baseline = git(cwd, "rev-parse", spec["base"] + ":" + scope_file)
             if git(cwd, "rev-parse", head + ":" + scope_file) != baseline:
@@ -442,6 +475,11 @@ class Factory:
         return target
 
     def checkpoint(self, spec, cwd):
+        if self.project:
+            approval = approved_scope(spec)
+            path = cwd / approval["path"]
+            if path.is_symlink() or not path.is_file() or path.read_bytes() != approval["content"].encode():
+                raise FactoryBlocked("BLOCKED_SCOPE", "Builder changed or removed Controller scope; not committed")
         if git(cwd, "status", "--porcelain", "--untracked-files=all"):
             git(cwd, "add", "--all", "--", ".")
             git(cwd, "-c", "user.name=Delivery Factory", "-c", "user.email=factory@localhost",
@@ -544,8 +582,15 @@ class Factory:
             path = Path(raw["path"])
             if not path.is_file() or path.is_symlink() or path.resolve() != path or hashlib.sha256(path.read_bytes()).hexdigest() != raw["sha256"]:
                 raise FactoryBlocked("UNKNOWN", "raw execution evidence is missing or changed")
+        for raw in json.loads(operation["result"]).get("project_evidence", []):
+            path = Path(raw["path"])
+            if not path.is_file() or path.is_symlink() or path.resolve() != path or hashlib.sha256(path.read_bytes()).hexdigest() != raw["sha256"]:
+                raise FactoryBlocked("UNKNOWN", "canonical project evidence is missing or changed")
 
     def agent(self, spec, cwd, stage, round_, payload):
+        if self.project:
+            approval = approved_scope(spec)
+            payload = {**payload, "mission_scope_file": approval["path"], "mission_scope_sha256": approval["sha256"]}
         lane = "developer"
         profile = self.config["profiles"][lane]
         identity = {"profile": self.profile_identities[lane], "engine": "codex-app-server", "stage": stage,
@@ -571,6 +616,8 @@ class Factory:
         return path
 
     def review(self, spec, cwd, target, lane):
+        if self.project:
+            return self.project_review(spec, cwd, target, lane)
         profile = self.config["profiles"][lane]
         review_cwd = self.review_context(spec, cwd, target, lane)
         from .factory_runtime import REVIEW_SCHEMA
@@ -629,6 +676,53 @@ class Factory:
                 "provider": profile["provider"], "profile": profile, "profile_identity": self.profile_identities[lane],
                 "lane": lane, "target": target}
 
+    def project_review(self, spec, cwd, target, lane):
+        identity = {"target": target, "backend": BACKENDS[LANES[lane]],
+                    "policy": target["project_policy"], "engine": "project-canonical-runner"}
+        payload = {"target": target, "review_range": target["review_range"], "lane": lane}
+        key = digest(identity)
+        result = self.operation(spec["mission_id"], key, "review", lane, identity, payload, True,
+            lambda transcript: self.runtime.project_review(spec, cwd, target, lane, transcript,
+                                                           self.operation_timeout(spec["mission_id"])))
+        if self.target(spec, cwd) != target:
+            raise FactoryBlocked("UNKNOWN", "canonical reviewer changed the exact target")
+        try:
+            checked = self.runtime.project_validate_review(spec, cwd, target, lane, result)
+            if checked.status not in {"PASS", "FAIL"} or not checked.artifact or not isinstance(checked.data, dict):
+                raise ValueError("project validator has no current receipt verdict")
+            findings = checked.data.get("findings")
+            if not isinstance(findings, list):
+                raise ValueError("canonical receipt omitted findings")
+            if result.get("fixture", False) is not self.config["simulation"]:
+                raise ValueError("fixture/live canonical evidence mismatch")
+        except (ValueError, KeyError, TypeError, OSError) as exc:
+            raise FactoryBlocked("UNKNOWN", f"canonical receipt validation failed: {exc}") from exc
+        # Do not lower the existing Factory barrier without an Owner decision.
+        status = "PASS" if checked.status == "PASS" and not findings else "FAIL"
+        return {"status": status, "findings": findings,
+                "output": {"overall_explanation": checked.evidence},
+                "evidence_key": key, "provider": "openai" if lane == "reviewer" else "deepseek",
+                "lane": lane, "backend": BACKENDS[LANES[lane]], "target": target,
+                "canonical_receipt": checked.artifact, "canonical_receipt_data": checked.data,
+                "review_range": target["review_range"], "fixture": self.config["simulation"]}
+
+    def project_final_gate(self, spec, cwd, target, reviews):
+        if {r["lane"] for r in reviews} != set(LANES) or any(r["status"] != "PASS" for r in reviews):
+            raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "both validated canonical receipts are required")
+        payload = {"target": target, "receipts": {r["backend"]: r["canonical_receipt"] for r in reviews}}
+        key = digest({"project_final_gate": payload})
+        result = self.operation(spec["mission_id"], key, "project_gate", "project", payload, payload, False,
+            lambda transcript: self.runtime.project_final_gate(spec, cwd, target, reviews, transcript,
+                                                               self.operation_timeout(spec["mission_id"])))
+        if (result.get("status") != "PASS" or result.get("target") != target
+                or result.get("fixture") is not self.config["simulation"]):
+            raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", result.get("reason", "project final validator rejected candidate"))
+        # Until actual PR/CI context is integrated, a local/fixture assertion
+        # cannot grant live readiness. This phase intentionally has no bypass.
+        if not self.config["simulation"]:
+            raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "phase-2 canonical PR/CI final gate is not integrated")
+        return {**result, "evidence_key": key}
+
     def gates(self, spec, cwd, target, kind, round_):
         results = []
         for index, command in enumerate(self.config[kind]):
@@ -682,9 +776,12 @@ class Factory:
         delivery = deliveries[-1] if deliveries else {}
         preflights = [json.loads(e["payload"]) for e in events if e["kind"] == "prepaid_preflight"]
         status, reason = row["status"], row["reason"]
-        if status == READY:
+        if status == READY or self.project and status == OFFLINE_PASS:
             try:
-                if self.target(json.loads(row["spec"]), Path(row["candidate"])) != delivery.get("target"):
+                spec, cwd = json.loads(row["spec"]), Path(row["candidate"])
+                if self.project and status == READY:
+                    raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "live project readiness is not implemented in phase 1")
+                if self.target(spec, cwd) != delivery.get("target"):
                     raise FactoryBlocked("UNKNOWN", "delivery HEAD/tree/scope changed after verification")
                 if not delivery.get("target", {}).get("files") or not isinstance(delivery.get("implemented"), str) or not delivery["implemented"].strip():
                     raise FactoryBlocked("UNKNOWN", "delivery implementation/change evidence is missing")
@@ -697,19 +794,43 @@ class Factory:
                         raise FactoryBlocked("UNKNOWN", "delivery evidence is incomplete")
                     self.verify_evidence(operation)
                 for review in delivery["reviews"]:
-                    if review["profile_identity"] != self.profile_identities[review["lane"]]:
+                    if self.project:
+                        key = review["evidence_key"]
+                        if key not in delivery["evidence_keys"]:
+                            raise FactoryBlocked("UNKNOWN", "review operation is absent from delivery evidence")
+                        op = self.db.execute("SELECT * FROM operations WHERE mission=? AND key=?", (mission, key)).fetchone()
+                        if op is None or op["stage"] != "review" or op["lane"] != review["lane"]:
+                            raise FactoryBlocked("UNKNOWN", "review operation identity mismatch")
+                        checked = self.runtime.project_validate_review(spec, cwd, delivery["target"], review["lane"], json.loads(op["result"]))
+                        if (checked.status != "PASS" or checked.artifact != review["canonical_receipt"]
+                                or checked.data != review["canonical_receipt_data"] or checked.data.get("findings")
+                                or review["status"] != "PASS"):
+                            raise FactoryBlocked("UNKNOWN", "canonical validator no longer approves the recorded receipt")
+                    elif review["profile_identity"] != self.profile_identities[review["lane"]]:
                         raise FactoryBlocked("PENDING_REVIEW", "review lane configuration changed; only that lane requires fresh evidence")
+                if self.project:
+                    gate = delivery["project_gate"]
+                    if gate["evidence_key"] not in delivery["evidence_keys"] or gate.get("fixture") is not True:
+                        raise FactoryBlocked("UNKNOWN", "offline project gate evidence is incomplete")
+                    op = self.db.execute("SELECT * FROM operations WHERE mission=? AND key=?", (mission, gate["evidence_key"])).fetchone()
+                    if (op is None or op["stage"] != "project_gate" or json.loads(op["result"]).get("status") != "PASS"
+                            or json.loads(op["result"]).get("target") != delivery["target"]):
+                        raise FactoryBlocked("UNKNOWN", "project final gate evidence is missing or rejected")
             except FactoryBlocked as exc:
                 status, reason = exc.status, exc.reason
             except Exception as exc:
                 status, reason = "UNKNOWN", str(exc)
+        verified = status == READY or self.project and status == OFFLINE_PASS
         return {"MISSION": mission, "DELIVERY_STATUS": status,
                 "PREPAID_PREFLIGHT": preflights[-1] if preflights else "NOT_RUN",
                 "IMPLEMENTED": delivery.get("implemented", "UNKNOWN"),
-                "TEST_RESULT": delivery.get("tests", "UNKNOWN") if status == READY else "UNKNOWN",
-                "CI_RESULT": delivery.get("ci", "UNKNOWN") if status == READY else "UNKNOWN",
-                "REVIEW_RESULT": delivery.get("reviews", "UNKNOWN") if status == READY else "UNKNOWN",
-                "BLOCKERS_REMAINING": [] if status == READY else [reason or status],
+                "TEST_RESULT": delivery.get("tests", "UNKNOWN") if verified else "UNKNOWN",
+                "CI_RESULT": delivery.get("ci", "UNKNOWN") if verified else "UNKNOWN",
+                "REVIEW_RESULT": delivery.get("reviews", "UNKNOWN") if verified else "UNKNOWN",
+                "BLOCKERS_REMAINING": ["live validation, exact PR/CI and business delivery are not established"] if self.project and verified else [] if status == READY else [reason or status],
+                "PROJECT_CONTRACT": PROJECT if self.project else "NOT_CONFIGURED",
+                "PROJECT_ACCEPTANCE": "OFFLINE_FIXTURE_ONLY" if self.project and status == OFFLINE_PASS else "NOT_ESTABLISHED",
+                "DONE": False,
                 "KNOWN_RISKS": delivery.get("risks", []),
                 "BUDGET_USED": {**accounting(operations, self.config["budget"]),
                                 "money": "UNKNOWN" if not self.config["simulation"] else "FIXTURE_NO_PROVIDER_COST"},
@@ -776,6 +897,8 @@ class Factory:
             uncertain = self.db.execute("SELECT id FROM operations WHERE mission=? AND status IN ('RUNNING','UNKNOWN') LIMIT 1", (mission,)).fetchone()
             if uncertain:
                 raise FactoryBlocked("UNKNOWN", f"unresolved operation {uncertain[0]}; no duplicate paid dispatch was authorized")
+            if self.project and row["status"] == OFFLINE_PASS:
+                return self.report(mission)
             if row["status"] == READY:
                 observed = self.report(mission)
                 if observed["DELIVERY_STATUS"] == READY:
@@ -847,7 +970,7 @@ class Factory:
                     outputs.append(output)
                 work = {"summary": "\n".join(o["summary"] for o in outputs), "known_risks": [risk for o in outputs for risk in o["known_risks"]]}
                 target = self.checkpoint(spec, cwd)
-                if not target["files"]:
+                if not target["files"] or self.project and set(target["files"]) == {spec["mission_scope_file"]}:
                     raise FactoryBlocked("UNKNOWN", "implementation produced no candidate changes or acceptance tests; no delivery was asserted")
                 self.state(mission, "TEST")
                 tests = self.gates(spec, cwd, target, "checks", round_)
@@ -867,11 +990,14 @@ class Factory:
                 if not feedback:
                     if self.target(spec, cwd) != target:
                         raise FactoryBlocked("UNKNOWN", "final delivery target changed after gates")
+                    project_gate = self.project_final_gate(spec, cwd, target, reviews) if self.project else None
                     delivery = {"target": target, "implemented": work["summary"], "risks": work["known_risks"],
                                 "tests": "PASS", "ci": "PASS", "hosted_ci": "PASS" if "hosted_ci" in self.config else "NOT_CONFIGURED", "reviews": reviews,
                                 "evidence_keys": [op[0] for op in self.db.execute("SELECT key FROM operations WHERE mission=? AND status='COMPLETE'", (mission,))]}
+                    if self.project:
+                        delivery.update(project_gate=project_gate, tests="OFFLINE_FIXTURE_PASS", ci="OFFLINE_FIXTURE_PASS")
                     self.event(mission, "delivery", delivery)
-                    self.state(mission, READY)
+                    self.state(mission, OFFLINE_PASS if self.project else READY)
                     return self.report(mission)
                 self.db.execute("UPDATE missions SET round=round+1 WHERE id=?", (mission,))
                 self.event(mission, "rework", {"target": target, "feedback": feedback})
