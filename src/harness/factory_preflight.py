@@ -17,6 +17,7 @@ from .sandbox import SAFE_PATH
 
 SCAN_BYTES = 64 * 1024 * 1024
 CONFIG_BYTES = 256 * 1024
+MAKE_BYTES = 512 * 1024  # Static file-read bound only; no paid budget change.
 
 
 def _git_environment():
@@ -100,7 +101,8 @@ def committed_text(repo, commit, name):
         return None
     metadata, _ = entry.split("\t", 1)
     mode, kind, _, size = metadata.split()
-    if mode not in ("100644", "100755") or kind != "blob" or int(size) > CONFIG_BYTES:
+    limit = MAKE_BYTES if name == "Makefile" else CONFIG_BYTES
+    if mode not in ("100644", "100755") or kind != "blob" or int(size) > limit:
         raise ValueError("configuration is not a bounded regular committed text file")
     return _read_git(repo, "show", f"{commit}:{name}")
 
@@ -110,6 +112,8 @@ def docker_gate(argv):
     if not argv:
         return False
     name = Path(argv[0]).name
+    if "/" in argv[0] and (not Path(argv[0]).is_absolute() or str(Path(argv[0]).parent) not in SAFE_PATH.split(":")):
+        return False  # A repository wrapper's basename is not a daemon contract.
     args = argv[1:]
     if name == "docker" and args and args[0] == "compose":
         name, args = "docker-compose", args[1:]
@@ -120,8 +124,10 @@ def docker_gate(argv):
             if len(args) < 2:
                 return False
             args = args[2:]
-        return bool(args and args[0] in {"exec", "run", "up", "down", "build", "restart", "start", "stop", "logs", "ps"})
-    return name == "docker" and bool(args and args[0] in {"exec", "run", "build", "pull", "push", "start", "stop", "restart", "logs", "ps"})
+        return bool(args and args[0] in {"exec", "run", "up", "down", "build", "restart", "start", "stop", "logs", "ps"}
+                    and not {"--help", "-h"} & set(args[1:]))
+    return name == "docker" and bool(args and args[0] in {"exec", "run", "build", "pull", "push", "start", "stop", "restart", "logs", "ps"}
+                                    and not {"--help", "-h"} & set(args[1:]))
 
 
 def make_docker_dependency(text, argv):
@@ -130,16 +136,26 @@ def make_docker_dependency(text, argv):
     Do not run make (even -n can execute $(shell ...)), or implement Make syntax.
     Dynamic/include/eval constructs are reported as unverified by the caller.
     """
-    if re.search(r"(?m)^\s*(?:-?include|sinclude|ifeq|ifneq|ifdef|ifndef|else|endif|define|override)\b|\$\((?:shell|eval|call)\b", text):
+    # Make directives are not tab-prefixed shell recipe lines. In particular,
+    # an unrelated recipe's `else` must not hide an ordinary reachable gate.
+    if re.search(r"(?m)^ *(?:-?include|sinclude|ifeq|ifneq|ifdef|ifndef|else|endif|define|override)\b|\$\((?:shell|eval|call)\b", text):
         raise ValueError("dynamic Make syntax is not interpreted")
+    if re.search(r"(?m)^ *(?:\.ONESHELL|\.IGNORE)\s*:|^ *(?:SHELL|\.SHELLFLAGS)\s*[:?+]?=", text):
+        raise ValueError("Make shell/error semantics are not interpreted")
     variables = {"MAKE": "make"}
     immediate = set()
     rules, current = {}, []
     for line in text.splitlines():
-        assignment = re.match(r"^([A-Za-z_]\w*)\s*([:?+]?=)\s*(.*)$", line)
+        if not line.startswith("\t"):
+            if "\\#" in line:
+                raise ValueError("escaped Make comments are not interpreted")
+            line = line.split("#", 1)[0].rstrip()
+        assignment = re.match(r"^ *([A-Za-z_]\w*|\.DEFAULT_GOAL)\s*([:?+]?=)\s*(.*)$", line)
         rule = re.match(r"^([\w. /-]+):([^=]*)$", line)
         if assignment:
             name, op, value = assignment.groups()
+            if name == "MAKEFLAGS" and value.strip() != "--no-print-directory":
+                raise ValueError("Make execution flags are not interpreted")
             if (op == ":=" or op == "+=" and name in immediate) and "$" in value:
                 raise ValueError("immediate dynamic Make assignment is not interpreted")
             if op == "?=" and name in variables:
@@ -162,7 +178,10 @@ def make_docker_dependency(text, argv):
             current = []
     goals = [a for a in argv[1:] if not a.startswith("-") and "=" not in a]
     if not goals:
-        goals = [next((name for name in rules if not name.startswith(".")), "")]
+        default = variables.get(".DEFAULT_GOAL", "").split("#", 1)[0].strip()
+        if default and not re.fullmatch(r"[\w./-]+", default):
+            raise ValueError("dynamic default Make goal is not interpreted")
+        goals = [default or next((name for name in rules if not name.startswith(".")), "")]
     seen, pending = set(), goals[:]
     while pending:
         goal = pending.pop()
@@ -242,6 +261,12 @@ def workflow_push(text, branch_prefix):
         return "UNVERIFIED", "push filters could not be determined"
     if set(push) - {"branches", "branches-ignore", "paths", "paths-ignore", "tags", "tags-ignore"}:
         return "UNVERIFIED", "unsupported push configuration cannot be determined"
+    tag_keys = {"tags", "tags-ignore"} & set(push)
+    if tag_keys and not {"branches", "branches-ignore"} & set(push):
+        if len(tag_keys) != 1 or any(not isinstance(push[key], list) or not push[key]
+                                   or any(not isinstance(p, str) for p in push[key]) for key in tag_keys):
+            return "UNVERIFIED", "tag filters could not be determined"
+        return "HARD_BLOCKER", "tag-only push filters exclude branch pushes; Factory publishes candidate branches, not tags"
     branches = push.get("branches")
     if branches is not None:
         if not isinstance(branches, list) or any(not isinstance(p, str) for p in branches):
@@ -285,16 +310,19 @@ def inspect_prepaid(spec, config):
             if not shutil.which(command[0], path=SAFE_PATH) and not command[0].startswith("./"):
                 add("HARD_BLOCKER", check, "configured executable is absent from gate runtime PATH")
             docker = docker_gate(command)
-            if name in ("sh", "bash", "dash") and any(a in ("-c", "-lc") for a in command[1:]):
-                index = next(i for i, a in enumerate(command) if a in ("-c", "-lc"))
-                if index + 1 < len(command):
-                    script = command[index + 1]
-                    if not re.search(r"[;&|\\]", script):
+            if name in ("sh", "bash", "dash"):
+                # Only ordinary -c/-lc invocations are recognized. Additional
+                # flags (e.g. -n), files and other modes are never interpreted.
+                if len(command) >= 3 and command[1] in ("-c", "-lc"):
+                    script = command[2]
+                    if not re.search(r"[;&|\\\n`$<>()]", script):
                         try:
                             words = shlex.split(script)
                             docker = docker_gate(words[1:] if words and words[0] == "exec" else words)
                         except ValueError:
                             pass
+                else:
+                    add("UNVERIFIED", check, "Shell options/mode could not be statically interpreted")
             if name in ("make", "gmake"):
                 try:
                     makefile = committed_text(repo, commit, "Makefile")

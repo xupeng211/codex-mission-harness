@@ -462,7 +462,10 @@ class Factory:
             uncertain = self.db.execute("SELECT id FROM operations WHERE mission=? AND status IN ('RUNNING','UNKNOWN') LIMIT 1", (mission,)).fetchone()
             if uncertain:
                 raise FactoryBlocked("UNKNOWN", "unresolved operation prevents a new paid dispatch; no replay or refund")
-            if not self.db.execute("SELECT 1 FROM operations WHERE mission=? AND paid=1 LIMIT 1", (mission,)).fetchone():
+            has_paid = self.db.execute("SELECT 1 FROM operations WHERE mission=? AND paid=1 LIMIT 1", (mission,)).fetchone()
+            if has_paid and self.row(mission)["status"] == "BLOCKED_PREFLIGHT":
+                raise FactoryBlocked("BLOCKED_PREFLIGHT", "preflight resume requires no paid operations; prior accounting is retained")
+            if not has_paid:
                 from .factory_preflight import inspect_prepaid
                 preflight = inspect_prepaid(json.loads(self.row(mission)["spec"]), self.config)
                 self.event(mission, "prepaid_preflight", preflight)
@@ -796,7 +799,13 @@ class Factory:
                 self.event(mission, "rework", {"target": delivery["target"], "feedback": feedback})
                 self.state(mission, "REWORK")
                 row = self.row(mission)
-            if row["status"] in ("UNKNOWN", "BLOCKED_BUDGET", "BLOCKED_SCOPE", "BLOCKED_LIMIT", "BLOCKED_PREFLIGHT"):
+            if row["status"] == "BLOCKED_PREFLIGHT":
+                if self.db.execute("SELECT 1 FROM operations WHERE mission=? AND paid=1 LIMIT 1", (mission,)).fetchone():
+                    return self.report(mission)
+                # First-paid operation rechecks preflight and appends a fresh
+                # event. Preserve spec, policy, round, submission time and usage.
+                self.state(mission, "PLAN")
+            elif row["status"] in ("UNKNOWN", "BLOCKED_BUDGET", "BLOCKED_SCOPE", "BLOCKED_LIMIT"):
                 return self.report(mission)
             planning_payload = {"objective": spec["objective"], "acceptance": spec["acceptance"], "constraints": spec["constraints"],
                                 "scope": spec["scope"], "instruction": "Act as technical lead. Understand the repository, plan a minimal complete solution and acceptance tests. Decide ordinary engineering questions yourself. Only unresolved major product ambiguity, safety, independence, budget or irreversible changes belong in decisions_required. Do not edit files. Return plan, bounded tasks, acceptance and decisions_required."}

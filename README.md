@@ -120,6 +120,8 @@ harness approve 任务编号 --action merge --head 交付显示的完整commit -
 
 `WARNING` 表示当前 baseline 没发现该项明确障碍；`UNVERIFIED` 表示无法静态确定。`NO_KNOWN_HARD_BLOCKER` 不代表环境 READY 或交付 PASS。未来 diff 的 `max_review_bytes`、实施后的上下文、复杂 Make/CI 过滤、包和服务、远端权限以及项目自己的 receipt 合同仍需后续验证。YAML 使用 PyYAML 安全解析，重复键和无法理解的配置保持未验证；预检不执行仓库脚本，也不自动 fetch 缺失 Git objects。
 
+只有因预检阻断且从未产生付费 operation 的任务，才可在环境修复后通过 `resume` 重新预检。每次结果追加记录；原授权、scope、提交时间和预算使用量均不重置，UNKNOWN 不重发。Make 的 `.DEFAULT_GOAL` 只支持普通字面目标；`.ONESHELL`、忽略错误和不支持的 Shell 模式（包括 `bash -n`）保持 UNVERIFIED。Makefile 静态读取最多 512 KiB，workflow 仍为 256 KiB，超限不声称已验证。仅接受 tag push 的 workflow 则明确阻断当前候选分支发布路径。
+
 Setup 默认选择 standard 授权；小任务可在首次 setup 时选择 `--size small`，较大项目可选 `--size large`：
 
 | 授权 | 最多执行次数 | 每次 token admission | 总 token admission | 最多开发/返工轮数 | 总时长 |

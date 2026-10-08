@@ -6,6 +6,7 @@ import hashlib
 import json
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -13,7 +14,7 @@ from unittest.mock import Mock, patch
 from harness.factory import Factory, FactoryBlocked, READY, git, validate_config
 from harness.factory_budget import planning_limits
 from harness.factory_fixture import AcceptanceRuntime, fixture_config
-from harness.factory_preflight import inspect_prepaid, make_docker_dependency, text_capacity, workflow_push
+from harness.factory_preflight import CONFIG_BYTES, MAKE_BYTES, committed_text, inspect_prepaid, make_docker_dependency, text_capacity, workflow_push
 from harness.factory_runtime import FactoryAppServer, LocalRuntime, RuntimeFailure
 
 
@@ -121,6 +122,57 @@ class PrepaidPreflightTests(unittest.TestCase):
         self.assertFalse(make_docker_dependency(text, ["make", "verify"]))
         self.assertTrue(make_docker_dependency(text, ["make", "deploy"]))
 
+    def test_oneshell_and_error_or_shell_overrides_remain_unverified(self):
+        for prefix in (".ONESHELL:\n", ".IGNORE: verify\n", "SHELL=/bin/bash\n",
+                       ".SHELLFLAGS=-n -c\n", "MAKEFLAGS += -n\n"):
+            with self.subTest(prefix=prefix):
+                body = prefix + "verify:\n\tif false; then\n\tdocker run image\n\tfi\n"
+                (self.repo / "Makefile").write_text(body)
+                self.commit()
+                self.config["checks"] = [["make", "verify"]]
+                spec = {**self.spec, "base": git(self.repo, "rev-parse", "HEAD")}
+                result = inspect_prepaid(spec, validate_config(self.config))
+                self.assertEqual(result["status"], "NO_KNOWN_HARD_BLOCKER")
+                self.assertTrue(any(x["check"] == "checks[0]" and x["level"] == "UNVERIFIED" for x in result["findings"]))
+                self.assertFalse(result["delivery_ready_asserted"])
+
+    def test_default_goal_honors_literal_goal_without_changing_explicit_goal(self):
+        body = ".DEFAULT_GOAL := verify\ndeploy:\n\tdocker run image\nverify:\n\tpython3 -m unittest\n"
+        self.assertFalse(make_docker_dependency(body, ["make"]))
+        self.assertFalse(make_docker_dependency(body, ["make", "verify"]))
+        self.assertTrue(make_docker_dependency(body, ["make", "deploy"]))
+        self.assertTrue(make_docker_dependency(body.replace(":= verify", ":= deploy"), ["make"]))
+        with self.assertRaises(ValueError):
+            make_docker_dependency(body.replace(":= verify", "= $(GOAL)"), ["make"])
+
+    def test_football_style_comments_and_unrelated_shell_else_do_not_hide_docker(self):
+        body = (".DEFAULT_GOAL := help\nMAKEFLAGS += --no-print-directory\n"
+                "COMPOSE_DEV=docker compose -f docker-compose.dev.yml\n"
+                "VALIDATION_PROFILE_RUNNER=$(COMPOSE_DEV) exec -T dev python3 check.py\n"
+                "help: ## Usage: make help FORMAT=<name>\n\t@echo help\n"
+                "other:\n\tif true; then echo ok; \\\n\telse echo other; fi\n"
+                "verify:\n\t@$(MAKE) verify-strict\n"
+                "verify-strict: ## Usage: make verify-strict MODE=<name>\n\t@$(VALIDATION_PROFILE_RUNNER) strict\n")
+        self.assertTrue(make_docker_dependency(body, ["make", "verify"]))
+        self.assertFalse(make_docker_dependency(body, ["make"]))
+
+    def test_large_makefile_read_is_bounded_without_raising_workflow_or_paid_limits(self):
+        (self.repo / "Makefile").write_text("#" + "x" * CONFIG_BYTES + "\n.DEFAULT_GOAL := verify\nverify:\n\tdocker compose exec dev pytest\n")
+        self.commit()
+        self.config["checks"] = [["make", "verify"]]
+        self.assert_zero_dispatch(self.factory())
+        (self.repo / "Makefile").write_text("#" + "x" * MAKE_BYTES + "\nverify:\n\tdocker run image\n")
+        workflow = self.repo / ".github/workflows/oversized.yml"
+        workflow.parent.mkdir(parents=True)
+        workflow.write_text("#" + "x" * CONFIG_BYTES + "\non: push\n")
+        self.commit()
+        spec = {**self.spec, "base": git(self.repo, "rev-parse", "HEAD")}
+        result = inspect_prepaid(spec, validate_config(self.config))
+        self.assertEqual(result["status"], "NO_KNOWN_HARD_BLOCKER")
+        self.assertTrue(any(x["check"] == "checks[0]" and x["level"] == "UNVERIFIED" for x in result["findings"]))
+        with self.assertRaises(ValueError):
+            committed_text(self.repo, spec["base"], ".github/workflows/oversized.yml")
+
     def test_optional_docker_and_queries_are_not_proven_environment_blockers(self):
         for recipe in ("docker --version", "docker compose config", "if false; then docker run image; fi",
                        "echo 'docker run image'", "-docker run image", "docker run image || true"):
@@ -155,6 +207,47 @@ class PrepaidPreflightTests(unittest.TestCase):
         self.config["checks"] = [["bash", "-lc", "docker compose exec dev pytest"]]
         self.assert_zero_dispatch(self.factory())
 
+    def test_shell_noexec_and_complex_scripts_are_unverified_not_docker_blockers(self):
+        marker = self.root / "must-not-execute-shell"
+        for command in (["bash", "-n", "-c", "docker run image"],
+                        ["bash", "-nc", "docker run image"],
+                        ["sh", "-n", "-c", "docker run image"],
+                        ["bash", "--noprofile", "-c", "docker run image"],
+                        ["bash", "-c", "docker run image\ntrue"],
+                        ["bash", "-c", "if false; then docker run image; fi"],
+                        ["bash", "-c", f"docker run $(touch {marker})"]):
+            with self.subTest(command=command):
+                self.config["checks"] = [command]
+                result = inspect_prepaid({**self.spec, "base": git(self.repo, "rev-parse", "HEAD")}, validate_config(self.config))
+                self.assertEqual(result["status"], "NO_KNOWN_HARD_BLOCKER")
+                self.assertTrue(any(x["check"] == "checks[0]" and x["level"] == "UNVERIFIED" for x in result["findings"]))
+        self.assertFalse(marker.exists())
+
+    def test_direct_docker_dependency_still_blocks_before_paid_dispatch(self):
+        self.config["checks"] = [["docker", "compose", "-f", "compose.yml", "exec", "dev", "pytest"]]
+        report = self.assert_zero_dispatch(self.factory())
+        self.assertTrue(any(x["level"] == "HARD_BLOCKER" and "Docker-dependent" in x["detail"] for x in report["PREPAID_PREFLIGHT"]["findings"]))
+
+    def test_repository_docker_wrappers_and_help_are_not_daemon_proof(self):
+        for command in (["./docker", "run", "fixture"], ["tools/docker", "run", "fixture"],
+                        ["docker", "run", "--help"], ["docker", "run", "--rm", "--help"],
+                        ["docker", "compose", "exec", "--help"]):
+            with self.subTest(command=command):
+                # Relative wrappers may be implemented by the task; only an
+                # explicit ./ command bypasses the host executable lookup.
+                self.config["checks"] = [command]
+                result = inspect_prepaid({**self.spec, "base": git(self.repo, "rev-parse", "HEAD")}, validate_config(self.config))
+                self.assertFalse(any(x["level"] == "HARD_BLOCKER" and "Docker-dependent" in x["detail"] for x in result["findings"]))
+
+    def test_tag_only_workflow_blocks_before_reservation(self):
+        workflow = self.repo / ".github/workflows/ci.yml"
+        workflow.parent.mkdir(parents=True)
+        workflow.write_text("on:\n  push:\n    tags: ['v*']\n")
+        self.commit()
+        self.config["hosted_ci"] = {"repository": "fixture/project", "workflows": ["ci.yml"]}
+        report = self.assert_zero_dispatch(self.factory())
+        self.assertIn("tag-only", report["BLOCKERS_REMAINING"][0])
+
     def test_absent_command_is_not_mistaken_for_a_ready_environment(self):
         self.config["checks"] = [["definitely-missing-prepaid-command"]]
         self.assert_zero_dispatch(self.factory())
@@ -180,6 +273,118 @@ class PrepaidPreflightTests(unittest.TestCase):
         f.config["budget"]["max_agent_runs"] += 1
         with self.assertRaisesRegex(ValueError, "immutable mission authority"):
             f.run("feature")
+
+    def test_repaired_environment_resumes_under_frozen_authority_and_appends_preflight(self):
+        import shutil
+        real_which = shutil.which
+        f = self.factory()
+        frozen = (f.row("feature")["spec"], f.row("feature")["policy"])
+        submitted = tuple(f.db.execute("SELECT * FROM events WHERE kind='submitted'").fetchone())
+        with patch("harness.factory_preflight.shutil.which", side_effect=lambda name, **kw: None if name == "python3" else real_which(name, **kw)):
+            self.assert_zero_dispatch(f)
+        original = tuple(f.db.execute("SELECT * FROM events WHERE kind='prepaid_preflight'").fetchone())
+        f.close()
+        f = self.factory()
+        self.assertEqual(f.run("feature")["DELIVERY_STATUS"], READY)
+        events = f.db.execute("SELECT * FROM events WHERE kind='prepaid_preflight' ORDER BY sequence").fetchall()
+        self.assertEqual(len(events), 2)
+        self.assertEqual(tuple(events[0]), original)
+        self.assertEqual(json.loads(events[1]["payload"])["status"], "NO_KNOWN_HARD_BLOCKER")
+        first_reservation = f.db.execute("SELECT MIN(sequence) FROM events WHERE kind='reserved'").fetchone()[0]
+        self.assertLess(events[1]["sequence"], first_reservation)
+        self.assertEqual((f.row("feature")["spec"], f.row("feature")["policy"]), frozen)
+        self.assertEqual(tuple(f.db.execute("SELECT * FROM events WHERE kind='submitted'").fetchone()), submitted)
+        self.assertEqual(f.report("feature")["BUDGET_USED"]["agent_runs"], 7)
+
+    def test_unrepaired_preflight_resume_remains_blocked_with_zero_usage(self):
+        self.config["checks"] = [["definitely-missing-prepaid-command"]]
+        f = self.factory()
+        self.assert_zero_dispatch(f)
+        original = tuple(f.db.execute("SELECT * FROM events WHERE kind='prepaid_preflight'").fetchone())
+        self.assert_zero_dispatch(f)
+        events = f.db.execute("SELECT * FROM events WHERE kind='prepaid_preflight' ORDER BY sequence").fetchall()
+        self.assertEqual(len(events), 2)
+        self.assertEqual(tuple(events[0]), original)
+
+    def test_paid_completed_operation_prevents_preflight_resume_and_direct_bypass(self):
+        f = self.factory()
+        f.prepare("feature")
+        f.operation("feature", "completed", "plan", "developer", {}, {}, True,
+                    lambda t: {"output": {}, "usage": {"fixture_provider_calls": 0}})
+        f.state("feature", "BLOCKED_PREFLIGHT", "offline paid-history guard fixture")
+        operation = tuple(f.db.execute("SELECT * FROM operations").fetchone())
+        budget = f.report("feature")["BUDGET_USED"]
+        with patch("harness.factory_preflight.inspect_prepaid", side_effect=AssertionError("paid history must not be preflight-resumed")), \
+             patch.object(f.runtime, "agent", side_effect=AssertionError("dispatch forbidden")):
+            self.assertEqual(f.run("feature")["DELIVERY_STATUS"], "BLOCKED_PREFLIGHT")
+            with self.assertRaisesRegex(FactoryBlocked, "no paid operations"):
+                f.operation("feature", "new", "plan", "developer", {}, {}, True, lambda t: {})
+        self.assertEqual(tuple(f.db.execute("SELECT * FROM operations").fetchone()), operation)
+        self.assertEqual(f.report("feature")["BUDGET_USED"], budget)
+
+    def test_unknown_and_running_requests_cannot_resume_or_block_a_separate_new_mission(self):
+        self.config["budget"].update(max_run_tokens=240000, max_total_tokens=8400000)
+        f = self.factory()
+        def unknown(t):
+            raise RuntimeFailure("offline UNKNOWN", {"input_tokens": 1, "output_tokens": 0})
+        def running(t):
+            raise KeyboardInterrupt("offline controller death")
+        for status, invoke, exception in (("UNKNOWN", unknown, FactoryBlocked), ("RUNNING", running, KeyboardInterrupt)):
+            mission = status.lower()
+            f.submit({**self.spec, "mission_id": mission})
+            f.prepare(mission)
+            with self.assertRaises(exception):
+                f.operation(mission, "uncertain", "plan", "developer", {}, {}, True, invoke)
+            f.state(mission, "BLOCKED_PREFLIGHT", "offline defensive resume fixture")
+            before = tuple(f.db.execute("SELECT * FROM operations WHERE mission=?", (mission,)).fetchone())
+            budget = f.report(mission)["BUDGET_USED"]
+            with patch("harness.factory_preflight.inspect_prepaid", side_effect=AssertionError("no historical recheck")), \
+                 patch.object(f.runtime, "agent", side_effect=AssertionError("no replay")):
+                self.assertEqual(f.run(mission)["DELIVERY_STATUS"], "UNKNOWN")
+                with self.assertRaisesRegex(FactoryBlocked, "unresolved operation"):
+                    f.operation(mission, "new", "plan", "developer", {}, {}, True, lambda t: {})
+            self.assertEqual(tuple(f.db.execute("SELECT * FROM operations WHERE mission=?", (mission,)).fetchone()), before)
+            self.assertEqual(f.report(mission)["BUDGET_USED"], budget)
+            self.assertEqual(budget["unknown_token_reservation"], 240000)
+        self.assertEqual(f.run("feature")["DELIVERY_STATUS"], READY)
+
+    def test_preflight_resume_does_not_reset_wall_clock_or_allow_authority_changes(self):
+        import shutil
+        real_which = shutil.which
+        self.config["budget"]["max_wall_seconds"] = 3600
+        f = self.factory()
+        with patch("harness.factory_preflight.shutil.which", side_effect=lambda name, **kw: None if name == "python3" else real_which(name, **kw)):
+            self.assert_zero_dispatch(f)
+        frozen = tuple(f.db.execute("SELECT spec,policy FROM missions").fetchone())
+        f.config["budget"]["max_agent_runs"] += 1
+        with self.assertRaisesRegex(ValueError, "immutable mission authority"):
+            f.run("feature")
+        f.config["budget"]["max_agent_runs"] -= 1
+        with self.assertRaisesRegex(ValueError, "immutable mission"):
+            f.submit({**self.spec, "scope": ["score.py"]})
+        with patch("harness.factory.time.time", return_value=time.time() + 3601), \
+             patch.object(f.runtime, "agent", side_effect=AssertionError("expired authority must not dispatch")):
+            self.assertEqual(f.run("feature")["DELIVERY_STATUS"], "BLOCKED_BUDGET")
+        self.assertEqual(tuple(f.db.execute("SELECT spec,policy FROM missions").fetchone()), frozen)
+        self.assertEqual(f.report("feature")["BUDGET_USED"]["agent_runs"], 0)
+
+    def test_crash_after_resumed_plan_recovers_complete_result_without_replay(self):
+        import shutil
+        real_which = shutil.which
+        f = self.factory()
+        with patch("harness.factory_preflight.shutil.which", side_effect=lambda name, **kw: None if name == "python3" else real_which(name, **kw)):
+            self.assert_zero_dispatch(f)
+        original_agent = f.agent
+        def crash(*args):
+            original_agent(*args)
+            raise KeyboardInterrupt("offline crash after planning result committed")
+        with patch.object(f, "agent", side_effect=crash), self.assertRaises(KeyboardInterrupt):
+            f.run("feature")
+        self.assertEqual(f.row("feature")["status"], "PLAN")
+        before = tuple(f.db.execute("SELECT * FROM operations WHERE stage='plan'").fetchone())
+        self.assertEqual(f.run("feature")["DELIVERY_STATUS"], READY)
+        self.assertEqual(tuple(f.db.execute("SELECT * FROM operations WHERE stage='plan'").fetchone()), before)
+        self.assertEqual(sum(c["role"] == "plan" for c in f.runtime.calls), 1)
 
     def test_unknown_operation_never_replays_under_new_key_or_refunds_on_resume(self):
         self.config["budget"].update(max_run_tokens=240000, max_total_tokens=8400000)
@@ -229,6 +434,24 @@ class PrepaidPreflightTests(unittest.TestCase):
 
 
 class WorkflowTriggerTests(unittest.TestCase):
+    def test_tag_only_push_excludes_candidates_even_with_path_filters(self):
+        for body in ("tags: ['v*']", "tags-ignore: ['old-*']", "tags: ['v*']\n    paths: ['src/**']"):
+            with self.subTest(body=body):
+                self.assertEqual(workflow_push("on:\n  push:\n    " + body + "\n", "factory/feature-")[0], "HARD_BLOCKER")
+
+    def test_mixed_branch_and_tag_filters_do_not_falsely_exclude_candidates(self):
+        for body in ("branches: ['factory/**']\n    tags: ['v*']",
+                     "branches-ignore: [main]\n    tags: ['v*']",
+                     "branches: ['factory/feature-exact']\n    tags-ignore: ['v*']"):
+            with self.subTest(body=body):
+                self.assertEqual(workflow_push("on:\n  push:\n    " + body + "\n", "factory/feature-")[0], "UNVERIFIED")
+        self.assertEqual(workflow_push("on:\n  push:\n    branches: [main]\n    tags: ['v*']\n", "factory/feature-")[0], "HARD_BLOCKER")
+
+    def test_malformed_tag_filters_are_unverified(self):
+        for body in ("tags: null", "tags: []", "tags: v*", "tags: [true]", "tags: ['v*']\n    tags-ignore: ['old-*']"):
+            with self.subTest(body=body):
+                self.assertEqual(workflow_push("on:\n  push:\n    " + body + "\n", "factory/feature-")[0], "UNVERIFIED")
+
     def test_known_no_push_and_literal_exclusions(self):
         for text in ("on: [pull_request]\n", "on:\n  workflow_dispatch:\n", "on:\n  push:\n    branches: [main, release]\n"):
             self.assertEqual(workflow_push(text, "factory/feature-")[0], "HARD_BLOCKER")
