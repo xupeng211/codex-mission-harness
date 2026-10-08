@@ -22,8 +22,9 @@ jobs:
       - run: make verify
       - name: Build and verify installed wheel
         run: |
-          python -m pip wheel --no-deps . --wheel-dir "$RUNNER_TEMP/harness-wheels"
+          python -m pip wheel . --wheel-dir "$RUNNER_TEMP/harness-wheels"
           python -m venv "$RUNNER_TEMP/harness-wheel-venv"
-          "$RUNNER_TEMP/harness-wheel-venv/bin/pip" install --no-index --no-deps "$RUNNER_TEMP"/harness-wheels/*.whl
+          "$RUNNER_TEMP/harness-wheel-venv/bin/pip" install --no-index --find-links "$RUNNER_TEMP/harness-wheels" "$RUNNER_TEMP"/harness-wheels/codex_mission_harness-*.whl
           cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/harness-wheel-venv/bin/python" -c 'from harness.factory_preflight import workflow_push; assert workflow_push("on: [pull_request]", "factory/test-")[0] == "HARD_BLOCKER"'
           "$RUNNER_TEMP/harness-wheel-venv/bin/harness" factory-demo --output "$RUNNER_TEMP/harness-installed-demo"

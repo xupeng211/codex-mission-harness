@@ -249,7 +249,7 @@ class DeliveryLimitsTests(unittest.TestCase):
         self.assertEqual(data['partial_usage_runs'], 1)
         self.assertEqual(data['unknown_token_reservation'], 100)
         self.assertEqual(data['committed_tokens'], 140)
-        with self.assertRaisesRegex(FactoryBlocked, 'token admission exhausted'):
+        with self.assertRaisesRegex(FactoryBlocked, 'unresolved operation prevents a new paid dispatch'):
             self.paid('next', {'input_tokens': 0, 'output_tokens': 0})
 
     def test_proven_complete_failed_response_keeps_real_usage_without_guessing(self):

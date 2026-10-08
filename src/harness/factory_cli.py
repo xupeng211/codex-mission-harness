@@ -41,6 +41,10 @@ def readable(result):
                   "开发、测试和审核已完成。最终合并/发布仍需你的明确批准。"]
     else:
         lines += ["原因：" + '; '.join(result['BLOCKERS_REMAINING'])]
+    preflight = result.get("PREPAID_PREFLIGHT")
+    if isinstance(preflight, dict):
+        lines += ["付费前预检：" + preflight["status"]]
+        lines += [f"{finding['level']} {finding['check']}：{finding['detail']}" for finding in preflight["findings"]]
     lines += ["完整证据：harness delivery --json"]
     return '\n'.join(lines)
 

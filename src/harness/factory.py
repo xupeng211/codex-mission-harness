@@ -21,7 +21,7 @@ from pathlib import Path
 
 from .factory_runtime import LocalRuntime, official_rubric, VENDOR
 from .sandbox import SAFE_PATH
-from .factory_budget import accounting
+from .factory_budget import accounting, planning_limits
 
 
 READY = "READY_FOR_USER_ACCEPTANCE"
@@ -456,12 +456,27 @@ class Factory:
                 raise FactoryBlocked("UNKNOWN", f"{stage} dispatch/result is uncertain; operation {old['id']} was not repeated")
             self.verify_evidence(old)
             return json.loads(old["result"])
+        if self.cancel_requested(mission):
+            raise FactoryBlocked("CANCELLED", "user cancelled; completed evidence and all reservations are retained")
+        if paid:
+            uncertain = self.db.execute("SELECT id FROM operations WHERE mission=? AND status IN ('RUNNING','UNKNOWN') LIMIT 1", (mission,)).fetchone()
+            if uncertain:
+                raise FactoryBlocked("UNKNOWN", "unresolved operation prevents a new paid dispatch; no replay or refund")
+            has_paid = self.db.execute("SELECT 1 FROM operations WHERE mission=? AND paid=1 LIMIT 1", (mission,)).fetchone()
+            if has_paid and self.row(mission)["status"] == "BLOCKED_PREFLIGHT":
+                raise FactoryBlocked("BLOCKED_PREFLIGHT", "preflight resume requires no paid operations; prior accounting is retained")
+            if not has_paid:
+                from .factory_preflight import inspect_prepaid
+                preflight = inspect_prepaid(json.loads(self.row(mission)["spec"]), self.config)
+                self.event(mission, "prepaid_preflight", preflight)
+                self.db.commit()
+                if preflight["status"] == "HARD_BLOCKER":
+                    detail = "; ".join(f["check"] + ": " + f["detail"] for f in preflight["findings"] if f["level"] == "HARD_BLOCKER")
+                    raise FactoryBlocked("BLOCKED_PREFLIGHT", detail)
         operation_id = uuid.uuid4().hex
         evidence_dir = private_dir(self.root / "evidence" / mission)
         evidence = evidence_dir / f"{operation_id}.json"
         transcript = evidence_dir / f"{operation_id}.raw"
-        if self.cancel_requested(mission):
-            raise FactoryBlocked("CANCELLED", "user cancelled; completed evidence and all reservations are retained")
         try:
             self.db.execute("BEGIN IMMEDIATE")
             budget = self.config["budget"]
@@ -511,6 +526,10 @@ class Factory:
             from .factory_budget import tokens
             if (tokens(usage) or 0) > self.config["budget"]["max_run_tokens"]:
                 raise FactoryBlocked("BLOCKED_BUDGET", "run token allowance exceeded; telemetry retained, no further dispatch")
+        if paid and stage == "plan":
+            from .factory_budget import tokens
+            if (tokens(usage) or 0) > planning_limits(self.config["budget"], self.config["timeout_seconds"])["max_tokens"]:
+                raise FactoryBlocked("BLOCKED_BUDGET", "planning token allowance exceeded; telemetry and UNKNOWN reservations retained")
         if self.cancel_requested(mission):
             raise FactoryBlocked("CANCELLED", "user cancelled; in-flight usage may remain UNKNOWN and is never refunded")
         if status != "COMPLETE":
@@ -661,6 +680,7 @@ class Factory:
         events = self.db.execute("SELECT kind,payload FROM events WHERE mission=? ORDER BY sequence", (mission,)).fetchall()
         deliveries = [json.loads(e["payload"]) for e in events if e["kind"] == "delivery"]
         delivery = deliveries[-1] if deliveries else {}
+        preflights = [json.loads(e["payload"]) for e in events if e["kind"] == "prepaid_preflight"]
         status, reason = row["status"], row["reason"]
         if status == READY:
             try:
@@ -684,6 +704,7 @@ class Factory:
             except Exception as exc:
                 status, reason = "UNKNOWN", str(exc)
         return {"MISSION": mission, "DELIVERY_STATUS": status,
+                "PREPAID_PREFLIGHT": preflights[-1] if preflights else "NOT_RUN",
                 "IMPLEMENTED": delivery.get("implemented", "UNKNOWN"),
                 "TEST_RESULT": delivery.get("tests", "UNKNOWN") if status == READY else "UNKNOWN",
                 "CI_RESULT": delivery.get("ci", "UNKNOWN") if status == READY else "UNKNOWN",
@@ -778,7 +799,13 @@ class Factory:
                 self.event(mission, "rework", {"target": delivery["target"], "feedback": feedback})
                 self.state(mission, "REWORK")
                 row = self.row(mission)
-            if row["status"] in ("UNKNOWN", "BLOCKED_BUDGET", "BLOCKED_SCOPE", "BLOCKED_LIMIT"):
+            if row["status"] == "BLOCKED_PREFLIGHT":
+                if self.db.execute("SELECT 1 FROM operations WHERE mission=? AND paid=1 LIMIT 1", (mission,)).fetchone():
+                    return self.report(mission)
+                # First-paid operation rechecks preflight and appends a fresh
+                # event. Preserve spec, policy, round, submission time and usage.
+                self.state(mission, "PLAN")
+            elif row["status"] in ("UNKNOWN", "BLOCKED_BUDGET", "BLOCKED_SCOPE", "BLOCKED_LIMIT"):
                 return self.report(mission)
             planning_payload = {"objective": spec["objective"], "acceptance": spec["acceptance"], "constraints": spec["constraints"],
                                 "scope": spec["scope"], "instruction": "Act as technical lead. Understand the repository, plan a minimal complete solution and acceptance tests. Decide ordinary engineering questions yourself. Only unresolved major product ambiguity, safety, independence, budget or irreversible changes belong in decisions_required. Do not edit files. Return plan, bounded tasks, acceptance and decisions_required."}

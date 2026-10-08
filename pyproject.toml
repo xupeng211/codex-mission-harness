@@ -3,6 +3,7 @@ name = "codex-mission-harness"
 version = "0.2.0"
 description = "AI software delivery factory governance over official Codex execution and review"
 requires-python = ">=3.11"
+dependencies = ["PyYAML>=6.0,<7"]
 [project.scripts]
 harness = "harness.cli:main"
 
