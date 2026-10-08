@@ -405,7 +405,8 @@ class FactoryAcceptanceTests(unittest.TestCase):
         self.addCleanup(limited.close)
         limited.submit(self.spec)
         report = limited.run("feature")
-        self.assertEqual(report["DELIVERY_STATUS"], "BLOCKED_SCOPE")
+        self.assertEqual(report["DELIVERY_STATUS"], "BLOCKED_PREFLIGHT")
+        self.assertEqual(report["BUDGET_USED"]["agent_runs"], 0)
         self.assertIn("nothing was truncated", report["BLOCKERS_REMAINING"][0])
 
     def test_immutable_budget_authority_cannot_be_increased_on_resume(self):

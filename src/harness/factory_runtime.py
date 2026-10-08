@@ -118,7 +118,9 @@ class FactoryAppServer(AppServerCodex):
             home = self._codex_home(profile.get("codex_home"))
             self._source_home = home
         executable = self._trusted_executable("codex", str(cwd))
-        self._native_identity = {"executable": str(executable), "launcher_sha256": hashlib.sha256(executable.read_bytes()).hexdigest()}
+        self._native_identity = {"executable": str(executable), "launcher_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+                                 "execution_limits": {"token_limit": token_limit, "timeout_seconds": timeout,
+                                                      "physical_token_ceiling": "NOT_GUARANTEED"}}
         watchdog = self._trusted_executable("timeout", str(cwd))
         rules = {str(root): "deny" for root in denied_roots if not (read_only and root in cwd.parents)}
         if not read_only:
@@ -443,8 +445,16 @@ class LocalRuntime:
         return identity
 
     def agent(self, role, profile, cwd, payload, transcript, timeout, denied_roots):
+        token_limit = self.resource_policy.get("max_run_tokens")
+        if role == "plan":
+            from .factory_budget import planning_limits
+            limits = planning_limits(self.resource_policy, timeout)
+            token_limit, timeout = limits["max_tokens"], limits["timeout_seconds"]
+            payload = {**payload, "planning_resource_guard": {
+                **limits, "physical_token_ceiling": "NOT_GUARANTEED",
+                "instruction": "Use targeted searches and small excerpts. Do not dump the repository, generated bundles or unrelated documentation. Stop exploring once you can return a bounded actionable plan; if essential information is missing, state the unresolved decision. Do not repeat broad scans."}}
         server = FactoryAppServer(profile, cwd, transcript, timeout, denied_roots,
-                                  role in ("plan", "review"), role == "review", self.resource_policy.get("max_run_tokens"))
+                                  role in ("plan", "review"), role == "review", token_limit)
         self.current_process = server.proc
         try:
             schema = REVIEW_SCHEMA if role == "review" else PLAN_SCHEMA if role == "plan" else WORK_SCHEMA

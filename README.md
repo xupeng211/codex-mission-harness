@@ -116,6 +116,10 @@ harness approve 任务编号 --action merge --head 交付显示的完整commit -
 
 `status` 和 `delivery` 显示执行次数、已观察的 token、未知 usage 及其永久保留额。金额没有真实遥测时明确为 `UNKNOWN`；不猜订阅价格，不把失败算成免费，不回填历史 UNKNOWN。
 
+第一次付费 dispatch 前，Factory 会记录 `PREPAID_PREFLIGHT`：只读取提交时的 baseline 和配置，不运行项目测试、Make、Docker 或 Provider 资格请求。独立审核的全库文本超过 `max_context_bytes`、缺少门禁可执行程序、明确依赖 Docker daemon 的门禁，以及 hosted workflow 不接受 Factory 候选分支 push 等已知问题标为 `HARD_BLOCKER`，以 `BLOCKED_PREFLIGHT` 停止，执行次数与 token 预留均为零。基础文本即使可读也不截断；扫描最多读取 64 MiB blob，有时间限制，不完整的扫描只提供下界。
+
+`WARNING` 表示当前 baseline 没发现该项明确障碍；`UNVERIFIED` 表示无法静态确定。`NO_KNOWN_HARD_BLOCKER` 不代表环境 READY 或交付 PASS。未来 diff 的 `max_review_bytes`、实施后的上下文、复杂 Make/CI 过滤、包和服务、远端权限以及项目自己的 receipt 合同仍需后续验证。YAML 使用 PyYAML 安全解析，重复键和无法理解的配置保持未验证；预检不执行仓库脚本，也不自动 fetch 缺失 Git objects。
+
 Setup 默认选择 standard 授权；小任务可在首次 setup 时选择 `--size small`，较大项目可选 `--size large`：
 
 | 授权 | 最多执行次数 | 每次 token admission | 总 token admission | 最多开发/返工轮数 | 总时长 |
@@ -128,7 +132,11 @@ Setup 默认选择 standard 授权；小任务可在首次 setup 时选择 `--si
 
 每次 dispatch 之前预留 per-run token capacity。已返回的真实 usage 用于后续 admission；UNKNOWN 永久保留整次额度。失败 turn 的 usage 可能只是已完成响应的部分遥测；它会如实保存，并额外保留未完成执行的完整 reservation，不据此退还额度。调用次数、总时长、返工轮数和预算授权不可自动提高。新配置不能扩大旧任务 authority；历史 12/12 的耗尽任务保持原记录。
 
+PLAN 另有更小的执行阈值：`min(原 per-run 上限, 32,000 tokens)` 和 `min(当前执行截止时间, 120 秒)`；旧的仅计次数配置也有这项 PLAN 限制。它复用 Codex native rollout budget、token usage 遥测、独立 watchdog 和已有 proxy admission，不增加执行次数或新的预算授权。规划指令要求定向搜索、小段读取和尽早返回有界计划。部分 usage 超出 PLAN 阈值时立即停止后续派发，operation 仍为 UNKNOWN，原授权的完整 reservation 原样保留；不因 PLAN 阈值变小而退款或重发。
+
 Codex 自己的 native rollout budget 限制采样循环，控制器同时检查包含 cached input 的 token 遥测，并有独立进程/时长限制。Token admission 是本地调度上限，Provider 一次已发出的响应在收到 usage 时可能越过阈值；发生这种情况会保留真实超额并停止，不能交付成功。它不是精确美元扣费保证；要求严格金额封顶时，使用 Provider 账户支出限额。Harness 不会自行调整这个外部限额。
+
+官方将 native rollout budget 标为开发中的功能。本地离线协议测试验证已安装 Codex 接受这些配置；没有运行模型来证明物理 token 硬帽。进程终止也不能撤回 Provider 已收到的请求。
 
 ## 出错时最少要理解什么
 
@@ -138,6 +146,7 @@ Codex 自己的 native rollout budget 限制采样循环，控制器同时检查
 - `UNKNOWN`：证据或请求结果不明确，没有 PASS，也不会重复付费请求。
 - `BLOCKED_BUDGET / BLOCKED_LIMIT`：授权额度或返工次数耗尽，系统已停止。
 - `BLOCKED_SCOPE`：变更超出授权范围、目标/工作流不符或上下文太大，系统已停止。
+- `BLOCKED_PREFLIGHT`：第一次付费请求前发现明确容量、环境或 CI 障碍，尚未派发。
 - `CANCELLED`：取消请求已生效，旧账本保持不变。
 - `WAITING_PRODUCT_DECISION`：真正涉及产品方向的歧义，需要你做产品决定；普通技术选择由系统处理。
 

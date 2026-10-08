@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from harness.factory import Factory, git
+from harness.factory_budget import planning_limits
 from harness.factory_fixture import AcceptanceRuntime, fixture_config
 from harness.factory_runtime import FactoryAppServer, LocalRuntime
 
@@ -34,10 +35,10 @@ class NativeProtocolTests(unittest.TestCase):
         (self.auth / "private-sentinel").write_text("not-a-real-credential")
         (self.root / "state/control/private-sentinel").write_text("not-visible-to-agent")
 
-    def server(self, read_only):
+    def server(self, read_only, token_limit=None, timeout=30):
         server = FactoryAppServer({"provider": "openai", "model": "offline-protocol-no-inference", "codex_home": str(self.auth)},
                                   self.cwd, self.root / ("review.raw" if read_only else "develop.raw"),
-                                  30, [self.root / "state", self.source], read_only, read_only)
+                                  timeout, [self.root / "state", self.source], read_only, read_only, token_limit)
         self.addCleanup(server.close)
         server.start_or_resume(None, str(self.cwd))
         self.assertEqual(server.runtime_identity["provider"], "openai")
@@ -86,6 +87,19 @@ class NativeProtocolTests(unittest.TestCase):
         server = self.server(False)
         result = self.exec(server, "import os,json;print(json.dumps({'bytecode':os.environ.get('PYTHONDONTWRITEBYTECODE')}))")
         self.assertEqual(result, {"bytecode": "1"})
+
+    def test_installed_native_planning_budget_is_configured_without_inference(self):
+        limits = planning_limits({"max_run_tokens": 240000}, 900)
+        server = self.server(True, limits["max_tokens"], limits["timeout_seconds"])
+        effective = server._request("config/read", {"includeLayers": False})["config"]
+        native = effective["features"]["rollout_budget"]
+        self.assertTrue(native["enabled"])
+        self.assertEqual(native["limit_tokens"], 32000)
+        self.assertEqual(native["sampling_token_weight"], 1.0)
+        self.assertEqual(native["prefill_token_weight"], 1.0)
+        self.assertEqual(server.runtime_identity["native_runtime"]["execution_limits"],
+                         {"token_limit": 32000, "timeout_seconds": 120, "physical_token_ceiling": "NOT_GUARANTEED"})
+        self.assertFalse(any(e.get("method") == "turn/started" for e in server.events))
 
     def test_reviewer_official_permissions_deny_code_edits(self):
         server = self.server(True)
