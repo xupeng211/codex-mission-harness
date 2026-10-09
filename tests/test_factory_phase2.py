@@ -9,12 +9,13 @@ import re
 import subprocess
 import unittest
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from harness.factory import Factory, FactoryBlocked, git, validate_config
 from harness.factory_project import OFFLINE_PASS
 from harness.factory_runtime import LocalRuntime
-from harness.factory_validation import digest as validation_digest, preflight
+from harness.factory_validation import digest as validation_digest, preflight, RESOURCE_CAPABILITIES
 from harness.factory_pr_ci import branch_for, expected_jobs
 import test_factory_project as stage1
 
@@ -59,6 +60,11 @@ class FakeDocker:
         self.failure = None
         self.exit_code = 0
         self.mutate = lambda value: None
+        self.info = {"ID": "fixture-daemon", "ServerVersion": "fixture-version", "OSType": "linux",
+                     "CgroupDriver": "systemd", "CgroupVersion": "2",
+                     **{key: True for key in RESOURCE_CAPABILITIES}}
+        self.info_calls = 0
+        self.info_mutate = lambda value: None
 
     def capture(self, container, path, timeout, cancelled):
         running = json.loads(Path(path).with_suffix(".validation.json").read_text())
@@ -74,6 +80,11 @@ class FakeDocker:
         self.calls.append(args)
         if self.failure == "daemon" and args[0] == "info":
             raise RuntimeError("fixture unavailable daemon")
+        if args[0] == "info":
+            self.info_calls += 1
+            value = copy.deepcopy(self.info)
+            self.info_mutate(value)
+            return json.dumps(value).encode()
         if args[:2] == ("image", "inspect"):
             return json.dumps([{"RepoDigests": [args[2]], "Id": "sha256:" + "a" * 64}]).encode()
         if args[0] == "create":
@@ -96,8 +107,13 @@ class FakeDocker:
             name = args[1]
             if self.failure == "timeout" and name.endswith("-profile"):
                 raise subprocess.TimeoutExpired("fixture docker inspect", timeout)
+            created = self.containers[name]
+            memory = int(created[created.index("--memory") + 1].removesuffix("m")) * 1024 * 1024
             value = {"State": {"Status": "exited", "ExitCode": self.exit_code if name.endswith("-profile") else 0,
-                               "OOMKilled": False, "Error": ""}, "HostConfig": {"NetworkMode": "none"}}
+                               "OOMKilled": False, "Error": ""},
+                     "HostConfig": {"NetworkMode": "none", "Memory": memory, "MemorySwap": memory,
+                                    "NanoCpus": int(created[created.index("--cpus") + 1]) * 1_000_000_000,
+                                    "PidsLimit": int(created[created.index("--pids-limit") + 1])}}
             self.mutate(value)
             return json.dumps([value]).encode()
         if args[0] == "start" and "--attach" in args:
@@ -389,6 +405,270 @@ class Phase2Tests(unittest.TestCase):
         self.assertEqual([w[0] for w in self.runtime.api.writes], ["push", "create-pr"])
         self.assertFalse(self.runtime.api.writes[1][1]["draft"])
         self.assertEqual(self.runtime.api.writes[0][1][1], target["head"])
+
+    def publication_case(self):
+        spec, cwd, target = self.candidate()
+        self.runtime.api = FakeGitHub(spec, target)
+        self.runtime.api.pr_exists = False
+        self.approve(target)
+        grant = self.f.publication_approval(spec, target)
+        # Deterministic virtual clock: no sleeping or real GitHub operations.
+        clock = datetime.now(timezone.utc)
+        grant["expires_at"] = (clock + timedelta(seconds=10)).isoformat()
+        return spec, cwd, target, grant, clock
+
+    def test_publication_read_expiry_stops_before_any_write(self):
+        spec, cwd, target, grant, clock = self.publication_case()
+        api = self.runtime.api
+        original = api.get
+        current = [clock]
+        def read(*args, **kwargs):
+            value = original(*args, **kwargs)
+            current[0] = clock + timedelta(seconds=11)
+            return value
+        api.get = read
+        with patch.object(self.f, "publication_approval", return_value=grant), patch("harness.factory_pr_ci.datetime") as date:
+            date.fromisoformat.side_effect = datetime.fromisoformat
+            date.now.side_effect = lambda tz: current[0]
+            with self.assertRaisesRegex(FactoryBlocked, "expired"):
+                self.gates(spec, cwd, target, "ci")
+        self.assertEqual(api.writes, [])
+        op = self.f.db.execute("SELECT status,result FROM operations WHERE stage='project_pr_ci'").fetchone()
+        self.assertEqual(op["status"], "COMPLETE")
+        self.assertEqual(json.loads(op["result"])["publication_progress"], {"push":"NOT_STARTED", "create_pr":"NOT_STARTED"})
+
+    def test_publication_push_expiry_records_partial_and_new_grant_can_resume(self):
+        spec, cwd, target, grant, clock = self.publication_case()
+        api = self.runtime.api
+        original = api.push
+        current = [clock]
+        def push(*args):
+            original(*args)
+            current[0] = clock + timedelta(seconds=11)
+        api.push = push
+        with patch.object(self.f, "publication_approval", return_value=grant), patch("harness.factory_pr_ci.datetime") as date:
+            date.fromisoformat.side_effect = datetime.fromisoformat
+            date.now.side_effect = lambda tz: current[0]
+            with self.assertRaisesRegex(FactoryBlocked, "expired"):
+                self.gates(spec, cwd, target, "ci")
+        self.assertEqual([w[0] for w in api.writes], ["push"])
+        op = self.f.db.execute("SELECT * FROM operations WHERE stage='project_pr_ci'").fetchone()
+        result = json.loads(op["result"])
+        self.assertEqual(result["publication_progress"], {"push":"COMPLETE", "create_pr":"NOT_STARTED"})
+        self.assertEqual(op["status"], "COMPLETE")
+        self.f.verify_evidence(op)
+        raw = Path(result["raw_evidence"][0]["path"]).read_text()
+        self.assertIn('"push": "COMPLETE", "create_pr": "NOT_STARTED"', raw)
+        # A known stop is reusable only through a genuinely new human grant.
+        old_id = op["id"]
+        self.approve(target)
+        api.push = original
+        resumed = self.gates(spec, cwd, target, "ci")[-1]
+        self.assertEqual(resumed["status"], "PASS")
+        self.assertNotEqual(resumed["approval_id"], grant["approval_id"])
+        self.assertEqual(self.f.db.execute("SELECT status FROM operations WHERE id=?", (old_id,)).fetchone()[0], "COMPLETE")
+
+    def test_publication_grant_expiring_during_intent_fsync_cannot_dispatch(self):
+        spec, cwd, target, grant, clock = self.publication_case()
+        # Complete the local profile first so only PR progress uses this clock.
+        with patch.object(self.f, "publication_approval", side_effect=FactoryBlocked("BLOCKED_PUBLICATION_AUTH", "fixture pause")):
+            with self.assertRaises(FactoryBlocked): self.gates(spec,cwd,target,"ci")
+        current, syncs = [clock], [0]
+        def sync(fd):
+            syncs[0] += 1
+            if syncs[0] == 2: current[0] = clock + timedelta(seconds=11)
+        with patch.object(self.f, "publication_approval", return_value=grant), patch("harness.factory_pr_ci.os.fsync", side_effect=sync), patch("harness.factory_pr_ci.datetime") as date:
+            date.fromisoformat.side_effect = datetime.fromisoformat
+            date.now.side_effect = lambda tz: current[0]
+            with self.assertRaisesRegex(FactoryBlocked, "expired"): self.gates(spec,cwd,target,"ci")
+        self.assertEqual(self.runtime.api.writes, [])
+
+    def test_publication_expired_grant_after_factory_restart_cannot_dispatch(self):
+        spec, cwd, target = self.candidate()
+        self.approve(target)
+        expiry = datetime.now(timezone.utc) + timedelta(hours=2)
+        api = FakeGitHub(spec, target)
+        api.pr_exists = False
+        self.runtime.api = api
+        self.f.close()
+        self.f = Factory(self.root / "phase2-state", self.config, self.runtime)
+        self.addCleanup(self.f.close)
+        with patch("harness.factory_pr_ci.datetime") as date:
+            date.fromisoformat.side_effect = datetime.fromisoformat
+            date.now.return_value = expiry
+            with self.assertRaisesRegex(FactoryBlocked, "expired"):
+                self.gates(spec, cwd, target, "ci")
+        self.assertEqual(api.calls, [])
+        self.assertEqual(api.writes, [])
+
+    def test_publication_identity_actions_and_remote_base_rechecked_before_writes(self):
+        for field in ("repository", "head", "base", "actions", "candidate", "remote_base"):
+            with self.subTest(field=field):
+                spec, cwd, target = self.candidate()
+                self.runtime.api = FakeGitHub(spec, target)
+                api = self.runtime.api
+                api.pr_exists = False
+                self.approve(target)
+                grant = self.f.publication_approval(spec, target)
+                original = api.get
+                reads = [0]
+                def read(path, **kwargs):
+                    value = original(path, **kwargs)
+                    reads[0] += 1
+                    if reads[0] == 2:
+                        if field == "candidate":
+                            (cwd / "score.py").write_text("changed after freezing")
+                        elif field == "remote_base":
+                            api.mutate = lambda bundle: bundle["base_branch"]["commit"].update(sha="f"*40)
+                        else:
+                            grant["identity"][field] = [] if field == "actions" else "changed"
+                    return value
+                api.get = read
+                with patch.object(self.f, "publication_approval", return_value=grant):
+                    with self.assertRaises(FactoryBlocked): self.gates(spec, cwd, target, "ci")
+                self.assertEqual(api.writes, [])
+                git(cwd, "checkout", "--", "score.py")
+
+    def test_ambiguous_publication_write_remains_unknown_and_cannot_replay(self):
+        spec, cwd, target = self.candidate()
+        api = FakeGitHub(spec, target)
+        api.pr_exists = False
+        self.runtime.api = api
+        original = api.push
+        def ambiguous(*args):
+            original(*args)
+            raise RuntimeError("push response lost")
+        api.push = ambiguous
+        self.approve(target)
+        with self.assertRaises(FactoryBlocked): self.gates(spec, cwd, target, "ci")
+        op = self.f.db.execute("SELECT * FROM operations WHERE stage='project_pr_ci'").fetchone()
+        self.assertEqual(op["status"], "UNKNOWN")
+        with self.assertRaises(FactoryBlocked): self.gates(spec, cwd, target, "ci")
+        with self.assertRaises(ValueError): self.approve(target)
+        self.assertEqual([w[0] for w in api.writes], ["push"])
+
+    def test_ambiguous_pr_creation_remains_unknown_and_cannot_replay(self):
+        spec, cwd, target = self.candidate()
+        api = FakeGitHub(spec, target)
+        api.pr_exists = False
+        self.runtime.api = api
+        original = api.post
+        def ambiguous(*args):
+            original(*args)
+            raise RuntimeError("PR creation response lost")
+        api.post = ambiguous
+        self.approve(target)
+        with self.assertRaises(FactoryBlocked): self.gates(spec, cwd, target, "ci")
+        op = self.f.db.execute("SELECT * FROM operations WHERE stage='project_pr_ci'").fetchone()
+        self.assertEqual(op["status"], "UNKNOWN")
+        raw = Path(json.loads(op["result"])["raw_evidence"][0]["path"]).read_text()
+        self.assertIn('"push": "COMPLETE", "create_pr": "UNKNOWN"', raw)
+        calls = len(api.calls)
+        with self.assertRaises(FactoryBlocked): self.gates(spec, cwd, target, "ci")
+        with self.assertRaises(ValueError): self.approve(target)
+        self.assertEqual(len(api.calls), calls)
+        self.assertEqual([w[0] for w in api.writes], ["push", "create-pr"])
+
+    def test_full_factory_publication_stop_waits_for_new_authorization(self):
+        # Remove the shared fixture's deliberate arithmetic defect: this test
+        # isolates publication resume for one frozen HEAD, without rework.
+        original_agent = self.runtime.agent
+        self.runtime.agent = lambda role, *args: original_agent("rework" if role == "implement" else role, *args)
+        original_grant = self.f.publication_approval
+        def approved(spec, target):
+            self.approve(target)
+            return original_grant(spec, target)
+        self.f.publication_approval = approved
+        original_ci = self.runtime.project_ci
+        current = [datetime.now(timezone.utc)]
+        def project_ci(policy, spec, cwd, target, *args):
+            api = self.runtime.api = FakeGitHub(spec, target)
+            api.pr_exists = False
+            push = api.push
+            def completed_push(*argv):
+                push(*argv)
+                current[0] += timedelta(hours=2)
+            api.push = completed_push
+            return original_ci(policy, spec, cwd, target, *args)
+        self.runtime.project_ci = project_ci
+        original_probe = preflight
+        def probe(policy, executor=None, *args, **kwargs):
+            return original_probe(policy, self.runtime.docker, *args, **kwargs) if executor is not None else {"status":"VERIFIED"}
+        with patch("harness.factory_validation.preflight", side_effect=probe), patch("harness.factory_pr_ci.datetime") as date:
+            date.fromisoformat.side_effect = datetime.fromisoformat
+            date.now.side_effect = lambda tz: current[0]
+            self.f.submit(self.spec)
+            report = self.f.run("feature")
+        self.assertEqual(report["DELIVERY_STATUS"], "BLOCKED_PUBLICATION_AUTH")
+        self.assertFalse(report["DONE"])
+        self.assertEqual([w[0] for w in self.runtime.api.writes], ["push"])
+        self.assertFalse(self.f.db.execute("SELECT 1 FROM operations WHERE status IN ('UNKNOWN','RUNNING')").fetchone())
+        old_approval = self.f.db.execute("SELECT id FROM approvals WHERE action='publish-pr'").fetchone()[0]
+        spec, cwd = self.f.prepare("feature")
+        target = self.f.target(spec, cwd)
+        self.f.publication_approval = original_grant
+        self.approve(target)
+        self.assertNotEqual(self.f.db.execute("SELECT id FROM approvals WHERE action='publish-pr' ORDER BY at DESC").fetchone()[0], old_approval)
+        self.runtime.project_ci = original_ci
+        self.runtime.api.push = FakeGitHub.push.__get__(self.runtime.api)
+        resumed = self.f.run("feature")
+        self.assertEqual(resumed["DELIVERY_STATUS"], OFFLINE_PASS, resumed)
+        self.assertFalse(resumed["DONE"])
+        self.assertEqual(resumed["TARGET_HEAD"], target["head"])
+
+    def test_docker_missing_or_unknown_resource_support_blocks_before_containers(self):
+        spec, cwd, target = self.candidate()
+        original = copy.deepcopy(self.runtime.docker.info)
+        round_ = 0
+        for key in RESOURCE_CAPABILITIES:
+            for value in (False, None, "true", "MISSING"):
+                with self.subTest(key=key, value=value):
+                    self.runtime.docker.info = copy.deepcopy(original)
+                    if value == "MISSING": self.runtime.docker.info.pop(key)
+                    else: self.runtime.docker.info[key] = value
+                    calls = len(self.runtime.docker.calls)
+                    with self.assertRaises(FactoryBlocked): self.f.gates(spec,cwd,target,"checks",round_)
+                    self.assertFalse(any(c[0] == "create" for c in self.runtime.docker.calls[calls:]))
+                    round_ += 1
+
+    def test_docker_execution_environment_change_fail_closed_and_cleanup(self):
+        spec, cwd, target = self.candidate()
+        for round_, point in enumerate((2, 3, 5, 6)):
+            with self.subTest(info_call=point):
+                docker = self.runtime.docker = FakeDocker()
+                docker.info_mutate = lambda value: value.update(ID="different-daemon") if docker.info_calls >= point else None
+                with self.assertRaises(FactoryBlocked): self.f.gates(spec,cwd,target,"checks",round_)
+                result = json.loads(self.f.db.execute("SELECT result FROM operations WHERE stage='checks' ORDER BY started DESC").fetchone()[0])
+                self.assertEqual(result["status"], "UNKNOWN")
+                self.assertEqual(result["cleanup"], "COMPLETE")
+                self.assertFalse(docker.containers)
+
+    def test_docker_ignored_container_limits_and_bad_cached_support_rejected(self):
+        spec, cwd, target = self.candidate()
+        docker = self.runtime.docker
+        original = docker.call
+        dropped = ["PidsLimit"]
+        def ignored(*args, **kwargs):
+            value = original(*args, **kwargs)
+            if args[0] == "inspect" and args[1].endswith("-profile"):
+                value = json.loads(value)
+                value[0]["HostConfig"][dropped[0]] = 0
+                return json.dumps(value).encode()
+            return value
+        docker.call = ignored
+        for round_, key in enumerate(("NanoCpus", "Memory", "MemorySwap", "PidsLimit")):
+            with self.subTest(limit=key):
+                dropped[0] = key
+                with self.assertRaises(FactoryBlocked): self.f.gates(spec,cwd,target,"checks",round_)
+                self.assertFalse(docker.containers)
+        docker.call = original
+        result = self.f.gates(spec,cwd,target,"checks",4)[0]
+        from harness.factory_validation import validate_result
+        for field in ("readiness", "resource_environment_after"):
+            corrupted = copy.deepcopy(result)
+            if field == "readiness": corrupted[field]["resource_environment"]["MemoryLimit"] = False
+            else: corrupted[field]["ID"] = "changed"
+            with self.assertRaises(ValueError): validate_result(corrupted,VALIDATION,spec,target,"strict",True)
 
     def test_publication_approval_does_not_authorize_a_new_head_or_expired_grant(self):
         from harness.factory_pr_ci import validate_approval

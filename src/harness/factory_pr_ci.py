@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import time
@@ -20,6 +21,11 @@ WORKFLOW = "production-gate.yml"
 CHECK_NAMES = {"production-gate": "Environment / Proxy / Static / Unit Gate",
                "docker-build": "Docker Build Validation"}
 SHA = re.compile(r"[0-9a-f]{40}")
+PUBLICATION_ACTIONS = ["push", "create-pr"]
+
+
+class PublicationAuthorizationError(ValueError):
+    """Known authorization stop, before an unattempted remote write."""
 
 
 def digest(value):
@@ -97,7 +103,8 @@ def repository_identity(spec, policy):
 def validate_approval(approval, policy, spec, target):
     expected = {"mission_id": spec["mission_id"], "repository": policy["repository"],
                 "branch": branch_for(spec, target), "base": target["base"],
-                "head": target["head"], "tree": target["tree"], "policy_sha256": digest(policy)}
+                "head": target["head"], "tree": target["tree"], "policy_sha256": digest(policy),
+                "actions": PUBLICATION_ACTIONS}
     if not isinstance(approval, dict) or approval.get("identity") != expected:
         raise ValueError("separate exact-candidate PR publication approval is missing or stale")
     expiry = datetime.fromisoformat(approval["expires_at"])
@@ -389,6 +396,7 @@ def run(policy, spec, cwd, target, approval, transcript, timeout, api=None, canc
     validate_policy(policy)
     repository_identity(spec, policy)
     validate_approval(approval, policy, spec, target)
+    frozen_approval = json.loads(json.dumps(approval))
     source = workflow_at(cwd, target["base"])
     expected_jobs(source)
     if workflow_at(cwd, target["head"]) != source:
@@ -397,6 +405,46 @@ def run(policy, spec, cwd, target, approval, transcript, timeout, api=None, canc
     deadline = time.monotonic() + timeout
     root = "repos/" + policy["repository"]
     branch = branch_for(spec, target)
+    progress = {"push": "NOT_STARTED", "create_pr": "NOT_STARTED"}
+
+    def record_progress():
+        with Path(transcript).open("a") as stream:
+            stream.write(json.dumps({"publication_progress": progress, "mission_id": spec["mission_id"],
+                                     "approval_id": frozen_approval["approval_id"],
+                                     "identity": frozen_approval["identity"]}) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    def authorize_write(action):
+        # Remote reads can consume the grant's lifetime. Check the current base
+        # first, then the unchanged grant and local candidate immediately before
+        # dispatch. Never refresh/extend a grant or infer permission from a push.
+        base = api.get(root + "/branches/main")["commit"]["sha"]
+        if cancelled() or time.monotonic() >= deadline:
+            raise InterruptedError("publication cancelled or deadline exhausted")
+        field = {"push": "push", "create-pr": "create_pr"}[action]
+        try:
+            if approval != frozen_approval:
+                raise ValueError("publication approval changed after entry")
+            identity = validate_approval(approval, policy, spec, target)
+            repository_identity(spec, policy)
+            if identity != frozen_approval["identity"] or action not in identity["actions"]:
+                raise ValueError("publication identity or allowed action changed")
+            if (base != identity["base"]
+                    or _read_git(cwd, "rev-parse", "HEAD").strip() != identity["head"]
+                    or _read_git(cwd, "rev-parse", "HEAD^{tree}").strip() != identity["tree"]
+                    or _read_git(cwd, "status", "--porcelain", "--untracked-files=all").strip()):
+                raise ValueError("publication repository/base/candidate identity changed")
+            # Persist intent before dispatch; even fsync can consume the grant's
+            # lifetime. The unchanged grant/expiry check is the final step.
+            progress[field] = "UNKNOWN"
+            record_progress()
+            if approval != frozen_approval:
+                raise ValueError("publication approval changed before dispatch")
+            validate_approval(approval, policy, spec, target)
+        except (ValueError, KeyError, TypeError) as exc:
+            progress[field] = "NOT_STARTED"
+            raise PublicationAuthorizationError(str(exc)) from exc
     if api.get(root + "/branches/main")["commit"]["sha"] != target["base"]:
         raise ValueError("remote base moved; do not publish")
     prs = pages(api, root + f"/pulls?state=open&base=main&head={policy['repository'].split('/')[0]}:{branch}")
@@ -409,12 +457,29 @@ def run(policy, spec, cwd, target, approval, transcript, timeout, api=None, canc
         if existing.get("body") != approval["body"]:
             raise ValueError("existing PR body differs from concrete publication approval")
     else:
-        # Authorization was checked before either write. Never change draft
-        # state, close/reopen a PR, retry an ambiguous write or force-push.
-        api.push(policy["repository"], target["head"], branch)
-        created = api.post(root + "/pulls", {"title": f"Factory: {spec['mission_id']}", "head": branch,
-                                            "base": "main", "body": approval["body"], "draft": False})
-        number = created["number"]
+        record_progress()
+        try:
+            authorize_write("push")
+            api.push(policy["repository"], target["head"], branch)
+            progress["push"] = "COMPLETE"
+            record_progress()
+            authorize_write("create-pr")
+            created = api.post(root + "/pulls", {"title": f"Factory: {spec['mission_id']}", "head": branch,
+                                                "base": "main", "body": approval["body"], "draft": False})
+            number = created["number"]
+            if type(number) is not int or number <= 0:
+                raise ValueError("PR creation response identity unknown")
+            progress.update(create_pr="COMPLETE", pr_number=number)
+            record_progress()
+        except PublicationAuthorizationError as exc:
+            # Both states are known: any earlier push returned successfully,
+            # and the next write was never dispatched. Ambiguous writes still
+            # raise normally into Factory's existing UNKNOWN/no-replay guard.
+            record_progress()
+            return {"status": "BLOCKED_PUBLICATION_AUTH", "reason": str(exc), "target": target,
+                    "mission_id": spec["mission_id"], "fixture": api.fixture,
+                    "policy_sha256": digest(policy), "approval_id": frozen_approval["approval_id"],
+                    "publication_progress": progress, "MERGE_PERFORMED": False}
     while time.monotonic() < deadline:
         if cancelled():
             raise InterruptedError("PR CI observation cancelled")

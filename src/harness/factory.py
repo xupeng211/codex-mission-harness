@@ -776,7 +776,7 @@ class Factory:
     def approve_pr_publication(self, mission, expected_head, reason, body, expires_seconds=3600):
         """Record separate human publication approval. This method performs no remote write."""
         from datetime import datetime, timedelta, timezone
-        from .factory_pr_ci import branch_for, digest as policy_digest
+        from .factory_pr_ci import branch_for, digest as policy_digest, PUBLICATION_ACTIONS
         if not self.project or "project_pr_ci" not in self.config or not isinstance(reason, str) or not reason.strip():
             raise ValueError("project PR publication needs explicit policy and human reason")
         bounded_int(expires_seconds, "publication approval lifetime", 1, 86400)
@@ -793,7 +793,7 @@ class Factory:
         approval = {"approval_id": uuid.uuid4().hex,
                     "identity": {"mission_id": mission, "repository": policy["repository"], "base": target["base"],
                                  "head": target["head"], "tree": target["tree"], "branch": branch_for(spec, target),
-                                 "policy_sha256": policy_digest(policy)},
+                                 "policy_sha256": policy_digest(policy), "actions": PUBLICATION_ACTIONS.copy()},
                     "body": body, "body_sha256": hashlib.sha256(body.encode()).hexdigest(),
                     "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=expires_seconds)).isoformat()}
         self.db.execute("INSERT INTO approvals VALUES(?,?,?,?,?,?)",
@@ -846,6 +846,18 @@ class Factory:
             result = self.operation(spec["mission_id"], key, "project_pr_ci", "github", payload, payload, False,
                 lambda transcript: self.runtime.project_ci(policy, spec, cwd, target, approval, transcript,
                                                           self.operation_timeout(spec["mission_id"])))
+            if result.get("status") == "BLOCKED_PUBLICATION_AUTH":
+                from .factory_pr_ci import digest as policy_digest
+                if (result.get("target") != target or result.get("mission_id") != spec["mission_id"]
+                        or result.get("fixture") is not self.config["simulation"]
+                        or result.get("policy_sha256") != policy_digest(policy)
+                        or result.get("approval_id") != approval["approval_id"]
+                        or result.get("publication_progress") not in (
+                            {"push": "NOT_STARTED", "create_pr": "NOT_STARTED"},
+                            {"push": "COMPLETE", "create_pr": "NOT_STARTED"})
+                        or result.get("MERGE_PERFORMED") is not False):
+                    raise FactoryBlocked("UNKNOWN", "publication stop identity or partial state is unknown")
+                raise FactoryBlocked("BLOCKED_PUBLICATION_AUTH", result["reason"])
             try:
                 self.runtime.project_validate_ci(policy, spec, cwd, target, result, refresh=True)
             except Exception as exc:

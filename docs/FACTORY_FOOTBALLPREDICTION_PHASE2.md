@@ -16,6 +16,14 @@ digest pin；镜像必须不包含凭据，并在 `/opt/cmh` 保存匹配候选�
 预检真实探测本地 daemon、digest、工具、关键依赖和锁文件哈希，字段存在不代表可用。
 锁文件改变需要重新准备可信依赖镜像；Factory 不会联网补依赖。
 
+受控执行器还要求 Docker 明确报告 `CpuCfsPeriod`、`CpuCfsQuota`、`MemoryLimit`、
+`SwapLimit`、`PidsLimit` 全部为布尔 true，Linux cgroup 版本和驱动、daemon ID 与版本
+必须可识别。缺失、未知或不支持时阻断，不删除任何限制后重试。就绪探针、数据库和
+验证容器的实际 HostConfig 必须包含配置指定的 NanoCpus、Memory、MemorySwap、
+PidsLimit；数据库和验证容器启动前及验证结束后重读能力/环境身份，变化时为 UNKNOWN。
+这些字段和容器限额保留在验证证据中；缺少新证据的旧结果不能恢复成当前合同通过。
+这依赖受信任本地 Docker 对能力和配置的报告，不代替实际业务 profile 的受控运行证明。
+
 Controller 使用固定本地 daemon socket，但该 socket、宿主 HOME、认证目录、原项目
 Git 对象和 Factory evidence 从不挂载到候选容器。每轮 clone 一份独立 Git 对象快照，
 清除远端 URL / hooks，保存只读 `origin/main` 基线用于原 profile 的完整范围计算，
@@ -55,8 +63,16 @@ harness approve <mission> --action publish-pr --head <完整候选SHA> \
 该命令只记录 owner approval，不联网。正文必须明确包含
 `Mission scope contract: \`docs/agentic/missions/<mission>.json\``。
 批准绑定 mission、repository、base/head/tree、分支、CI policy、正文哈希及到期时间。
+允许动作明确绑定为 `push`、`create-pr`。每次远端写入前先重读远端 base，再检查
+原授权未改变、允许动作、source origin、干净候选 HEAD/tree 与有效期；写入之间不延长、
+刷新或重新生成授权。缺少动作绑定的历史授权不被自动升级。
 之后经明确恢复才执行冻结候选的非 force push，并创建或复用唯一对应 PR。
 实际远端写响应未知会落入原 UNKNOWN 操作，不自动重复创建。
+如果 push 已确认成功、create-PR 尚未调用时授权失效，保留 fsync 的逐步发布记录，
+返回 `BLOCKED_PUBLICATION_AUTH`，明确记录 push COMPLETE / create_pr NOT_STARTED。
+该已知部分结果保存为完成的操作证据，必须另行取得新授权才能继续，旧记录不改写。
+写入调用开始后先记 UNKNOWN；响应丢失则仍按原 UNKNOWN 防重发处理，新授权也不能
+绕过未决操作。Factory 不自动回滚已推送分支，也不因此创建 PR。
 默认批准非 Draft PR；已有 Draft 会明确阻断，不转换状态、不重开、不 rerun。
 Factory 没有自动 merge/release/deploy 调用，候选从不获得 Controller GitHub 凭据。
 
@@ -110,3 +126,12 @@ fixtures；live READY 表示可以提交用户验收/merge 判断，`DONE` 永�
 
 建议合并 Harness 变更前做独立 Exact-HEAD 审查；本轮未执行付费独立 review。
 不需要通用容器平台、矩阵解释器、第二套 review policy 或新的调度层。
+
+## 最终边界修复的离线反例
+
+补充 Factory → LocalRuntime 路径的虚拟时钟测试：入口有效且写入前仍有效、读取期间
+过期、push 后过期、重启后过期、授权身份/动作变化、远端 base 变化、候选变脏，
+以及 push / create-PR 响应丢失。已知部分完成须等待新授权；UNKNOWN 不重派发。
+Docker 替身覆盖全部关键能力的支持/缺失/false/未知类型、daemon 在不同执行阶段变化、
+每项容器限额被忽略及缓存证据缺失/变化。全部远端写入均为 fake API；没有真实
+Provider、业务 profile、push、PR 创建或 merge。真实环境交付仍需上述单独授权和证据。

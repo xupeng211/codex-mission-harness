@@ -15,6 +15,9 @@ from .factory_preflight import _git_environment, _read_git
 from .sandbox import SAFE_PATH
 
 
+RESOURCE_CAPABILITIES = ("CpuCfsPeriod", "CpuCfsQuota", "MemoryLimit", "SwapLimit", "PidsLimit")
+
+
 class ValidationCleanupError(RuntimeError):
     pass
 
@@ -89,6 +92,34 @@ def limits(policy):
             "--restart=no", "--log-driver=none"]
 
 
+def check_resource_environment(info):
+    # Docker reports kernel/cgroup support separately from requested flags.
+    # Unknown/missing/string-valued capabilities cannot establish support.
+    if (not isinstance(info, dict)
+            or any(info.get(key) is not True for key in RESOURCE_CAPABILITIES)
+            or info.get("OSType") != "linux"
+            or info.get("CgroupVersion") not in {"1", "2"}
+            or info.get("CgroupDriver") not in {"systemd", "cgroupfs"}
+            or any(not isinstance(info.get(key), str) or not info[key] for key in ("ID", "ServerVersion"))):
+        raise ValueError("Docker CPU quota, memory/swap or PID resource support is missing or unknown")
+    return {key: info[key] for key in (*RESOURCE_CAPABILITIES, "ID", "ServerVersion", "OSType",
+                                     "CgroupVersion", "CgroupDriver")}
+
+
+def resource_environment(call):
+    return check_resource_environment(json.loads(call("info", "--format", "{{json .}}")))
+
+
+def check_container_resources(info, policy):
+    expected = {"NanoCpus": policy["cpus"] * 1_000_000_000,
+                "Memory": policy["memory_mb"] * 1024 * 1024,
+                "MemorySwap": policy["memory_mb"] * 1024 * 1024, "PidsLimit": policy["pids"]}
+    actual = {key: info.get("HostConfig", {}).get(key) for key in expected}
+    if actual != expected or any(type(value) is not int for value in actual.values()):
+        raise ValueError("container CPU/memory/swap/PID limits differ from trusted policy")
+    return actual
+
+
 def image_identity(executor, image):
     info = json.loads(executor.call("image", "inspect", image))[0]
     if image not in info.get("RepoDigests", []) or not re.fullmatch(r"sha256:[0-9a-f]{64}", info.get("Id", "")):
@@ -106,7 +137,7 @@ def preflight(policy, executor=None, expected_locks=None, timeout=90):
         if remaining <= 0:
             raise TimeoutError("validation readiness probe timed out")
         return executor.call(*args, timeout=min(timeout, remaining))
-    call("info", "--format", "{{.ServerVersion}}")
+    environment = resource_environment(call)
     images = {key: image_identity(executor, policy[key]) for key in ("image", "postgres_image")}
     name = "cmh-preflight-" + uuid.uuid4().hex
     created = False
@@ -129,9 +160,13 @@ def preflight(policy, executor=None, expected_locks=None, timeout=90):
         actual_locks = {Path(path).name: sha for sha, path in re.findall(r"(?m)^([0-9a-f]{64})  (/opt/cmh/[^\n]+)$", output)}
         if expected_locks is not None and actual_locks != expected_locks:
             raise ValueError("prepared image dependencies differ from the exact candidate lockfiles")
-        state = json.loads(call("inspect", name))[0]["State"]
+        inspected = json.loads(call("inspect", name))[0]
+        check_container_resources(inspected, policy)
+        state = inspected["State"]
         if state.get("Status") != "exited" or state.get("ExitCode") != 0 or state.get("OOMKilled") or state.get("Error"):
             raise ValueError("isolated image readiness probe failed")
+        if resource_environment(call) != environment:
+            raise ValueError("Docker execution environment changed during readiness probe")
     finally:
         if created:
             try:
@@ -139,7 +174,8 @@ def preflight(policy, executor=None, expected_locks=None, timeout=90):
             except Exception as exc:
                 raise ValidationCleanupError("readiness container cleanup failed: " + name) from exc
     return {"status": "VERIFIED" if not executor.fixture else "FIXTURE_VERIFIED", "images": images,
-            "config_sha256": digest(policy), "dependency_locks": actual_locks}
+            "config_sha256": digest(policy), "dependency_locks": actual_locks,
+            "resource_environment": environment}
 
 
 def dependency_locks(cwd, revision):
@@ -153,6 +189,12 @@ def validate_result(result, policy, spec, target, profile, simulation):
     if result.get("identity") != expected or result.get("fixture") is not simulation:
         raise ValueError("validation identity or fixture provenance mismatch")
     readiness = result.get("readiness", {})
+    environment = check_resource_environment(readiness.get("resource_environment"))
+    if (result.get("resource_environment_after") != environment
+            or set(result.get("container_resources", {})) != {"database", "validation"}):
+        raise ValueError("execution resource environment evidence missing or changed")
+    for resources in result["container_resources"].values():
+        check_container_resources({"HostConfig": resources}, policy)
     if (readiness.get("config_sha256") != digest(policy)
             or readiness.get("status") != ("FIXTURE_VERIFIED" if simulation else "VERIFIED")
             or set(readiness.get("images", {})) != {"image", "postgres_image"}
@@ -206,6 +248,12 @@ def run(policy, spec, cwd, target, command, transcript, timeout, executor=None, 
         return executor.call(*args, timeout=min(30, remaining))
     try:
         result["readiness"] = preflight(policy, executor, dependency_locks(cwd, target["head"]), timeout)
+        environment = result["readiness"]["resource_environment"]
+        def same_environment():
+            current = resource_environment(call)
+            if current != environment:
+                raise ValueError("Docker execution environment changed after readiness")
+            return current
         # Independent objects, sanitized metadata, immutable host mount. Neither
         # the original object store nor any Controller evidence enters Docker.
         subprocess.run(["git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null", "clone",
@@ -226,16 +274,19 @@ def run(policy, spec, cwd, target, command, transcript, timeout, executor=None, 
                 if not path.is_symlink():
                     path.chmod(0o755 if path.stat().st_mode & 0o111 else 0o644)
         password = uuid.uuid4().hex
+        same_environment()
         resources.append(("container", db))
         call("create", "--pull=never", "--name", db, "--network=none",
              "--user=999:999", *limits(policy), "--tmpfs", "/var/lib/postgresql/data:rw,nosuid,size=512m,uid=999,gid=999",
              "--tmpfs", "/var/run/postgresql:rw,nosuid,size=16m,uid=999,gid=999", "--tmpfs", "/tmp:rw,nosuid,size=64m",
              "-e", "PGDATA=/var/lib/postgresql/data", "-e", "POSTGRES_DB=football_validation",
              "-e", "POSTGRES_USER=validation", "-e", "POSTGRES_PASSWORD=" + password, policy["postgres_image"])
-        call("start", db)
         db_info = json.loads(call("inspect", db))[0]
+        result["container_resources"] = {"database": check_container_resources(db_info, policy)}
         if db_info.get("HostConfig", {}).get("NetworkMode") != "none":
             raise ValueError("temporary database does not have an isolated loopback-only namespace")
+        same_environment()
+        call("start", db)
         while True:
             try:
                 call("exec", db, "pg_isready", "-U", "validation", "-d", "football_validation")
@@ -269,9 +320,14 @@ def run(policy, spec, cwd, target, command, transcript, timeout, executor=None, 
              "printf '%s\\n' " + marker + "; status=0; python3 scripts/devops/validation_profiles.py " + profile + " || status=$?; "
              "after=$(git status --porcelain=v1 -uall); "
              "if test \"$before\" != \"$after\"; then echo CMH_SOURCE_INTEGRITY_FAILURE; exit 125; fi; exit \"$status\"")
+        profile_info = json.loads(call("inspect", container))[0]
+        result["container_resources"]["validation"] = check_container_resources(profile_info, policy)
+        same_environment()
         stream_exit = executor.capture(container, transcript, max(0, deadline - time.monotonic()), cancelled)
         while True:
-            state = json.loads(call("inspect", container))[0]["State"]
+            inspected = json.loads(call("inspect", container))[0]
+            check_container_resources(inspected, policy)
+            state = inspected["State"]
             if state.get("Status") == "exited":
                 if state.get("OOMKilled") or state.get("Error") or type(state.get("ExitCode")) is not int:
                     raise ValueError("container termination incomplete or resource failure")
@@ -291,6 +347,8 @@ def run(policy, spec, cwd, target, command, transcript, timeout, executor=None, 
         if marker.encode() not in logs:
             raise ValueError("dependency preparation did not establish the formal profile environment")
         result["environment_ready"] = True
+        check_container_resources(json.loads(call("inspect", db))[0], policy)
+        result["resource_environment_after"] = same_environment()
         result["status"] = "PASS" if result["exit_code"] == 0 else "FAIL"
     except BaseException as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
