@@ -19,6 +19,7 @@ from .codex import AppServerCodex
 from .model_registry import read_private_token
 from .sandbox import project_gate_invocation, preflight_project_gate, SAFE_PATH
 from .factory_proxy import validate_transport, ProxyPolicy, ProxyRelay, digest as route_digest
+from .factory_project import FootballPredictionContract, LANES
 
 
 VENDOR = Path(__file__).parent / "vendor" / "codex"
@@ -79,7 +80,8 @@ class FactoryAppServer(AppServerCodex):
     """
 
     def __init__(self, profile: dict, cwd: Path, transcript: Path, timeout: int,
-                 denied_roots: list[Path], read_only: bool, reviewer: bool = False, token_limit: int | None = None):
+                 denied_roots: list[Path], read_only: bool, reviewer: bool = False, token_limit: int | None = None,
+                 protected_paths: tuple[Path, ...] = ()):
         self._policy_cwd = self._canonical_worktree(str(cwd))
         self._forbidden_actions = self._effective_policy(("release",))
         self._configured_forbidden_actions = self._forbidden_actions
@@ -127,6 +129,10 @@ class FactoryAppServer(AppServerCodex):
             rules[":root"] = "deny"
         rules[":minimal"] = "read"
         rules[str(cwd)] = "read" if read_only else "write"
+        for path in protected_paths:
+            if path.is_symlink() or not path.is_relative_to(cwd):
+                raise ValueError("protected Controller scope must be inside the candidate")
+            rules[str(path)] = "read"
         # npm's trusted launcher executes its bundled Rust sandbox helper.
         # A minimal read profile must expose that installed package as well.
         installed_runtime = executable.parent.parent if executable.name == "codex.js" and (executable.parent.parent / "package.json").is_file() else executable.parent
@@ -453,8 +459,10 @@ class LocalRuntime:
             payload = {**payload, "planning_resource_guard": {
                 **limits, "physical_token_ceiling": "NOT_GUARANTEED",
                 "instruction": "Use targeted searches and small excerpts. Do not dump the repository, generated bundles or unrelated documentation. Stop exploring once you can return a bounded actionable plan; if essential information is missing, state the unresolved decision. Do not repeat broad scans."}}
+        protected = (cwd / payload["mission_scope_file"],) if payload.get("mission_scope_file") else ()
         server = FactoryAppServer(profile, cwd, transcript, timeout, denied_roots,
-                                  role in ("plan", "review"), role == "review", token_limit)
+                                  role in ("plan", "review"), role == "review", token_limit,
+                                  protected_paths=protected)
         self.current_process = server.proc
         try:
             schema = REVIEW_SCHEMA if role == "review" else PLAN_SCHEMA if role == "plan" else WORK_SCHEMA
@@ -505,6 +513,61 @@ class LocalRuntime:
                 os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
             self.current_process = None
+
+    def project_policy(self, spec, cwd, paths):
+        return FootballPredictionContract().policy(spec, cwd, paths)
+
+    def prepare_project_review(self, spec, cwd, target, lane, timeout):
+        contract = FootballPredictionContract()
+        argv, evidence = contract.review_arguments(spec, cwd, target, lane)
+        if lane == "reviewer":
+            argv += ["--timeout-seconds", str(timeout)]
+        watchdog = AppServerCodex._trusted_executable("timeout", str(cwd))
+        argv = [str(watchdog), "--signal=TERM", "--kill-after=5", str(timeout), *argv]
+        environment = contract.adapter.review_environment(LANES[lane], worktree=str(cwd), base=target["base"])
+        return argv, evidence, environment
+
+    def project_review(self, spec, cwd, target, lane, transcript, timeout, *, prepared=None):
+        contract = FootballPredictionContract()
+        argv, evidence, environment = prepared if prepared is not None else self.prepare_project_review(
+            spec, cwd, target, lane, timeout)
+        # Recheck the private directory immediately before launch as well.
+        contract.adapter._validate_review_evidence_dir(evidence)
+        stderr = transcript.with_suffix(".stderr")
+        with transcript.open("xb") as output, stderr.open("xb") as errors:
+            os.fchmod(output.fileno(), 0o600)
+            os.fchmod(errors.fileno(), 0o600)
+            proc = subprocess.Popen(argv, cwd=cwd, env=environment, stdout=output,
+                                    stderr=errors, start_new_session=True)
+            self.current_process = proc
+            try:
+                code = proc.wait(timeout=timeout + 6)
+            except BaseException:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+                raise
+            finally:
+                self.current_process = None
+        result = {"stdout_path": str(transcript), "stderr_path": str(stderr),
+                  "evidence_dir": str(evidence), "exit_code": code, "fixture": False,
+                  "executed_runner_argv": argv, "usage": None, "usage_complete": False}
+        checked = contract.validate_review(spec, cwd, target, lane, result)
+        # Reference actual artifacts, not reconstructed CLI provenance. The
+        # project's validator verifies the underlying receipt/raw evidence.
+        result["project_evidence"] = [{"path": str(path.resolve()),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            for path in evidence.iterdir() if path.is_file() and not path.is_symlink()]
+        result["canonical_receipt"] = checked.artifact
+        return result
+
+    def project_validate_review(self, spec, cwd, target, lane, result):
+        return FootballPredictionContract().validate_review(spec, cwd, target, lane, result)
+
+    def project_final_gate(self, spec, cwd, target, reviews, transcript, timeout):
+        gate = FootballPredictionContract().final_gate()
+        result = {"status": gate.status, "reason": gate.evidence, "target": target, "fixture": False}
+        transcript.write_text(json.dumps(result))
+        return result
 
     def hosted_ci(self, policy, cwd, target, branch, transcript, timeout):
         watchdog = AppServerCodex._trusted_executable("timeout", str(cwd))
