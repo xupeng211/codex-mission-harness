@@ -227,8 +227,8 @@ print(json.dumps({'workflow_class': scope.workflow_class, 'required_backends': l
         return checked
 
     def final_gate(self, spec=None, cwd=None, target=None, receipts=None, context=None):
-        # No PR publication, CI waiter or caller-supplied green status is added
-        # here. Phase 2 must supply actual context to adapter.merge_ready().
+        # Factory supplies validated PR context; the original project command
+        # still rechecks scope, receipts, governance and remote merge readiness.
         if context is None:
             return GateResult("BLOCKED_EXTERNAL", "canonical agent-merge-ready requires phase-2 exact PR/CI context")
         if set(receipts or {}) != set(LANES.values()):

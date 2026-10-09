@@ -398,8 +398,10 @@ class LocalRuntime:
     def __init__(self):
         self.resource_policy = {}
         self.current_process = None
+        self._validation_cancelled = False
 
     def cancel(self):
+        self._validation_cancelled = True
         proc = self.current_process
         if proc is not None and proc.poll() is None:
             try:
@@ -563,10 +565,41 @@ class LocalRuntime:
     def project_validate_review(self, spec, cwd, target, lane, result):
         return FootballPredictionContract().validate_review(spec, cwd, target, lane, result)
 
-    def project_final_gate(self, spec, cwd, target, reviews, transcript, timeout):
-        gate = FootballPredictionContract().final_gate()
-        result = {"status": gate.status, "reason": gate.evidence, "target": target, "fixture": False}
+    def project_validation(self, policy, spec, command, cwd, target, transcript, timeout):
+        from .factory_validation import run
+        return run(policy, spec, cwd, target, command, transcript, timeout,
+                   cancelled=lambda: self._validation_cancelled)
+
+    def project_ci(self, policy, spec, cwd, target, approval, transcript, timeout):
+        from .factory_pr_ci import run
+        return run(policy, spec, cwd, target, approval, transcript, timeout,
+                   cancelled=lambda: self._validation_cancelled)
+
+    def project_validate_ci(self, policy, spec, cwd, target, result, refresh=False):
+        from .factory_pr_ci import GitHub, validate_result
+        # Reconciliation is read-only. Its log is retained alongside original
+        # evidence but never substitutes for the immutable operation record.
+        path = cwd.parent / ("pr-ci-recheck-" + uuid.uuid4().hex + ".jsonl")
+        api = GitHub(cwd, path, 60) if refresh else None
+        return validate_result(result, policy, spec, cwd, target, self.simulation, api)
+
+    def project_final_gate(self, spec, cwd, target, reviews, transcript, timeout, *, context=None):
+        receipts = {LANES[r["lane"]]: r["canonical_receipt"] for r in reviews}
+        gate = FootballPredictionContract().final_gate(spec, cwd, target, receipts, context)
+        result = {"status": gate.status, "reason": gate.evidence, "target": target, "fixture": False,
+                  "canonical_gate": gate.data}
         transcript.write_text(json.dumps(result))
+        evidence = cwd.parent / ".cmh-merge-evidence" / spec.get("mission_id", "") / target["head"]
+        if evidence.is_dir():
+            artifacts = []
+            for p in evidence.iterdir():
+                if p.is_file() and not p.is_symlink():
+                    copy = transcript.parent / (transcript.stem + "-merge-" + p.name)
+                    with copy.open("xb") as stream:
+                        stream.write(p.read_bytes())
+                    copy.chmod(0o400)
+                    artifacts.append({"path": str(copy), "sha256": hashlib.sha256(copy.read_bytes()).hexdigest()})
+            result["project_evidence"] = artifacts
         return result
 
     def hosted_ci(self, policy, cwd, target, branch, transcript, timeout):

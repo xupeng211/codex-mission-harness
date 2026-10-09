@@ -83,9 +83,10 @@ def main(argv=None):
     onboarding.add_argument("--proxy-provider", default="cli_proxy_api")
     approve = sub.add_parser("factory-approve", aliases=["approve"], help="Record explicit human approval; never execute merge/release")
     approve.add_argument("mission_id")
-    approve.add_argument("--action", choices=["merge", "release"], required=True)
+    approve.add_argument("--action", choices=["merge", "release", "publish-pr"], required=True)
     approve.add_argument("--head", required=True)
     approve.add_argument("--reason", required=True)
+    approve.add_argument("--pr-body", type=Path, help="Concrete PR body approved for this exact HEAD; records approval only")
     fixture = sub.add_parser("factory-demo", help="Free local end-to-end acceptance, including a real code fix")
     fixture.add_argument("--output", type=Path)
     sub.add_parser("factory-doctor", help="Check local configuration and capabilities without model inference")
@@ -153,7 +154,12 @@ def main(argv=None):
                             mission = latest[0]
                         result = factory.run(mission) if args.command == "factory-resume" else factory.cancel(mission) if args.command == "cancel" else factory.report(mission)
                     else:
-                        result = factory.approve(args.mission_id, args.action, args.reason, args.head)
+                        if args.action == "publish-pr":
+                            if args.pr_body is None:
+                                raise ValueError("publish-pr approval requires --pr-body")
+                            result = factory.approve_pr_publication(args.mission_id, args.head, args.reason, args.pr_body.read_text())
+                        else:
+                            result = factory.approve(args.mission_id, args.action, args.reason, args.head)
                 finally:
                     factory.close()
         print(readable(result) if friendly and not args.json else json.dumps(result, ensure_ascii=False, indent=2))

@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "budget": {
+    "max_agent_runs": 35,
+    "max_total_tokens": 8400000,
+    "max_run_tokens": 240000,
+    "max_wall_seconds": 21600
+  },
+  "max_rounds": 5,
+  "timeout_seconds": 900,
+  "independent_review_required": true,
+  "max_review_bytes": 1048576,
+  "max_context_bytes": 2097152,
+  "checks": [
+    [
+      "make",
+      "verify-strict"
+    ]
+  ],
+  "ci": [
+    [
+      "make",
+      "verify-pr"
+    ]
+  ],
+  "profiles": {
+    "developer": {
+      "provider": "openai",
+      "transport": {
+        "type": "official"
+      }
+    },
+    "reviewer": {
+      "provider": "openai",
+      "transport": {
+        "type": "official"
+      }
+    },
+    "second_reviewer": {
+      "provider": "deepseek",
+      "model": "deepseek-flash",
+      "transport": {
+        "type": "direct"
+      },
+      "max_output_tokens": 16384,
+      "token_file": "/absolute/path/to/owner-only-deepseek-token"
+    }
+  },
+  "project_contract": "footballprediction",
+  "repository": "/absolute/path/to/FootballPrediction",
+  "trusted_validation": {
+    "image": "trusted-prepared/footballprediction@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "postgres_image": "postgres@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "cpus": 2,
+    "memory_mb": 4096,
+    "pids": 256,
+    "tmpfs_mb": 2048
+  },
+  "project_pr_ci": {
+    "repository": "xupeng211/FootballPrediction",
+    "workflow": "production-gate.yml",
+    "base_branch": "main"
+  }
+}
