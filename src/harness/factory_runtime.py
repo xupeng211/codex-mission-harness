@@ -517,16 +517,26 @@ class LocalRuntime:
     def project_policy(self, spec, cwd, paths):
         return FootballPredictionContract().policy(spec, cwd, paths)
 
-    def project_review(self, spec, cwd, target, lane, transcript, timeout):
+    def prepare_project_review(self, spec, cwd, target, lane, timeout):
         contract = FootballPredictionContract()
         argv, evidence = contract.review_arguments(spec, cwd, target, lane)
         if lane == "reviewer":
             argv += ["--timeout-seconds", str(timeout)]
         watchdog = AppServerCodex._trusted_executable("timeout", str(cwd))
         argv = [str(watchdog), "--signal=TERM", "--kill-after=5", str(timeout), *argv]
-        stderr = transcript.with_suffix(".stderr")
         environment = contract.adapter.review_environment(LANES[lane], worktree=str(cwd), base=target["base"])
+        return argv, evidence, environment
+
+    def project_review(self, spec, cwd, target, lane, transcript, timeout, *, prepared=None):
+        contract = FootballPredictionContract()
+        argv, evidence, environment = prepared if prepared is not None else self.prepare_project_review(
+            spec, cwd, target, lane, timeout)
+        # Recheck the private directory immediately before launch as well.
+        contract.adapter._validate_review_evidence_dir(evidence)
+        stderr = transcript.with_suffix(".stderr")
         with transcript.open("xb") as output, stderr.open("xb") as errors:
+            os.fchmod(output.fileno(), 0o600)
+            os.fchmod(errors.fileno(), 0o600)
             proc = subprocess.Popen(argv, cwd=cwd, env=environment, stdout=output,
                                     stderr=errors, start_new_session=True)
             self.current_process = proc

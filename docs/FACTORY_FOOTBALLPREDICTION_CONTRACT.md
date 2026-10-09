@@ -91,3 +91,54 @@ receipt validator 与项目 API doubles。它验证 Harness 的委托、绑定�
 pin 均正确返回，未授权路径被项目原函数拒绝。此检查没有运行 reviewer，
 没有读取认证内容，也不证明真实 receipt、Provider 或最终 PR gate 可用。
 项目 receipt 的时效/工具漂移判定仍由原 validator 负责；不新增猜测的 TTL。
+
+## 目录初始化与真实接口离线集成
+
+canonical operation 在现有缓存、取消和 RUNNING/UNKNOWN 防重发检查之后，
+付费 reservation 之前执行可信本地准备。Controller 只接受账本中的候选路径，
+收紧自有 candidate/mission 目录权限；Runtime 经 `review_arguments` 从
+mission/reviewer/exact HEAD 推导 `.cmh-review-evidence` 路径，复用已有
+`_private_dir` 检查和创建 owner-only 目录。拒绝路径穿越、symlink、非目录
+冲突和不可信祖先，不接受 Builder 指定的 evidence 路径。argv、environment
+及 watchdog 准备失败不会产生 paid operation；失败后不需要退款或改写 UNKNOWN。
+已 dispatch 的失败仍按原 UNKNOWN 规则保留 reservation，历史任务不补派。
+外层 stdout/stderr 在启动 runner 前设置为 0600。
+
+DeepSeek receipt 消费者绑定 scope 时从 Git 读取原始 bytes。CRLF 与 LF 各自
+保留精确 hash，不做换行归一化。Controller 的 Git 字节解码路径同样不做
+universal-newline 转换；修改任何 scope 字节都不能借用原 scope 审批。
+
+`tests/test_factory_project_integration.py` 从只读项目仓库的上述固定 SHA
+提取正式源码，使用临时 synthetic base/candidate，执行真实 Controller →
+LocalRuntime → review_arguments → adapter → canonical runner/validator。
+只替换 trusted checkout 的 fixture 定位、认证/环境探测和 Provider backend；
+原项目 CLI 参数、receipt writer、classifier/consumer 仍运行。fake backend
+位于 `tests/fixtures/footballprediction_fake_backend.py`，其回执和模拟身份仅
+用于临时测试，绝非正式执行证据。未找到只读源码会明确 SKIP，不能报告真实
+接口验收 PASS；可用 `FOOTBALLPREDICTION_CONTRACT_REPO` 指定源码位置。
+测试不读取认证内容、不运行真实模型、Docker、CI 或业务 E2E。
+
+本次真实接口集成发现额外 P1：当前项目 `classify --json` 返回
+`review_receipt` 路径与 `classification`，没有 adapter 所要求的内嵌 `receipt`。
+因此 Codex fake backend 已执行、原 classifier 判为 VALID_CURRENT 后，adapter
+仍拒绝消费。此问题超出本轮限定的目录/CRLF 两项修复，未擅自修改；双 lane
+完整集成测试保留失败，不将模拟输出改成虚假的真实接口格式，也不放宽门禁。
+其兼容修复需 Owner 单独授权，解决前不能宣称阶段 1 完整接入通过。
+
+## 首次付费审核之前的费用条件（仅调查，未实现新计费能力）
+
+在上述项目 SHA，`deepseek_review_chunks.py` 的 diff/prompt 分块上限分别是
+32,000/40,000 bytes，最多 64 chunks。`_run_chunked_review` 对每个 chunk
+执行一次 `backend.run`；小 diff 执行一次。每次 backend 创建一个 Claude CLI
+进程，默认/最大 backend timeout 为 900 秒。Factory 的一个 outer operation
+因此不是一个 Provider HTTP 请求：它可能包含 1～64 次 backend 执行；CLI
+内部请求、重试、输出 token 和物理费用上限尚未证明。两个 reviewer 的 outer
+reservation 也不能当作“两次 HTTP 请求”的证据。Codex CLI 内部请求数同样
+未证明。Factory watchdog 和逻辑 token reservation 都不是物理费用硬上界。
+
+首次真实付费审核必须先明确并批准 exact diff/scope 对应的 chunk 数、两条
+canonical lane 的费用暴露及可接受上限；证明或取得明确有限的请求、输出和
+重试授权，并验证 usage/费用观测及 timeout/cancellation 的实际行为。两个
+必需 backend 的认证、模型 pin、正式 validator 和本地准备需在付费前确认
+可用。计费或结果不确定时继续保留 UNKNOWN，不自动重试、补发或返还预算。
+在这些条件未满足前，本轮离线 PASS 不能支持首次真实付费审核的成本安全结论。

@@ -486,7 +486,7 @@ class Factory:
                 "commit", "-m", f"Implement mission {spec['mission_id']}")
         return self.target(spec, cwd)
 
-    def operation(self, mission, key, stage, lane, identity, payload, paid, invoke):
+    def operation(self, mission, key, stage, lane, identity, payload, paid, invoke, prepare=None):
         """Reserve before dispatch. A lost response is never replayed under a new guise."""
         old = self.db.execute("SELECT * FROM operations WHERE mission=? AND key=?", (mission, key)).fetchone()
         if old:
@@ -511,6 +511,9 @@ class Factory:
                 if preflight["status"] == "HARD_BLOCKER":
                     detail = "; ".join(f["check"] + ": " + f["detail"] for f in preflight["findings"] if f["level"] == "HARD_BLOCKER")
                     raise FactoryBlocked("BLOCKED_PREFLIGHT", detail)
+        # Trusted local preparation is not a paid dispatch. Keep it after the
+        # cache/uncertainty guards and outside the reservation transaction.
+        prepared = prepare() if prepare is not None else None
         operation_id = uuid.uuid4().hex
         evidence_dir = private_dir(self.root / "evidence" / mission)
         evidence = evidence_dir / f"{operation_id}.json"
@@ -536,7 +539,7 @@ class Factory:
             self.db.rollback()
             raise
         try:
-            result = invoke(transcript)
+            result = invoke(transcript, prepared) if prepare is not None else invoke(transcript)
             if not isinstance(result, dict):
                 raise ValueError("runtime returned a non-object result")
             result.setdefault("usage_complete", observed_usage(result.get("usage"), self.config["simulation"]) is not None)
@@ -681,9 +684,22 @@ class Factory:
                     "policy": target["project_policy"], "engine": "project-canonical-runner"}
         payload = {"target": target, "review_range": target["review_range"], "lane": lane}
         key = digest(identity)
+        def prepare():
+            try:
+                if Path(cwd).absolute() != Path(self.row(spec["mission_id"])["candidate"]):
+                    raise ValueError("canonical review must use the Controller-owned candidate")
+                # parents=True during clone preparation can leave this owned
+                # intermediate directory group-writable under umask 0002.
+                private_dir(self.root / "candidates")
+                private_dir(Path(cwd).parent)
+                return self.runtime.prepare_project_review(spec, cwd, target, lane,
+                    self.operation_timeout(spec["mission_id"]))
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+                raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", f"canonical local preparation failed: {exc}") from exc
         result = self.operation(spec["mission_id"], key, "review", lane, identity, payload, True,
-            lambda transcript: self.runtime.project_review(spec, cwd, target, lane, transcript,
-                                                           self.operation_timeout(spec["mission_id"])))
+            lambda transcript, prepared: self.runtime.project_review(spec, cwd, target, lane, transcript,
+                self.operation_timeout(spec["mission_id"]), prepared=prepared),
+            prepare=prepare)
         if self.target(spec, cwd) != target:
             raise FactoryBlocked("UNKNOWN", "canonical reviewer changed the exact target")
         try:

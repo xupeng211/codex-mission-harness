@@ -1417,9 +1417,12 @@ class FootballPredictionAdapter:
             if evidence.get("receipt_version") == "independent-review-receipt/v1":
                 try:
                     relative_scope = Path(scope_file).resolve().relative_to(Path(worktree).resolve()).as_posix()
-                    scope_bytes = self._trusted_git_output(
-                        Path(worktree), "show", f"{head}:{relative_scope}"
-                    ).encode("utf-8")
+                    scope_bytes = subprocess.check_output(
+                        self._trusted_command_argv(["git", "--no-replace-objects", "-C", worktree,
+                                                    "show", f"{head}:{relative_scope}"]),
+                        cwd=worktree, env=self._trusted_git_environment(),
+                        stderr=subprocess.PIPE, timeout=60,
+                    )
                 except (OSError, ValueError, subprocess.SubprocessError) as exc:
                     return GateResult("BLOCKED_EXTERNAL", f"cannot bind reviewed mission scope: {exc}", receipt)
                 scope_hash = hashlib.sha256(scope_bytes).hexdigest()

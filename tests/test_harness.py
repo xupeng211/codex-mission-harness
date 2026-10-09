@@ -3995,7 +3995,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         }
         with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
                 patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
-                patch.object(adapter, "_trusted_git_output", return_value="{}\n") as trusted_git, \
+                patch("harness.adapters.subprocess.check_output", return_value=b"{}\r\n") as trusted_git, \
                 patch.object(adapter, "_call", return_value=checked) as validator_call, \
                 patch.dict(os.environ, ambient_git):
             result = adapter.review_result(
@@ -4005,7 +4005,11 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
             )
         self.assertEqual(result.status, "PASS")
         trusted_git.assert_called_once()
-        self.assertEqual(trusted_git.call_args.args[1:], ("show", f"{'b' * 40}:scope.json"))
+        self.assertEqual(trusted_git.call_args.args[0][-2:], ["show", f"{'b' * 40}:scope.json"])
+        self.assertNotIn("text", trusted_git.call_args.kwargs)
+        self.assertEqual(validator_call.call_args.args[0][-1], hashlib.sha256(b"{}\r\n").hexdigest())
+        for name in ambient_git.keys() - {"GIT_CONFIG_COUNT"}:
+            self.assertNotIn(name, trusted_git.call_args.kwargs["env"])
         self.assertFalse(validator_call.call_args.kwargs["inherit_environment"])
         self.assertEqual(validator_call.call_args.kwargs["env"]["GIT_NO_REPLACE_OBJECTS"], "1")
         for name in ambient_git.keys() - {"GIT_CONFIG_COUNT"}:
@@ -4019,7 +4023,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
                 patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
                 patch.object(adapter, "_call", return_value=checked), \
-                patch.object(adapter, "_trusted_git_output", return_value="{}\n"):
+                patch("harness.adapters.subprocess.check_output", return_value=b"{}\n"):
             result = adapter.review_result(
                 "deepseek", worktree=str(worktree), base="a" * 40, head="b" * 40,
                 mission_id="mission", scope_file=str(worktree / "scope.json"),

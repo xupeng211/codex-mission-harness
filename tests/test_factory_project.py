@@ -53,7 +53,10 @@ class ProjectRuntime(AcceptanceRuntime):
                 "codex_model": "fixture-current-pin", "codex_effort": "medium",
                 "factory_required_backends": ["codex-cli", "claude-code-deepseek"], "factory_p3_blocks": True}
 
-    def project_review(self, spec, cwd, target, lane, transcript, timeout):
+    def prepare_project_review(self, spec, cwd, target, lane, timeout):
+        return None  # Synthetic runtime; real LocalRuntime integration is tested separately.
+
+    def project_review(self, spec, cwd, target, lane, transcript, timeout, *, prepared=None):
         self.calls.append({"role": "canonical-review-fixture", "lane": lane})
         reviewer = "codex" if lane == "reviewer" else "deepseek"
         findings = []
@@ -232,8 +235,8 @@ class ProjectContractTests(unittest.TestCase):
         self.scope["workflow_class"] = "CRITICAL"
         self.spec["approved_mission_scope"] = self.approval()
         original = self.runtime.project_review
-        def missing(*args):
-            result = original(*args)
+        def missing(*args, **kwargs):
+            result = original(*args, **kwargs)
             if args[3] == "second_reviewer":
                 Path(result["stdout_path"]).write_text('{"fixture":true}')
             return result

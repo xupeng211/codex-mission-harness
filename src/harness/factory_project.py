@@ -188,7 +188,13 @@ print(json.dumps({'workflow_class': scope.workflow_class, 'required_backends': l
 
     def review_arguments(self, spec, cwd, target, lane):
         reviewer = LANES[lane]
+        # Never take an evidence path from the Builder or mission input. The
+        # isolated candidate's parent is the Controller-owned mission root.
+        cwd = Path(cwd).absolute()
+        if cwd.resolve(strict=True) != cwd:
+            raise ValueError("canonical candidate path has symbolic-link components")
         evidence = self.adapter.review_evidence_dir(str(cwd), spec["mission_id"], reviewer, target["head"])
+        self.adapter._private_dir(evidence, private_root=cwd.parent / ".cmh-review-evidence")
         argv = self.adapter.review_argv(
             reviewer, worktree=str(cwd), base=target["base"], head=target["head"],
             mission_id=spec["mission_id"], scope_file=str(cwd / target["mission_scope_file"]),
