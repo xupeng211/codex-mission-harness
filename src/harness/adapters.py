@@ -1388,6 +1388,10 @@ class FootballPredictionAdapter:
             )
         receipt = str(receipt_path)
         if reviewer == "codex":
+            receipt_snapshot = self._read_private_review_log(receipt_path)
+            if (receipt_snapshot is None
+                    or hashlib.sha256(receipt_snapshot[0]).hexdigest() != receipt_snapshot[1]):
+                return GateResult("BLOCKED_EXTERNAL", "canonical Codex receipt is unreadable or oversized", receipt)
             trusted = self._trusted_base_checkout(worktree, base)
             argv = [self._trusted_python_interpreter(), "-I", "-B", str(trusted / "scripts/devops/codex_independent_review.py"), "classify", "--repo-root", worktree,
                     "--receipt", receipt, "--current-head", head, "--base-sha", base, "--mission-id", mission_id,
@@ -1466,12 +1470,23 @@ class FootballPredictionAdapter:
         classification = self._json_last_text(result.stdout)
         if (not isinstance(classification, dict)
                 or not isinstance(classification.get("classification"), dict)
-                or classification["classification"].get("classification") != "VALID_CURRENT"):
+                or classification["classification"].get("classification") != "VALID_CURRENT"
+                or classification["classification"].get("current_approval_eligible") is not True
+                or classification.get("review_receipt") != receipt):
             return GateResult("BLOCKED_EXTERNAL", "canonical Codex receipt is not VALID_CURRENT", receipt, classification)
-        validated = classification.get("receipt")
+        # The current official CLI returns a classification and a receipt
+        # reference, not an embedded receipt. Consume only the original bytes
+        # that remained unchanged across the authoritative classification.
+        confirmed = self._read_private_review_log(receipt_path)
+        if confirmed != receipt_snapshot:
+            return GateResult("BLOCKED_EXTERNAL", "canonical Codex receipt changed during classification", receipt)
+        try:
+            validated = json.loads(confirmed[0])
+        except (ValueError, UnicodeError):
+            return GateResult("BLOCKED_EXTERNAL", "canonical Codex receipt is invalid JSON", receipt)
         verdict = validated.get("review_result") if isinstance(validated, dict) else None
         if verdict not in {"PASS", "FAIL"}:
-            return GateResult("BLOCKED_EXTERNAL", "canonical Codex classifier omitted a valid receipt verdict", receipt, classification)
+            return GateResult("BLOCKED_EXTERNAL", "canonical Codex receipt omitted a valid verdict", receipt, classification)
         if verdict == "FAIL":
             return GateResult("FAIL", "canonical receipt reports findings", receipt, validated)
         return GateResult("PASS", "canonical exact-head receipt validated", receipt, validated)

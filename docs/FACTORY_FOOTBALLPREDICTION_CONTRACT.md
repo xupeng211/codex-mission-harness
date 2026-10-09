@@ -120,10 +120,11 @@ LocalRuntime → review_arguments → adapter → canonical runner/validator。
 
 本次真实接口集成发现额外 P1：当前项目 `classify --json` 返回
 `review_receipt` 路径与 `classification`，没有 adapter 所要求的内嵌 `receipt`。
-因此 Codex fake backend 已执行、原 classifier 判为 VALID_CURRENT 后，adapter
-仍拒绝消费。此问题超出本轮限定的目录/CRLF 两项修复，未擅自修改；双 lane
-完整集成测试保留失败，不将模拟输出改成虚假的真实接口格式，也不放宽门禁。
-其兼容修复需 Owner 单独授权，解决前不能宣称阶段 1 完整接入通过。
+Owner 已单独授权最小接口兼容修复。adapter 现在要求原 classifier 返回
+VALID_CURRENT、current_approval_eligible=true 并指向当前原始 receipt；比较
+分类前后的完整字节/hash，再消费原文件。缺失引用、分类拒绝、非私有文件、
+无 verdict 或分类过程中发生变化均阻断。不采用模拟内嵌 receipt 作为替代，
+不修改 canonical argv、模型 pin、双审数量或 P3 策略。
 
 ## 首次付费审核之前的费用条件（仅调查，未实现新计费能力）
 
