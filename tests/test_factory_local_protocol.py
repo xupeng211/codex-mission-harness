@@ -88,6 +88,18 @@ class NativeProtocolTests(unittest.TestCase):
         result = self.exec(server, "import os,json;print(json.dumps({'bytecode':os.environ.get('PYTHONDONTWRITEBYTECODE')}))")
         self.assertEqual(result, {"bytecode": "1"})
 
+    def test_agent_cannot_connect_host_docker_socket_without_inference(self):
+        # Connect-only probe, never a Docker request or daemon operation.
+        server = self.server(False)
+        code = ("import socket,json\nr={}\n"
+                "for path in ['/var/run/docker.sock','/run/docker.sock']:\n"
+                " s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\n"
+                " try: s.connect(path);r[path]='CONNECTED'\n"
+                " except OSError:r[path]='DENIED'\n"
+                " finally:s.close()\n"
+                "print(json.dumps(r))")
+        self.assertEqual(self.exec(server, code), {"/var/run/docker.sock":"DENIED", "/run/docker.sock":"DENIED"})
+
     def test_installed_native_planning_budget_is_configured_without_inference(self):
         limits = planning_limits({"max_run_tokens": 240000}, 900)
         server = self.server(True, limits["max_tokens"], limits["timeout_seconds"])

@@ -1,8 +1,9 @@
 # Factory FootballPrediction 合同适配：阶段 1
 
-本模块只接入项目合同，不提供 Docker executor、PR 发布或 PR CI waiter。
+本模块只接入项目合同；阶段 2 的显式 Docker 验证和 PR CI 适配见
+[FACTORY_FOOTBALLPREDICTION_PHASE2.md](FACTORY_FOOTBALLPREDICTION_PHASE2.md)。
 Fixture 通过为 `OFFLINE_CONTRACT_PASS`，不是真实 `READY_FOR_USER_ACCEPTANCE`、
-`MERGE_READY` 或 `DONE`。真实模式在最终项目门禁返回明确的阶段 2 blocker。
+`MERGE_READY` 或 `DONE`。缺少实际受信任验证和 exact PR/CI context 时真实模式阻断。
 
 ## 显式选择与 Controller 授权
 
@@ -72,7 +73,8 @@ Factory diff hash 与项目自身 diff policy/hash 保留各自含义。
 reservation，不宣称免费或退还额度。现有 watchdog 限制时长，不保证物理费用帽。
 
 `final_gate` 可委托现有项目 `agent-merge-ready`，缺少 PR/CI context 时拒绝。
-Factory 主流程本阶段不产生或接受真实 PR/CI context，真实 READY 始终阻断。
+Factory 主流程仅在显式阶段 2 模式接受经验证的 PR/CI context；首次付费执行仍因
+canonical runner 物理费用上界未证明而阻断。
 模拟 final gate PASS 只产生离线状态，merge approval 仍要求 live READY 与人工
 exact-head 授权，fixture 永不满足。阶段 2 再接入可信验证和实际远端证据；阶段 3
 才验证业务任务、实际 Provider receipt、MERGE_READY 与合并后的 main Gate。

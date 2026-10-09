@@ -335,7 +335,9 @@ def inspect_prepaid(spec, config):
             except (OSError, ValueError, subprocess.SubprocessError):
                 add("UNVERIFIED", "project_contract", "canonical baseline source cannot be inspected", path=path)
         add("UNVERIFIED", "independent_context", "canonical reviewer reads exact diff and relevant source; full-repository prompt capacity is not the contract")
-        add("UNVERIFIED", "project_final_gate", "live PR/CI final gate is deferred to phase 2; no live READY is available")
+        add("UNVERIFIED", "project_final_gate", "canonical receipts and current exact PR/CI must pass before live readiness")
+        if not config["simulation"]:
+            add("HARD_BLOCKER", "first_paid_execution", "canonical DeepSeek outer operation may execute up to 64 backend calls; physical cost ceiling is unproven and first live paid execution remains blocked")
     elif config["independent_review_required"]:
         try:
             capacity = text_capacity(repo, commit, config["max_context_bytes"])
@@ -352,6 +354,18 @@ def inspect_prepaid(spec, config):
         for executable in ("bwrap", "timeout"):
             if not shutil.which(executable, path=SAFE_PATH):
                 add("HARD_BLOCKER", "local_runtime", f"required executable {executable} is absent from gate runtime PATH")
+    trusted_ready = False
+    validation = config.get("trusted_validation")
+    if validation:
+        try:
+            from .factory_validation import preflight, dependency_locks
+            readiness = preflight(validation, expected_locks=dependency_locks(repo, commit))
+            if readiness["status"] != "VERIFIED":
+                raise ValueError("real Controller prerequisites are not verified")
+            trusted_ready = True
+            add("WARNING", "trusted_validation", "isolated Controller daemon/image readiness probe passed; formal project profiles have not run", evidence=readiness)
+        except Exception as exc:
+            add("HARD_BLOCKER", "trusted_validation", "trusted validation prerequisites failed: " + str(exc))
     for kind in ("checks", "ci"):
         for index, command in enumerate(config[kind]):
             check = f"{kind}[{index}]"
@@ -383,8 +397,12 @@ def inspect_prepaid(spec, config):
                         docker = make_docker_dependency(makefile, command)
                 except (OSError, ValueError, subprocess.SubprocessError):
                     add("UNVERIFIED", check, "committed Make dependencies could not be determined")
-            if docker:
+            canonical = command in (["make", "verify-targeted"], ["make", "verify-pr"], ["make", "verify-strict"])
+            if docker and not (trusted_ready and canonical):
                 add("HARD_BLOCKER", check, "Docker-dependent gate is incompatible with the current network-isolated sandbox, which exposes no Docker daemon/socket")
+            if config.get("project_contract") == "footballprediction" and canonical:
+                if not trusted_ready:
+                    add("HARD_BLOCKER", check, "canonical project profiles require an actually available trusted validation path; default sandbox has no daemon")
             add("UNVERIFIED", check, "command was not executed; packages, services, dynamic scripts and test behavior remain unverified")
     hosted = config.get("hosted_ci")
     if hosted:
@@ -400,6 +418,14 @@ def inspect_prepaid(spec, config):
             except (OSError, ValueError, UnicodeError, subprocess.SubprocessError, ImportError):
                 add("UNVERIFIED", "hosted_ci", "workflow could not be safely parsed", workflow=workflow)
         add("UNVERIFIED", "hosted_access", "remote workflow, permissions, required jobs and repository policy were not contacted or verified")
+    if config.get("project_pr_ci"):
+        try:
+            from .factory_pr_ci import expected_jobs
+            source = committed_text(repo, commit, ".github/workflows/production-gate.yml")
+            expected_jobs(source)
+        except Exception as exc:
+            add("HARD_BLOCKER", "project_pr_ci", "trusted PR workflow is unsupported: " + str(exc))
+        add("UNVERIFIED", "project_pr_ci", "PR publication requires separate exact-candidate approval; current remote rules/jobs/runs have not been verified")
     add("UNVERIFIED", "provider_access", "model access and project-specific receipt compatibility are not established by static preflight")
     blockers = [f for f in findings if f["level"] == "HARD_BLOCKER"]
     return {"version": 1, "status": "HARD_BLOCKER" if blockers else "NO_KNOWN_HARD_BLOCKER",
