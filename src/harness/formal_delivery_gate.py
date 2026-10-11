@@ -36,6 +36,15 @@ DELIVERY_LEDGER = EVIDENCE_ROOT / 'current-version-delivery-ledger.json'
 CONTINUATION_LEDGER = EVIDENCE_ROOT / 'current-version-delivery-ledger.continuation.json'
 CONTINUATION_VERSION = 'cmh-request5-reserved-unknown-continuation/v1'
 HISTORY_CONTINUATION_VERSION = 'cmh-reserved-history-continuation/v2'
+# Closed historical exceptions, not permission to launch these diagnostics.
+# Each pair binds the original signed authority and the entire immutable row,
+# including failure/usage, timestamps, reservations and noncanonical status.
+HISTORICAL_DIAGNOSTIC_ROWS = {
+    'b94472e65fc52efd8047d28b7d0d490e73f022daae676fc8c06cd487ca4aa179':
+        'c626a6f58bc8f78241ce478d30bd87f6bb1676ab5519912af5cf277217e02541',
+    '90c041c4483ab39b51487cf0211eda8394609962554963d294368f7ea76aeb43':
+        '583e3148b2fc9aa8491cd6f663b01d63a9da42db155323f6a16b258852820225',
+}
 REQUEST5_LEDGER_SHA256 = 'bef620a429653dea8d895e2417114db69a04859dba90d28f90af34f4eb13f138'
 REQUEST5_ROW_SHA256 = '57bf46b218deee3d9c795534f7909e7a40f1fc275f2f458a1456ca01d3c6c901'
 HISTORICAL_AUTHORIZATION = (EVIDENCE_ROOT / 'formal-60h-review/authorized-closure-20261003/'
@@ -445,6 +454,44 @@ def build_history_continuation(prior, prior_sha, ledger_path, key):
                                     for r in rows if r.get('reported_usage') == 'UNKNOWN'])
 
 
+def _historical_diagnostic(row, origin, origin_sha):
+    """Recognize accounting only, from an authenticated lineage authority.
+
+    Today's diagnostic launch contract stays unchanged. The two pinned older
+    overlays cannot be recreated or reused; their exact failed rows can only
+    be retained. Ordinary diagnostics must still match the current contract.
+    """
+    from .diagnostic_probe import STAGE, CLASSIFICATION, MODEL, validate_scope
+    if origin is None or origin.get('diagnostic_probe') is None:
+        return False
+    if origin_sha in HISTORICAL_DIAGNOSTIC_ROWS:
+        if digest(canonical(row)) != HISTORICAL_DIAGNOSTIC_ROWS[origin_sha]:
+            return False
+        scope = origin['diagnostic_probe']
+    else:
+        try:
+            scope = validate_scope(origin)
+        except ResourceGateDenied:
+            return False
+    lane = origin['providers']['openai']
+    return (origin['runtime']['models']['openai'] == MODEL
+            and row.get('provider') == 'openai' and row.get('stage') == STAGE
+            and row.get('execution_classification') == 'DIAGNOSTIC_PROBE'
+            and row.get('result_authority') == CLASSIFICATION
+            and row.get('authorization_sha256') == origin_sha
+            and row.get('model_configuration') == scope['model']
+            and row.get('model') == scope['model']['model']
+            and row.get('diagnostic_id') == row.get('run_id') == scope['diagnostic_id']
+            and row.get('prompt_sha256') == scope['prompt_sha256']
+            and row.get('schema_sha256') == scope['schema_sha256']
+            and row.get('route') == scope['route'] == 'codex_subscription'
+            and row.get('harness_logical_retry') == scope['harness_logical_retry'] == 0
+            and scope['max_logical_invocations'] == 1
+            and row.get('token_reservation') == scope['token_ceiling'] == lane['token_reservation']
+            and row.get('cost_reservation_microunits') == scope['cost_ceiling_microunits']
+            == lane['cost_reservation_microunits'])
+
+
 def _history_continuation_predecessor(auth, prior, key, *, offline=False):
     from .resource_gate import _stage_reservation
     c = auth['continuation']; path = Path(c['predecessor_ledger_path'])
@@ -465,18 +512,31 @@ def _history_continuation_predecessor(auth, prior, key, *, offline=False):
             or child.get('parent_ledger_sha256') != auth['parent']['ledger_sha256']
             or child.get('authorization_sha256') != auth['previous_authorization_sha256']):
         _deny('continuation predecessor identity mismatch')
-    lineage = {auth['previous_authorization_sha256']}; ancestor = prior
+    lineage = {auth['previous_authorization_sha256']: prior}; ancestor = prior
     while ancestor.get('previous_authorization_sha256'):
         sha = ancestor['previous_authorization_sha256']
         if sha in lineage or len(lineage) >= 256:
             _deny('predecessor authority lineage cycle or excessive depth')
-        lineage.add(sha); ancestor = _signed(ancestor['previous_authorization_path'], sha, key)
+        ancestor = _signed(ancestor['previous_authorization_path'], sha, key)
+        lineage[sha] = ancestor
     if len({r.get('request_id') for r in rows}) != len(rows):
         _deny('duplicate predecessor request')
+    for sha, row_sha in HISTORICAL_DIAGNOSTIC_ROWS.items():
+        if sha in lineage and sum(digest(canonical(r)) == row_sha for r in rows) != 1:
+            _deny('closed historical diagnostic must be retained exactly once')
     for number, row in enumerate(rows, 1):
         provider = row.get('provider'); lane = prior['providers'].get(provider)
+        from .diagnostic_probe import STAGE, CLASSIFICATION
+        diagnostic = (row.get('stage') == STAGE or
+                      row.get('execution_classification') == 'DIAGNOSTIC_PROBE' or
+                      row.get('result_authority') == CLASSIFICATION or
+                      lineage.get(row.get('authorization_sha256'), {}).get('diagnostic_probe') is not None)
+        diagnostic_valid = diagnostic and _historical_diagnostic(
+            row, lineage.get(row.get('authorization_sha256')), row.get('authorization_sha256'))
         if (not lane or row.get('number') != number or row.get('mission_id') != NEW_MISSION
-                or row.get('authorization_sha256') not in lineage or row.get('model') != lane['model']
+                or row.get('authorization_sha256') not in lineage
+                or diagnostic and not diagnostic_valid
+                or row.get('model') != lane['model'] and not diagnostic_valid
                 or row.get('status') not in {'RETURNED', 'FAILED'}
                 or row.get('token_reservation') != _stage_reservation(lane, provider, row.get('stage', ''))
                 or row.get('cost_reservation_microunits') != lane['cost_reservation_microunits']
