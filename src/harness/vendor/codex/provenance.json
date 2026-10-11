@@ -1,0 +1,18 @@
+{
+  "repository": "https://github.com/openai/codex",
+  "commit": "406eb53c074a29bd65aa7a8bd21d574234faf315",
+  "files": {
+    "review-rubric.md": {
+      "source": "codex-rs/prompts/templates/review/rubric.md",
+      "sha256": "ec60e7f36a1d1c2679ce095c0205ecc56f7dd8fb57707a13ef362072390f219f"
+    },
+    "LICENSE": {
+      "source": "LICENSE",
+      "sha256": "d17f227e4df5da1600391338865ce0f3055211760a36688f816941d58232d8dc"
+    },
+    "NOTICE": {
+      "source": "NOTICE",
+      "sha256": "9d71575ecfd9a843fc1677b0efb08053c6ba9fd686a0de1a6f5382fd3c220915"
+    }
+  }
+}

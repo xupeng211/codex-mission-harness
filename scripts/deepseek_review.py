@@ -27,6 +27,7 @@ ENDPOINT = "https://api.deepseek.com/anthropic"
 CHUNK_BYTES = 32000
 AGGREGATE_GROUP_BYTES = 96000
 MAX_REVIEW_PROMPT_BYTES = 400000
+MAX_V2_DIFF_BYTES = 256000
 MAX_LEGACY_DIFF_BYTES = 4096000
 MAX_LEGACY_CHUNKS = 128
 MAX_REVIEW_OUTPUT_BYTES = 128000
@@ -865,7 +866,7 @@ def validate(receipt, base, head, root=None, receipt_path=None, mission_id=None,
     if aggregate_result["findings"] != receipt["findings"]:
         raise ValueError("aggregate findings mismatch")
     if root is not None:
-        diff=bounded_diff(Path(root).resolve(),base,head)
+        diff=bounded_diff(Path(root).resolve(),base,head,max_bytes=MAX_LEGACY_DIFF_BYTES)
         if position!=len(diff) or digest(diff)!=receipt["diff_sha256"]: raise ValueError("receipt diff coverage mismatch")
         if descriptors!=chunks(diff): raise ValueError("chunk manifest does not match exact diff")
         manifest={"version":"cmh-deepseek-chunks/v2","base_sha":base,"head_sha":head,"diff_sha256":digest(diff),"chunks":descriptors}
@@ -1023,7 +1024,7 @@ def invoke_reviewer(command, prompt_text, env, timeout):
                 stdout_file.read(MAX_REVIEW_OUTPUT_BYTES), stderr_file.read(MAX_REVIEW_OUTPUT_BYTES))
 
 
-def bounded_diff(root, base, head, *, max_bytes=MAX_LEGACY_DIFF_BYTES, timeout=30):
+def bounded_diff(root, base, head, *, max_bytes=MAX_V2_DIFF_BYTES, timeout=30):
     """Read an exact Git diff with byte and time ceilings before any model call."""
     base, head = full_sha(base), full_sha(head)
     command = ["git", "--no-replace-objects", "-C", str(root), "diff", "--no-ext-diff",
@@ -1357,7 +1358,7 @@ def run(args):
     if git(root, "rev-parse", "HEAD").decode().strip().lower() != head:
         raise ValueError("worktree HEAD differs from requested HEAD")
     repository = repository_identity(git(root, "config", "--get", "remote.origin.url").decode().strip())
-    diff = bounded_diff(root, base, head)
+    diff = bounded_diff(root, base, head, max_bytes=MAX_LEGACY_DIFF_BYTES)
     plan = chunks(diff)
     diff_hash = digest(diff)
     manifest = {

@@ -1,10 +1,18 @@
 [project]
 name = "codex-mission-harness"
-version = "0.1.0"
-description = "Local, resumable orchestration for one Codex mission"
+version = "0.2.0"
+description = "AI software delivery factory governance over official Codex execution and review"
 requires-python = ">=3.11"
+dependencies = ["PyYAML>=6.0,<7"]
 [project.scripts]
 harness = "harness.cli:main"
 
 [tool.ruff]
 line-length = 100
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-data]
+harness = ["vendor/codex/*"]

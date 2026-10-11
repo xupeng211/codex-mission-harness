@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Protocol
 
 from .policy import SENSITIVE
+from .model_registry import load_registry
+from .model_qualification import require_builder_qualification
 
 
 @dataclass(frozen=True)
@@ -32,16 +34,23 @@ class AppServerCodex:
     """Thin JSON-RPC adapter for the locally installed App Server; protocol stays here."""
     MODEL = "gpt-5.6-sol"
     REASONING_EFFORT = "high"
+
     RESPONSE_TIMEOUT_SECONDS = 300.0
     MAX_PENDING_MESSAGES = 256
 
     def __init__(self, executable: str = "codex", *,
-                 forbidden_actions: tuple[str, ...] = (), worktree: str | None = None):
+                 forbidden_actions: tuple[str, ...] = (), worktree: str | None = None,
+                 builder_qualification: str | Path | None = None,
+                 builder_auth_key_file: str | Path | None = None):
         # Both the mission deny-list and its validated worktree are immutable
         # constructor inputs. A later caller may verify them, but may not bind
         # either authority boundary from turn-supplied data.
         if worktree is None:
             raise ValueError("Codex mission worktree must be constructor-bound")
+        require_builder_qualification(builder_qualification, builder_auth_key_file)
+        builder = load_registry().role("builder")
+        self.MODEL = builder.model
+        self.REASONING_EFFORT = builder.reasoning_effort
         self._forbidden_actions = self._effective_policy(forbidden_actions)
         self._configured_forbidden_actions = self._effective_policy(forbidden_actions)
         self._policy_cwd = self._canonical_worktree(worktree)
@@ -195,9 +204,9 @@ class AppServerCodex:
         return os.pathsep.join(trusted)
 
     @staticmethod
-    def _codex_home() -> str:
+    def _codex_home(raw_home: str | None = None) -> str:
         """Select the authenticated Codex home without inheriting a broad HOME."""
-        raw = os.environ.get("CODEX_HOME")
+        raw = raw_home if raw_home is not None else os.environ.get("CODEX_HOME")
         if raw:
             candidate = Path(raw)
             if not candidate.is_absolute():
@@ -446,6 +455,9 @@ class AppServerCodex:
         if line == "":
             self.close()
             raise RuntimeError("Codex App Server exited before sending a response")
+        observer = getattr(self, "_observe_wire_line", None)
+        if callable(observer):
+            observer(line)
         try:
             message = json.loads(line)
         except json.JSONDecodeError as exc:

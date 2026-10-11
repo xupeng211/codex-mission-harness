@@ -88,6 +88,7 @@ class HarnessTest(unittest.TestCase):
             directory.chmod(0o700)
         receipt = evidence / "receipt.json"
         receipt.write_text("{}")
+        receipt.chmod(0o600)
         stdout = Path(self.tmp.name) / "review.stdout"
         stdout.write_text(json.dumps({"review_receipt": str(receipt), "status": "PASS"}))
         return adapter, worktree, evidence, receipt, stdout
@@ -1033,7 +1034,8 @@ class HarnessTest(unittest.TestCase):
             worktree = root / "worktree"
             worktree.mkdir()
             subprocess.run(["git", "init", "-q", str(worktree)], check=True)
-            with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=True):
+            with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=True), \
+                 patch("harness.codex.require_builder_qualification"):
                 adapter = AppServerCodex(executable=executable, worktree=str(worktree))
                 try:
                     thread_id = adapter.start_or_resume(None, str(worktree))
@@ -1133,6 +1135,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         codex_home.mkdir(mode=0o700)
         self.assertEqual(AppServerCodex._canonical_worktree(str(first)), str(first))
         with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}), \
+                patch("harness.codex.require_builder_qualification"), \
                 patch("harness.codex.subprocess.Popen", return_value=process) as launch, \
                 patch.object(AppServerCodex, "_canonical_worktree", return_value=str(first)), \
                 patch.object(AppServerCodex, "_request", return_value={}) as request:
@@ -1190,6 +1193,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
             "poll": lambda self: 0,
         })()
         with patch.dict(os.environ, hostile, clear=True), \
+                patch("harness.codex.require_builder_qualification"), \
                 patch("harness.codex.subprocess.Popen", return_value=process) as launch, \
                 patch.object(AppServerCodex, "_canonical_worktree", return_value=str(first)), \
                 patch.object(AppServerCodex, "_request", return_value={}):
@@ -1229,7 +1233,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         launcher.chmod(0o755)
         codex_home = Path(self.tmp.name) / "launcher-codex-home"
         codex_home.mkdir(mode=0o700)
-        with patch.dict(os.environ, {
+        with patch("harness.codex.require_builder_qualification"), patch.dict(os.environ, {
                 "PATH": f"{repo}:/usr/bin:/bin", "CODEX_HOME": str(codex_home),
         }, clear=True), self.assertRaisesRegex(
                 RuntimeError, "inside the mission worktree"):
@@ -1258,7 +1262,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
             previous_cwd = Path.cwd()
             os.chdir(controller)
             try:
-                with patch.dict(os.environ, {
+                with patch("harness.codex.require_builder_qualification"), patch.dict(os.environ, {
                         "PATH": "/usr/bin:/bin", "CODEX_HOME": str(codex_home),
                         }, clear=True), \
                         patch("harness.codex.subprocess.Popen", return_value=process) as launch, \
@@ -1301,17 +1305,26 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
     def test_production_build_injects_immutable_mission_codex_policy(self):
         denied = ("live_provider_request", "quota_consumption")
         fake = FakeCodex()
-        with patch("harness.cli.AppServerCodex", return_value=fake) as constructor:
+        with patch("harness.cli.AppServerCodex") as constructor, \
+             self.assertRaisesRegex(ValueError, "builder qualification"):
+            build(Path(self.tmp.name), "footballprediction", forbidden_actions=denied)
+        constructor.assert_not_called()
+        with patch("harness.cli.validate_builder_qualification"), \
+             patch("harness.cli.AppServerCodex", return_value=fake) as constructor:
             supervisor = build(Path(self.tmp.name), "footballprediction",
                                forbidden_actions=denied)
-        constructor.assert_called_once_with(forbidden_actions=denied)
+        constructor.assert_called_once_with(forbidden_actions=denied,
+                                            builder_qualification=None,
+                                            builder_auth_key_file=None)
         self.assertIs(supervisor.codex, fake)
 
-        with patch("harness.cli.AppServerCodex", return_value=fake) as constructor:
+        with patch("harness.cli.validate_builder_qualification"), \
+             patch("harness.cli.AppServerCodex", return_value=fake) as constructor:
             build(Path(self.tmp.name), "footballprediction", forbidden_actions=denied,
                   worktree="/validated/worktree")
         constructor.assert_called_once_with(
             forbidden_actions=denied, worktree="/validated/worktree",
+            builder_qualification=None, builder_auth_key_file=None,
         )
 
         adapter = AppServerCodex.__new__(AppServerCodex)
@@ -2496,7 +2509,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
             self.assertEqual(kwargs["worktree"], tree.path)
             raise RuntimeError("stop after constructor boundary assertion")
 
-        argv = ["harness", "--root", self.tmp.name, "run", str(mission)]
+        argv = ["harness", "--root", self.tmp.name, "run", str(mission), "--legacy"]
         with patch.object(sys, "argv", argv), \
                 patch("harness.cli.WorktreeManager.ensure", side_effect=ensure), \
                 patch("harness.cli.build", side_effect=stop_after_build), \
@@ -3650,9 +3663,10 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
     def test_codex_receipt_classifier_imports_policy_from_trusted_base(self):
         adapter, worktree, evidence_dir, receipt, stdout = self._review_fixture()
         trusted = Path(self.tmp.name) / "trusted-base"
+        receipt.write_text(json.dumps({"review_result": "PASS", "findings": []}))
         classified = subprocess.CompletedProcess(
-            [], 0, json.dumps({"classification": {"classification": "VALID_CURRENT"},
-                               "receipt": {"review_result": "PASS", "findings": []}}), "",
+            [], 0, json.dumps({"classification": {"classification": "VALID_CURRENT", "current_approval_eligible": True},
+                               "review_receipt": str(receipt)}), "",
         )
         with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
                 patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
@@ -3676,10 +3690,11 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         for payload_status, receipt_verdict, expected in cases:
             with self.subTest(payload_status=payload_status, receipt_verdict=receipt_verdict):
                 stdout.write_text(json.dumps({"review_receipt": str(receipt), "status": payload_status}))
+                receipt.write_text(json.dumps({"review_result": receipt_verdict, "findings": []}))
                 classified = subprocess.CompletedProcess(
                     [], 0, json.dumps({
-                        "classification": {"classification": "VALID_CURRENT"},
-                        "receipt": {"review_result": receipt_verdict, "findings": []},
+                        "classification": {"classification": "VALID_CURRENT", "current_approval_eligible": True},
+                        "review_receipt": str(receipt),
                     }), "",
                 )
                 with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
@@ -3710,6 +3725,47 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
                 stdout_path=str(stdout), evidence_dir=str(evidence_dir),
             )
         self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+
+    def test_codex_classifier_rejects_stale_or_wrong_receipt_reference(self):
+        adapter, worktree, evidence_dir, receipt, stdout = self._review_fixture()
+        receipt.write_text(json.dumps({"review_result": "PASS", "findings": []}))
+        cases = [("INVALID", True, str(receipt)), ("STALE_TOOLING", True, str(receipt)),
+                 ("VALID_CURRENT", False, str(receipt)), ("VALID_CURRENT", True, None),
+                 ("VALID_CURRENT", True, str(receipt.with_name("other.json")))]
+        for status, eligible, reference in cases:
+            classified = subprocess.CompletedProcess([], 0, json.dumps({
+                "classification": {"classification": status, "current_approval_eligible": eligible},
+                "review_receipt": reference,
+                "receipt": {"review_result": "PASS", "findings": []}}), "")
+            with self.subTest(status=status, reference=reference), \
+                    patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
+                    patch.object(adapter, "_trusted_base_checkout", return_value=Path(self.tmp.name)), \
+                    patch.object(adapter, "review_environment", return_value={"PATH": "/usr/bin"}), \
+                    patch.object(adapter, "_call", return_value=classified):
+                result = adapter.review_result(
+                    "codex", worktree=str(worktree), base="a" * 40, head="b" * 40,
+                    mission_id="mission", scope_file=str(worktree / "scope.json"),
+                    stdout_path=str(stdout), evidence_dir=str(evidence_dir))
+            self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+
+    def test_codex_receipt_change_during_classification_fails_closed(self):
+        adapter, worktree, evidence_dir, receipt, stdout = self._review_fixture()
+        receipt.write_text(json.dumps({"review_result": "FAIL", "findings": []}))
+        def classify(*args, **kwargs):
+            receipt.write_text(json.dumps({"review_result": "PASS", "findings": []}))
+            return subprocess.CompletedProcess([], 0, json.dumps({
+                "classification": {"classification": "VALID_CURRENT", "current_approval_eligible": True},
+                "review_receipt": str(receipt)}), "")
+        with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
+                patch.object(adapter, "_trusted_base_checkout", return_value=Path(self.tmp.name)), \
+                patch.object(adapter, "review_environment", return_value={"PATH": "/usr/bin"}), \
+                patch.object(adapter, "_call", side_effect=classify):
+            result = adapter.review_result(
+                "codex", worktree=str(worktree), base="a" * 40, head="b" * 40,
+                mission_id="mission", scope_file=str(worktree / "scope.json"),
+                stdout_path=str(stdout), evidence_dir=str(evidence_dir))
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+        self.assertIn("changed during classification", result.evidence)
 
     def test_receiptless_codex_failures_get_typed_classification_and_private_evidence(self):
         cases = (
@@ -4024,7 +4080,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         }
         with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
                 patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
-                patch.object(adapter, "_trusted_git_output", return_value="{}\n") as trusted_git, \
+                patch("harness.adapters.subprocess.check_output", return_value=b"{}\r\n") as trusted_git, \
                 patch.object(adapter, "_call", return_value=checked) as validator_call, \
                 patch.dict(os.environ, ambient_git):
             result = adapter.review_result(
@@ -4034,7 +4090,11 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
             )
         self.assertEqual(result.status, "PASS")
         trusted_git.assert_called_once()
-        self.assertEqual(trusted_git.call_args.args[1:], ("show", f"{'b' * 40}:scope.json"))
+        self.assertEqual(trusted_git.call_args.args[0][-2:], ["show", f"{'b' * 40}:scope.json"])
+        self.assertNotIn("text", trusted_git.call_args.kwargs)
+        self.assertEqual(validator_call.call_args.args[0][-1], hashlib.sha256(b"{}\r\n").hexdigest())
+        for name in ambient_git.keys() - {"GIT_CONFIG_COUNT"}:
+            self.assertNotIn(name, trusted_git.call_args.kwargs["env"])
         self.assertFalse(validator_call.call_args.kwargs["inherit_environment"])
         self.assertEqual(validator_call.call_args.kwargs["env"]["GIT_NO_REPLACE_OBJECTS"], "1")
         for name in ambient_git.keys() - {"GIT_CONFIG_COUNT"}:
@@ -4048,7 +4108,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
                 patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
                 patch.object(adapter, "_call", return_value=checked), \
-                patch.object(adapter, "_trusted_git_output", return_value="{}\n"):
+                patch("harness.adapters.subprocess.check_output", return_value=b"{}\n"):
             result = adapter.review_result(
                 "deepseek", worktree=str(worktree), base="a" * 40, head="b" * 40,
                 mission_id="mission", scope_file=str(worktree / "scope.json"),
