@@ -257,7 +257,7 @@ def _invoke_reserved(prompt, key, schema, timeout, max_tokens):
         encoded = canonical(request_payload(prompt, schema))
     except (UnicodeError, TypeError, ValueError):
         raise DirectFailure('INVALID_REQUEST') from None
-    require_active_transport('deepseek', MODEL)
+    require_active_transport('deepseek', MODEL, prompt=prompt.encode(), claim_send=True)
     require_provider_credential('deepseek', key.encode())
     timeout = bounded_delivery_timeout(timeout)
     active = _active_reservation.get()

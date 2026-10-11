@@ -63,9 +63,16 @@ class ReviewRun:
 
     def __init__(self, evidence: Path, repository_root: Path, identity: dict,
                  stages: list[tuple[str, str]], storage, *, prefix: str):
-        if os.environ.get('CMH_RESOURCE_MISSION_ID') == 'HARNESS_CURRENT_VERSION_DELIVERY':
+        from .formal_delivery_gate import is_delivery_mission
+        if is_delivery_mission(os.environ.get('CMH_RESOURCE_MISSION_ID')):
             from .formal_delivery_gate import load_authorization, require_review_authority
-            require_review_authority(load_authorization())
+            auth = load_authorization()
+            require_review_authority(auth)
+            if auth.get('fresh_task'):
+                from .fresh_task import review_evidence_path
+                if (evidence != review_evidence_path(auth, identity['provider']) or
+                        identity['mission_id'] != auth['mission_id']):
+                    raise ValueError('fresh review cannot reuse a historical evidence namespace')
         self.storage = storage
         self.evidence, self.parent_fd = storage.open_private_directory(evidence, repository_root)
         self.lock_fd = os.open(".review-v2.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600,

@@ -600,8 +600,8 @@ class Reservation:
 def reserve(*, provider: str, model: str, prompt: bytes, stage: str,
             environment: dict[str, str] | None = None) -> Reservation:
     env = os.environ if environment is None else environment
-    from .formal_delivery_gate import NEW_MISSION, OLD_MISSION, reserve_delivery
-    if env.get("CMH_RESOURCE_MISSION_ID") == NEW_MISSION:
+    from .formal_delivery_gate import NEW_MISSION, is_delivery_mission, OLD_MISSION, reserve_delivery
+    if is_delivery_mission(env.get("CMH_RESOURCE_MISSION_ID")):
         return reserve_delivery(provider=provider, model=model, prompt=prompt,
                                 stage=stage, environment=env)
     needed = ("CMH_RESOURCE_AUTHORIZATION", "CMH_RESOURCE_AUTH_SHA256", "CMH_RESOURCE_GATE_KEY_FILE",

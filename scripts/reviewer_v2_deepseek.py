@@ -65,12 +65,12 @@ def _stderr_markers(stderr: bytes | str | None) -> dict[str, bool]:
 
 
 def _validate_completion_artifact(raw, mission_id=None, prompt=None):
-    from harness.formal_delivery_gate import NEW_MISSION
+    from harness.formal_delivery_gate import NEW_MISSION, is_delivery_mission
     try:
         value = json.loads(raw)
     except (ValueError, UnicodeError):
         return  # Existing parser reports malformed/empty output.
-    formal = (mission_id == NEW_MISSION or os.environ.get("CMH_RESOURCE_MISSION_ID") == NEW_MISSION)
+    formal = (is_delivery_mission(mission_id) or is_delivery_mission(os.environ.get("CMH_RESOURCE_MISSION_ID")))
     if formal or isinstance(value, dict) and "direct_completion" in value:
         try:
             schema = CHUNK_SCHEMA if set(value.get("structured_output", {})) == {"findings"} else SYNTHESIS_SCHEMA
@@ -594,8 +594,8 @@ def validate(receipt: dict, base: str, head: str, root: Path | None = None,
     if receipt_path is not None:
         _, fd = legacy.open_private_directory(receipt_path.parent, root, create=False)
         try:
-            from harness.formal_delivery_gate import NEW_MISSION
-            if receipt['mission_id'] == NEW_MISSION:
+            from harness.formal_delivery_gate import NEW_MISSION, is_delivery_mission
+            if is_delivery_mission(receipt['mission_id']):
                 state = json.loads(legacy.read_private_artifact(fd, 'state.json'))
                 review_history(state, lambda name: legacy.read_private_artifact(fd, name))
             for record, stage in [(item, "chunk") for item in chunks] + [

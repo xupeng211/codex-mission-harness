@@ -272,3 +272,87 @@ Internal USD/token/call reservations remain fully debited. `UNKNOWN` is never
 settled this way: only explicitly inherited, hash-bound historical UNKNOWN can
 appear in a covered prefix, and its full native wallet exposure is still
 subtracted. New UNKNOWN and in-flight requests continue to block execution.
+
+### Explicit fresh PR2 task after the frozen historical expiry
+
+`cmh-fresh-pr2-task/v1` adds one bounded transition to the existing delivery
+signature/ledger/sender contract. It is not a renewal or a second authorization
+system. The old fixed mission and all existing continuations still inherit their
+original clock, limits and consumed requests. Re-signing them never renews them.
+
+The production transition pins the latest 120-row ledger, checkpoint and signed
+historical authority. The same existing signer verifies the immutable parent and
+complete signed history, including the eight UNKNOWN records and the two closed
+noncanonical diagnostic exceptions. The predecessor must have expired. Its rows,
+checkpoints, grants, Qualification and findings are never written or imported as
+new execution results. The historical reservations remain in shared accounting;
+retained native-CNY UNKNOWN wallet exposure is also kept before every new send.
+Fresh account/settlement evidence must explicitly bind the historical ledger hash.
+There is no refund, financial reconciliation or claim that unknown usage is zero.
+
+The independently approved envelope uses the existing authorization version with
+an additional `fresh_task` descriptor. The exact `cmh-fresh-pr2-user-approval/v1`
+record must authorize paid execution and bind the entire envelope: the PR2
+base/head/tree, canonical full source scope and manifest, seven-slot request plan,
+current runtime/code/schema/registry, exact provider/model/effort, account route,
+independent budgets and start/expiry, historical reference and explicit target
+overlap. A draft with `explicit_paid_execution_approval=false` cannot activate.
+The mission and execution identities derive from the approval bytes. Only derived
+identity/path fields and the approval's own path/hash are excluded from its payload;
+changing a budget, expiry, model or target requires a different explicit approval.
+
+This bounded entry reviews only the frozen PR2 candidate
+`07034521e08276e8cca1a9ecc5d12e082a7b51f6`, tree
+`3fc17cb9584614b682c9565520f43bb9680e97e8`, against main
+`3d30b6600fffe30d52b1d28f7bf91cd4afcf7eb1`. It does not authorize PR4, builder
+execution, DeepSeek CLI fallback, push, CI dispatch or merge. The canonical
+premerge Consumer and PR2 -> actual merged main -> PR4 dependency remain unchanged.
+The runtime includes this contract module and the existing Consumer in its signed
+file manifest. Any changed runtime requires fresh exact approval, not reused
+Qualification or ancestor receipts. The original source/decision schemas are not
+relaxed.
+
+One frozen historical ledger has exactly one deterministic fresh successor path,
+regardless of approval ID, mission name, run ID, environment or worktree. Exclusive
+initialization rejects a second approval/activation or a reset of an existing
+ledger/checkpoint. Resume uses the original signed fresh ledger and committed
+artifacts. There is no general API to create unlimited successors. A missing,
+altered, ambiguous or in-flight history remains fail-closed. A valid signed grant
+alone is insufficient to dispatch: reservation and raw sender also require the
+active matching ledger and current time/account evidence.
+
+Each provider has exactly seven ordered, deterministic new request slots. Both
+start with their own four Qualification cases. GPT then has structured preflight,
+chunk and group; DeepSeek has chunk, group and aggregate. DeepSeek slots cannot
+start before all seven GPT slots have returned with verified accounting. The
+execution Controller must additionally require the complete legal GPT PASS receipt
+before starting DeepSeek; returned transport status alone is not a semantic PASS.
+No GPT findings are included in DeepSeek inputs. Qualification/review failure,
+UNKNOWN or in-flight state cannot advance to another slot. Even a normally
+supported formatting/source retry has no extra slot under this fresh plan.
+
+The final Provider boundary checks the exact reserved prompt and atomically
+records a durable one-send claim. Reusing that reservation cannot cross transport
+again. Both the independent/shared nominal budget ceilings and the new approved
+native-CNY ceiling apply; capacity units are not Provider tokens. Each request
+retains its full reservation on UNKNOWN. The existing staged wallet and canonical
+subscription availability contracts remain mandatory in production. Snapshots
+must stay fresh, and old account capacity is not a new approval. The new expiry
+must not exceed the predecessor contract's wall-clock duration; no automatic
+extension or clock mutation is provided.
+
+Reviewer/Qualification evidence directories also have deterministic new
+namespaces. Old directories cannot be reused or overwritten. New receipts and
+Qualification bind the exact fresh task/authority; other missions, historical
+Qualification, Astra diagnostics, incomplete receipt sets, changed HEAD or source
+remain rejected by the existing validators and Consumer. Offline fixtures cannot
+enter the production loader or sender and cannot issue live Qualification.
+
+`fresh_task.build_scope`, `build_request_plan` and `approval_payload` are pure
+candidate-building helpers. They do not sign approval, create a production grant,
+initialize its ledger or contact a Provider. Only separately approved future
+production preparation may sign the exact new envelope and call the existing
+`initialize_ledger` entry. The model calls remain 7 POST / 7 CLI logical slots.
+GPT physical HTTP and actual subscription quota/cost remain UNKNOWN; DeepSeek
+Provider physical charge hard bounds remain UNPROVEN. Prices, net balance,
+historical liabilities and other allocations require new evidence before payment.

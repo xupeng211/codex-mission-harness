@@ -464,8 +464,8 @@ def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec
     if receipt_path is not None:
         _, directory_fd = secure.open_private_directory(Path(receipt_path).parent, root, create=False)
         try:
-            from harness.formal_delivery_gate import NEW_MISSION
-            if receipt['mission_id'] == NEW_MISSION:
+            from harness.formal_delivery_gate import NEW_MISSION, is_delivery_mission
+            if is_delivery_mission(receipt['mission_id']):
                 state = json.loads(secure.read_private_artifact(directory_fd, 'state.json'))
                 review_history(state, lambda name: secure.read_private_artifact(directory_fd, name))
             for item in [*receipt["chunks"], *receipt["groups"], *synthesis]:

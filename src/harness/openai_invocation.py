@@ -348,11 +348,11 @@ def _invoke_openai_unmetered(prompt: str, spec: ModelSpec, schema: dict, *, time
                   source_env: dict[str, str] | None = None,
                   transport_sink=None) -> InvocationResult:
     from .formal_delivery_gate import require_active_transport
-    require_active_transport(spec.provider, spec.model)
+    require_active_transport(spec.provider, spec.model, prompt=prompt.encode(), claim_send=True)
     from .formal_delivery_gate import bounded_delivery_timeout
     timeout = bounded_delivery_timeout(timeout)
-    from .formal_delivery_gate import NEW_MISSION, require_provider_credential, _read
-    if os.environ.get("CMH_RESOURCE_MISSION_ID") == NEW_MISSION:
+    from .formal_delivery_gate import NEW_MISSION, is_delivery_mission, require_provider_credential, _read
+    if is_delivery_mission(os.environ.get("CMH_RESOURCE_MISSION_ID")):
         require_provider_credential("openai", _read(Path(codex_home) / "auth.json"))
     if spec.provider != "openai" or not spec.model or not spec.reasoning_effort:
         raise ValueError("configured OpenAI model and reasoning are required")

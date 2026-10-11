@@ -247,8 +247,8 @@ def _evaluate_cases(spec: ModelSpec, invoke: Callable[[ModelSpec, str], str], *,
     missing/invalid response fails that case and preserves the model identity.
     """
     passed, failed, hashes = [], [], []
-    from .formal_delivery_gate import NEW_MISSION
-    resumable = mode == "real_provider" and os.environ.get('CMH_RESOURCE_MISSION_ID') == NEW_MISSION
+    from .formal_delivery_gate import NEW_MISSION, is_delivery_mission
+    resumable = mode == "real_provider" and is_delivery_mission(os.environ.get('CMH_RESOURCE_MISSION_ID'))
     if resumable and evidence is None:
         raise ResourceGateDenied('delivery qualification requires durable evidence')
     completed = evidence.delivery_progress(spec) if resumable else []
@@ -414,10 +414,14 @@ def qualify_live(spec: ModelSpec, *, token_file: str | Path | None = None,
     """Run actual provider calls after noninteractive auth validation."""
     from .model_registry import preflight, read_private_token
 
-    from .formal_delivery_gate import NEW_MISSION, load_authorization, qualification_binding
-    if os.environ.get('CMH_RESOURCE_MISSION_ID') == NEW_MISSION:
+    from .formal_delivery_gate import NEW_MISSION, is_delivery_mission, load_authorization, qualification_binding
+    if is_delivery_mission(os.environ.get('CMH_RESOURCE_MISSION_ID')):
         from .resource_gate import digest, canonical
         auth = load_authorization()
+        if auth.get('fresh_task'):
+            from .fresh_task import qualification_evidence_path
+            if evidence_dir != qualification_evidence_path(auth, spec.provider):
+                raise ResourceGateDenied('fresh qualification needs its own evidence namespace')
         if evidence_dir is None or not Path(evidence_dir).is_absolute():
             raise ResourceGateDenied('delivery qualification requires a fixed private evidence directory')
         # The CLI normally chooses a fresh UUID. Funding continuation instead
@@ -426,8 +430,8 @@ def qualify_live(spec: ModelSpec, *, token_file: str | Path | None = None,
             qualification_binding(auth), model=spec.identity(), directory=str(evidence_dir))))
     preflight(spec, token_file=token_file)
     token = read_private_token(Path(token_file)) if token_file else None
-    from .formal_delivery_gate import NEW_MISSION
-    evidence = QualificationEvidence(evidence_dir, resume=os.environ.get('CMH_RESOURCE_MISSION_ID') == NEW_MISSION) \
+    from .formal_delivery_gate import NEW_MISSION, is_delivery_mission
+    evidence = QualificationEvidence(evidence_dir, resume=is_delivery_mission(os.environ.get('CMH_RESOURCE_MISSION_ID'))) \
         if evidence_dir is not None else None
     return _evaluate_cases(spec,
                            lambda actual, prompt: _actual_provider_invoke(
@@ -478,8 +482,8 @@ def qualification_receipt(result: QualificationResult, *, auth_key: str,
                    {'name': c.name, 'source': c.source, 'findings': c.findings, 'expected': c.expected}
                    for c in CASES], sort_keys=True, separators=(',', ':')).encode()).hexdigest(),
                "authentication_identity": hmac.new(auth_key.encode(), b'cmh-qualification-auth/v1', hashlib.sha256).hexdigest()}
-    from .formal_delivery_gate import NEW_MISSION, load_authorization, qualification_binding
-    if os.environ.get("CMH_RESOURCE_MISSION_ID") == NEW_MISSION:
+    from .formal_delivery_gate import NEW_MISSION, is_delivery_mission, load_authorization, qualification_binding
+    if is_delivery_mission(os.environ.get("CMH_RESOURCE_MISSION_ID")):
         if result.mode != "real_provider" or role not in {"independent_reviewer", "final_reviewer"}:
             raise ValueError("offline qualification cannot issue a formal delivery receipt")
         receipt["delivery_binding"] = qualification_binding(load_authorization())
@@ -514,9 +518,9 @@ def validate_qualification_receipt(path: str | Path, spec: ModelSpec, *, auth_ke
                      "registry_sha256", "contract_sha256", "runner_sha256", "cli_runner_sha256",
                      "invocation_sha256", "builder_runtime_sha256",
                      "qualification_schema_sha256", "registry_code_sha256", "full_scope_contract_sha256", "review_runner_sha256", "case_manifest_sha256", "authentication_identity", "integrity_sha256"}
-    from .formal_delivery_gate import (NEW_MISSION, load_authorization,
+    from .formal_delivery_gate import (NEW_MISSION, is_delivery_mission, load_authorization,
                                       validate_qualification_binding)
-    if os.environ.get("CMH_RESOURCE_MISSION_ID") == NEW_MISSION:
+    if is_delivery_mission(os.environ.get("CMH_RESOURCE_MISSION_ID")):
         expected_keys.add("delivery_binding")
         validate_qualification_binding(receipt.get("delivery_binding"), load_authorization())
     if not isinstance(receipt, dict) or set(receipt) != expected_keys \
@@ -543,7 +547,7 @@ def validate_qualification_receipt(path: str | Path, spec: ModelSpec, *, auth_ke
               "invocation_sha256": Path(deepseek_direct.__file__) if spec.provider == "deepseek" else Path(openai_invocation.__file__),
               "builder_runtime_sha256": Path(codex.__file__),
               "registry_code_sha256": Path(model_registry.__file__)}
-    formal = os.environ.get('CMH_RESOURCE_MISSION_ID') == NEW_MISSION
+    formal = is_delivery_mission(os.environ.get('CMH_RESOURCE_MISSION_ID'))
     if formal:
         qualification_history(receipt, load_authorization())
     if any(receipt[key] != (artifact_code_hash(file, receipt['delivery_binding']['authorization_sha256'])

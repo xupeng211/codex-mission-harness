@@ -50,6 +50,10 @@ def origin_authority(origin_sha, auth=None):
     auth = auth or gate.load_authorization()
     key = gate._read(os.environ['CMH_RESOURCE_GATE_KEY_FILE'])
     ledger = gate._verify_child(Path(auth['ledger_path']), key, auth)
+    if auth.get('fresh_task'):
+        if origin_sha != auth['_authorization_sha256']:
+            raise ValueError('fresh task cannot inherit historical receipt or qualification')
+        return auth, ledger
     if origin_sha not in auth['_lineage_sha256']:
         raise ValueError('artifact authority is not in verified predecessor lineage')
     origin, sha = auth, auth['_authorization_sha256']
@@ -86,17 +90,20 @@ def origin_authority(origin_sha, auth=None):
 
 def authority_matches(origin_sha, mission_id):
     from . import formal_delivery_gate as gate
-    if mission_id != gate.NEW_MISSION:
+    if not gate.is_delivery_mission(mission_id):
         from .reviewer_v2_contract import contract_authorization_identity
         return origin_sha == contract_authorization_identity(mission_id)
-    origin_authority(origin_sha)
+    auth = gate.load_authorization()
+    if auth["mission_id"] != mission_id:
+        raise ValueError("receipt authority belongs to another task")
+    origin_authority(origin_sha, auth)
     return True
 
 
 def artifact_code_hash(path, origin_sha):
     """Original code provenance is retained, only after semantic comparison."""
-    from .formal_delivery_gate import NEW_MISSION
-    if os.environ.get('CMH_RESOURCE_MISSION_ID') != NEW_MISSION:
+    from .formal_delivery_gate import NEW_MISSION, is_delivery_mission
+    if not is_delivery_mission(os.environ.get('CMH_RESOURCE_MISSION_ID')):
         return digest(Path(path).read_bytes())
     origin, _ = origin_authority(origin_sha)
     root = Path(__file__).resolve().parents[2]

@@ -972,8 +972,8 @@ def bounded_prompt_bytes(prompt_text):
     return rendered
 
 def _invoke_reviewer_unmetered(command, prompt_text, env, timeout):
-    from harness.formal_delivery_gate import NEW_MISSION, OLD_MISSION
-    if os.environ.get("CMH_RESOURCE_MISSION_ID") in {NEW_MISSION, OLD_MISSION}:
+    from harness.formal_delivery_gate import NEW_MISSION, OLD_MISSION, is_delivery_mission
+    if is_delivery_mission(os.environ.get("CMH_RESOURCE_MISSION_ID")) or os.environ.get("CMH_RESOURCE_MISSION_ID") == OLD_MISSION:
         from harness.resource_gate import ResourceGateDenied
         raise ResourceGateDenied("formal DeepSeek CLI route is frozen; Direct adapter required")
     from harness.formal_delivery_gate import require_active_transport

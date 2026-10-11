@@ -18,7 +18,7 @@ from harness.openai_invocation import (InvocationFailure, MAX_EVENT_STREAM_BYTES
 
 class OpenAIInvocationTests(unittest.TestCase):
     # This transport-only fixture mocks the separately tested live resource gate.
-    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args: None)
+    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args, **_kwargs: None)
     def test_preflight_result_requires_exact_structured_schema(self):
         from harness.openai_invocation import _invoke_openai_unmetered as invoke_openai
         from harness.model_registry import load_registry
@@ -49,7 +49,7 @@ class OpenAIInvocationTests(unittest.TestCase):
                                           schema, timeout=1)
 
     # This transport-only fixture mocks the separately tested live resource gate.
-    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args: None)
+    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args, **_kwargs: None)
     def test_zero_exit_error_event_is_rejected_and_classified_for_bounded_resume(self):
         from harness.openai_invocation import _invoke_openai_unmetered as invoke_openai
         for message, category in [('stream disconnected: connection reset', 'TRANSIENT_TRANSPORT'),
@@ -70,7 +70,7 @@ class OpenAIInvocationTests(unittest.TestCase):
             self.assertFalse(caught.exception.evidence.get('structured_result_present', False))
 
     # This transport-only fixture mocks the separately tested live resource gate.
-    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args: None)
+    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args, **_kwargs: None)
     def test_agent_message_cannot_invent_retryable_transport_failure(self):
         from harness.openai_invocation import _invoke_openai_unmetered as invoke_openai
         stream = (b'{"type":"thread.started"}\n{"type":"turn.started"}\n' +
@@ -155,14 +155,14 @@ class OpenAIInvocationTests(unittest.TestCase):
             self.assertFalse(_trusted_ca_path(alias / "ca-certificates.crt", directory=False))
 
     # This transport-only fixture mocks the separately tested live resource gate.
-    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args: None)
+    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args, **_kwargs: None)
     def test_model_identity_is_required(self):
         from harness.openai_invocation import _invoke_openai_unmetered as invoke_openai
         with self.assertRaises(ValueError):
             invoke_openai("x", ModelSpec("openai", "", "high"), {}, timeout=1)
 
     # This transport-only fixture mocks the separately tested live resource gate.
-    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args: None)
+    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args, **_kwargs: None)
     def test_process_exit_and_missing_result_never_pass(self):
         from harness.openai_invocation import _invoke_openai_unmetered as invoke_openai
         complete = (b'{"type":"thread.started"}\n{"type":"turn.started"}\n'
@@ -180,7 +180,7 @@ class OpenAIInvocationTests(unittest.TestCase):
                 self.assertFalse(caught.exception.evidence.get("structured_result_present", False))
 
     # This transport-only fixture mocks the separately tested live resource gate.
-    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args: None)
+    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args, **_kwargs: None)
     def test_timeout_kills_process_group_and_retains_incomplete_events(self):
         from harness.openai_invocation import _invoke_openai_unmetered as invoke_openai
         process = Mock(pid=1234, returncode=-9)
@@ -198,7 +198,7 @@ class OpenAIInvocationTests(unittest.TestCase):
         self.assertFalse(caught.exception.evidence["terminal_observed"])
 
     # This transport-only fixture mocks the separately tested live resource gate.
-    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args: None)
+    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args, **_kwargs: None)
     def test_timeout_process_group_exit_race_is_classified(self):
         from harness.openai_invocation import _invoke_openai_unmetered as invoke_openai
         process = Mock(pid=1234, returncode=-9)
@@ -212,7 +212,7 @@ class OpenAIInvocationTests(unittest.TestCase):
         self.assertEqual(caught.exception.category, "TURN_TIMEOUT_UNDIAGNOSED")
 
     # This transport-only fixture mocks the separately tested live resource gate.
-    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args: None)
+    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args, **_kwargs: None)
     def test_broken_provider_pipe_is_classified_and_cleanup_attempted(self):
         from harness.openai_invocation import _invoke_openai_unmetered as invoke_openai
         process = Mock(pid=1234)

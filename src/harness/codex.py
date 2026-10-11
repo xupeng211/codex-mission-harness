@@ -42,8 +42,8 @@ class AppServerCodex:
                  forbidden_actions: tuple[str, ...] = (), worktree: str | None = None,
                  builder_qualification: str | Path | None = None,
                  builder_auth_key_file: str | Path | None = None):
-        from .formal_delivery_gate import NEW_MISSION
-        if os.environ.get("CMH_RESOURCE_MISSION_ID") == NEW_MISSION:
+        from .formal_delivery_gate import is_delivery_mission
+        if is_delivery_mission(os.environ.get("CMH_RESOURCE_MISSION_ID")):
             raise ValueError("current-version delivery authorization does not permit builder execution")
         # Both the mission deny-list and its validated worktree are immutable
         # constructor inputs. A later caller may verify them, but may not bind

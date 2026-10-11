@@ -61,9 +61,12 @@ FORMAL_MISSION_ID = "HARNESS_AUTONOMOUS_PRE_MERGE_DELIVERY"
 
 def contract_authorization_identity(mission_id: str) -> str:
     """Require the separately signed contract approval for formal review runs."""
-    from .formal_delivery_gate import NEW_MISSION, load_authorization
-    if mission_id == NEW_MISSION:
-        return load_authorization()["_authorization_sha256"]
+    from .formal_delivery_gate import NEW_MISSION, is_delivery_mission, load_authorization
+    if is_delivery_mission(mission_id):
+        auth = load_authorization()
+        if auth["mission_id"] != mission_id:
+            raise ValueError("source binding authority belongs to another task")
+        return auth["_authorization_sha256"]
     if mission_id != FORMAL_MISSION_ID:
         return "OFFLINE_FIXTURE_ONLY"
     path, key_path, expected_hash = (os.environ.get(name) for name in

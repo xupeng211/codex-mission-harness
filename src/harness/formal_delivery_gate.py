@@ -49,7 +49,7 @@ REQUEST5_LEDGER_SHA256 = 'bef620a429653dea8d895e2417114db69a04859dba90d28f90af34
 REQUEST5_ROW_SHA256 = '57bf46b218deee3d9c795534f7909e7a40f1fc275f2f458a1456ca01d3c6c901'
 HISTORICAL_AUTHORIZATION = (EVIDENCE_ROOT / 'formal-60h-review/authorized-closure-20261003/'
                             'final-dual-review-delivery-20261003/hard-delivery-resource-authorization.json')
-RUNTIME_FILES = ('src/harness/diagnostic_probe.py', 'src/harness/artifact_lineage.py', 'src/harness/deepseek_direct.py', 'src/harness/formal_delivery_gate.py', 'src/harness/resource_gate.py',
+RUNTIME_FILES = ('src/harness/fresh_task.py', 'scripts/reviewer_v2_gate.py', 'src/harness/diagnostic_probe.py', 'src/harness/artifact_lineage.py', 'src/harness/deepseek_direct.py', 'src/harness/formal_delivery_gate.py', 'src/harness/resource_gate.py',
                  'src/harness/reviewer_v2_contract.py', 'src/harness/model_qualification.py',
                  'src/harness/model_registry.py', 'src/harness/openai_invocation.py',
                  'src/harness/full_diff_manifest.py', 'src/harness/review_resume.py',
@@ -134,6 +134,11 @@ def _history(rows):
     return result
 
 
+def is_delivery_mission(mission):
+    from .fresh_task import is_fresh_mission
+    return mission == NEW_MISSION or is_fresh_mission(mission)
+
+
 def _load(env, anchor, runtime, now, *, offline=False):
     """Pure validation seam for offline fixtures; production never injects trust."""
     try:
@@ -142,14 +147,15 @@ def _load(env, anchor, runtime, now, *, offline=False):
         auth = _signed(env['CMH_RESOURCE_AUTHORIZATION'], auth_hash, key)
         if '_formal_runtime' in auth:
             _deny('derived diagnostic runtime cannot be supplied as signed authority')
+        fresh = 'fresh_task' in auth
         domain = 'OFFLINE_TEST' if offline else 'FORMAL'
         if (auth.get('version') != AUTH_VERSION or auth.get('evidence_domain') != domain
                 or auth.get('approval_source') != 'EXPLICIT_USER_APPROVAL'
                 or not isinstance(auth.get('authorization_id'), str)
                 or not auth['authorization_id'] or auth.get('activation_approved') is not True
-                or auth.get('mission_id') != NEW_MISSION
-                or env['CMH_RESOURCE_MISSION_ID'] != NEW_MISSION
-                or auth.get('scope') != ['PR2', 'PR4']
+                or (not is_delivery_mission(auth.get('mission_id')) if fresh else auth.get('mission_id') != NEW_MISSION)
+                or env['CMH_RESOURCE_MISSION_ID'] != auth.get('mission_id')
+                or auth.get('scope') != (['PR2'] if fresh else ['PR2', 'PR4'])
                 or auth.get('source_binding_version') != SOURCE_VERSION
                 or auth.get('source_binding_approved') is not True
                 or auth.get('old_mission_frozen') is not True
@@ -190,6 +196,17 @@ def _load(env, anchor, runtime, now, *, offline=False):
         history = _history(rows)
         if history['deepseek']['cost'] != 28800000:
             _deny('historical DeepSeek full reservation was lost')
+        fresh_history = None
+        if fresh:
+            from .fresh_task import validate
+            fresh_history = validate(auth, env, key, runtime, now, offline=offline)
+            extra = _history(fresh_history['requests'])
+            history['global_calls'] += extra['global_calls']
+            for provider in ('deepseek', 'openai'):
+                for name in ('calls', 'unmetered_calls', 'cost'):
+                    history[provider][name] += extra[provider][name]
+                for category in CATEGORIES:
+                    history[provider]['tokens'][category] += extra[provider]['tokens'][category]
         if auth['runtime'] != runtime:
             _deny('delivery Git, runtime, registry or model identity changed')
         if (runtime['models']['deepseek']['model'] != 'deepseek-flash'
@@ -198,7 +215,7 @@ def _load(env, anchor, runtime, now, *, offline=False):
         if not offline and runtime['models']['openai'].get('reasoning_effort') != 'high':
             _deny('formal OpenAI reasoning contract must remain high')
         targets = auth['targets']
-        if (set(targets) != {'PR2', 'PR4'}
+        if not fresh and (set(targets) != {'PR2', 'PR4'}
                 or targets['PR4']['head'] != runtime['head']
                 or any(set(item) != {'base', 'head'} or any(not isinstance(v, str) or
                        not re.fullmatch('[0-9a-f]{40}', v) for v in item.values())
@@ -207,11 +224,13 @@ def _load(env, anchor, runtime, now, *, offline=False):
         if not offline:
             from .full_diff_manifest import git
             root = Path(__file__).resolve().parents[2]
-            git(root, 'merge-base', '--is-ancestor', targets['PR2']['head'], targets['PR4']['base'])
+            if not fresh:
+                git(root, 'merge-base', '--is-ancestor', targets['PR2']['head'], targets['PR4']['base'])
             for item in targets.values():
                 git(root, 'merge-base', '--is-ancestor', item['base'], item['head'])
         ledger = Path(auth['ledger_path'])
-        expected_ledger = (continuation_ledger_path(auth['continuation'])
+        from .fresh_task import task_ledger_path
+        expected_ledger = (task_ledger_path(auth['fresh_task']['history']) if fresh else continuation_ledger_path(auth['continuation'])
                            if auth.get('continuation', {}).get('version') == HISTORY_CONTINUATION_VERSION
                            else CONTINUATION_LEDGER if auth.get('continuation') else DELIVERY_LEDGER)
         if (str(ledger) != env['CMH_RESOURCE_LEDGER'] or ledger.resolve() != ledger
@@ -239,6 +258,8 @@ def _load(env, anchor, runtime, now, *, offline=False):
                 or not _integer(account['observed_epoch']) or not _integer(account['expires_epoch'])
                 or not account['observed_epoch'] <= now < account['expires_epoch']):
             _deny('authoritative net shared capacity proof is missing or expired')
+        if fresh and account.get('fresh_history_sha256') != auth['fresh_task']['history']['predecessor_ledger_sha256']:
+            _deny('fresh shared capacity must explicitly include retained history')
         if digest(_read(account['official_source_path'])) != account['official_source_sha256']:
             _deny('official shared capacity evidence changed')
         for provider in ('deepseek', 'openai'):
@@ -363,7 +384,8 @@ def _load(env, anchor, runtime, now, *, offline=False):
         if auth.get('continuation') and predecessor_child is None:
             _deny('continuation requires an explicit signed predecessor authority')
         validated = dict(auth, _authorization_sha256=auth_hash, _history=history, _account=account,
-                         _lineage_sha256=lineage, _previous=previous, _predecessor_child=predecessor_child)
+                         _lineage_sha256=lineage, _previous=previous, _predecessor_child=predecessor_child,
+                         _fresh_history=fresh_history)
         if auth.get('diagnostic_probe') is not None:
             from .diagnostic_probe import transport_authority
             return transport_authority(validated)
@@ -882,6 +904,9 @@ def _funding_check(auth, ledger, key, stage, now):
         _deny('pending wallet exposure currency missing or incompatible')
     free = (value['available_' + suffix] - value['unsettled_liability_' + suffix] -
             value['other_allocations_' + suffix] - sum(r['wallet_exposure_' + suffix] for r in pending))
+    if auth.get('fresh_task'):
+        from .fresh_task import native_funding_check
+        free = native_funding_check(auth, ledger, value, upper, free)
     required = upper + auth['deepseek_funding_policy']['safety_margin_' + suffix]
     if free < required:
         raise FundingPause('余额不足；请手动补款并刷新可信证据', required=required,
@@ -930,7 +955,7 @@ def require_review_authority(auth):
 
 def qualification_binding(auth):
     require_review_authority(auth)
-    return {'mission_id': NEW_MISSION, 'authorization_sha256': auth['_authorization_sha256'],
+    return {'mission_id': auth['mission_id'], 'authorization_sha256': auth['_authorization_sha256'],
             'parent_ledger_sha256': auth['parent']['ledger_sha256'],
             'runtime_sha256': digest(canonical(auth['runtime']))}
 
@@ -939,6 +964,8 @@ def validate_qualification_binding(binding, auth):
     if auth['evidence_domain'] != 'FORMAL':
         _deny('synthetic qualification cannot authorize formal delivery')
     if binding != qualification_binding(auth):
+        if auth.get('fresh_task'):
+            _deny('fresh task cannot inherit old qualification')
         from .artifact_lineage import origin_authority
         if not isinstance(binding, dict):
             _deny('qualification origin binding missing')
@@ -950,7 +977,7 @@ def validate_qualification_binding(binding, auth):
 
 
 def require_invocation_spec(spec):
-    if os.environ.get('CMH_RESOURCE_MISSION_ID') == NEW_MISSION:
+    if is_delivery_mission(os.environ.get('CMH_RESOURCE_MISSION_ID')):
         auth = load_authorization()
         if spec.identity() != auth['runtime']['models'].get(spec.provider):
             _deny('provider invocation differs from the signed model and reasoning contract')
@@ -963,7 +990,7 @@ def credential_identity(provider, credential_bytes, key):
 
 
 def require_provider_credential(provider, credential_bytes):
-    if os.environ.get('CMH_RESOURCE_MISSION_ID') == NEW_MISSION:
+    if is_delivery_mission(os.environ.get('CMH_RESOURCE_MISSION_ID')):
         auth = load_authorization()
         key = _read(os.environ['CMH_RESOURCE_GATE_KEY_FILE'])
         if (not credential_bytes or credential_identity(provider, credential_bytes, key) !=
@@ -985,12 +1012,12 @@ def _bounded_timeout(auth, now, requested):
 
 
 def bounded_delivery_timeout(requested):
-    if os.environ.get('CMH_RESOURCE_MISSION_ID') == NEW_MISSION:
+    if is_delivery_mission(os.environ.get('CMH_RESOURCE_MISSION_ID')):
         return _bounded_timeout(load_authorization(), time.time(), requested)
     return requested
 
 
-def require_active_transport(provider, model):
+def require_active_transport(provider, model, *, prompt=None, claim_send=False):
     """The lower-level CLI helpers cannot bypass activation or atomic reservation."""
     from .resource_gate import _active_reservation
     active = _active_reservation.get()
@@ -998,7 +1025,7 @@ def require_active_transport(provider, model):
         _deny('synthetic reservations cannot enter provider transport')
     if (active.provider, active.model) != (provider, model):
         _deny('raw provider transport differs from its active resource reservation')
-    if os.environ.get('CMH_RESOURCE_MISSION_ID') == NEW_MISSION:
+    if is_delivery_mission(os.environ.get('CMH_RESOURCE_MISSION_ID')):
         auth = load_authorization()
         if provider == 'deepseek' and (not auth.get('deepseek_funding_policy') or
                                      _funding_currency(auth) != 'CNY'):
@@ -1007,7 +1034,9 @@ def require_active_transport(provider, model):
                 (active.provider, active.model) != (provider, model) or
                 active.authorization_sha256 != auth['_authorization_sha256']):
             _deny('raw provider transport requires an active formal delivery reservation')
-        ledger = _checked_child(active.ledger, _read(active.ledger_key_path))
+        if auth.get('fresh_task') and str(active.ledger) != auth['ledger_path']:
+            _deny('fresh transport cannot select another ledger')
+        ledger = _verify_child(active.ledger, _read(active.ledger_key_path), auth)
         if provider == 'openai':
             _current_availability(auth, ledger, _read(active.ledger_key_path), time.time())
         if provider == 'deepseek' and auth.get('deepseek_funding_policy'):
@@ -1022,6 +1051,9 @@ def require_active_transport(provider, model):
         if not any(row.get('request_id') == active.request_id and row.get('status') == 'STARTED'
                    and row.get('evidence_domain') == 'FORMAL' for row in ledger['requests']):
             _deny('raw provider transport reservation identity or state invalid')
+        if auth.get('fresh_task') and claim_send:
+            from .fresh_task import claim_transport
+            claim_transport(auth, active, prompt)
     else:
         from .resource_gate import _authorization
         try:
@@ -1046,7 +1078,7 @@ def require_active_transport(provider, model):
 
 
 def bind_review(mission_id, root, base, head, registry_hash, spec, qualification):
-    if mission_id != NEW_MISSION and os.environ.get('CMH_RESOURCE_MISSION_ID') != NEW_MISSION:
+    if not is_delivery_mission(mission_id) and not is_delivery_mission(os.environ.get('CMH_RESOURCE_MISSION_ID')):
         return None
     auth = load_authorization()
     require_review_authority(auth)
@@ -1054,7 +1086,7 @@ def bind_review(mission_id, root, base, head, registry_hash, spec, qualification
     from .full_diff_manifest import git, read_diff, plan, synthesis_stage_names
     target = next((name for name, item in auth['targets'].items()
                    if item == {'base': base, 'head': head}), None)
-    if (mission_id != NEW_MISSION or target is None
+    if (mission_id != auth['mission_id'] or target is None
             or git(root, 'rev-parse', 'HEAD').decode().strip() != head
             or git(root, 'status', '--porcelain').strip()
             or registry_hash != auth['runtime']['registry_sha256']
@@ -1105,7 +1137,7 @@ def _verify_child(path, key, auth):
     ledger = _checked_child(path, key)
     if (ledger.get('version') != LEDGER_VERSION
             or ledger.get('evidence_domain') != auth['evidence_domain']
-            or ledger.get('mission_id') != NEW_MISSION
+            or ledger.get('mission_id') != auth['mission_id']
             or ledger.get('parent_ledger_sha256') != auth['parent']['ledger_sha256']
             or ledger.get('authorization_sha256') != auth['_authorization_sha256']):
         _deny('empty or unlinked ledger cannot restart delivery accounting')
@@ -1114,11 +1146,14 @@ def _verify_child(path, key, auth):
             rows[:len(auth['_predecessor_child']['requests'])] != auth['_predecessor_child']['requests']):
         _deny('continuation cannot modify, truncate or refund inherited history')
     if (not isinstance(rows, list) or any(row.get('number') != i or
-            row.get('mission_id') != NEW_MISSION or
+            row.get('mission_id') != auth['mission_id'] or
             row.get('authorization_sha256') not in auth['_lineage_sha256']
             for i, row in enumerate(rows, 1)) or
             len({r.get('request_id') for r in rows}) != len(rows)):
         _deny('delivery ledger continuity or identity invalid')
+    if auth.get('fresh_task'):
+        from .fresh_task import verify_ledger
+        verify_ledger(auth, ledger)
     return ledger
 
 
@@ -1153,6 +1188,8 @@ def _reserve_validated(auth, env, provider, model, prompt, stage, now, *, offlin
         if not diagnostic:
             _deny('diagnostic-only authority cannot launch a formal stage')
     lane = auth['providers'][provider]
+    if auth.get('fresh_task') and not auth['started_epoch'] <= now < min(auth['expires_epoch'], auth['started_epoch'] + auth['max_wall_clock_seconds']):
+        _deny('fresh task expired before reservation')
     if not offline:
         _limits(auth, provider, model)  # Preserve existing price/route and token safety rules.
     if lane['model'] != model:
@@ -1191,6 +1228,11 @@ def _reserve_validated(auth, env, provider, model, prompt, stage, now, *, offlin
                 if (attempts.get(item, 0) >= 2 or attempts.get(item, 0) and
                         sum(max(0, count - 1) for count in attempts.values()) >= 2):
                     _deny('same-stage or provider total bounded retry limit reached')
+        fresh_slot = None
+        if auth.get('fresh_task'):
+            from .fresh_task import reserve_slot
+            context = _review_context.get()
+            fresh_slot = reserve_slot(auth, rows, provider, stage, prompt, context)
         if any(_unresolved(auth, r) for r in rows):
             _deny('new mission has an unreconciled or in-flight request')
         if (len(rows) >= auth['max_new_calls'] or len(prior) >= lane['max_new_calls']
@@ -1227,8 +1269,9 @@ def _reserve_validated(auth, env, provider, model, prompt, stage, now, *, offlin
                     request_high_water=len(rows), authorization_sha256=auth['_authorization_sha256'])
                 _write_child(path, ledger, key)
                 raise
-        request_id = uuid.uuid4().hex
-        row = {'number': len(rows) + 1, 'request_id': request_id, 'mission_id': NEW_MISSION,
+        request_id = (digest(canonical(dict(mission_id=auth['mission_id'], provider=provider, slot=fresh_slot)))
+                      if fresh_slot else uuid.uuid4().hex)
+        row = {'number': len(rows) + 1, 'request_id': request_id, 'mission_id': auth['mission_id'],
                'authorization_sha256': auth['_authorization_sha256'], 'provider': provider,
                'model': model, 'run_id': env['CMH_RESOURCE_RUN_ID'], 'stage': stage,
                'started_epoch': now, 'status': 'STARTED', 'formal_delivery_gate': True,
@@ -1238,6 +1281,9 @@ def _reserve_validated(auth, env, provider, model, prompt, stage, now, *, offlin
                'token_reservation': reservation, 'cost_unit': lane['cost_unit'],
                'cost_reservation_microunits': lane['cost_reservation_microunits'],
                'usage_accounting': 'FULL_RESERVATION_RETAINED'}
+        if fresh_slot:
+            row.update(request_slot=fresh_slot, execution_id=auth['execution_id'], transport_claimed=False,
+                       request_plan_sha256=digest(canonical(auth['fresh_task']['request_plan'])))
         if availability is not None:
             row.update(subscription_availability_epoch=availability['epoch'],
                        subscription_availability_sha256=ledger['openai_availability']['sha256'])
@@ -1309,10 +1355,14 @@ def _activate_validated(auth, env, *, offline=False):
             return
         if auth['_previous'] is not None:
             _deny('identity update cannot replace missing child history with an empty ledger')
-        ledger = {'version': LEDGER_VERSION, 'evidence_domain': 'FORMAL', 'mission_id': NEW_MISSION,
+        ledger = {'version': LEDGER_VERSION, 'evidence_domain': 'FORMAL', 'mission_id': auth['mission_id'],
                   'parent_ledger_sha256': auth['parent']['ledger_sha256'],
                   'authorization_sha256': auth['_authorization_sha256'], 'requests': []}
         ledger['evidence_domain'] = auth['evidence_domain']
+        if auth.get('fresh_task'):
+            ledger.update(execution_id=auth['execution_id'],
+                          fresh_history_sha256=auth['fresh_task']['history']['predecessor_ledger_sha256'],
+                          request_plan_sha256=digest(canonical(auth['fresh_task']['request_plan'])))
         _write_child(path, ledger, key)
 
 
