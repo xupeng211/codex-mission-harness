@@ -27,9 +27,13 @@ from direct_deepseek_fixture import envelope, USAGE
 
 
 class FreshTaskEndToEndTests(unittest.TestCase):
+    def prepare_fixture(self, fixture):
+        pass
+
     def test_20_21_22_complete_new_task_consumer_and_cross_identity_rejection(self):
         f = fixtures.FreshTaskTests(); f.setUp()
         self.addCleanup(f.doCleanups)
+        self.prepare_fixture(f)
         auth = f.load()
         root = Path('/home/xupeng/codex-mission-harness.pr2-final-candidate')
         runtime_root = Path(gate.__file__).resolve().parents[2]

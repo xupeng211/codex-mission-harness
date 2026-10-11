@@ -69,11 +69,13 @@ class FreshTaskTests(unittest.TestCase):
     def approve(self):
         self.write(self.account_path, sign_authorization(self.accounts, self.key.read_bytes()))
         self.payload['account_evidence_sha256'] = digest(self.account_path.read_bytes())
-        self.write(self.approval, dict(version=fresh.APPROVAL_VERSION, evidence_domain='OFFLINE_TEST',
+        successor = fresh.is_successor(self.payload)
+        self.write(self.approval, dict(version=fresh.SUCCESSOR_APPROVAL_VERSION if successor else fresh.APPROVAL_VERSION, evidence_domain='OFFLINE_TEST',
                   explicit_paid_execution_approval=True, payload=fresh.approval_payload(self.payload)))
         sha = digest(self.approval.read_bytes())
         self.payload.update(user_approval_path=str(self.approval), user_approval_sha256=sha,
-                            mission_id=fresh.PREFIX + sha, execution_id=digest(b'cmh-fresh-execution/v1/' + sha.encode()))
+                            mission_id=(fresh.SUCCESSOR_PREFIX if successor else fresh.PREFIX) + sha,
+                            execution_id=digest((b'cmh-successor-execution/v1/' if successor else b'cmh-fresh-execution/v1/') + sha.encode()))
         self.env['CMH_RESOURCE_MISSION_ID'] = self.payload['mission_id']
         self.write_auth()
 

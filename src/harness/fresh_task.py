@@ -1,12 +1,13 @@
-"""One explicit fresh PR2 task, using the existing delivery signature and ledger.
+"""Bounded PR2 tasks, using the existing delivery signature and ledger.
 
-No approvals are issued here. One immutable predecessor has one successor path;
+No approvals are issued here. Each of the two fixed edges has one successor path;
 changing an approval, mission, signature or working directory cannot fork it.
 """
 from __future__ import annotations
 
 import copy
 import json
+import os
 import re
 from pathlib import Path
 from .resource_gate import canonical, digest, ResourceGateDenied
@@ -14,6 +15,24 @@ from .resource_gate import canonical, digest, ResourceGateDenied
 VERSION = 'cmh-fresh-pr2-task/v1'
 APPROVAL_VERSION = 'cmh-fresh-pr2-user-approval/v1'
 PREFIX = 'HARNESS_PR2_FRESH_'
+SUCCESSOR_VERSION = 'cmh-fixed-failed-pr2-successor/v1'
+SUCCESSOR_APPROVAL_VERSION = 'cmh-fixed-failed-pr2-successor-approval/v1'
+SUCCESSOR_PREFIX = 'HARNESS_PR2_SUCCESSOR_'
+SUCCESSOR_RISKS = ['PARENT_UNKNOWN_RETAINED_NOT_SETTLED',
+                   'GPT_QUOTA_UNKNOWN_NO_ADDITIONAL_PURCHASE',
+                   'PROVIDER_PHYSICAL_COST_HARD_BOUND_UNPROVEN']
+FAILED_MISSION = PREFIX + 'feb176100bf42820f7fcf39705961ad1e80cd468082679e5c7927400b49724fb'
+FAILED_LEDGER_SHA = '304ac852dae5b71692c51f2b884f638a02ebfa2b81469441c3a275db7fa1807d'
+FAILED_CHECKPOINT_SHA = 'fa104d0ba8e5b11e4208dcdb503b26083fa81d031dfae4df38a677380d7dc819'
+FAILED_AUTH_SHA = '74c064dc9f70c92807110d36b71f8b1ebda3b524cb42117f9d06a7eb03a0cb77'
+FAILED_ROW_SHA = 'e10b1a373fa02d18d98cb6e921b98e567e9298ae3a06b28a35d71037f0f878aa'
+FAILED_EVIDENCE = {
+    'gpt-real-failure-diagnosis.json': 'f5c80f92a670b951c203a3bfd07dc903ac81f59adcb523de1c86e15e36abf096',
+    'gpt-original-transport/stdout.jsonl': '0ab9599d4c02b9aca723be96dbe59ff8a3b075c15e9f724b94040632f24d4b21',
+    'gpt-original-transport/stderr': 'b18c9ea979e17bae93c1c1db737db608dc3769b29708d2cf400881a004443178',
+    'gpt-original-transport/response.json': 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+    'gpt-original-transport/binding.json': 'dcaba68b09ec5ed009666220e60ad8d272987113784bdad5d78554f8d009a479',
+}
 TASK_ROOT = Path('/home/xupeng/codex-mission-harness-evidence/autonomous-premerge-20261002')
 HISTORY_LEDGER_SHA = '9bdc7e61d1cdba8a33a3a87c3f1304e1830c0a5f9d259d205266355871f6983f'
 HISTORY_CHECKPOINT_SHA = 'd1497e738fceb4e6abcd8e0d5340ee2252c761116a16913881b3b7fa2d49879d'
@@ -26,7 +45,12 @@ DERIVED_FIELDS = {'mission_id', 'execution_id', 'ledger_path', 'user_approval_pa
 
 
 def is_fresh_mission(mission):
-    return isinstance(mission, str) and re.fullmatch(PREFIX + '[0-9a-f]{64}', mission) is not None
+    return isinstance(mission, str) and re.fullmatch(
+        '(' + PREFIX + '|' + SUCCESSOR_PREFIX + ')[0-9a-f]{64}', mission) is not None
+
+
+def is_successor(auth):
+    return auth.get('fresh_task', {}).get('version') == SUCCESSOR_VERSION
 
 
 def approval_payload(auth):
@@ -39,6 +63,15 @@ def task_ledger_path(history):
     if not isinstance(sha, str) or not re.fullmatch('[0-9a-f]{64}', sha):
         raise ResourceGateDenied('fresh predecessor hash malformed')
     return TASK_ROOT / ('fresh-pr2-task-' + sha + '.json')
+
+
+def authorization_ledger_path(auth):
+    if is_successor(auth):
+        sha = auth['fresh_task']['successor']['ledger_sha256']
+        if not isinstance(sha, str) or not re.fullmatch('[0-9a-f]{64}', sha):
+            _deny('successor parent hash malformed')
+        return TASK_ROOT / ('successor-pr2-task-' + sha + '.json')
+    return task_ledger_path(auth['fresh_task']['history'])
 
 
 def build_scope(root, runtime, base=TARGET_BASE, head=TARGET_HEAD):
@@ -90,9 +123,11 @@ def validate(auth, env, key, runtime, now, *, offline=False):
     """Additional bounded semantics, before shared legacy/account checks."""
     from . import formal_delivery_gate as gate
     f = auth['fresh_task']
+    successor = is_successor(auth)
     if (set(f) != {'version', 'history_authorization_path', 'history', 'scope',
-                   'request_plan', 'overlapping_target_approved', 'budget_microcny'}
-            or f['version'] != VERSION or f['overlapping_target_approved'] is not True
+                   'request_plan', 'overlapping_target_approved', 'budget_microcny'} |
+                   ({'successor'} if successor else set())
+            or f['version'] not in {VERSION, SUCCESSOR_VERSION} or f['overlapping_target_approved'] is not True
             or any(k in auth for k in ('continuation', 'previous_authorization_path',
                 'previous_authorization_sha256', 'child_baseline_checkpoint_sha256', 'diagnostic_probe'))):
         _deny('fresh task cannot renew, migrate or diagnose an old task')
@@ -107,16 +142,18 @@ def validate(auth, env, key, runtime, now, *, offline=False):
         _deny('unknown fresh authorization field')
     approval = json.loads(gate._read(auth['user_approval_path']))
     if (set(approval) != {'version', 'evidence_domain', 'explicit_paid_execution_approval', 'payload'}
-            or approval['version'] != APPROVAL_VERSION
+            or approval['version'] != (SUCCESSOR_APPROVAL_VERSION if successor else APPROVAL_VERSION)
             or approval['evidence_domain'] != auth['evidence_domain']
             or approval['explicit_paid_execution_approval'] is not True
             or approval['payload'] != approval_payload(auth)):
         _deny('fresh task needs exact new explicit execution approval')
     approval_sha = digest(gate._read(auth['user_approval_path']))
+    prefix = SUCCESSOR_PREFIX if successor else PREFIX
+    execution_domain = b'cmh-successor-execution/v1/' if successor else b'cmh-fresh-execution/v1/'
     if (approval_sha != auth['user_approval_sha256']
-            or auth['mission_id'] != PREFIX + approval_sha
+            or auth['mission_id'] != prefix + approval_sha
             or env['CMH_RESOURCE_MISSION_ID'] != auth['mission_id']
-            or auth['execution_id'] != digest(b'cmh-fresh-execution/v1/' + approval_sha.encode())):
+            or auth['execution_id'] != digest(execution_domain + approval_sha.encode())):
         _deny('fresh task identity must derive from its exact new approval')
     c = f['history']
     if not offline and (c['predecessor_ledger_sha256'] != HISTORY_LEDGER_SHA or
@@ -137,10 +174,10 @@ def validate(auth, env, key, runtime, now, *, offline=False):
     history = gate._history_continuation_predecessor(reader, prior, key, offline=offline)
     if len(history['requests']) != 120 or len(c['historical_unknowns']) != 8:
         _deny('fresh transition must retain the complete 120-row/eight-UNKNOWN history')
-    if (auth['ledger_path'] != str(task_ledger_path(c)) or
+    if (auth['ledger_path'] != str(authorization_ledger_path(auth)) or
             env['CMH_RESOURCE_LEDGER'] != auth['ledger_path'] or
             Path(auth['ledger_path']) == Path(c['predecessor_ledger_path'])):
-        _deny('one frozen history has exactly one fresh successor namespace')
+        _deny('bounded task requires its unique immutable ledger namespace')
     root = Path(gate.__file__).resolve().parents[2]
     scope, manifest = build_scope(root, runtime)
     plan = build_request_plan(scope, manifest)
@@ -173,7 +210,108 @@ def validate(auth, env, key, runtime, now, *, offline=False):
         policy = auth['deepseek_funding_policy']
         if f['budget_microcny'] < 7 * gate._native_cny_bound(policy) + policy['safety_margin_microcny']:
             _deny('fresh native budget cannot cover its complete plan and margin')
+    if successor:
+        if not offline and (auth['deepseek_funding_policy'].get('no_overdraft_policy') != gate.OPERATIONAL_NO_OVERDRAFT
+                or auth['deepseek_funding_policy']['max_snapshot_age_seconds'] > 300
+                or auth['openai_availability_policy']['max_snapshot_age_seconds'] > 300):
+            _deny('successor retains operational financial safety and fresh 300-second snapshots')
+        failed = validate_failed_parent(auth, env, key, now, offline=offline)
+        # Accounting only: never import the failed row into the new request slots.
+        history = dict(history, requests=history['requests'] + failed['requests'])
     return history
+
+
+def validate_failed_parent(auth, env, key, now, *, offline=False):
+    """One pinned authentication failure, not a general UNKNOWN recovery API."""
+    from . import formal_delivery_gate as gate
+    s = auth['fresh_task']['successor']
+    if (set(s) != {'mission_id', 'authorization_path', 'authorization_sha256', 'ledger_path',
+                  'ledger_sha256', 'checkpoint_sha256', 'unknown_row_sha256', 'failure_evidence',
+                  'retain_unknown', 'refund', 'abandon_failed_execution_approved', 'accepted_risks',
+                  'read_only_get_limits'}
+            or s['retain_unknown'] is not True or s['refund'] != 0
+            or s['abandon_failed_execution_approved'] is not True
+            or s['accepted_risks'] != SUCCESSOR_RISKS):
+        _deny('successor requires exact nonrefundable failed-parent disposition')
+    gets = s['read_only_get_limits']
+    if (set(gets) != {'logical', 'physical', 'automatic_retries'}
+            or not gate._integer(gets['logical']) or not gate._integer(gets['physical'])
+            or not 0 <= gets['logical'] <= 9 or not gets['logical'] <= gets['physical'] <= min(10, gets['logical'] + 1)
+            or gets['automatic_retries'] != 0):
+        _deny('successor needs separately approved bounded read-only GET permission')
+    if not offline and (s['mission_id'] != FAILED_MISSION or s['ledger_sha256'] != FAILED_LEDGER_SHA
+            or s['checkpoint_sha256'] != FAILED_CHECKPOINT_SHA or s['authorization_sha256'] != FAILED_AUTH_SHA
+            or s['unknown_row_sha256'] != FAILED_ROW_SHA
+            or {n: v['sha256'] for n, v in s['failure_evidence'].items()} != FAILED_EVIDENCE):
+        _deny('successor is restricted to the fixed real GPT authentication failure')
+    parent = gate._signed(s['authorization_path'], s['authorization_sha256'], key)
+    if (parent.get('fresh_task', {}).get('version') != VERSION
+            or 'successor' in parent['fresh_task'] or parent['mission_id'] != s['mission_id']
+            or parent['parent'] != auth['parent'] or parent['evidence_domain'] != auth['evidence_domain']
+            or parent['fresh_task']['history'] != auth['fresh_task']['history']
+            or parent['ledger_path'] != s['ledger_path'] or parent['mission_id'] == auth['mission_id']
+            or parent['execution_id'] == auth['execution_id']):
+        _deny('successor parent cannot be substituted, nested or reused as execution identity')
+    parent_env = dict(env, CMH_RESOURCE_MISSION_ID=parent['mission_id'], CMH_RESOURCE_LEDGER=parent['ledger_path'])
+    validate(parent, parent_env, key, parent['runtime'], now, offline=offline)
+    path = Path(s['ledger_path'])
+    if (digest(gate._read(path)) != s['ledger_sha256'] or
+            digest(gate._read(gate._checkpoint_path(path))) != s['checkpoint_sha256']):
+        _deny('failed parent ledger/checkpoint changed')
+    failed = gate._verify_child(path, key, dict(parent,
+        _authorization_sha256=s['authorization_sha256'], _lineage_sha256=[s['authorization_sha256']]))
+    rows = failed['requests']
+    if (len(rows) != 1 or digest(canonical(rows[0])) != s['unknown_row_sha256']
+            or rows[0].get('provider') != 'openai' or rows[0].get('status') != 'FAILED'
+            or rows[0].get('reported_usage') != 'UNKNOWN'
+            or rows[0].get('usage_accounting') != 'USAGE_UNVERIFIED_BLOCK_FUTURE_CALLS'
+            or rows[0].get('request_slot') != 'qualification:clean'
+            or rows[0].get('transport_claimed') is not True
+            or auth['approved_at_epoch'] < rows[0]['finished_epoch']):
+        _deny('successor cannot erase, refund or generalize the pinned failed UNKNOWN')
+    if set(s['failure_evidence']) != set(FAILED_EVIDENCE):
+        _deny('successor requires the complete original authentication-failure evidence')
+    for ref in s['failure_evidence'].values():
+        if set(ref) != {'path', 'sha256'} or digest(gate._read(ref['path'])) != ref['sha256']:
+            _deny('original failed execution evidence changed')
+    return failed
+
+
+def activation_claim_path(auth):
+    return authorization_ledger_path(auth).with_suffix('.activation.json')
+
+
+def activation_identity(auth):
+    return dict(version=SUCCESSOR_VERSION, mission_id=auth['mission_id'], execution_id=auth['execution_id'],
+                authorization_sha256=auth['_authorization_sha256'], ledger_path=auth['ledger_path'],
+                failed_parent_ledger_sha256=auth['fresh_task']['successor']['ledger_sha256'])
+
+
+def claim_activation(auth, key):
+    """Called under the existing ledger lock; persisted before journal/ledger writes.
+
+    Partial creation remains a permanent fail-closed claim, never reinitializable.
+    """
+    path = activation_claim_path(auth)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        _deny('fixed failed parent already has its one successor activation claim')
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            from .resource_gate import sign_authorization
+            stream.write(canonical(sign_authorization(activation_identity(auth), key)) + b'\n')
+            stream.flush(); os.fsync(stream.fileno())
+    finally:
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try: os.fsync(directory)
+        finally: os.close(directory)
+
+
+def verify_activation(auth, key):
+    from . import formal_delivery_gate as gate
+    if gate._signed(activation_claim_path(auth), None, key) != activation_identity(auth):
+        _deny('successor lost its immutable exclusive activation claim')
 
 
 def reserve_slot(auth, rows, provider, stage, prompt, context):
@@ -252,6 +390,9 @@ def native_funding_check(auth, ledger, snapshot, upper, free):
     source = json.loads(gate._read(snapshot['settlement_source_path']))
     if source.get('fresh_history_sha256') != history_sha:
         _deny('fresh settlement evidence omits historical liabilities')
+    if is_successor(auth):
+        require_parent_capacity_binding(auth, snapshot)
+        require_parent_capacity_binding(auth, source)
     unknowns = [r for r in auth['_fresh_history']['requests'] if r['provider'] == 'deepseek'
                 and r.get('reported_usage') == 'UNKNOWN']
     if any(not gate._integer(r.get('wallet_exposure_microcny'), 1) for r in unknowns):
@@ -265,10 +406,16 @@ def native_funding_check(auth, ledger, snapshot, upper, free):
     return free - retained
 
 
+def require_parent_capacity_binding(auth, capacity):
+    if is_successor(auth) and capacity.get('successor_parent_ledger_sha256') != auth['fresh_task']['successor']['ledger_sha256']:
+        _deny('successor capacity must include the failed parent full UNKNOWN reservation')
+
+
 def review_evidence_path(auth, provider):
     if provider not in {'openai', 'deepseek'}:
         _deny('unknown fresh evidence provider')
-    return TASK_ROOT / ('fresh-pr2-evidence-' + auth['user_approval_sha256']) / provider
+    prefix = 'successor-pr2-evidence-' if is_successor(auth) else 'fresh-pr2-evidence-'
+    return TASK_ROOT / (prefix + auth['user_approval_sha256']) / provider
 
 
 def qualification_evidence_path(auth, provider):

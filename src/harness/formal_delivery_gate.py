@@ -229,8 +229,8 @@ def _load(env, anchor, runtime, now, *, offline=False):
             for item in targets.values():
                 git(root, 'merge-base', '--is-ancestor', item['base'], item['head'])
         ledger = Path(auth['ledger_path'])
-        from .fresh_task import task_ledger_path
-        expected_ledger = (task_ledger_path(auth['fresh_task']['history']) if fresh else continuation_ledger_path(auth['continuation'])
+        from .fresh_task import authorization_ledger_path
+        expected_ledger = (authorization_ledger_path(auth) if fresh else continuation_ledger_path(auth['continuation'])
                            if auth.get('continuation', {}).get('version') == HISTORY_CONTINUATION_VERSION
                            else CONTINUATION_LEDGER if auth.get('continuation') else DELIVERY_LEDGER)
         if (str(ledger) != env['CMH_RESOURCE_LEDGER'] or ledger.resolve() != ledger
@@ -260,6 +260,9 @@ def _load(env, anchor, runtime, now, *, offline=False):
             _deny('authoritative net shared capacity proof is missing or expired')
         if fresh and account.get('fresh_history_sha256') != auth['fresh_task']['history']['predecessor_ledger_sha256']:
             _deny('fresh shared capacity must explicitly include retained history')
+        if fresh:
+            from .fresh_task import require_parent_capacity_binding
+            require_parent_capacity_binding(auth, account)
         if digest(_read(account['official_source_path'])) != account['official_source_sha256']:
             _deny('official shared capacity evidence changed')
         for provider in ('deepseek', 'openai'):
@@ -1152,8 +1155,10 @@ def _verify_child(path, key, auth):
             len({r.get('request_id') for r in rows}) != len(rows)):
         _deny('delivery ledger continuity or identity invalid')
     if auth.get('fresh_task'):
-        from .fresh_task import verify_ledger
+        from .fresh_task import verify_ledger, is_successor, verify_activation
         verify_ledger(auth, ledger)
+        if is_successor(auth):
+            verify_activation(auth, key)
     return ledger
 
 
@@ -1355,6 +1360,9 @@ def _activate_validated(auth, env, *, offline=False):
             return
         if auth['_previous'] is not None:
             _deny('identity update cannot replace missing child history with an empty ledger')
+        from .fresh_task import is_successor, claim_activation
+        if is_successor(auth):
+            claim_activation(auth, key)
         ledger = {'version': LEDGER_VERSION, 'evidence_domain': 'FORMAL', 'mission_id': auth['mission_id'],
                   'parent_ledger_sha256': auth['parent']['ledger_sha256'],
                   'authorization_sha256': auth['_authorization_sha256'], 'requests': []}
