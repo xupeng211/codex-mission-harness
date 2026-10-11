@@ -45,10 +45,6 @@ class FootballPredictionAdapter:
         "schemas/agentic/codex_review_result.schema.json", "schemas/agentic/codex_review_receipt.schema.json",
         "schemas/agentic/independent_review_result.schema.json", "schemas/agentic/independent_review_receipt.schema.json",
     )
-    REVIEWER_PROVENANCE = {
-        "codex": ("gpt-5.6-sol", "high"),
-        "deepseek": ("deepseek-flash", None),
-    }
 
     @staticmethod
     def _safe_mission_id(mission_id: str) -> str:
@@ -733,7 +729,8 @@ class FootballPredictionAdapter:
         model = policy.get("model")
         reasoning = policy.get("reasoning_effort")
         if (not isinstance(codex_binary, str) or not Path(codex_binary).is_absolute()
-                or model != "gpt-5.6-sol" or reasoning != "high"):
+                or not isinstance(model, str) or re.fullmatch(r"[A-Za-z0-9_.:-]+", model) is None
+                or reasoning not in {"low", "medium", "high", "xhigh"}):
             raise RuntimeError("trusted Codex reviewer executable or model provenance is invalid")
         return {
             "codex_home": self._validate_canonical_codex_home(policy.get("codex_home"), worktree=worktree),
@@ -1155,11 +1152,12 @@ class FootballPredictionAdapter:
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
             pass
 
-        model, reasoning = self.REVIEWER_PROVENANCE.get(reviewer, ("unknown", None))
+        # A receiptless failure cannot establish an executed model. At most
+        # record a successfully resolved current policy; never revive old pins.
+        model, reasoning = "unknown", None
         codex_home: str | None = None
         codex_binary: str | None = None
         if reviewer == "codex":
-            model, reasoning = "gpt-5.6-sol", "high"
             if not contract_failure:
                 try:
                     policy = self._canonical_codex_reviewer_policy(worktree=worktree, base=base)
@@ -1400,6 +1398,10 @@ class FootballPredictionAdapter:
             )
         receipt = str(receipt_path)
         if reviewer == "codex":
+            receipt_snapshot = self._read_private_review_log(receipt_path)
+            if (receipt_snapshot is None
+                    or hashlib.sha256(receipt_snapshot[0]).hexdigest() != receipt_snapshot[1]):
+                return GateResult("BLOCKED_EXTERNAL", "canonical Codex receipt is unreadable or oversized", receipt)
             trusted = self._trusted_base_checkout(worktree, base)
             argv = [self._trusted_python_interpreter(), "-I", "-B", str(trusted / "scripts/devops/codex_independent_review.py"), "classify", "--repo-root", worktree,
                     "--receipt", receipt, "--current-head", head, "--base-sha", base, "--mission-id", mission_id,
@@ -1429,9 +1431,12 @@ class FootballPredictionAdapter:
             if evidence.get("receipt_version") == "independent-review-receipt/v1":
                 try:
                     relative_scope = Path(scope_file).resolve().relative_to(Path(worktree).resolve()).as_posix()
-                    scope_bytes = self._trusted_git_output(
-                        Path(worktree), "show", f"{head}:{relative_scope}"
-                    ).encode("utf-8")
+                    scope_bytes = subprocess.check_output(
+                        self._trusted_command_argv(["git", "--no-replace-objects", "-C", worktree,
+                                                    "show", f"{head}:{relative_scope}"]),
+                        cwd=worktree, env=self._trusted_git_environment(),
+                        stderr=subprocess.PIPE, timeout=60,
+                    )
                 except (OSError, ValueError, subprocess.SubprocessError) as exc:
                     return GateResult("BLOCKED_EXTERNAL", f"cannot bind reviewed mission scope: {exc}", receipt)
                 scope_hash = hashlib.sha256(scope_bytes).hexdigest()
@@ -1475,12 +1480,23 @@ class FootballPredictionAdapter:
         classification = self._json_last_text(result.stdout)
         if (not isinstance(classification, dict)
                 or not isinstance(classification.get("classification"), dict)
-                or classification["classification"].get("classification") != "VALID_CURRENT"):
+                or classification["classification"].get("classification") != "VALID_CURRENT"
+                or classification["classification"].get("current_approval_eligible") is not True
+                or classification.get("review_receipt") != receipt):
             return GateResult("BLOCKED_EXTERNAL", "canonical Codex receipt is not VALID_CURRENT", receipt, classification)
-        validated = classification.get("receipt")
+        # The current official CLI returns a classification and a receipt
+        # reference, not an embedded receipt. Consume only the original bytes
+        # that remained unchanged across the authoritative classification.
+        confirmed = self._read_private_review_log(receipt_path)
+        if confirmed != receipt_snapshot:
+            return GateResult("BLOCKED_EXTERNAL", "canonical Codex receipt changed during classification", receipt)
+        try:
+            validated = json.loads(confirmed[0])
+        except (ValueError, UnicodeError):
+            return GateResult("BLOCKED_EXTERNAL", "canonical Codex receipt is invalid JSON", receipt)
         verdict = validated.get("review_result") if isinstance(validated, dict) else None
         if verdict not in {"PASS", "FAIL"}:
-            return GateResult("BLOCKED_EXTERNAL", "canonical Codex classifier omitted a valid receipt verdict", receipt, classification)
+            return GateResult("BLOCKED_EXTERNAL", "canonical Codex receipt omitted a valid verdict", receipt, classification)
         if verdict == "FAIL":
             return GateResult("FAIL", "canonical receipt reports findings", receipt, validated)
         return GateResult("PASS", "canonical exact-head receipt validated", receipt, validated)
@@ -1641,7 +1657,7 @@ class FootballPredictionAdapter:
 
     def merge_ready(self, *, worktree: str, base: str, head: str, mission_id: str,
                     scope_file: str, pr_number: int, pr_repo: str, pr_base_sha: str,
-                    receipts: dict[str, str], ci_status: str) -> GateResult:
+                    receipts: dict[str, str], ci_status: str, use_project_policy: bool = False) -> GateResult:
         """Delegate the final merge-readiness decision to the target project."""
         codex_receipt = receipts.get("codex")
         deepseek_receipt = receipts.get("deepseek")
@@ -1727,8 +1743,9 @@ class FootballPredictionAdapter:
         protected_invariants = "PASS" if local_verdict == "PASS" else "UNKNOWN"
         forbidden_side_effects = "NO" if local_verdict == "PASS" else "UNKNOWN"
         required_pr_governance = "UNKNOWN"
-        argv += ["--selected-backend", "codex" if codex_receipt else "deepseek",
-                "--pr", str(pr_number), "--remote-ci-status", ci_status,
+        if not use_project_policy:
+            argv += ["--selected-backend", "codex" if codex_receipt else "deepseek"]
+        argv += ["--pr", str(pr_number), "--remote-ci-status", ci_status,
                 "--protected-invariants", protected_invariants,
                 "--forbidden-side-effects", forbidden_side_effects,
                 "--required-pr-governance", required_pr_governance, "--json"]

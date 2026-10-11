@@ -88,6 +88,7 @@ class HarnessTest(unittest.TestCase):
             directory.chmod(0o700)
         receipt = evidence / "receipt.json"
         receipt.write_text("{}")
+        receipt.chmod(0o600)
         stdout = Path(self.tmp.name) / "review.stdout"
         stdout.write_text(json.dumps({"review_receipt": str(receipt), "status": "PASS"}))
         return adapter, worktree, evidence, receipt, stdout
@@ -2508,7 +2509,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
             self.assertEqual(kwargs["worktree"], tree.path)
             raise RuntimeError("stop after constructor boundary assertion")
 
-        argv = ["harness", "--root", self.tmp.name, "run", str(mission)]
+        argv = ["harness", "--root", self.tmp.name, "run", str(mission), "--legacy"]
         with patch.object(sys, "argv", argv), \
                 patch("harness.cli.WorktreeManager.ensure", side_effect=ensure), \
                 patch("harness.cli.build", side_effect=stop_after_build), \
@@ -3662,9 +3663,10 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
     def test_codex_receipt_classifier_imports_policy_from_trusted_base(self):
         adapter, worktree, evidence_dir, receipt, stdout = self._review_fixture()
         trusted = Path(self.tmp.name) / "trusted-base"
+        receipt.write_text(json.dumps({"review_result": "PASS", "findings": []}))
         classified = subprocess.CompletedProcess(
-            [], 0, json.dumps({"classification": {"classification": "VALID_CURRENT"},
-                               "receipt": {"review_result": "PASS", "findings": []}}), "",
+            [], 0, json.dumps({"classification": {"classification": "VALID_CURRENT", "current_approval_eligible": True},
+                               "review_receipt": str(receipt)}), "",
         )
         with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
                 patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
@@ -3688,10 +3690,11 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         for payload_status, receipt_verdict, expected in cases:
             with self.subTest(payload_status=payload_status, receipt_verdict=receipt_verdict):
                 stdout.write_text(json.dumps({"review_receipt": str(receipt), "status": payload_status}))
+                receipt.write_text(json.dumps({"review_result": receipt_verdict, "findings": []}))
                 classified = subprocess.CompletedProcess(
                     [], 0, json.dumps({
-                        "classification": {"classification": "VALID_CURRENT"},
-                        "receipt": {"review_result": receipt_verdict, "findings": []},
+                        "classification": {"classification": "VALID_CURRENT", "current_approval_eligible": True},
+                        "review_receipt": str(receipt),
                     }), "",
                 )
                 with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
@@ -3722,6 +3725,47 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
                 stdout_path=str(stdout), evidence_dir=str(evidence_dir),
             )
         self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+
+    def test_codex_classifier_rejects_stale_or_wrong_receipt_reference(self):
+        adapter, worktree, evidence_dir, receipt, stdout = self._review_fixture()
+        receipt.write_text(json.dumps({"review_result": "PASS", "findings": []}))
+        cases = [("INVALID", True, str(receipt)), ("STALE_TOOLING", True, str(receipt)),
+                 ("VALID_CURRENT", False, str(receipt)), ("VALID_CURRENT", True, None),
+                 ("VALID_CURRENT", True, str(receipt.with_name("other.json")))]
+        for status, eligible, reference in cases:
+            classified = subprocess.CompletedProcess([], 0, json.dumps({
+                "classification": {"classification": status, "current_approval_eligible": eligible},
+                "review_receipt": reference,
+                "receipt": {"review_result": "PASS", "findings": []}}), "")
+            with self.subTest(status=status, reference=reference), \
+                    patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
+                    patch.object(adapter, "_trusted_base_checkout", return_value=Path(self.tmp.name)), \
+                    patch.object(adapter, "review_environment", return_value={"PATH": "/usr/bin"}), \
+                    patch.object(adapter, "_call", return_value=classified):
+                result = adapter.review_result(
+                    "codex", worktree=str(worktree), base="a" * 40, head="b" * 40,
+                    mission_id="mission", scope_file=str(worktree / "scope.json"),
+                    stdout_path=str(stdout), evidence_dir=str(evidence_dir))
+            self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+
+    def test_codex_receipt_change_during_classification_fails_closed(self):
+        adapter, worktree, evidence_dir, receipt, stdout = self._review_fixture()
+        receipt.write_text(json.dumps({"review_result": "FAIL", "findings": []}))
+        def classify(*args, **kwargs):
+            receipt.write_text(json.dumps({"review_result": "PASS", "findings": []}))
+            return subprocess.CompletedProcess([], 0, json.dumps({
+                "classification": {"classification": "VALID_CURRENT", "current_approval_eligible": True},
+                "review_receipt": str(receipt)}), "")
+        with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
+                patch.object(adapter, "_trusted_base_checkout", return_value=Path(self.tmp.name)), \
+                patch.object(adapter, "review_environment", return_value={"PATH": "/usr/bin"}), \
+                patch.object(adapter, "_call", side_effect=classify):
+            result = adapter.review_result(
+                "codex", worktree=str(worktree), base="a" * 40, head="b" * 40,
+                mission_id="mission", scope_file=str(worktree / "scope.json"),
+                stdout_path=str(stdout), evidence_dir=str(evidence_dir))
+        self.assertEqual(result.status, "BLOCKED_EXTERNAL")
+        self.assertIn("changed during classification", result.evidence)
 
     def test_receiptless_codex_failures_get_typed_classification_and_private_evidence(self):
         cases = (
@@ -4036,7 +4080,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         }
         with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
                 patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
-                patch.object(adapter, "_trusted_git_output", return_value="{}\n") as trusted_git, \
+                patch("harness.adapters.subprocess.check_output", return_value=b"{}\r\n") as trusted_git, \
                 patch.object(adapter, "_call", return_value=checked) as validator_call, \
                 patch.dict(os.environ, ambient_git):
             result = adapter.review_result(
@@ -4046,7 +4090,11 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
             )
         self.assertEqual(result.status, "PASS")
         trusted_git.assert_called_once()
-        self.assertEqual(trusted_git.call_args.args[1:], ("show", f"{'b' * 40}:scope.json"))
+        self.assertEqual(trusted_git.call_args.args[0][-2:], ["show", f"{'b' * 40}:scope.json"])
+        self.assertNotIn("text", trusted_git.call_args.kwargs)
+        self.assertEqual(validator_call.call_args.args[0][-1], hashlib.sha256(b"{}\r\n").hexdigest())
+        for name in ambient_git.keys() - {"GIT_CONFIG_COUNT"}:
+            self.assertNotIn(name, trusted_git.call_args.kwargs["env"])
         self.assertFalse(validator_call.call_args.kwargs["inherit_environment"])
         self.assertEqual(validator_call.call_args.kwargs["env"]["GIT_NO_REPLACE_OBJECTS"], "1")
         for name in ambient_git.keys() - {"GIT_CONFIG_COUNT"}:
@@ -4060,7 +4108,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         with patch.object(adapter, "review_preflight", return_value=GateResult("PASS")), \
                 patch.object(adapter, "_trusted_base_checkout", return_value=trusted), \
                 patch.object(adapter, "_call", return_value=checked), \
-                patch.object(adapter, "_trusted_git_output", return_value="{}\n"):
+                patch("harness.adapters.subprocess.check_output", return_value=b"{}\n"):
             result = adapter.review_result(
                 "deepseek", worktree=str(worktree), base="a" * 40, head="b" * 40,
                 mission_id="mission", scope_file=str(worktree / "scope.json"),

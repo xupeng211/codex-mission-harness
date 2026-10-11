@@ -5,3 +5,7 @@ data/*.sqlite-*
 data/logs/
 data/worktrees/
 .coverage
+build/
+dist/
+*.egg-info/
+.venv/

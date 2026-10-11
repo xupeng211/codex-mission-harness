@@ -5,9 +5,26 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.12', '3.13', '3.14']
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
-          python-version: '3.14'
+          python-version: ${{ matrix.python-version }}
+      - name: Install sandbox dependency
+        timeout-minutes: 5
+        run: |
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y bubblewrap
+      - run: python -m pip install --disable-pip-version-check -e .
       - run: make verify
+      - name: Build and verify installed wheel
+        run: |
+          python -m pip wheel . --wheel-dir "$RUNNER_TEMP/harness-wheels"
+          python -m venv "$RUNNER_TEMP/harness-wheel-venv"
+          "$RUNNER_TEMP/harness-wheel-venv/bin/pip" install --no-index --find-links "$RUNNER_TEMP/harness-wheels" "$RUNNER_TEMP"/harness-wheels/codex_mission_harness-*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/harness-wheel-venv/bin/python" -c 'from harness.factory_preflight import workflow_push; assert workflow_push("on: [pull_request]", "factory/test-")[0] == "HARD_BLOCKER"'
+          "$RUNNER_TEMP/harness-wheel-venv/bin/harness" factory-demo --output "$RUNNER_TEMP/harness-installed-demo"

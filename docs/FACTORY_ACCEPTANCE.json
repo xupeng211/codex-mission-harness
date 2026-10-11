@@ -1,0 +1,150 @@
+{
+  "MISSION": "average-feature",
+  "DELIVERY_STATUS": "READY_FOR_USER_ACCEPTANCE",
+  "IMPLEMENTED": "Added average(values), preserving add and empty/fractional behavior.",
+  "TEST_RESULT": "PASS",
+  "CI_RESULT": "PASS",
+  "REVIEW_RESULT": [
+    {
+      "evidence_key": "337517353b2f5670e2b02362d696ef19b4ccfe1c459ae020c37d1b21ccc22e20",
+      "findings": [],
+      "lane": "reviewer",
+      "output": {
+        "findings": [],
+        "overall_confidence_score": 1.0,
+        "overall_correctness": "patch is correct",
+        "overall_explanation": "Empty, integral and fractional behavior is implemented; add is preserved."
+      },
+      "profile": {
+        "model": "fixture-reviewer",
+        "provider": "openai"
+      },
+      "profile_identity": {
+        "configured": {
+          "model": "fixture-reviewer",
+          "provider": "openai"
+        },
+        "fixture": true
+      },
+      "provider": "openai",
+      "status": "PASS",
+      "target": {
+        "base": "1c075c350c1eca9726c5915d0df1eba26c8a72e8",
+        "commit": "86a8cfad956f7fae771b95f2c273173ec82de340",
+        "diff_sha256": "661ff03c665d30060c0fdcbeb8b1f597981885ebf0dee4bd2821cd089586136a",
+        "files": [
+          "score.py",
+          "tests/test_score.py"
+        ],
+        "head": "86a8cfad956f7fae771b95f2c273173ec82de340",
+        "repository": "/tmp/codex-factory-acceptance-final-20261007/source",
+        "scope": [
+          "**"
+        ],
+        "tree": "48e8f6dfef13c759e21a4a24f38e2bfc37a3ec39"
+      }
+    },
+    {
+      "evidence_key": "27f13bd0760352bbadd795476ad7c5aa1013e1d2504638466988f98cda33f844",
+      "findings": [],
+      "lane": "second_reviewer",
+      "output": {
+        "findings": [],
+        "overall_confidence_score": 1.0,
+        "overall_correctness": "patch is correct",
+        "overall_explanation": "Empty, integral and fractional behavior is implemented; add is preserved."
+      },
+      "profile": {
+        "model": "fixture-independent",
+        "provider": "deepseek",
+        "token_file": "/fixture/not-a-real-token"
+      },
+      "profile_identity": {
+        "configured": {
+          "model": "fixture-independent",
+          "provider": "deepseek",
+          "token_file": "/fixture/not-a-real-token"
+        },
+        "fixture": true
+      },
+      "provider": "deepseek",
+      "status": "PASS",
+      "target": {
+        "base": "1c075c350c1eca9726c5915d0df1eba26c8a72e8",
+        "commit": "86a8cfad956f7fae771b95f2c273173ec82de340",
+        "diff_sha256": "661ff03c665d30060c0fdcbeb8b1f597981885ebf0dee4bd2821cd089586136a",
+        "files": [
+          "score.py",
+          "tests/test_score.py"
+        ],
+        "head": "86a8cfad956f7fae771b95f2c273173ec82de340",
+        "repository": "/tmp/codex-factory-acceptance-final-20261007/source",
+        "scope": [
+          "**"
+        ],
+        "tree": "48e8f6dfef13c759e21a4a24f38e2bfc37a3ec39"
+      }
+    }
+  ],
+  "BLOCKERS_REMAINING": [],
+  "KNOWN_RISKS": [],
+  "BUDGET_USED": {
+    "agent_runs": 7,
+    "limit": 12,
+    "unknown_usage_runs": 0,
+    "money": "FIXTURE_NO_PROVIDER_COST"
+  },
+  "TARGET_HEAD": "86a8cfad956f7fae771b95f2c273173ec82de340",
+  "EXACT_TARGET": {
+    "base": "1c075c350c1eca9726c5915d0df1eba26c8a72e8",
+    "commit": "86a8cfad956f7fae771b95f2c273173ec82de340",
+    "diff_sha256": "661ff03c665d30060c0fdcbeb8b1f597981885ebf0dee4bd2821cd089586136a",
+    "files": [
+      "score.py",
+      "tests/test_score.py"
+    ],
+    "head": "86a8cfad956f7fae771b95f2c273173ec82de340",
+    "repository": "/tmp/codex-factory-acceptance-final-20261007/source",
+    "scope": [
+      "**"
+    ],
+    "tree": "48e8f6dfef13c759e21a4a24f38e2bfc37a3ec39"
+  },
+  "DELIVERY_EVIDENCE": [
+    "/tmp/codex-factory-acceptance-final-20261007/state/evidence/average-feature/b94220113c5b4be2af1e316e29bebfdb.json",
+    "/tmp/codex-factory-acceptance-final-20261007/state/evidence/average-feature/def562afc43a481f9ae25fccab432345.json",
+    "/tmp/codex-factory-acceptance-final-20261007/state/evidence/average-feature/5feb471a5fad4b47984ace3340adb2b1.json",
+    "/tmp/codex-factory-acceptance-final-20261007/state/evidence/average-feature/47dbdd2a0dbc4e43a4cc29b267d4a7ed.json",
+    "/tmp/codex-factory-acceptance-final-20261007/state/evidence/average-feature/7606fd77bd344b10b44db490be19e6dc.json",
+    "/tmp/codex-factory-acceptance-final-20261007/state/evidence/average-feature/b2285d7415fd4f29b3051fe3020c02ed.json",
+    "/tmp/codex-factory-acceptance-final-20261007/state/evidence/average-feature/f32472897c404bd3abe95fc5777f4410.json",
+    "/tmp/codex-factory-acceptance-final-20261007/state/evidence/average-feature/c4726d0e3f854b02b9b2dd5b57eb4d24.json",
+    "/tmp/codex-factory-acceptance-final-20261007/state/evidence/average-feature/788e1dd926d2464fa06f4b7ecaa88a0d.json",
+    "/tmp/codex-factory-acceptance-final-20261007/state/evidence/average-feature/754c3ff2b4694406b09181b1ce3d1764.json",
+    "/tmp/codex-factory-acceptance-final-20261007/state/evidence/average-feature/deb926d611c642a2bb117028451a3464.json"
+  ],
+  "CANDIDATE": "/tmp/codex-factory-acceptance-final-20261007/state/candidates/average-feature",
+  "SIMULATION": true,
+  "HUMAN_APPROVAL_REQUIRED": [
+    "merge",
+    "release"
+  ],
+  "MERGE_PERFORMED": false,
+  "E2E_STAGES": [
+    "plan",
+    "implement",
+    "checks",
+    "ci",
+    "review",
+    "review",
+    "rework",
+    "checks",
+    "ci",
+    "review",
+    "review"
+  ],
+  "SOURCE_UNCHANGED": true,
+  "ACCEPTANCE_REPORT": "/tmp/codex-factory-acceptance-final-20261007/acceptance-report.json",
+  "NON_CANONICAL": true,
+  "VALIDATION_KIND": "LOCAL_FIXTURE_ACCEPTANCE; NO_REAL_PROVIDER_INFERENCE"
+}
