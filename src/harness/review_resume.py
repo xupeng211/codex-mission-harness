@@ -163,6 +163,9 @@ class ReviewRun:
                       "diagnostic_artifacts": [],
                       "failure_count": 0, "last_failure": None,
                       "lease": {"pid": os.getpid(), "start_ticks": _start_ticks(), "run_id": run_id}}
+        if (self.identity.get('provider') == 'openai' and
+                os.environ.get('CMH_RESOURCE_MISSION_ID') == 'HARNESS_CURRENT_VERSION_DELIVERY'):
+            self.state['accepted_request_binding_version'] = 1
         _atomic_state(self.fd, self.state)
 
     @property
@@ -189,10 +192,17 @@ class ReviewRun:
             raw = self.storage.read_private_artifact(self.fd, record["artifact_path"])
             if sha256(raw) != record.get("artifact_sha256") or sha256(raw) != record["output_hash"]:
                 raise ValueError("committed review artifact changed")
+            if (self.state.get('accepted_request_binding_version') == 1 and
+                    not isinstance(record.get('accepted_request'), dict)):
+                raise ValueError('committed review request binding missing')
         for diagnostic in self.state.get("diagnostic_artifacts", []):
             raw = self.storage.read_private_artifact(self.fd, diagnostic["path"])
             if sha256(raw) != diagnostic["sha256"]:
                 raise ValueError("review diagnostic artifact changed")
+        if (completed and self.identity.get('provider') == 'openai' and
+                os.environ.get('CMH_RESOURCE_MISSION_ID') == 'HARNESS_CURRENT_VERSION_DELIVERY'):
+            from .artifact_lineage import review_history
+            review_history(self.state, lambda name: self.storage.read_private_artifact(self.fd, name))
 
     def stage(self, name: str, kind: str, input_bytes: bytes, execute: Callable[[], bytes],
               validate: Callable[[bytes], object]) -> tuple[bytes, object]:
@@ -232,11 +242,29 @@ class ReviewRun:
             if kind in {"chunk", "group", "cross-group"}:
                 self._failed_response(name, kind, input_bytes, raw, exc, diagnostic_start)
             raise
-        self.storage.write_private_artifact(self.fd, artifact, raw, uuid.uuid4().hex)
-        self.state["completed"][name] = {
+        record = {
             "artifact_path": artifact, "artifact_sha256": sha256(raw),
             "input_hash": input_hash, "output_hash": sha256(raw),
             "completed_at": int(time.time()), "validator_result": "PASS"}
+        if (self.identity.get('provider') == 'openai' and
+                os.environ.get('CMH_RESOURCE_MISSION_ID') == 'HARNESS_CURRENT_VERSION_DELIVERY'):
+            transports = [json.loads(self.storage.read_private_artifact(self.fd, d['path']))
+                          for d in self.state['diagnostic_artifacts'][diagnostic_start:]
+                          if d['path'].startswith(name + '-transport-')]
+            if len(transports) != 1 or not isinstance(transports[0].get('resource_request'), dict):
+                raise ValueError('accepted OpenAI invocation binding missing or ambiguous')
+            transport = transports[0]
+            request = transport['resource_request']
+            if (transport.get('stage') != name or transport.get('prompt_sha256') != input_hash
+                    or transport.get('resource_run_id') != self.state['review_run_id']):
+                raise ValueError('accepted OpenAI transport identity mismatch')
+            record['accepted_request'] = {key: request.get(key) for key in
+                ('request_id', 'authorization_sha256', 'provider', 'run_id', 'stage', 'prompt_sha256')}
+            record['accepted_request']['response_sha256'] = sha256(raw)
+            from .artifact_lineage import review_history
+            review_history(dict(self.state, completed={name: record}), lambda _: raw)
+        self.storage.write_private_artifact(self.fd, artifact, raw, uuid.uuid4().hex)
+        self.state["completed"][name] = record
         self.state["completed_order"].append(name)
         self.state["failure_count"] = 0
         self.state["last_failure"] = None
@@ -305,10 +333,18 @@ class ReviewRun:
                            if row.get("run_id") == self.state["review_run_id"]
                            and row.get("stage") in {name, name + ".json"}
                            and row.get("prompt_sha256") == sha256(prompt)]
+                # Capture the physical invocation while its reservation is active,
+                # including on retries. Never infer the accepted request by recency.
+                from .resource_gate import _active_reservation
+                active = _active_reservation.get()
+                if active is not None:
+                    matches = [row for row in matches if row.get('request_id') == active.request_id
+                               and row.get('authorization_sha256') == active.authorization_sha256]
                 if len(matches) == 1:
                     row = matches[0]
                     request = {key: row.get(key) for key in
-                               ("number", "request_id", "status", "reported_usage")}
+                               ("number", "request_id", "status", "reported_usage", "authorization_sha256",
+                                "provider", "run_id", "stage", "prompt_sha256")}
             except (OSError, ValueError, KeyError):
                 pass
         return request

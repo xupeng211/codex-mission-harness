@@ -153,12 +153,34 @@ def review_history(state, read_artifact):
         if digest(raw) != record['artifact_sha256'] or digest(raw) != record['output_hash']:
             raise ValueError('reused artifact hash changed')
         stage = name + '.json' if state['identity']['provider'] == 'deepseek' else name
-        rows = [r for r in ledger['requests'] if r.get('run_id') == state['review_run_id']
-                and r['stage'] == stage and r['status'] == 'RETURNED'
-                and r['prompt_sha256'] == record['input_hash']]
+        binding = record.get('accepted_request')
+        if binding is not None:
+            if (not isinstance(binding, dict) or any(
+                    not isinstance(binding.get(k), str) or not binding[k] for k in
+                    ('request_id', 'authorization_sha256', 'provider', 'run_id', 'stage',
+                     'prompt_sha256', 'response_sha256'))):
+                raise ValueError('accepted review request binding invalid')
+            rows = [r for r in ledger['requests'] if r.get('request_id') == binding.get('request_id')]
+        else:
+            if state.get('accepted_request_binding_version') == 1:
+                raise ValueError('accepted review request binding missing')
+            # Legacy single-call evidence remains eligible only when unambiguous.
+            rows = [r for r in ledger['requests'] if r.get('run_id') == state['review_run_id']
+                    and r['stage'] == stage and r['status'] == 'RETURNED'
+                    and r['provider'] == state['identity']['provider']
+                    and r['prompt_sha256'] == record['input_hash']]
         if len(rows) != 1 or not isinstance(rows[0].get('reported_usage'), dict):
             raise ValueError('reused artifact corresponding verified request missing or ambiguous')
         row = rows[0]
+        if (row.get('run_id') != state['review_run_id'] or row.get('stage') != stage
+                or row.get('provider') != state['identity']['provider']
+                or row.get('prompt_sha256') != record['input_hash'] or row.get('status') != 'RETURNED'):
+            raise ValueError('accepted review request identity mismatch')
+        if binding is not None and binding != dict(
+                request_id=row.get('request_id'), authorization_sha256=row.get('authorization_sha256'),
+                provider=row['provider'], run_id=state['review_run_id'], stage=stage,
+                prompt_sha256=record['input_hash'], response_sha256=digest(raw)):
+            raise ValueError('accepted review request/response binding mismatch')
         origin, _ = origin_authority(row['authorization_sha256'], auth)
         if row['usage_accounting'] != 'FULL_RESERVATION_RETAINED':
             raise ValueError('reused artifact accounting reduced')

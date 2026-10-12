@@ -224,7 +224,7 @@ def main() -> int:
             root=root, base=base, head=head, deepseek_receipt=receipts[0],
             openai_receipt=receipts[1], mission_id=args.mission_id, repository=repository,
             deepseek_validator=lambda value: deepseek.validate(
-                value, base, head, root, deepseek_path, args.mission_id, repository, deepseek_key,
+                value, base, head, root, deepseek_path, args.mission_id, repository, deepseek_auth_key,
                 registry_path=args.registry),
             openai_validator=lambda value: openai.validate(
                 value, root=root, base=base, head=head, spec=final,

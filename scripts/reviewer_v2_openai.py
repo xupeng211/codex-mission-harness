@@ -560,7 +560,9 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
         preflight(spec, probe=False, timeout=min(timeout, 120))
         prompt = 'Return JSON with an empty findings array. Use the exact chunk schema.'
         stage_run("structured-preflight", "preflight", prompt,
-                  lambda: invoke_codex(prompt, spec, stage="chunk", timeout=min(timeout, 120)),
+                  lambda: invoke_codex(prompt, spec, stage="chunk", timeout=min(timeout, 120),
+                      transport_sink=lambda p, out, err:
+                          run_state.capture_transport("structured-preflight", p, out, err)),
                   _result)
         receipt, _ = _assemble(diff, base, head, call, stage_run=stage_run, manifest=manifest)
         receipt.update({"model": spec.model, "reasoning_effort": spec.reasoning_effort,

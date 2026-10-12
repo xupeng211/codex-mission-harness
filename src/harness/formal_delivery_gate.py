@@ -804,7 +804,8 @@ def verified_failed_wallet_settlements(auth, rows):
     from .deepseek_direct import normalize_usage
     proofs = []
     for row in rows:
-        if row.get('status') != 'FAILED' or _retained_request5(auth, row):
+        if (row.get('status') != 'FAILED' or row.get('provider') != 'deepseek' or
+                _retained_request5(auth, row)):
             continue
         policy = auth.get('deepseek_funding_policy', {})
         usage = row.get('reported_usage')
@@ -850,7 +851,8 @@ def _current_funds(auth, ledger, key, now):
     if (entry['epoch'] != value['epoch'] or n > len(rows)
             or value['covered_prefix_sha256'] != digest(canonical(rows[:n]))):
         _deny('wallet settlement coverage differs from authenticated request prefix')
-    failed = [r for r in rows[:n] if r.get('status') == 'FAILED' and not _retained_request5(auth, r)]
+    failed = [r for r in rows[:n] if r.get('status') == 'FAILED' and r.get('provider') == 'deepseek'
+              and not _retained_request5(auth, r)]
     if failed:
         proofs = verified_failed_wallet_settlements(auth, rows[:n])
         try:
@@ -860,6 +862,33 @@ def _current_funds(auth, ledger, key, now):
         if evidence.get('verified_failed_wallet_settlements') != proofs:
             _deny('failed wallet usage, price or cost settlement proof differs')
     for row in rows[:n]:
+        if row.get('provider') not in auth['providers']:
+            _deny('wallet settlement prefix provider identity invalid')
+        if (row.get('provider') == 'openai' and row.get('status') == 'FAILED' and
+                not _retained_request5(auth, row)):
+            # OpenAI has no native CNY tariff, but its terminal signed usage and
+            # full internal debit remain mandatory for global prefix coverage.
+            from .openai_invocation import verify_openai_usage
+            from .resource_gate import _stage_reservation
+            origin = auth
+            if row.get('authorization_sha256') != auth['_authorization_sha256']:
+                from .artifact_lineage import origin_authority
+                origin, _ = origin_authority(row.get('authorization_sha256'), auth)
+            lane = origin['providers']['openai']
+            usage = row.get('reported_usage')
+            if (row.get('mission_id') != NEW_MISSION or row.get('model') != lane['model']
+                    or row.get('usage_accounting') != 'FULL_RESERVATION_RETAINED'
+                    or row.get('token_reservation') != _stage_reservation(lane, 'openai', row.get('stage', ''))
+                    or row.get('cost_reservation_microunits') != lane['cost_reservation_microunits']
+                    or row.get('cost_unit') != lane['cost_unit'] or not isinstance(usage, dict)
+                    or not isinstance(usage.get('tokens'), dict)
+                    or any(not _integer(usage['tokens'].get(k), 0) or
+                           usage['tokens'][k] > row['token_reservation'][k] for k in CATEGORIES)):
+                _deny('OpenAI failed wallet prefix requires verified usage and full reservation')
+            try:
+                verify_openai_usage(usage, row, origin, key)
+            except (OSError, ValueError, KeyError, TypeError):
+                _deny('OpenAI failed wallet prefix raw usage proof invalid')
         if (_retained_request5(auth, row) or
                 row.get('status') in {'RETURNED', 'FAILED'} and
                 row.get('usage_accounting') == 'FULL_RESERVATION_RETAINED'):
