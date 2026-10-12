@@ -298,6 +298,9 @@ class FootballPredictionAdapter:
                 or current.get("base_sha") != facts.get("base_sha")
                 or current.get("state") != "OPEN"):
             return GateResult("BLOCKED_EXTERNAL", "PR identity changed before preflight input preparation")
+        if (not isinstance(base, str) or re.fullmatch(r"[0-9a-fA-F]{40}", base) is None
+                or base.lower() != current.get("base_sha")):
+            return GateResult("BLOCKED_EXTERNAL", "preflight base does not match the PR base SHA")
         body = (detail.data or {}).get("body") if isinstance(detail.data, dict) else None
         if not isinstance(body, str):
             return GateResult("BLOCKED_EXTERNAL", "PR discovery omitted a usable PR body")
@@ -609,6 +612,11 @@ class FootballPredictionAdapter:
             ["git", "-C", worktree, "config", "--local", "--name-only", "--list"],
             cwd=worktree, env=env, text=True, stderr=subprocess.PIPE, timeout=30,
         ).splitlines()
+        if "extensions.worktreeconfig" in (name.lower() for name in configured):
+            configured.extend(subprocess.check_output(
+                ["git", "-C", worktree, "config", "--worktree", "--name-only", "--list"],
+                cwd=worktree, env=env, text=True, stderr=subprocess.PIPE, timeout=30,
+            ).splitlines())
         for raw in configured:
             key = raw.lower()
             suffix = key.rsplit(".", 1)[-1]
@@ -621,8 +629,8 @@ class FootballPredictionAdapter:
                     or key.startswith("submodule.") and suffix == "update"):
                 raise RuntimeError("repository has executable local Git configuration")
 
-    @staticmethod
-    def _trusted_review_path(worktree: str) -> str:
+    @classmethod
+    def _trusted_review_path(cls, worktree: str) -> str:
         """Keep only absolute, owner-controlled PATH directories outside the reviewed tree."""
         repository = Path(worktree).resolve(strict=True)
         owners = {0, os.getuid()} if hasattr(os, "getuid") else {0}
@@ -652,8 +660,10 @@ class FootballPredictionAdapter:
             if trusted and rendered not in safe:
                 safe.append(rendered)
         path = os.pathsep.join(safe)
-        if not path or not shutil.which("git", path=path):
+        git_binary = shutil.which("git", path=path) if path else None
+        if not git_binary:
             raise RuntimeError("trusted reviewer PATH is unavailable")
+        cls._validate_executable(git_binary, owners=owners)
         return path
 
     @staticmethod
@@ -1404,7 +1414,7 @@ class FootballPredictionAdapter:
             # inventing a competing review protocol.
             try:
                 evidence = json.loads(Path(receipt).read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            except (OSError, UnicodeError, json.JSONDecodeError):
                 return GateResult("BLOCKED_EXTERNAL", "DeepSeek receipt is unreadable", receipt)
             if not isinstance(evidence, dict):
                 return GateResult("BLOCKED_EXTERNAL", "DeepSeek receipt is not a JSON object", receipt)
