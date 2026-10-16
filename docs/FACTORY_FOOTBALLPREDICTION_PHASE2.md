@@ -30,6 +30,10 @@ ESLint/c8/nyc 配置均被拒绝。文件哈希、HEAD/tree 和镜像绑定保�
 `.git/cmh-qa/binding.json`，验证结果必须携带对应绑定；旧结果缺少绑定时不能放行。
 `package.json`、`package-lock.json` 和 ESLint 配置在验证工作目录中只读挂载，dispatcher 使用
 固定解释器以隔离模式运行；原有完整日志、资源检查及源码变更拒绝继续有效。
+预检和执行共同使用 `/usr/local/bin/python3 -I`；镜像必须提供该准确路径及其所需
+QA 模块，不能以 PATH 中另一个 `python3` 代替。两种布局均将 `node_modules` 文件
+链接到只读可信镜像的 `/opt/cmh/node_modules`，使 ESLint/c8 从镜像执行，同时保留
+`/app` 的 `noexec`；不复制工具到候选的不可执行文件系统，也不放开源码执行权限。
 
 只有 dispatcher 字节 SHA-256 精确等于
 `8cadabeaa949eed535943be39d18f69df0a2624095c7d50f53d4704a67478a85`

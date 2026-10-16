@@ -16,7 +16,7 @@ from unittest.mock import patch
 from harness.factory import Factory, FactoryBlocked, git, validate_config
 from harness.factory_project import OFFLINE_PASS
 from harness.factory_runtime import LocalRuntime
-from harness.factory_validation import digest as validation_digest, preflight, RESOURCE_CAPABILITIES, bind_trusted_qa, workspace_layout, QA_ANCHORS, TRUSTED_QA_FILES
+from harness.factory_validation import digest as validation_digest, preflight, RESOURCE_CAPABILITIES, bind_trusted_qa, workspace_layout, QA_ANCHORS, TRUSTED_QA_FILES, QA_PYTHON
 from harness.factory_pr_ci import branch_for, expected_jobs
 import test_factory_project as stage1
 
@@ -94,6 +94,10 @@ class FakeDocker:
         if args[0] == "create":
             name = args[args.index("--name") + 1]
             self.containers[name] = args
+            if name.startswith("cmh-preflight-"):
+                assert "test -x " + QA_PYTHON + ";" in args[-1]
+                assert QA_PYTHON + " -I -c 'import pytest,pytest_cov,ruff,mypy'" in args[-1]
+                assert "command -v python3" not in args[-1]
             if name.endswith("-db"):
                 assert "POSTGRES_DB=football_db" in args
                 assert "POSTGRES_USER=validation" in args
@@ -121,7 +125,8 @@ class FakeDocker:
                 root = "/app" if legacy else "/snapshot"
                 assert "/usr/local/bin/python3 -I " + root + "/scripts/devops/validation_profiles.py" in args[-1]
                 assert "python3 scripts/devops/validation_profiles.py" not in args[-1]
-                assert ("cp -as" if legacy else "cp -R") + " /opt/cmh/node_modules/. /app/node_modules/" in args[-1]
+                assert "cp -as /opt/cmh/node_modules/. /app/node_modules/" in args[-1]
+                assert "cp -R /opt/cmh/node_modules/. /app/node_modules/" not in args[-1]
                 assert "node_modules/.package-lock.sha256" in args[-1]
                 assert "container:" in args[args.index("--network") + 1]
                 assert not any("docker.sock" in a or "host-gateway" in a for a in args)
@@ -140,6 +145,8 @@ class FakeDocker:
             self.mutate(value)
             return json.dumps([value]).encode()
         if args[0] == "start" and "--attach" in args:
+            if self.failure in {"python_missing", "python_import"}:
+                raise subprocess.CalledProcessError(1, "fixture fixed interpreter readiness probe")
             return "".join(hashlib.sha256(value.encode()).hexdigest()+"  /opt/cmh/"+name+"\n" for name,value in LOCKS.items()).encode()
         if args[0] == "start" and args[-1].endswith("-db") and self.failure == "db_startup":
             raise RuntimeError("fixture temporary database failed to initialize")
@@ -384,6 +391,38 @@ class Phase2Tests(unittest.TestCase):
                                  (True, (*QA_ANCHORS, "requirements.txt", "scripts"), "/app"))
                 path.write_bytes(path.read_bytes() + b"changed")
                 self.assertEqual(workspace_layout(root), (False, QA_ANCHORS, "/snapshot"))
+
+    def test_both_layouts_keep_noexec_source_and_link_image_tools(self):
+        spec, cwd, target = self.candidate()
+        for round_, legacy in enumerate((False, True)):
+            with self.subTest(legacy=legacy):
+                anchors = (*QA_ANCHORS, "requirements.txt", "scripts") if legacy else QA_ANCHORS
+                with patch("harness.factory_validation.workspace_layout",
+                           return_value=(legacy, anchors, "/app" if legacy else "/snapshot")):
+                    result = self.f.gates(spec, cwd, target, "checks", round_)[0]
+                self.assertEqual(result["status"], "PASS")
+                profile = next(c for c in reversed(self.runtime.docker.calls)
+                               if c[0] == "create" and c[c.index("--name") + 1].endswith("-profile"))
+                self.assertIn("/app:rw,noexec,nosuid,size=128m,uid=65534,gid=65534", profile)
+                self.assertIn("cp -as /opt/cmh/node_modules/. /app/node_modules/;", profile[-1])
+                self.assertNotIn("cp -R /opt/cmh/node_modules/", profile[-1])
+                self.assertFalse(self.runtime.docker.containers)
+
+    def test_preflight_requires_exact_isolated_python_and_rejects_failure(self):
+        docker = FakeDocker()
+        self.assertEqual(preflight(VALIDATION, docker)["status"], "FIXTURE_VERIFIED")
+        probe = next(c for c in docker.calls if c[0] == "create")[-1]
+        self.assertIn("test -x " + QA_PYTHON + ";", probe)
+        self.assertIn(QA_PYTHON + " -I -c 'import pytest,pytest_cov,ruff,mypy'", probe)
+        self.assertNotIn("command -v python3", probe)
+        for fault in ("python_missing", "python_import"):
+            with self.subTest(fault=fault):
+                docker = FakeDocker()
+                docker.failure = fault
+                with self.assertRaises(subprocess.CalledProcessError):
+                    preflight(VALIDATION, docker)
+                self.assertFalse(docker.containers)
+                self.assertTrue(any(c[0] == "rm" for c in docker.calls))
 
     def test_legacy_mapping_freezes_scripts_and_preserves_failure_exit(self):
         for code in (0, 7):

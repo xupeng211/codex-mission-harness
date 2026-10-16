@@ -19,6 +19,7 @@ RESOURCE_CAPABILITIES = ("CpuCfsPeriod", "CpuCfsQuota", "MemoryLimit", "SwapLimi
 # 原项目蓝图 SQL 的 GRANT DATABASE 合同；仅用于一次性隔离实例。
 DATABASE_NAME = "football_db"
 DATABASE_IDENTITY = "football_db|validation|t|t|t"
+QA_PYTHON = "/usr/local/bin/python3"
 
 
 class ValidationCleanupError(RuntimeError):
@@ -151,8 +152,8 @@ def preflight(policy, executor=None, expected_locks=None, timeout=90):
         call("create", "--pull=never", "--name", name, "--network=none", "--user=65534:65534",
                       *limits(policy), "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m,mode=1777",
                       "--entrypoint=/bin/sh", policy["image"], "-ec",
-                      "test ! -S /var/run/docker.sock; command -v python3; command -v node; command -v git; "
-                      "command -v npm; command -v python; python3 -c 'import pytest,pytest_cov,ruff,mypy'; "
+                      "test ! -S /var/run/docker.sock; test -x " + QA_PYTHON + "; command -v node; command -v git; "
+                      "command -v npm; command -v python; " + QA_PYTHON + " -I -c 'import pytest,pytest_cov,ruff,mypy'; "
                       "test -r /opt/cmh/package-lock.json; test -r /opt/cmh/requirements.txt; "
                       "test -d /opt/cmh/node_modules; NODE_PATH=/opt/cmh/node_modules "
                       "node -e 'require(\"playwright\");require(\"pg\");require(\"nock\");"
@@ -401,11 +402,10 @@ def run(policy, spec, cwd, target, command, transcript, timeout, executor=None, 
              ("cp -R /snapshot/scripts/ops/. /app/scripts/ops/; " if legacy else "") +
              "cmp package-lock.json /opt/cmh/package-lock.json; cmp requirements.txt /opt/cmh/requirements.txt; " +
              "mkdir -p node_modules; " +
-             ("cp -as /opt/cmh/node_modules/. /app/node_modules/; " if legacy else
-              "cp -R /opt/cmh/node_modules/. /app/node_modules/; ") +
+             "cp -as /opt/cmh/node_modules/. /app/node_modules/; " +
              "sha256sum package-lock.json | cut -d ' ' -f1 > node_modules/.package-lock.sha256; "
              "before=$(git status --porcelain=v1 -uall); test -z \"$before\"; "
-             "printf '%s\\n' " + marker + "; status=0; /usr/local/bin/python3 -I " + qa_root + "/scripts/devops/validation_profiles.py " + profile + " || status=$?; "
+             "printf '%s\\n' " + marker + "; status=0; " + QA_PYTHON + " -I " + qa_root + "/scripts/devops/validation_profiles.py " + profile + " || status=$?; "
              "after=$(git status --porcelain=v1 -uall); "
              "if test \"$before\" != \"$after\"; then echo CMH_SOURCE_INTEGRITY_FAILURE; exit 125; fi; exit \"$status\"")
         profile_info = json.loads(call("inspect", container))[0]
