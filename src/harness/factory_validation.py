@@ -16,6 +16,9 @@ from .sandbox import SAFE_PATH
 
 
 RESOURCE_CAPABILITIES = ("CpuCfsPeriod", "CpuCfsQuota", "MemoryLimit", "SwapLimit", "PidsLimit")
+# 原项目蓝图 SQL 的 GRANT DATABASE 合同；仅用于一次性隔离实例。
+DATABASE_NAME = "football_db"
+DATABASE_IDENTITY = "football_db|validation|t|t|t"
 
 
 class ValidationCleanupError(RuntimeError):
@@ -183,11 +186,75 @@ def dependency_locks(cwd, revision):
             for name in ("package-lock.json", "requirements.txt")}
 
 
+
+TRUSTED_QA_FILES = (
+    "scripts/devops/validation_profiles.py", "scripts/devops/gatekeeper.sh",
+    ".eslintrc.json", "package.json", "package-lock.json", "requirements.txt",
+)
+QA_ANCHORS = ("package.json", "package-lock.json", ".eslintrc.json")
+# Approved main 14633c3: this dispatcher derives cwd from its physical file.
+# Unknown/new dispatchers retain the original /snapshot trusted-mode route.
+LEGACY_DISPATCHER_SHA256 = "8cadabeaa949eed535943be39d18f69df0a2624095c7d50f53d4704a67478a85"
+
+
+def workspace_layout(snapshot):
+    legacy = hashlib.sha256((snapshot / TRUSTED_QA_FILES[0]).read_bytes()).hexdigest() == LEGACY_DISPATCHER_SHA256
+    anchors = (*QA_ANCHORS, "requirements.txt", "scripts") if legacy else QA_ANCHORS
+    return legacy, anchors, "/app" if legacy else "/snapshot"
+
+
+
+def bind_trusted_qa(snapshot, target, image):
+    """Controller 生成的绑定只进入只读快照；候选工作区不能更新它。"""
+    if (_read_git(snapshot, "rev-parse", "HEAD").strip() != target["head"]
+            or _read_git(snapshot, "rev-parse", "HEAD^{tree}").strip() != target["tree"]):
+        raise ValueError("trusted QA snapshot HEAD/tree mismatch")
+    files = {}
+    for name in TRUSTED_QA_FILES:
+        path = snapshot / name
+        entry = _read_git(snapshot, "ls-files", "--stage", "--", name).split()
+        if (not entry or entry[0] not in {"100644", "100755"}
+                or path.is_symlink() or path.resolve() != snapshot / name):
+            raise ValueError("trusted QA source is not a regular frozen file: " + name)
+        frozen = subprocess.run(["git", "--no-replace-objects", "-C", str(snapshot),
+                                 "show", target["head"] + ":" + name],
+                                env=_git_environment(), capture_output=True, check=True).stdout
+        if path.read_bytes() != frozen:
+            raise ValueError("trusted QA source differs from frozen HEAD: " + name)
+        files[name] = hashlib.sha256(frozen).hexdigest()
+    # 当前合同没有隐式配置；不把未来配置静默替换为空配置。
+    package = json.loads((snapshot / "package.json").read_text())
+    if any(key in package for key in ("c8", "nyc", "eslintConfig", "eslintIgnore")):
+        raise ValueError("unsupported implicit QA package configuration")
+    for path in snapshot.rglob("*"):
+        if ".git" in path.relative_to(snapshot).parts:
+            continue
+        if (path.name in {".eslintignore", ".c8rc", ".c8rc.json", ".nycrc", ".nycrc.json"}
+                or (path.name.startswith(".eslintrc") and path != snapshot / ".eslintrc.json")):
+            raise ValueError("unsupported implicit QA configuration: " + str(path))
+    binding = snapshot / ".git/cmh-qa"
+    binding.mkdir()
+    (binding / "eslint-ignore").write_text("")
+    (binding / "c8.json").write_text("{}\n")
+    files[".git/cmh-qa/eslint-ignore"] = hashlib.sha256(b"").hexdigest()
+    files[".git/cmh-qa/c8.json"] = hashlib.sha256(b"{}\n").hexdigest()
+    manifest = {"head": target["head"], "tree": target["tree"], "image": image, "files": files}
+    (binding / "binding.json").write_text(json.dumps(manifest, sort_keys=True))
+    return manifest
+
 def validate_result(result, policy, spec, target, profile, simulation):
     expected = {"mission_id": spec["mission_id"], "head": target["head"], "tree": target["tree"],
                 "profile": profile, "config_sha256": digest(policy), "image_digest": policy["image"]}
     if result.get("identity") != expected or result.get("fixture") is not simulation:
         raise ValueError("validation identity or fixture provenance mismatch")
+    binding = result.get("trusted_qa_binding", {})
+    if (binding.get("head") != target["head"] or binding.get("tree") != target["tree"]
+            or binding.get("image") != policy["image"]
+            or set(binding.get("files", {})) != set(TRUSTED_QA_FILES) | {".git/cmh-qa/eslint-ignore", ".git/cmh-qa/c8.json"}
+            or any(not re.fullmatch(r"[0-9a-f]{64}", value) for value in binding["files"].values())):
+        raise ValueError("trusted QA snapshot binding is missing or inconsistent")
+    if result.get("database_identity") != DATABASE_IDENTITY:
+        raise ValueError("temporary database identity/initialization privileges are unverified")
     readiness = result.get("readiness", {})
     environment = check_resource_environment(readiness.get("resource_environment"))
     if (result.get("resource_environment_after") != environment
@@ -265,6 +332,8 @@ def run(policy, spec, cwd, target, command, transcript, timeout, executor=None, 
         (snapshot / ".git/config").write_text("[core]\n repositoryformatversion=0\n bare=false\n hooksPath=/dev/null\n")
         if _read_git(snapshot, "rev-parse", "HEAD").strip() != target["head"] or _read_git(snapshot, "rev-parse", "HEAD^{tree}").strip() != target["tree"]:
             raise ValueError("snapshot HEAD/tree differs from frozen candidate")
+        result["trusted_qa_binding"] = bind_trusted_qa(snapshot, target, policy["image"])
+        legacy, anchors, qa_root = workspace_layout(snapshot)
         # Docker uses uid 65534, which can read only this disposable snapshot.
         Path(temporary.name).chmod(0o755)
         for directory, _, files in os.walk(snapshot):
@@ -279,7 +348,7 @@ def run(policy, spec, cwd, target, command, transcript, timeout, executor=None, 
         call("create", "--pull=never", "--name", db, "--network=none",
              "--user=999:999", *limits(policy), "--tmpfs", "/var/lib/postgresql/data:rw,nosuid,size=512m,uid=999,gid=999",
              "--tmpfs", "/var/run/postgresql:rw,nosuid,size=16m,uid=999,gid=999", "--tmpfs", "/tmp:rw,nosuid,size=64m",
-             "-e", "PGDATA=/var/lib/postgresql/data", "-e", "POSTGRES_DB=football_validation",
+             "-e", "PGDATA=/var/lib/postgresql/data", "-e", "POSTGRES_DB=" + DATABASE_NAME,
              "-e", "POSTGRES_USER=validation", "-e", "POSTGRES_PASSWORD=" + password, policy["postgres_image"])
         db_info = json.loads(call("inspect", db))[0]
         result["container_resources"] = {"database": check_container_resources(db_info, policy)}
@@ -289,35 +358,54 @@ def run(policy, spec, cwd, target, command, transcript, timeout, executor=None, 
         call("start", db)
         while True:
             try:
-                call("exec", db, "pg_isready", "-U", "validation", "-d", "football_validation")
+                call("exec", db, "pg_isready", "-h", "127.0.0.1", "-p", "5432",
+                     "-U", "validation", "-d", DATABASE_NAME)
                 break
             except subprocess.CalledProcessError:
                 if time.monotonic() >= deadline or cancelled():
                     raise TimeoutError("temporary database did not become ready")
                 time.sleep(0.2)
+        # pg_isready 不验证库名、认证或权限。用与 profile 相同的 TCP 参数
+        # 实际连接；不执行候选 SQL，不提升现有 POSTGRES_USER 初始化权限。
+        identity = call("exec", "-e", "PGPASSWORD=" + password, "-e", "PGCONNECT_TIMEOUT=5",
+                        "-e", "PGOPTIONS=-c statement_timeout=5000", db,
+                        "psql", "-X", "-w", "-h", "127.0.0.1", "-p", "5432",
+                        "-U", "validation", "-d", DATABASE_NAME, "-v", "ON_ERROR_STOP=1", "-A", "-t", "-c",
+                        "SELECT current_database(), current_user, rolsuper, rolcreatedb, rolcreaterole "
+                        "FROM pg_roles WHERE rolname = current_user").decode().strip()
+        if identity != DATABASE_IDENTITY:
+            raise ValueError("temporary database identity or initialization privileges mismatch")
+        result["database_identity"] = identity
         resources.append(("container", container))
         # Share only the temporary DB's network=none namespace. Source is copied
         # into bounded tmpfs so normal coverage/temp artifacts work. Its Git
         # objects remain a separate read-only mount, and tracked edits fail closed.
         call("create", "--pull=never", "--name", container, "--network", "container:" + db, "--user=65534:65534",
              *limits(policy), "--mount", f"type=bind,src={snapshot},dst=/snapshot,readonly",
-             "--tmpfs", f"/app:rw,nosuid,size={policy['tmpfs_mb']}m,uid=65534,gid=65534",
+             "--tmpfs", f"/app:rw,noexec,nosuid,size={policy['tmpfs_mb']}m,uid=65534,gid=65534",
              "--mount", f"type=bind,src={snapshot / '.git'},dst=/app/.git,readonly",
+             *[value for name in anchors for value in
+               ("--mount", f"type=bind,src={snapshot / name},dst=/app/{name},readonly")],
+             *(["--tmpfs", "/app/scripts/ops:rw,noexec,nosuid,size=64m,uid=65534,gid=65534"] if legacy else []),
              "--tmpfs", "/tmp:rw,nosuid,size=256m,mode=1777", "--workdir=/app", "--entrypoint=/usr/bin/env",
              policy["image"], "-i", "PATH=" + SAFE_PATH, "HOME=/tmp", "LANG=C.UTF-8",
              "PYTHONDONTWRITEBYTECODE=1", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
              "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=safe.directory", "GIT_CONFIG_VALUE_0=/app", "GITHUB_BASE_REF=main",
              "GIT_NO_REPLACE_OBJECTS=1", "GIT_OPTIONAL_LOCKS=0", "GATEKEEPER_IN_CONTAINER=1",
-             "GATEKEEPER_WORKSPACE_ROOT=/app", "DB_HOST=127.0.0.1", "DB_PORT=5432", "DB_NAME=football_validation",
+             "GATEKEEPER_WORKSPACE_ROOT=/app", "DB_HOST=127.0.0.1", "DB_PORT=5432", "DB_NAME=" + DATABASE_NAME,
              "DB_USER=validation", "DB_PASSWORD=" + password, "REDIS_HOST=127.0.0.1", "REDIS_PORT=6379",
              "BASE_REF=" + target["base"], "HEAD_REF=" + target["head"], "GATEKEEPER_BUILD=0",
              "/bin/sh", "-ec", "git -c safe.directory=/snapshot -C /snapshot archive HEAD > /tmp/source.tar; "
-             "tar -xf /tmp/source.tar -C /app; rm /tmp/source.tar; "
-             "cmp package-lock.json /opt/cmh/package-lock.json; mkdir -p node_modules; "
-             "cmp requirements.txt /opt/cmh/requirements.txt; cp -R /opt/cmh/node_modules/. /app/node_modules/; "
+             "tar --anchored " + " ".join("--exclude=" + name for name in anchors) + " "
+             "-xf /tmp/source.tar -C /app; rm /tmp/source.tar; " +
+             ("cp -R /snapshot/scripts/ops/. /app/scripts/ops/; " if legacy else "") +
+             "cmp package-lock.json /opt/cmh/package-lock.json; cmp requirements.txt /opt/cmh/requirements.txt; " +
+             "mkdir -p node_modules; " +
+             ("cp -as /opt/cmh/node_modules/. /app/node_modules/; " if legacy else
+              "cp -R /opt/cmh/node_modules/. /app/node_modules/; ") +
              "sha256sum package-lock.json | cut -d ' ' -f1 > node_modules/.package-lock.sha256; "
              "before=$(git status --porcelain=v1 -uall); test -z \"$before\"; "
-             "printf '%s\\n' " + marker + "; status=0; python3 scripts/devops/validation_profiles.py " + profile + " || status=$?; "
+             "printf '%s\\n' " + marker + "; status=0; /usr/local/bin/python3 -I " + qa_root + "/scripts/devops/validation_profiles.py " + profile + " || status=$?; "
              "after=$(git status --porcelain=v1 -uall); "
              "if test \"$before\" != \"$after\"; then echo CMH_SOURCE_INTEGRITY_FAILURE; exit 125; fi; exit \"$status\"")
         profile_info = json.loads(call("inspect", container))[0]
