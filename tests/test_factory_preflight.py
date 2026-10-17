@@ -539,7 +539,8 @@ class PlanningGuardTests(unittest.TestCase):
         self.assertEqual(args[-1], 32000)
         prompt = json.loads(server.execute.call_args.args[0])
         self.assertEqual(prompt["planning_resource_guard"]["physical_token_ceiling"], "NOT_GUARANTEED")
-        runtime.resource_policy = {"max_run_tokens": 12}
+        runtime.resource_policy = {"max_run_tokens": 12, "max_first_turn_tokens": 60000,
+                                  "max_repair_incremental_tokens": 36000}
         with patch("harness.factory_runtime.FactoryAppServer", return_value=server) as constructor:
             runtime.agent("implement", {}, Path("/fixture"), {}, Path("/fixture.raw"), 9, [])
         self.assertEqual(constructor.call_args.args[3], 9)

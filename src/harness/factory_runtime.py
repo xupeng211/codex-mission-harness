@@ -326,7 +326,13 @@ class FactoryAppServer(AppServerCodex):
             params["baseInstructions"] = official_rubric()
         # Disable remote tools; their independent authority is outside this local factory.
         params["config"]["mcp_servers"] = self.disabled_mcp
-        params["config"]["features"] = {"hooks": False, "apps": False, "multi_agent": False, "multi_agent_v2": False}
+        features = {"hooks": False, "apps": False, "multi_agent": False, "multi_agent_v2": False}
+        if self.token_limit:
+            features["rollout_budget"] = {
+                "enabled": True, "limit_tokens": self.token_limit,
+                "reminder_at_remaining_tokens": [max(1, self.token_limit // 4)],
+                "sampling_token_weight": 1.0, "prefill_token_weight": 1.0}
+        params["config"]["features"] = features
         params["config"]["project_root_markers"] = []
         return params
 
@@ -481,6 +487,13 @@ class LocalRuntime:
         return_thread = bool(payload.pop("_return_thread", False))
         reuse_session = bool(payload.pop("_reuse_session", False))
         token_limit = self.resource_policy.get("max_run_tokens")
+        operation_limit = payload.pop("_operation_token_limit", None)
+        if operation_limit is not None:
+            from .factory_budget import operation_token_limit
+            expected = operation_token_limit(self.resource_policy, role, local_candidate=True)
+            if operation_limit != expected:
+                raise RuntimeFailure("operation token limit differs from verified stage authority", None, None)
+            token_limit = operation_limit
         if role == "plan":
             from .factory_budget import planning_limits
             limits = planning_limits(self.resource_policy, timeout)
@@ -499,6 +512,8 @@ class LocalRuntime:
             server._response_timeout = timeout
             server._end_time = time.monotonic() + timeout
             server.token_limit = token_limit
+            if hasattr(server, "_native_identity"):
+                server._native_identity["execution_limits"]["token_limit"] = token_limit
         else:
             server = FactoryAppServer(profile, cwd, transcript, timeout, denied_roots,
                                       role in ("plan", "review"), role == "review", token_limit,

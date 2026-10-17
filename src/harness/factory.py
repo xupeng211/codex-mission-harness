@@ -21,7 +21,7 @@ from pathlib import Path
 
 from .factory_runtime import LocalRuntime, official_rubric, VENDOR
 from .sandbox import SAFE_PATH
-from .factory_budget import accounting, planning_limits
+from .factory_budget import accounting, operation_token_limit, planning_limits
 from .factory_project import (PROJECT, OFFLINE_PASS, LANES, BACKENDS, approved_scope,
                               materialize_scope, scope_binding, review_manifest)
 from . import factory_candidate as candidate_stage
@@ -137,13 +137,22 @@ def validate_config(raw: dict) -> dict:
         if "trusted_validation" not in config:
             raise ValueError("project PR readiness also requires trusted formal validation")
     budget = config.get("budget")
-    if not isinstance(budget, dict) or "max_agent_runs" not in budget or set(budget) - {"max_agent_runs", "max_total_tokens", "max_run_tokens", "max_wall_seconds"}:
+    budget_fields = {"max_agent_runs", "max_total_tokens", "max_run_tokens", "max_wall_seconds",
+                     "max_first_turn_tokens", "max_repair_incremental_tokens"}
+    if not isinstance(budget, dict) or "max_agent_runs" not in budget or set(budget) - budget_fields:
         raise ValueError("invalid mission resource authority; monetary usage remains UNKNOWN")
     if ("max_total_tokens" in budget) != ("max_run_tokens" in budget):
         raise ValueError("total and per-run token authority must be specified together")
     for name, upper in (("max_total_tokens", 100_000_000), ("max_run_tokens", 2_000_000), ("max_wall_seconds", 86400)):
         if name in budget:
             bounded_int(budget[name], name, 1, upper)
+    staged_fields = {"max_first_turn_tokens", "max_repair_incremental_tokens"}
+    if bool(staged_fields & set(budget)) and not staged_fields <= set(budget):
+        raise ValueError("first-turn and repair token authorities must be specified together")
+    for name in staged_fields & set(budget):
+        bounded_int(budget[name], name, 1, 2_000_000)
+        if budget[name] > budget.get("max_total_tokens", 0):
+            raise ValueError("stage token authority exceeds mission token authority")
     if budget.get("max_run_tokens", 0) > budget.get("max_total_tokens", 0):
         raise ValueError("per-run token reservation exceeds mission token authority")
     if "repository" in config and (not isinstance(config["repository"], str) or not Path(config["repository"]).is_absolute()):
@@ -534,8 +543,12 @@ class Factory:
             return json.loads(old["result"])
         if self.cancel_requested(mission):
             raise FactoryBlocked("CANCELLED", "user cancelled; completed evidence and all reservations are retained")
+        budget = self.config["budget"]
+        local_mode = candidate_stage.requested(json.loads(self.row(mission)["spec"])) if paid else False
+        effective_limit = operation_token_limit(budget, stage, local_candidate=local_mode) if paid else None
+        if paid and effective_limit is not None:
+            identity = {**identity, "operation_token_limit": effective_limit}
         if paid:
-            local_mode = candidate_stage.requested(json.loads(self.row(mission)["spec"]))
             uncertain = self.db.execute("SELECT id FROM operations WHERE mission=? AND status IN ('RUNNING','UNKNOWN') LIMIT 1", (mission,)).fetchone()
             if uncertain:
                 raise FactoryBlocked("UNKNOWN", "unresolved operation prevents a new paid dispatch; no replay or refund")
@@ -567,12 +580,12 @@ class Factory:
             started = self.db.execute("SELECT MIN(at) FROM events WHERE mission=? AND kind='submitted'", (mission,)).fetchone()[0]
             if "max_wall_seconds" in budget and time.time() - started >= budget["max_wall_seconds"]:
                 raise FactoryBlocked("BLOCKED_BUDGET", "authorized mission wall-clock exhausted")
-            if paid and "max_total_tokens" in budget and resources["committed_tokens"] + budget["max_run_tokens"] > budget["max_total_tokens"]:
+            if paid and "max_total_tokens" in budget and resources["committed_tokens"] + effective_limit > budget["max_total_tokens"]:
                 raise FactoryBlocked("BLOCKED_BUDGET", "token admission exhausted; UNKNOWN reservations are permanent")
             used = self.db.execute("SELECT COUNT(*) FROM operations WHERE mission=? AND paid=1", (mission,)).fetchone()[0]
             local_mode = candidate_stage.requested(json.loads(self.row(mission)["spec"])) if paid else False
-            effective_limit = min(self.config["budget"]["max_agent_runs"], 2 if local_mode else self.config["budget"]["max_agent_runs"])
-            if paid and used >= effective_limit:
+            effective_run_limit = min(self.config["budget"]["max_agent_runs"], 2 if local_mode else self.config["budget"]["max_agent_runs"])
+            if paid and used >= effective_run_limit:
                 raise FactoryBlocked("BLOCKED_BUDGET", "authorized agent-run budget exhausted; failures and UNKNOWN remain charged")
             self.db.execute("INSERT INTO operations(id,mission,key,stage,lane,paid,identity,input,status,started) VALUES(?,?,?,?,?,?,?,?,?,?)",
                             (operation_id, mission, key, stage, lane, int(paid), encoded(identity), encoded(payload), "RUNNING", time.time()))
@@ -608,9 +621,9 @@ class Factory:
                          encoded(usage) if usage is not None else None, time.time(), operation_id))
         self.event(mission, "completed", {"operation": operation_id, "status": status, "evidence": str(evidence)})
         self.db.commit()
-        if paid and "max_run_tokens" in self.config["budget"]:
+        if paid and effective_limit is not None:
             from .factory_budget import tokens
-            if (tokens(usage) or 0) > self.config["budget"]["max_run_tokens"]:
+            if (tokens(usage) or 0) > effective_limit:
                 raise FactoryBlocked("BLOCKED_BUDGET", "run token allowance exceeded; telemetry retained, no further dispatch")
         if paid and stage == "plan":
             from .factory_budget import tokens
@@ -1280,11 +1293,15 @@ class Factory:
 
     def _authorization_summary(self, spec, cwd):
         auth = spec["local_candidate_authorization"]
+        limits = dict(self.config["budget"])
+        # max_run_tokens remains the legacy-mode cap; local_candidate uses the
+        # explicitly authorized first-turn and repair caps below.
+        limits.pop("max_run_tokens", None)
         return {"AUTHORIZATION_VERIFIED": True, "AUTHORIZATION_IDENTITY": auth["approval_id"],
                 "AUTHORIZED_TASK": spec["objective"], "REPOSITORY_AND_BASE": {"repository": spec["repository"], "base": spec["base"]},
                 "CANDIDATE_WORKSPACE": str(cwd), "ALLOWED_SCOPE": spec["scope"],
                 "FORBIDDEN_ACTIONS": ["network", "push", "pull", "PR", "merge", "release", "deployment", "external API"],
-                "EXECUTION_LIMITS": {"max_turns": 2, "max_repairs": 1, **self.config["budget"]}}
+                "EXECUTION_LIMITS": {"max_turns": 2, "max_repairs": 1, **limits}}
 
     def _verify_local_resume(self, spec, cwd, target):
         candidate_stage.authorize(spec, self.config, cwd, self.profile_identities["developer"])
@@ -1294,15 +1311,17 @@ class Factory:
     def _single_agent_operation(self, spec, cwd, payload, stage, round_, thread_id):
         lane = "developer"
         profile = self.config["profiles"][lane]
+        token_limit = operation_token_limit(self.config["budget"], stage, local_candidate=True)
         identity = {"profile": self.profile_identities[lane], "engine": "codex-app-server",
                     "stage": stage, "repository": spec["repository"], "base": spec["base"],
                     "dispatch_head": git(cwd, "rev-parse", "HEAD"), "scope": spec["scope"],
+                    "operation_token_limit": token_limit,
                     "thread_id": thread_id}
         key = digest({"stage": stage, "round": round_, "profile": self.profile_identities[lane], "payload": payload})
         self._single_thread_id = thread_id
         def invoke(transcript):
             call_payload = {**payload, "_thread_id": thread_id, "_return_thread": True,
-                            "_reuse_session": True}
+                            "_reuse_session": True, "_operation_token_limit": token_limit}
             result = self.runtime.agent(stage, profile, cwd, call_payload, transcript,
                     self.operation_timeout(spec["mission_id"]), [self.root, Path(spec["repository"])])
             if result.get("thread_id"):

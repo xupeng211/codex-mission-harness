@@ -14,7 +14,7 @@ from harness.factory import Factory, FactoryBlocked, git, validate_config
 from harness.factory_candidate import BILLING, LOCAL_READY
 from harness.factory_cli import readable
 from harness.factory_preflight import inspect_prepaid
-from harness.factory_runtime import LocalRuntime
+from harness.factory_runtime import FactoryAppServer, LocalRuntime, RuntimeFailure
 import test_factory_project as project_tests
 
 
@@ -24,12 +24,15 @@ class LocalRuntimeFixture(project_tests.ProjectRuntime):
         self.failure = None
         self.threads = []
         self.snapshots = []
+        self.operation_limits = []
+        self.usage_totals = []
 
     def agent(self, role, profile, cwd, payload, transcript, timeout, denied_roots):
         self.threads.append(payload.get("_thread_id"))
+        self.operation_limits.append((role, payload.get("_operation_token_limit")))
         result = super().agent(role, profile, cwd, payload, transcript, timeout, denied_roots)
         if role in {"implement", "rework"}:
-            if self.failure != "tests" and not (self.failure == "repair" and role == "implement"):
+            if self.failure != "tests" and not (self.failure in {"repair", "repair-unknown"} and role == "implement"):
                 path = cwd / "score.py"
                 path.write_text(path.read_text().replace(" // ", " / "))
             if self.failure == "tests":
@@ -43,14 +46,15 @@ class LocalRuntimeFixture(project_tests.ProjectRuntime):
             if self.failure == "no-change":
                 git(cwd, "reset", "--hard", "HEAD")
                 git(cwd, "clean", "-fd")
-            if self.failure in {"FAIL", "UNKNOWN"}:
-                result.update(status=self.failure, error="simulated failure")
+            if self.failure in {"FAIL", "UNKNOWN"} or self.failure == "repair-unknown" and role == "rework":
+                result.update(status="UNKNOWN" if self.failure in {"UNKNOWN", "repair-unknown"} else self.failure,
+                              error="simulated failure", usage_complete=self.failure not in {"UNKNOWN", "repair-unknown"})
             if self.failure == "identity":
                 result.pop("runtime_identity")
         # Unit fixture contract for cumulative thread usage and stable session identity.
         n = len(self.threads)
-        usage = {"total": {"inputTokens": 10000 * n, "outputTokens": 1000 * n,
-                            "totalTokens": 11000 * n}}
+        total = self.usage_totals[n - 1] if len(self.usage_totals) >= n else 11000 * n
+        usage = {"total": {"inputTokens": total, "outputTokens": 0, "totalTokens": total}}
         result.update(usage=usage, thread_id="fixture-thread")
         return result
 
@@ -60,8 +64,9 @@ class LocalCandidateTests(unittest.TestCase):
     def setUp(self):
         project_tests.ProjectContractTests.setUp(self)
         self.f.close()
-        self.config["budget"] = {"max_agent_runs": 5, "max_run_tokens": 30000,
-                                 "max_total_tokens": 50000, "max_wall_seconds": 300}
+        self.config["budget"] = {"max_agent_runs": 5, "max_run_tokens": 36000,
+                                 "max_first_turn_tokens": 60000, "max_repair_incremental_tokens": 36000,
+                                 "max_total_tokens": 96000, "max_wall_seconds": 300}
         self.config.pop("project_contract", None)
         self.runtime = LocalRuntimeFixture()
         self.f = Factory(self.root / "state", self.config, self.runtime)
@@ -141,6 +146,25 @@ class LocalCandidateTests(unittest.TestCase):
         self.assertEqual(self.runtime.final_calls, 0)
         self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM operations").fetchone()[0], 0)
 
+    def test_stage_budget_must_be_complete_and_match_local_authorization(self):
+        incomplete = copy.deepcopy(self.config)
+        incomplete["budget"].pop("max_repair_incremental_tokens")
+        with self.assertRaisesRegex(ValueError, "specified together"):
+            validate_config(incomplete)
+
+        self.spec["local_candidate_authorization"]["budget"]["max_first_turn_tokens"] = 59999
+        with self.assertRaisesRegex(ValueError, "differs from task or resource/test policy"):
+            self.f.submit(self.spec)
+        self.assertEqual(len(self.runtime.calls), 0)
+        self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM operations").fetchone()[0], 0)
+
+    def test_authorization_summary_exposes_stage_caps_without_legacy_shared_cap(self):
+        limits = self.f._authorization_summary(self.spec, self.root / "candidate")["EXECUTION_LIMITS"]
+        self.assertEqual(limits["max_first_turn_tokens"], 60000)
+        self.assertEqual(limits["max_repair_incremental_tokens"], 36000)
+        self.assertEqual(limits["max_total_tokens"], 96000)
+        self.assertNotIn("max_run_tokens", limits)
+
     def test_project_scope_and_local_authority_mismatches_reject_before_dispatch(self):
         self.configure_project_candidate()
         original = copy.deepcopy(self.spec)
@@ -207,6 +231,72 @@ class LocalCandidateTests(unittest.TestCase):
             "totalTokens": 2}}, one[1]), None)
         self.assertEqual(usage_increment(None, one[1]), None)
 
+    def test_e2e02_usage_is_within_first_turn_stage_limit_and_delivery_completes(self):
+        self.runtime.usage_totals = [57690]
+        report = self.ready()
+        self.assertEqual(self.runtime.operation_limits, [("implement", 60000)])
+        identity = json.loads(self.f.db.execute("SELECT identity FROM operations WHERE mission='feature' AND paid=1").fetchone()[0])
+        self.assertEqual(identity["operation_token_limit"], 60000)
+        self.assertEqual(report["BUDGET_USED"]["observed_tokens"], 57690)
+        self.assertEqual(report["BUDGET_USED"]["committed_tokens"], 57690)
+
+    def test_repair_uses_incremental_limit_and_same_thread_cumulative_usage(self):
+        self.runtime.failure = "repair"
+        self.runtime.usage_totals = [58000, 76000]
+        report = self.ready()
+        self.assertEqual(self.runtime.operation_limits, [("implement", 60000), ("rework", 36000)])
+        self.assertEqual(self.runtime.threads, [None, "fixture-thread"])
+        self.assertEqual(report["BUDGET_USED"]["observed_tokens"], 76000)
+        self.assertEqual(report["BUDGET_USED"]["committed_tokens"], 76000)
+
+    def test_repair_increment_over_its_stage_limit_stops(self):
+        self.runtime.failure = "repair"
+        self.runtime.usage_totals = [58000, 94001]
+        report = self.run_candidate()
+        self.assertEqual(report["DELIVERY_STATUS"], "BLOCKED_BUDGET")
+        self.assertEqual(self.runtime.operation_limits, [("implement", 60000), ("rework", 36000)])
+        rows = self.f.db.execute("SELECT stage,identity FROM operations WHERE mission='feature' AND paid=1 ORDER BY started").fetchall()
+        self.assertEqual([(row["stage"], json.loads(row["identity"])["operation_token_limit"]) for row in rows],
+                         [("implement", 60000), ("rework", 36000)])
+
+    def test_first_turn_over_limit_and_unknown_do_not_repair(self):
+        self.runtime.usage_totals = [60001]
+        report = self.run_candidate()
+        self.assertEqual(report["DELIVERY_STATUS"], "BLOCKED_BUDGET")
+        self.assertEqual(self.runtime.operation_limits, [("implement", 60000)])
+
+        self.f.close()
+        self.runtime = LocalRuntimeFixture()
+        self.runtime.failure = "UNKNOWN"
+        self.runtime.usage_totals = [57690]
+        self.f = Factory(self.root / "unknown-state", self.config, self.runtime)
+        self.authorize()
+        report = self.run_candidate()
+        self.assertEqual(report["DELIVERY_STATUS"], "UNKNOWN")
+        self.assertEqual(self.runtime.operation_limits, [("implement", 60000)])
+        self.assertEqual(report["BUDGET_USED"]["unknown_token_reservation"], 60000)
+        self.assertEqual(report["BUDGET_USED"]["observed_tokens"], 57690)
+
+    def test_unknown_repair_reserves_repair_allowance_and_stops(self):
+        self.runtime.failure = "repair-unknown"
+        self.runtime.usage_totals = [58000, 76000]
+        report = self.run_candidate()
+        self.assertEqual(report["DELIVERY_STATUS"], "UNKNOWN")
+        self.assertEqual(self.runtime.operation_limits, [("implement", 60000), ("rework", 36000)])
+        self.assertEqual(report["BUDGET_USED"]["unknown_token_reservation"], 36000)
+        self.assertEqual(report["BUDGET_USED"]["observed_tokens"], 76000)
+
+    def test_repair_total_budget_is_reserved_before_dispatch(self):
+        self.runtime.failure = "repair"
+        self.runtime.usage_totals = [58000]
+        self.config["budget"]["max_total_tokens"] = 80000
+        self.f.close()
+        self.f = Factory(self.root / "limited-total-state", self.config, self.runtime)
+        self.authorize()
+        report = self.run_candidate()
+        self.assertEqual(report["DELIVERY_STATUS"], "BLOCKED_BUDGET")
+        self.assertEqual(self.runtime.operation_limits, [("implement", 60000)])
+
     def test_localruntime_reuses_one_appserver_process_and_thread_for_repair_turn(self):
         class FakeServer:
             instances = []
@@ -219,6 +309,8 @@ class LocalCandidateTests(unittest.TestCase):
                 self.runtime_identity = {"provider": "openai", "model": "fixture", "thread_id": "thread-1"}
                 self.closed = 0
                 self.turn = 0
+                self.token_limit = token_limit
+                self.limits = [token_limit]
                 self.__class__.instances.append(self)
             def execute(self, prompt, schema, thread_id=None, return_thread=False):
                 self.turn += 1
@@ -231,18 +323,39 @@ class LocalCandidateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch("harness.factory_runtime.FactoryAppServer", FakeServer):
             root = Path(directory)
             runtime = LocalRuntime()
+            runtime.resource_policy = {"max_run_tokens": 36000, "max_first_turn_tokens": 60000,
+                                       "max_repair_incremental_tokens": 36000}
             profile = {"provider": "openai", "model": "fixture"}
             denied = [root / "state", root / "source"]
-            first = runtime.agent("implement", profile, root, {"_return_thread": True, "_reuse_session": True},
+            first = runtime.agent("implement", profile, root, {"_return_thread": True, "_reuse_session": True,
+                                  "_operation_token_limit": 60000},
                                   root / "first.raw", 30, denied)
             second = runtime.agent("rework", profile, root, {"_thread_id": first["thread_id"],
-                                   "_return_thread": True, "_reuse_session": True},
+                                   "_return_thread": True, "_reuse_session": True,
+                                   "_operation_token_limit": 36000},
                                    root / "second.raw", 30, denied)
             self.assertEqual(first["thread_id"], second["thread_id"])
             self.assertEqual(len(FakeServer.instances), 1)
             self.assertEqual(FakeServer.instances[0].turn, 2)
+            self.assertEqual(FakeServer.instances[0].limits, [60000])
+            self.assertEqual(FakeServer.instances[0].token_limit, 36000)
             runtime.close_session()
             self.assertEqual(FakeServer.instances[0].closed, 1)
+
+    def test_runtime_observer_applies_repair_cap_to_cumulative_thread_snapshot(self):
+        server = FactoryAppServer.__new__(FactoryAppServer)
+        server.events, server.token_limit, server.runtime_identity = [], 36000, {}
+        server._turn_usage_baseline = {"total": {"inputTokens": 58000, "outputTokens": 0,
+                                                  "totalTokens": 58000}}
+        cumulative = {"total": {"inputTokens": 76000, "outputTokens": 0, "totalTokens": 76000}}
+        with patch("harness.codex.AppServerCodex._read_message", return_value={
+                "method": "thread/tokenUsage/updated", "params": {"tokenUsage": cumulative}}):
+            self.assertEqual(server._read_message()["params"]["tokenUsage"], cumulative)
+        over = {"total": {"inputTokens": 94001, "outputTokens": 0, "totalTokens": 94001}}
+        with patch("harness.codex.AppServerCodex._read_message", return_value={
+                "method": "thread/tokenUsage/updated", "params": {"tokenUsage": over}}):
+            with self.assertRaises(RuntimeFailure):
+                server._read_message()
 
     def test_authorized_summary_resolves_pending_draft_but_real_scope_conflict_blocks(self):
         self.spec.setdefault("constraints", []).append("Model execution is pending approval before implementation")
@@ -376,6 +489,8 @@ class LocalCandidateTests(unittest.TestCase):
         self.f.close()
         self.config["budget"]["max_total_tokens"] = 10000
         self.config["budget"]["max_run_tokens"] = 6000
+        self.config["budget"]["max_first_turn_tokens"] = 6000
+        self.config["budget"]["max_repair_incremental_tokens"] = 4000
         self.f = Factory(self.root / "state", self.config, self.runtime)
         self.authorize()
         original = self.runtime.agent

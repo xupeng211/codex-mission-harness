@@ -113,6 +113,16 @@ class NativeProtocolTests(unittest.TestCase):
                          {"token_limit": 32000, "timeout_seconds": 120, "physical_token_ceiling": "NOT_GUARANTEED"})
         self.assertFalse(any(e.get("method") == "turn/started" for e in server.events))
 
+    def test_stage_budget_is_sent_when_starting_or_resuming_same_thread(self):
+        server = self.server(True, 60000)
+        first = server._thread_policy_params(str(self.cwd))["config"]["features"]["rollout_budget"]
+        self.assertEqual(first["limit_tokens"], 60000)
+        server.token_limit = 36000
+        repair = server._thread_policy_params(str(self.cwd))["config"]["features"]["rollout_budget"]
+        self.assertEqual(repair["limit_tokens"], 36000)
+        self.assertEqual(repair["sampling_token_weight"], 1.0)
+        self.assertEqual(repair["prefill_token_weight"], 1.0)
+
     def test_reviewer_official_permissions_deny_code_edits(self):
         server = self.server(True)
         paths = {"source": str(self.cwd / "score.py"), "auth": str(self.auth / "private-sentinel"),

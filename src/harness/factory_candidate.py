@@ -121,9 +121,10 @@ def authorize(spec, config, candidate=None, executor=None, *, executing=True):
     if {"hosted_ci", "project_pr_ci", "task_budget"} & set(config):
         raise ValueError("local candidate cannot authorize publication or a shared task wallet")
     if (not spec.get("acceptance") or not spec.get("scope") or "**" in spec["scope"]
-            or not {"max_agent_runs", "max_run_tokens", "max_total_tokens", "max_wall_seconds"}
+            or not {"max_agent_runs", "max_run_tokens", "max_total_tokens", "max_wall_seconds",
+                    "max_first_turn_tokens", "max_repair_incremental_tokens"}
             <= set(config["budget"])):
-        raise ValueError("local candidate requires explicit acceptance, paths and resource ceilings")
+        raise ValueError("local candidate requires explicit acceptance, paths and stage-specific resource ceilings")
     if config["budget"]["max_agent_runs"] < 2:
         raise ValueError("local candidate budget must permit initial execution and one repair")
     bindings = {key: spec[key] for key in ("mission_id", "repository", "base", "acceptance")}
