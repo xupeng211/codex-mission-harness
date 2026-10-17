@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -15,7 +16,7 @@ from unittest.mock import patch
 from harness.factory import Factory, FactoryBlocked, git, validate_config
 from harness.factory_project import OFFLINE_PASS
 from harness.factory_runtime import LocalRuntime
-from harness.factory_validation import digest as validation_digest, preflight, RESOURCE_CAPABILITIES
+from harness.factory_validation import digest as validation_digest, preflight, RESOURCE_CAPABILITIES, bind_trusted_qa, workspace_layout, QA_ANCHORS, TRUSTED_QA_FILES, QA_PYTHON
 from harness.factory_pr_ci import branch_for, expected_jobs
 import test_factory_project as stage1
 
@@ -50,6 +51,8 @@ jobs:
           fetch-depth: 0
 """
 LOCKS = {"package-lock.json":"fixture-lock\n", "requirements.txt":"fixture-requirements\n"}
+QA_SOURCE = {name: "fixture trusted source\n" for name in TRUSTED_QA_FILES if name not in LOCKS}
+QA_SOURCE.update({"package.json": "{}\n", ".eslintrc.json": "{}\n"})
 
 
 class FakeDocker:
@@ -65,6 +68,7 @@ class FakeDocker:
                      **{key: True for key in RESOURCE_CAPABILITIES}}
         self.info_calls = 0
         self.info_mutate = lambda value: None
+        self.database_identity = b"football_db|validation|t|t|t\n"
 
     def capture(self, container, path, timeout, cancelled):
         running = json.loads(Path(path).with_suffix(".validation.json").read_text())
@@ -90,6 +94,13 @@ class FakeDocker:
         if args[0] == "create":
             name = args[args.index("--name") + 1]
             self.containers[name] = args
+            if name.startswith("cmh-preflight-"):
+                assert "test -x " + QA_PYTHON + ";" in args[-1]
+                assert QA_PYTHON + " -I -c 'import pytest,pytest_cov,ruff,mypy'" in args[-1]
+                assert "command -v python3" not in args[-1]
+            if name.endswith("-db"):
+                assert "POSTGRES_DB=football_db" in args
+                assert "POSTGRES_USER=validation" in args
             if self.failure == "startup" and name.endswith("-profile"):
                 raise RuntimeError("fixture ambiguous startup failure")
             if name.endswith("-profile"):
@@ -100,6 +111,23 @@ class FakeDocker:
                 assert git(source, "rev-parse", "HEAD")
                 assert git(source, "config", "--local", "core.hooksPath") == "/dev/null"
                 assert "readonly" in mount
+                manifest = json.loads((source / ".git/cmh-qa/binding.json").read_text())
+                assert manifest["head"] == git(source, "rev-parse", "HEAD")
+                assert manifest["tree"] == git(source, "rev-parse", "HEAD^{tree}")
+                assert set(manifest["files"]) == set(TRUSTED_QA_FILES) | {".git/cmh-qa/eslint-ignore", ".git/cmh-qa/c8.json"}
+                for path, sha in manifest["files"].items():
+                    assert hashlib.sha256((source / path).read_bytes()).hexdigest() == sha
+                legacy = "/usr/local/bin/python3 -I /app/scripts/devops/validation_profiles.py" in args[-1]
+                for anchor in ((*QA_ANCHORS, "requirements.txt", "scripts") if legacy else QA_ANCHORS):
+                    assert f"type=bind,src={source / anchor},dst=/app/{anchor},readonly" in args
+                    assert "--exclude=" + anchor in args[-1]
+                assert "/app:rw,noexec,nosuid,size=128m,uid=65534,gid=65534" in args
+                root = "/app" if legacy else "/snapshot"
+                assert "/usr/local/bin/python3 -I " + root + "/scripts/devops/validation_profiles.py" in args[-1]
+                assert "python3 scripts/devops/validation_profiles.py" not in args[-1]
+                assert "cp -as /opt/cmh/node_modules/. /app/node_modules/" in args[-1]
+                assert "cp -R /opt/cmh/node_modules/. /app/node_modules/" not in args[-1]
+                assert "node_modules/.package-lock.sha256" in args[-1]
                 assert "container:" in args[args.index("--network") + 1]
                 assert not any("docker.sock" in a or "host-gateway" in a for a in args)
             return name.encode()
@@ -117,7 +145,28 @@ class FakeDocker:
             self.mutate(value)
             return json.dumps([value]).encode()
         if args[0] == "start" and "--attach" in args:
+            if self.failure in {"python_missing", "python_import"}:
+                raise subprocess.CalledProcessError(1, "fixture fixed interpreter readiness probe")
             return "".join(hashlib.sha256(value.encode()).hexdigest()+"  /opt/cmh/"+name+"\n" for name,value in LOCKS.items()).encode()
+        if args[0] == "start" and args[-1].endswith("-db") and self.failure == "db_startup":
+            raise RuntimeError("fixture temporary database failed to initialize")
+        if args[0] == "exec" and "pg_isready" in args:
+            assert args[args.index("-h") + 1] == "127.0.0.1"
+            assert args[args.index("-p") + 1] == "5432"
+            assert args[args.index("-d") + 1] == "football_db"
+        if args[0] == "exec" and "psql" in args:
+            db = next(name for name in self.containers if name.endswith("-db"))
+            created = self.containers[db]
+            assert args[args.index("-h") + 1] == "127.0.0.1"
+            assert args[args.index("-p") + 1] == "5432"
+            assert "POSTGRES_DB=" + args[args.index("-d") + 1] in created
+            assert "POSTGRES_USER=" + args[args.index("-U") + 1] in created
+            password = next(v.split("=", 1)[1] for v in created if v.startswith("POSTGRES_PASSWORD="))
+            assert "PGPASSWORD=" + password in args
+            assert "-X" in args and "-w" in args and "ON_ERROR_STOP=1" in args
+            if self.failure == "db_init":
+                raise subprocess.CalledProcessError(2, "fixture psql", stderr=b"database initialization failed")
+            return self.database_identity
         if args[0] == "logs":
             if self.failure == "logs":
                 raise RuntimeError("fixture log stream incomplete")
@@ -126,6 +175,8 @@ class FakeDocker:
             marker = re.search(r"CMH_ENVIRONMENT_READY_[a-z0-9]+", self.containers[args[-1]][-1])[0]
             return (marker + "\nfixture profile stdout and stderr\n").encode()
         if args[0] == "rm":
+            if self.failure == "db_cleanup" and args[-1].endswith("-db"):
+                raise RuntimeError("fixture temporary database cleanup failed")
             if self.failure == "cleanup" and args[-1].endswith("-profile"):
                 raise RuntimeError("fixture cleanup failed")
             self.containers.pop(args[-1], None)
@@ -258,7 +309,10 @@ class Phase2Tests(unittest.TestCase):
         self.f.close()
         (self.repo / ".github/workflows").mkdir(parents=True)
         (self.repo / ".github/workflows/production-gate.yml").write_text(WORKFLOW)
-        for name,value in LOCKS.items(): (self.repo / name).write_text(value)
+        for name, value in {**LOCKS, **QA_SOURCE}.items():
+            path = self.repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(value)
         git(self.repo, "add", ".")
         git(self.repo, "-c", "user.name=Fixture", "-c", "user.email=f@localhost", "commit", "-qm", "workflow fixture")
         self.base = git(self.repo, "rev-parse", "HEAD")
@@ -283,6 +337,110 @@ class Phase2Tests(unittest.TestCase):
 
     def gates(self, spec, cwd, target, kind):
         return self.f.gates(spec, cwd, target, kind, 0)
+
+    def test_trusted_snapshot_rejects_symlinks_byte_changes_and_implicit_config(self):
+        for failure in ("head", "tree", "symlink", "bytes", "config", "package-config"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                snapshot = Path(tmp) / "snapshot"
+                subprocess.run(["git", "clone", "--no-local", str(self.repo), str(snapshot)],
+                               capture_output=True, check=True)
+                target = {"head": git(snapshot, "rev-parse", "HEAD"),
+                          "tree": git(snapshot, "rev-parse", "HEAD^{tree}")}
+                if failure in {"head", "tree"}:
+                    target[failure] = "f" * 40
+                elif failure == "symlink":
+                    path = snapshot / "scripts/devops/gatekeeper.sh"
+                    path.unlink()
+                    path.symlink_to(snapshot / "package.json")
+                elif failure == "bytes":
+                    (snapshot / "scripts/devops/validation_profiles.py").write_text("replaced")
+                elif failure == "config":
+                    (snapshot / ".c8rc.json").write_text('{"exclude":["**/*"]}')
+                else:
+                    (snapshot / "package.json").write_text('{"c8":{}}')
+                    git(snapshot, "add", "package.json")
+                    git(snapshot, "-c", "user.name=Fixture", "-c", "user.email=f@localhost", "commit", "-qm", "implicit config")
+                    target["head"] = git(snapshot, "rev-parse", "HEAD")
+                    target["tree"] = git(snapshot, "rev-parse", "HEAD^{tree}")
+                with self.assertRaises(ValueError):
+                    bind_trusted_qa(snapshot, target, VALIDATION["image"])
+
+    def test_trusted_result_rejects_missing_or_stale_qa_binding(self):
+        from harness.factory_validation import validate_result
+        spec, cwd, target = self.candidate()
+        result = self.gates(spec, cwd, target, "checks")[0]
+        for failure in ("missing", "head", "tree", "image"):
+            with self.subTest(failure=failure):
+                corrupted = copy.deepcopy(result)
+                if failure == "missing":
+                    corrupted.pop("trusted_qa_binding")
+                else:
+                    corrupted["trusted_qa_binding"][failure] = "stale"
+                with self.assertRaisesRegex(ValueError, "QA snapshot binding"):
+                    validate_result(corrupted, VALIDATION, spec, target, "strict", True)
+
+    def test_legacy_workspace_requires_exact_dispatcher_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / TRUSTED_QA_FILES[0]
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"known frozen legacy dispatcher")
+            pin = hashlib.sha256(path.read_bytes()).hexdigest()
+            with patch("harness.factory_validation.LEGACY_DISPATCHER_SHA256", pin):
+                self.assertEqual(workspace_layout(root),
+                                 (True, (*QA_ANCHORS, "requirements.txt", "scripts"), "/app"))
+                path.write_bytes(path.read_bytes() + b"changed")
+                self.assertEqual(workspace_layout(root), (False, QA_ANCHORS, "/snapshot"))
+
+    def test_both_layouts_keep_noexec_source_and_link_image_tools(self):
+        spec, cwd, target = self.candidate()
+        for round_, legacy in enumerate((False, True)):
+            with self.subTest(legacy=legacy):
+                anchors = (*QA_ANCHORS, "requirements.txt", "scripts") if legacy else QA_ANCHORS
+                with patch("harness.factory_validation.workspace_layout",
+                           return_value=(legacy, anchors, "/app" if legacy else "/snapshot")):
+                    result = self.f.gates(spec, cwd, target, "checks", round_)[0]
+                self.assertEqual(result["status"], "PASS")
+                profile = next(c for c in reversed(self.runtime.docker.calls)
+                               if c[0] == "create" and c[c.index("--name") + 1].endswith("-profile"))
+                self.assertIn("/app:rw,noexec,nosuid,size=128m,uid=65534,gid=65534", profile)
+                self.assertIn("cp -as /opt/cmh/node_modules/. /app/node_modules/;", profile[-1])
+                self.assertNotIn("cp -R /opt/cmh/node_modules/", profile[-1])
+                self.assertFalse(self.runtime.docker.containers)
+
+    def test_preflight_requires_exact_isolated_python_and_rejects_failure(self):
+        docker = FakeDocker()
+        self.assertEqual(preflight(VALIDATION, docker)["status"], "FIXTURE_VERIFIED")
+        probe = next(c for c in docker.calls if c[0] == "create")[-1]
+        self.assertIn("test -x " + QA_PYTHON + ";", probe)
+        self.assertIn(QA_PYTHON + " -I -c 'import pytest,pytest_cov,ruff,mypy'", probe)
+        self.assertNotIn("command -v python3", probe)
+        for fault in ("python_missing", "python_import"):
+            with self.subTest(fault=fault):
+                docker = FakeDocker()
+                docker.failure = fault
+                with self.assertRaises(subprocess.CalledProcessError):
+                    preflight(VALIDATION, docker)
+                self.assertFalse(docker.containers)
+                self.assertTrue(any(c[0] == "rm" for c in docker.calls))
+
+    def test_legacy_mapping_freezes_scripts_and_preserves_failure_exit(self):
+        for code in (0, 7):
+            spec, cwd, target = self.candidate()
+            self.runtime.docker.exit_code = code
+            layout = (True, (*QA_ANCHORS, "requirements.txt", "scripts"), "/app")
+            with patch("harness.factory_validation.workspace_layout", return_value=layout):
+                result = self.f.gates(spec, cwd, target, "checks", code)[0]
+            self.assertEqual(result["exit_code"], code)
+            self.assertEqual(result["status"], "FAIL" if code else "PASS")
+            profile = next(c for c in reversed(self.runtime.docker.calls)
+                           if c[0] == "create" and c[c.index("--name") + 1].endswith("-profile"))
+            self.assertTrue(any("dst=/app/scripts,readonly" in part for part in profile))
+            self.assertTrue(any("dst=/snapshot,readonly" in part for part in profile))
+            self.assertIn("--exclude=scripts", profile[-1])
+            self.assertIn("/app/scripts/ops:rw,noexec,nosuid,size=64m,uid=65534,gid=65534", profile)
+            self.assertIn("cp -R /snapshot/scripts/ops/. /app/scripts/ops/", profile[-1])
+            self.assertFalse(self.runtime.docker.containers)
 
     def test_real_factory_localruntime_docker_path_exact_identity_and_no_shared_git(self):
         spec, cwd, target = self.candidate()
@@ -314,6 +472,65 @@ class Phase2Tests(unittest.TestCase):
                 if fault == "cleanup": self.assertEqual(result["cleanup"], "FAILED")
                 if fault == "timeout": self.assertTrue(result["interrupted"])
                 self.runtime.docker.failure = None
+
+    def test_temporary_database_contract_and_connection_are_isolated_and_verified(self):
+        spec, cwd, target = self.candidate()
+        result = self.gates(spec, cwd, target, "checks")[0]
+        self.assertEqual(result["database_identity"], "football_db|validation|t|t|t")
+        calls = self.runtime.docker.calls
+        db = next(c for c in calls if c[0] == "create" and c[c.index("--name") + 1].endswith("-db"))
+        profile = next(c for c in calls if c[0] == "create" and c[c.index("--name") + 1].endswith("-profile"))
+        self.assertIn("DB_NAME=football_db", profile)
+        self.assertIn("DB_USER=validation", profile)
+        self.assertIn("DB_HOST=127.0.0.1", profile)
+        self.assertIn("DB_PORT=5432", profile)
+        password = next(v.split("=", 1)[1] for v in db if v.startswith("POSTGRES_PASSWORD="))
+        self.assertIn("DB_PASSWORD=" + password, profile)
+        self.assertNotIn(password, json.dumps(result))
+        self.assertIn("--network=none", db)
+        self.assertIn("--user=999:999", db)
+        for launch in (db, profile):
+            for flag in ("--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only", "--restart=no"):
+                self.assertIn(flag, launch)
+            self.assertFalse(any(v in {"--privileged", "-p", "--publish"} or "docker.sock" in v for v in launch))
+        probe = next(c for c in calls if c[0] == "exec" and "psql" in c)
+        self.assertLess(calls.index(probe), calls.index(profile))
+        from harness.factory_validation import validate_result
+        for identity in (None, "football_validation|validation|t|t|t", "football_db|validation|f|t|t"):
+            corrupted = copy.deepcopy(result)
+            corrupted["database_identity"] = identity
+            with self.assertRaisesRegex(ValueError, "database identity"):
+                validate_result(corrupted, VALIDATION, spec, target, "strict", True)
+
+    def test_wrong_database_identity_or_privileges_block_before_profile_and_never_replay(self):
+        spec, cwd, target = self.candidate()
+        for round_, identity in enumerate((b"football_validation|validation|t|t|t\n",
+                b"football_db|wrong_user|t|t|t\n", b"football_db|validation|f|t|t\n",
+                b"football_db|validation|t|f|t\n", b"football_db|validation|t|t|f\n", b"")):
+            with self.subTest(identity=identity):
+                docker = self.runtime.docker = FakeDocker()
+                docker.database_identity = identity
+                with self.assertRaises(FactoryBlocked): self.f.gates(spec, cwd, target, "checks", round_)
+                self.assertFalse(any(c[0] == "create" and c[c.index("--name") + 1].endswith("-profile") for c in docker.calls))
+                self.assertFalse(docker.containers)
+                count = len(docker.calls)
+                with self.assertRaises(FactoryBlocked): self.f.gates(spec, cwd, target, "checks", round_)
+                self.assertEqual(len(docker.calls), count)
+
+    def test_temporary_database_start_initialization_or_cleanup_failure_blocks(self):
+        spec, cwd, target = self.candidate()
+        for round_, fault in enumerate(("db_startup", "db_init", "db_cleanup")):
+            with self.subTest(fault=fault):
+                docker = self.runtime.docker = FakeDocker()
+                docker.failure = fault
+                with self.assertRaises(FactoryBlocked): self.f.gates(spec, cwd, target, "checks", round_)
+                row = self.f.db.execute("SELECT result FROM operations WHERE stage='checks' ORDER BY started DESC").fetchone()
+                result = json.loads(row[0])
+                self.assertEqual(result["status"], "UNKNOWN")
+                self.assertEqual(result["cleanup"], "FAILED" if fault == "db_cleanup" else "COMPLETE")
+                if fault != "db_cleanup":
+                    self.assertFalse(docker.containers)
+                    self.assertFalse(any(c[0] == "create" and c[c.index("--name") + 1].endswith("-profile") for c in docker.calls))
 
     def test_abnormal_exit_and_source_mutation_are_unknown(self):
         spec, cwd, target = self.candidate()

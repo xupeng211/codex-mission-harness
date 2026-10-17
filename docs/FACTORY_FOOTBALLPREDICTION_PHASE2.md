@@ -16,6 +16,40 @@ digest pin；镜像必须不包含凭据，并在 `/opt/cmh` 保存匹配候选�
 预检真实探测本地 daemon、digest、工具、关键依赖和锁文件哈希，字段存在不代表可用。
 锁文件改变需要重新准备可信依赖镜像；Factory 不会联网补依赖。
 
+### PR A：可信 QA 输入和临时数据库绑定
+
+本次从 H6 已提交对象提取 QA 改进：`83be6e7cc422d75b094619970dce0f98ff5623bb`
+中的文件冻结和数据库检查，以及 `fa4a0a3b680f1bc8f8e8cda9e41ae8bd1be4d590`
+中的旧 dispatcher 布局兼容；不引入这些提交中的执行编排、Provider 或预算扩展。
+
+Controller 在独立快照中核对 HEAD/tree，并逐字节核对当前 HEAD 中的
+`scripts/devops/validation_profiles.py`、`scripts/devops/gatekeeper.sh`、
+`.eslintrc.json`、`package.json`、`package-lock.json` 和 `requirements.txt`。
+这些文件必须是普通跟踪文件；符号链接、工作区字节变化以及不支持的隐式
+ESLint/c8/nyc 配置均被拒绝。文件哈希、HEAD/tree 和镜像绑定保存在快照的
+`.git/cmh-qa/binding.json`，验证结果必须携带对应绑定；旧结果缺少绑定时不能放行。
+`package.json`、`package-lock.json` 和 ESLint 配置在验证工作目录中只读挂载，dispatcher 使用
+固定解释器以隔离模式运行；原有完整日志、资源检查及源码变更拒绝继续有效。
+预检和执行共同使用 `/usr/local/bin/python3 -I`；镜像必须提供该准确路径及其所需
+QA 模块，不能以 PATH 中另一个 `python3` 代替。两种布局均将 `node_modules` 文件
+链接到只读可信镜像的 `/opt/cmh/node_modules`，使 ESLint/c8 从镜像执行，同时保留
+`/app` 的 `noexec`；不复制工具到候选的不可执行文件系统，也不放开源码执行权限。
+
+只有 dispatcher 字节 SHA-256 精确等于
+`8cadabeaa949eed535943be39d18f69df0a2624095c7d50f53d4704a67478a85`
+时使用旧 `/app` 布局。该布局额外冻结 `requirements.txt` 和 `scripts`，仅将快照的
+`scripts/ops` 复制到限额临时可写层；依赖来自可信镜像。其他 dispatcher 继续使用
+`/snapshot` 路径，不因兼容逻辑获得旧布局身份，也不跳过原 profile 或失败退出码。
+
+临时数据库名固定为 `football_db`、用户为 `validation`，以匹配原项目 SQL 合同。
+除 `pg_isready` 外，还必须通过相同回环 TCP 参数执行只读身份查询，精确验证
+数据库名、用户及隔离实例的初始化权限；不匹配或查询失败时不启动验证容器。
+这些权限只属于无端口、无外网、使用临时密码和 tmpfs 的一次性 PostgreSQL，
+不连接正式数据库。初始化、异常退出或必需清理失败仍为 UNKNOWN，不能返回 PASS。
+
+PR A 的 fixture 测试证明调用、绑定和拒绝语义；它们不证明真实业务 profile 或
+Harness 自主业务交付成功。单 Agent 本地交付属于后续 PR B。
+
 受控执行器还要求 Docker 明确报告 `CpuCfsPeriod`、`CpuCfsQuota`、`MemoryLimit`、
 `SwapLimit`、`PidsLimit` 全部为布尔 true，Linux cgroup 版本和驱动、daemon ID 与版本
 必须可识别。缺失、未知或不支持时阻断，不删除任何限制后重试。就绪探针、数据库和
