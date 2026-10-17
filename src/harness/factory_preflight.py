@@ -320,10 +320,12 @@ def workflow_push(text, branch_prefix):
 def inspect_prepaid(spec, config):
     """Inspect the immutable baseline, not mutable working-tree diagnostics."""
     repo, commit = Path(spec["repository"]), spec["base"]
+    from .factory_candidate import requested as local_requested
+    local_mode = local_requested(spec)
     findings = []
     def add(level, check, detail, **values):
         findings.append({"level": level, "check": check, "detail": detail, **values})
-    if config.get("project_contract") == "footballprediction":
+    if config.get("project_contract") == "footballprediction" and not local_mode:
         from .adapters import FootballPredictionAdapter
         # Canonical tool-based review does not serialize the whole repository.
         # Check admission identity only; future diff and receipts remain unknown.
@@ -338,7 +340,7 @@ def inspect_prepaid(spec, config):
         add("UNVERIFIED", "project_final_gate", "canonical receipts and current exact PR/CI must pass before live readiness")
         if not config["simulation"]:
             add("HARD_BLOCKER", "first_paid_execution", "canonical DeepSeek outer operation may execute up to 64 backend calls; physical cost ceiling is unproven and first live paid execution remains blocked")
-    elif config["independent_review_required"]:
+    elif config["independent_review_required"] and not local_mode:
         try:
             capacity = text_capacity(repo, commit, config["max_context_bytes"])
             if capacity["text_bytes_lower_bound"] > capacity["limit_bytes"]:

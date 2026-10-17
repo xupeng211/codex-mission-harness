@@ -24,6 +24,7 @@ from .sandbox import SAFE_PATH
 from .factory_budget import accounting, planning_limits
 from .factory_project import (PROJECT, OFFLINE_PASS, LANES, BACKENDS, approved_scope,
                               materialize_scope, scope_binding, review_manifest)
+from . import factory_candidate as candidate_stage
 
 
 READY = "READY_FOR_USER_ACCEPTANCE"
@@ -105,7 +106,7 @@ def validate_config(raw: dict) -> dict:
     """Operator policy is separate from the customer's product requirement."""
     allowed = {"version", "simulation", "budget", "max_rounds", "timeout_seconds", "checks", "ci",
                "profiles", "independent_review_required", "max_review_bytes", "max_context_bytes", "repository", "hosted_ci", "project_contract",
-               "trusted_validation", "project_pr_ci"}
+               "trusted_validation", "project_pr_ci", "local_acceptance"}
     if not isinstance(raw, dict) or set(raw) - allowed or type(raw.get("version")) is not int or raw.get("version") != 1:
         raise ValueError("invalid factory configuration")
     config = json.loads(encoded(raw))
@@ -121,6 +122,7 @@ def validate_config(raw: dict) -> dict:
             raise ValueError("project mode requires explicit PR CI; push CI is incompatible")
     if {"trusted_validation", "project_pr_ci"} & set(config) and config.get("project_contract") != PROJECT:
         raise ValueError("trusted validation/PR CI are only available in explicit project mode")
+    candidate_stage.validate_policy(config)
     if "trusted_validation" in config:
         from .factory_validation import validate_policy, profile_for
         validate_policy(config["trusted_validation"])
@@ -200,7 +202,7 @@ def policy_identity(config):
 
 
 def validate_mission(raw):
-    keys = {"version", "mission_id", "repository", "objective", "acceptance", "constraints", "scope", "base", "mission_scope_file", "approved_mission_scope"}
+    keys = {"version", "mission_id", "repository", "objective", "acceptance", "constraints", "scope", "base", "mission_scope_file", "approved_mission_scope", "delivery_mode", "local_candidate_authorization"}
     if not isinstance(raw, dict) or set(raw) - keys or type(raw.get("version")) is not int or raw.get("version") != 2:
         raise ValueError("factory missions require version 2")
     mission = json.loads(encoded(raw))
@@ -235,6 +237,10 @@ def validate_mission(raw):
             raise ValueError("mission_scope_file must be a tracked relative path")
         if "approved_mission_scope" not in mission:
             git(repo, "cat-file", "-e", mission["base"] + ":" + scope_file)
+    if "delivery_mode" in mission and mission["delivery_mode"] != candidate_stage.LOCAL_MODE:
+        raise ValueError("unknown delivery mode")
+    if "local_candidate_authorization" in mission and not candidate_stage.requested(mission):
+        raise ValueError("local authorization requires explicit local_candidate mode")
     return mission
 
 
@@ -399,7 +405,9 @@ class Factory:
 
     def submit(self, raw):
         spec = validate_mission(raw)
-        if self.project:
+        if candidate_stage.requested(spec):
+            candidate_stage.authorize(spec, self.config)
+        if self.project and not candidate_stage.requested(spec):
             approved_scope(spec)
             if "project_pr_ci" in self.config:
                 from .factory_pr_ci import repository_identity
@@ -423,6 +431,8 @@ class Factory:
             candidate = candidate / "source"
         if candidate.exists():
             raise ValueError("unowned candidate path already exists")
+        if candidate_stage.requested(spec):
+            candidate_stage.authorize(spec, self.config, candidate, self.profile_identities["developer"])
         self.db.execute("INSERT INTO missions(id,spec,policy,status,candidate) VALUES(?,?,?,?,?)",
                         (mission, encoded(spec), encoded(policy_identity(self.config)), "CREATED", str(candidate)))
         self.event(mission, "submitted", {"spec": spec, "profiles": self.config["profiles"]})
@@ -441,7 +451,8 @@ class Factory:
             git(cwd, "checkout", "-b", f"factory/{mission}", spec["base"])
             if self.project:
                 materialize_scope(spec, cwd, git)
-                self.runtime.project_policy(spec, cwd, [spec["mission_scope_file"]])
+                if not candidate_stage.requested(spec):
+                    self.runtime.project_policy(spec, cwd, [spec["mission_scope_file"]])
             self.state(mission, "PLAN")
         if cwd.resolve() != cwd or not (cwd / ".git").is_dir() or (cwd / ".git").is_symlink():
             raise FactoryBlocked("UNKNOWN", "candidate isolation identity is invalid")
@@ -468,7 +479,7 @@ class Factory:
         target = {"repository": spec["repository"], "base": spec["base"], "head": head,
                 "commit": head, "tree": git(cwd, "rev-parse", "HEAD^{tree}"),
                 "scope": spec["scope"], "files": files, "diff_sha256": hashlib.sha256(diff.encode()).hexdigest()}
-        if self.project:
+        if self.project and not candidate_stage.requested(spec):
             try:
                 target.update(scope_binding(spec, cwd, head, git))
                 target["review_range"] = review_manifest(cwd, target, git)
@@ -507,6 +518,7 @@ class Factory:
 
     def operation(self, mission, key, stage, lane, identity, payload, paid, invoke, prepare=None):
         """Reserve before dispatch. A lost response is never replayed under a new guise."""
+        candidate_stage.check_dispatch(self, mission, stage)
         old = self.db.execute("SELECT * FROM operations WHERE mission=? AND key=?", (mission, key)).fetchone()
         if old:
             if old["status"] != "COMPLETE":
@@ -516,6 +528,7 @@ class Factory:
         if self.cancel_requested(mission):
             raise FactoryBlocked("CANCELLED", "user cancelled; completed evidence and all reservations are retained")
         if paid:
+            local_mode = candidate_stage.requested(json.loads(self.row(mission)["spec"]))
             uncertain = self.db.execute("SELECT id FROM operations WHERE mission=? AND status IN ('RUNNING','UNKNOWN') LIMIT 1", (mission,)).fetchone()
             if uncertain:
                 raise FactoryBlocked("UNKNOWN", "unresolved operation prevents a new paid dispatch; no replay or refund")
@@ -527,8 +540,10 @@ class Factory:
                 preflight = inspect_prepaid(json.loads(self.row(mission)["spec"]), self.config)
                 self.event(mission, "prepaid_preflight", preflight)
                 self.db.commit()
-                if preflight["status"] == "HARD_BLOCKER":
-                    detail = "; ".join(f["check"] + ": " + f["detail"] for f in preflight["findings"] if f["level"] == "HARD_BLOCKER")
+                blockers = [f for f in preflight["findings"] if f["level"] == "HARD_BLOCKER"
+                            and not (local_mode and f["check"] in {"first_paid_execution", "independent_context"})]
+                if blockers:
+                    detail = "; ".join(f["check"] + ": " + f["detail"] for f in blockers)
                     raise FactoryBlocked("BLOCKED_PREFLIGHT", detail)
         # Trusted local preparation is not a paid dispatch. Keep it after the
         # cache/uncertainty guards and outside the reservation transaction.
@@ -548,7 +563,9 @@ class Factory:
             if paid and "max_total_tokens" in budget and resources["committed_tokens"] + budget["max_run_tokens"] > budget["max_total_tokens"]:
                 raise FactoryBlocked("BLOCKED_BUDGET", "token admission exhausted; UNKNOWN reservations are permanent")
             used = self.db.execute("SELECT COUNT(*) FROM operations WHERE mission=? AND paid=1", (mission,)).fetchone()[0]
-            if paid and used >= self.config["budget"]["max_agent_runs"]:
+            local_mode = candidate_stage.requested(json.loads(self.row(mission)["spec"])) if paid else False
+            effective_limit = min(self.config["budget"]["max_agent_runs"], 2 if local_mode else self.config["budget"]["max_agent_runs"])
+            if paid and used >= effective_limit:
                 raise FactoryBlocked("BLOCKED_BUDGET", "authorized agent-run budget exhausted; failures and UNKNOWN remain charged")
             self.db.execute("INSERT INTO operations(id,mission,key,stage,lane,paid,identity,input,status,started) VALUES(?,?,?,?,?,?,?,?,?,?)",
                             (operation_id, mission, key, stage, lane, int(paid), encoded(identity), encoded(payload), "RUNNING", time.time()))
@@ -612,6 +629,7 @@ class Factory:
                 raise FactoryBlocked("UNKNOWN", "canonical project evidence is missing or changed")
 
     def agent(self, spec, cwd, stage, round_, payload):
+        candidate_stage.check_dispatch(self, spec["mission_id"], stage)
         if self.project:
             approval = approved_scope(spec)
             payload = {**payload, "mission_scope_file": approval["path"], "mission_scope_sha256": approval["sha256"]}
@@ -815,10 +833,13 @@ class Factory:
             raise FactoryBlocked("BLOCKED_PUBLICATION_AUTH", str(exc)) from exc
 
     def gates(self, spec, cwd, target, kind, round_):
+        candidate_stage.check_dispatch(self, spec["mission_id"], kind)
+        if candidate_stage.requested(spec) and kind == "checks":
+            round_ = getattr(self, "_single_qa_round", round_)
         results = []
         for index, command in enumerate(self.config[kind]):
             validation = self.config.get("trusted_validation")
-            if validation and kind == "checks" and target["project_policy"]["workflow_class"] in {"STRICT", "CRITICAL"} and command != ["make", "verify-strict"]:
+            if validation and kind == "checks" and target.get("project_policy", {}).get("workflow_class") in {"STRICT", "CRITICAL"} and command != ["make", "verify-strict"]:
                 raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "STRICT/CRITICAL require the formal strict validation profile")
             payload = {"command": command, "target": target, "round": round_,
                        **({"validation": validation, "mission_id": spec["mission_id"]} if validation else {})}
@@ -902,6 +923,10 @@ class Factory:
         row = self.row(mission)
         operations = self.db.execute("SELECT * FROM operations WHERE mission=? ORDER BY started", (mission,)).fetchall()
         events = self.db.execute("SELECT kind,payload FROM events WHERE mission=? ORDER BY sequence", (mission,)).fetchall()
+        spec = json.loads(row["spec"])
+        if candidate_stage.requested(spec):
+            preflights = [json.loads(e["payload"]) for e in events if e["kind"] == "prepaid_preflight"]
+            return candidate_stage.report(self, row, operations, preflights, events)
         deliveries = [json.loads(e["payload"]) for e in events if e["kind"] == "delivery"]
         delivery = deliveries[-1] if deliveries else {}
         preflights = [json.loads(e["payload"]) for e in events if e["kind"] == "prepaid_preflight"]
@@ -1039,11 +1064,16 @@ class Factory:
             finally:
                 stopped.set()
                 watcher.join(timeout=1)
+                if hasattr(self.runtime, "close_session"):
+                    self.runtime.close_session()
 
     def _run(self, mission):
         try:
             if self.cancel_requested(mission):
                 raise FactoryBlocked("CANCELLED", "user cancelled; no dispatch or resume is authorized")
+            authority_spec = json.loads(self.row(mission)["spec"])
+            if candidate_stage.requested(authority_spec):
+                return self._run_local_candidate(authority_spec, Path(self.row(mission)["candidate"]), self.row(mission))
             spec, cwd = self.prepare(mission)
             row = self.row(mission)
             uncertain = self.db.execute("SELECT id FROM operations WHERE mission=? AND status IN ('RUNNING','UNKNOWN') LIMIT 1", (mission,)).fetchone()
@@ -1162,6 +1192,129 @@ class Factory:
         except Exception as exc:
             self.state(mission, "UNKNOWN", f"{type(exc).__name__}: {exc}")
         return self.report(mission)
+
+    def _run_local_candidate(self, spec, cwd, row):
+        """Explicitly authorized one-thread local delivery; legacy path is untouched."""
+        mission = spec["mission_id"]
+        self._local_started = time.monotonic()
+        try:
+            candidate_stage.authorize(spec, self.config, Path(row["candidate"]),
+                                      self.profile_identities["developer"])
+            if row["status"] in ("UNKNOWN", "BLOCKED_BUDGET", "BLOCKED_SCOPE", "BLOCKED_LIMIT",
+                                 "BLOCKED_LOCAL_AUTHORITY", candidate_stage.LOCAL_READY):
+                return self.report(mission)
+            if row["status"] == "CREATED":
+                row = self.row(mission)
+            spec, cwd = self.prepare(mission)
+            row = self.row(mission)
+            operation_rows = self.db.execute("SELECT * FROM operations WHERE mission=?", (mission,)).fetchall()
+            if operation_rows:
+                # A completed first turn is resumed only in this live process;
+                # any persisted unresolved operation remains governed by the global UNKNOWN guard.
+                raise FactoryBlocked("UNKNOWN", "single-agent turn evidence already exists but its in-memory thread is unavailable")
+            instruction = self._authorization_summary(spec, Path(row["candidate"]))
+            payload = {"objective": spec["objective"], "acceptance": spec["acceptance"],
+                       "constraints": spec["constraints"], "scope": spec["scope"],
+                       "authorization": instruction,
+                       "instruction": "You are the sole Codex execution agent. Understand the repository, plan and implement the complete task, add regression coverage, and make ordinary fixes. Do not ask for a separate planner or reviewer. Do not commit, merge, publish, push, deploy, contact external services, or change files outside scope. Return JSON with summary and known_risks."}
+            self.state(mission, "IMPLEMENT")
+            self._single_thread_id = None
+            self._single_usage_snapshot = None
+            self._single_qa_round = 0
+            result = self._single_agent_operation(spec, cwd, payload, "implement", 0, None)
+            work = result["output"]
+            target = self.checkpoint(spec, cwd)
+            if not target["files"]:
+                raise FactoryBlocked("UNKNOWN", "implementation produced no candidate changes; no delivery asserted")
+            self.state(mission, "TEST")
+            checks = self.gates(spec, cwd, target, "checks", 0)
+            ci = []
+            if not candidate_stage.targeted(spec, self.config):
+                self.state(mission, "CI")
+                ci = self.gates(spec, cwd, target, "ci", 0)
+            failed = [r for r in checks + ci if r["status"] != "PASS"]
+            if failed:
+                if self._single_thread_id is None:
+                    raise FactoryBlocked("UNKNOWN", "same-thread repair unavailable; no new thread authorized")
+                self._verify_local_resume(spec, cwd, target)
+                repair_payload = {**payload, "diagnostics": failed,
+                    "instruction": "The trusted Controller QA below failed. Fix only these concrete failures, add/update regression tests as needed, and return summary and known_risks. This is the one authorized ordinary repair; do not start another task or take external actions."}
+                self.state(mission, "REWORK")
+                result = self._single_agent_operation(spec, cwd, repair_payload, "rework", 1, self._single_thread_id)
+                work = result["output"]
+                target = self.checkpoint(spec, cwd)
+                if not target["files"]:
+                    raise FactoryBlocked("UNKNOWN", "repair removed all candidate changes")
+                self.state(mission, "TEST")
+                self._single_qa_round = 1
+                checks = self.gates(spec, cwd, target, "checks", 1)
+                ci = []
+                if not candidate_stage.targeted(spec, self.config):
+                    self.state(mission, "CI")
+                    ci = self.gates(spec, cwd, target, "ci", 1)
+                if any(r["status"] != "PASS" for r in checks + ci):
+                    raise FactoryBlocked("BLOCKED_LIMIT", "trusted QA still fails after the one authorized same-thread repair")
+                target = self.checkpoint(spec, cwd)
+                checks = self.gates(spec, cwd, target, "checks", 1)
+                if not candidate_stage.targeted(spec, self.config):
+                    ci = self.gates(spec, cwd, target, "ci", 1)
+                if any(r["status"] != "PASS" for r in checks + ci):
+                    raise FactoryBlocked("BLOCKED_LIMIT", "post-repair full QA failed")
+            if any(r["status"] != "PASS" for r in checks + ci):
+                raise FactoryBlocked("BLOCKED_LIMIT", "trusted QA failed; no local candidate delivered")
+            self._verify_local_resume(spec, cwd, target)
+            result = candidate_stage.complete(self, spec, cwd, target, work, checks, ci)
+            return result
+        except FactoryBlocked as exc:
+            self.state(mission, exc.status, exc.reason)
+        except Exception as exc:
+            self.state(mission, "UNKNOWN", f"{type(exc).__name__}: {exc}")
+        return self.report(mission)
+
+    def _authorization_summary(self, spec, cwd):
+        auth = spec["local_candidate_authorization"]
+        return {"AUTHORIZATION_VERIFIED": True, "AUTHORIZATION_IDENTITY": auth["approval_id"],
+                "AUTHORIZED_TASK": spec["objective"], "REPOSITORY_AND_BASE": {"repository": spec["repository"], "base": spec["base"]},
+                "CANDIDATE_WORKSPACE": str(cwd), "ALLOWED_SCOPE": spec["scope"],
+                "FORBIDDEN_ACTIONS": ["network", "push", "pull", "PR", "merge", "release", "deployment", "external API"],
+                "EXECUTION_LIMITS": {"max_turns": 2, "max_repairs": 1, **self.config["budget"]}}
+
+    def _verify_local_resume(self, spec, cwd, target):
+        candidate_stage.authorize(spec, self.config, cwd, self.profile_identities["developer"])
+        if self.target(spec, cwd) != target or git(cwd, "remote"):
+            raise FactoryBlocked("BLOCKED_SCOPE", "candidate identity, HEAD, scope, or remote boundary changed")
+
+    def _single_agent_operation(self, spec, cwd, payload, stage, round_, thread_id):
+        lane = "developer"
+        profile = self.config["profiles"][lane]
+        identity = {"profile": self.profile_identities[lane], "engine": "codex-app-server",
+                    "stage": stage, "repository": spec["repository"], "base": spec["base"],
+                    "dispatch_head": git(cwd, "rev-parse", "HEAD"), "scope": spec["scope"],
+                    "thread_id": thread_id}
+        key = digest({"stage": stage, "round": round_, "profile": self.profile_identities[lane], "payload": payload})
+        self._single_thread_id = thread_id
+        def invoke(transcript):
+            call_payload = {**payload, "_thread_id": thread_id, "_return_thread": True,
+                            "_reuse_session": True}
+            result = self.runtime.agent(stage, profile, cwd, call_payload, transcript,
+                    self.operation_timeout(spec["mission_id"]), [self.root, Path(spec["repository"])])
+            if result.get("thread_id"):
+                if thread_id is not None and result["thread_id"] != thread_id:
+                    raise FactoryBlocked("UNKNOWN", "runtime changed execution thread between turns")
+                self._single_thread_id = result["thread_id"]
+            elif isinstance(self.runtime, LocalRuntime):
+                raise FactoryBlocked("UNKNOWN", "official App Server did not return a thread identity")
+            measured = candidate_stage.usage_increment(result.get("usage"), self._single_usage_snapshot)
+            if measured is None:
+                raise FactoryBlocked("UNKNOWN", "thread usage snapshot missing, regressed, or incomplete")
+            delta, snapshot = measured
+            self._single_usage_snapshot = snapshot
+            result["usage_delta"] = delta
+            result["usage_snapshot"] = result.get("usage")
+            result["usage"] = {"total": delta} if "totalTokens" in delta or "total_tokens" in delta else delta
+            return result
+        result = self.operation(spec["mission_id"], key, stage, lane, identity, payload, True, invoke)
+        return result
 
     def approve(self, mission, action, reason, expected_head):
         if action not in ("merge", "release") or not isinstance(reason, str) or not reason.strip():

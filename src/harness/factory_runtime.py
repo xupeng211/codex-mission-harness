@@ -285,7 +285,11 @@ class FactoryAppServer(AppServerCodex):
         if message.get("method") == "thread/tokenUsage/updated":
             self.usage = message.get("params", {}).get("tokenUsage")
             from .factory_budget import tokens
-            if self.token_limit and (tokens(self.usage) or 0) > self.token_limit:
+            measured = tokens(self.usage)
+            baseline = tokens(getattr(self, "_turn_usage_baseline", None)) or 0
+            if measured is None or measured < baseline:
+                raise RuntimeFailure("Codex token telemetry missing or regressed", self.usage, self.runtime_identity)
+            if self.token_limit and measured - baseline > self.token_limit:
                 raise RuntimeFailure("Codex token telemetry exceeded run allowance", self.usage, self.runtime_identity)
         return message
 
@@ -326,8 +330,9 @@ class FactoryAppServer(AppServerCodex):
         params["config"]["project_root_markers"] = []
         return params
 
-    def execute(self, prompt: str, schema: dict) -> dict:
-        thread_id = self.start_or_resume(None, self._policy_cwd)
+    def execute(self, prompt: str, schema: dict, thread_id: str | None = None, return_thread: bool = False) -> dict:
+        self._turn_usage_baseline = self.usage
+        thread_id = self.start_or_resume(thread_id, self._policy_cwd)
         params = {"threadId": thread_id, "input": [{"type": "text", "text": prompt}],
                   "outputSchema": schema, **self._policy_params(self._policy_cwd)}
         if self.MODEL:
@@ -342,6 +347,7 @@ class FactoryAppServer(AppServerCodex):
             raise RuntimeError("explicit configured model was rerouted; exact model identity changed")
         self.runtime_identity.update(thread_id=thread_id, turn_id=turn_id, model_routing=routed)
         items = {i["id"]: i for i in completed.get("items", []) if "id" in i}
+        turn_usage = []
         for event in self.events:
             p = event.get("params", {})
             if p.get("threadId") == thread_id and p.get("turnId") == turn_id:
@@ -350,7 +356,15 @@ class FactoryAppServer(AppServerCodex):
                     if "id" in item:
                         items[item["id"]] = item
                 if event.get("method") == "thread/tokenUsage/updated":
-                    self.usage = p.get("tokenUsage")
+                    turn_usage.append(p.get("tokenUsage"))
+        if not turn_usage or any(value is None for value in turn_usage):
+            raise RuntimeFailure("turn usage telemetry missing or incomplete; no replay", self.usage, self.runtime_identity)
+        from .factory_budget import tokens
+        if any(tokens(value) is None for value in turn_usage):
+            raise RuntimeFailure("turn usage telemetry invalid; no replay", turn_usage[-1], self.runtime_identity)
+        if len(turn_usage) > 1 and any(turn_usage[i] == turn_usage[i - 1] for i in range(1, len(turn_usage))):
+            raise RuntimeFailure("duplicate turn usage event; no replay", turn_usage[-1], self.runtime_identity)
+        self.usage = turn_usage[-1]
         text = [i["text"] for i in items.values() if i.get("type") == "agentMessage"
                 and i.get("phase") in (None, "final_answer")]
         if not text:
@@ -365,7 +379,8 @@ class FactoryAppServer(AppServerCodex):
             if not receipt["usage_complete"]:
                 raise RuntimeFailure("explicit proxy result/usage identity is uncertain; no replay", self.usage, self.runtime_identity)
         return {"output": json.loads(text[-1]), "usage": self.usage,
-                "thread_id": thread_id, "turn_id": turn_id,
+                "thread_id": thread_id if return_thread else None, "turn_id": turn_id,
+                "usage_events": turn_usage,
                 "runtime_identity": self.runtime_identity, "model_routing": routed,
                 **({"physical_accounting": receipt, "usage_complete": receipt["usage_complete"]} if receipt else {})}
 
@@ -399,6 +414,15 @@ class LocalRuntime:
         self.resource_policy = {}
         self.current_process = None
         self._validation_cancelled = False
+        self._single_server = None
+        self._single_binding = None
+
+    def close_session(self):
+        if self._single_server is not None:
+            self._single_server.close()
+        self._single_server = None
+        self._single_binding = None
+        self.current_process = None
 
     def cancel(self):
         self._validation_cancelled = True
@@ -453,6 +477,9 @@ class LocalRuntime:
         return identity
 
     def agent(self, role, profile, cwd, payload, transcript, timeout, denied_roots):
+        thread_id = payload.pop("_thread_id", None)
+        return_thread = bool(payload.pop("_return_thread", False))
+        reuse_session = bool(payload.pop("_reuse_session", False))
         token_limit = self.resource_policy.get("max_run_tokens")
         if role == "plan":
             from .factory_budget import planning_limits
@@ -462,13 +489,30 @@ class LocalRuntime:
                 **limits, "physical_token_ceiling": "NOT_GUARANTEED",
                 "instruction": "Use targeted searches and small excerpts. Do not dump the repository, generated bundles or unrelated documentation. Stop exploring once you can return a bounded actionable plan; if essential information is missing, state the unresolved decision. Do not repeat broad scans."}}
         protected = (cwd / payload["mission_scope_file"],) if payload.get("mission_scope_file") else ()
-        server = FactoryAppServer(profile, cwd, transcript, timeout, denied_roots,
-                                  role in ("plan", "review"), role == "review", token_limit,
-                                  protected_paths=protected)
+        binding = (json.dumps(profile, sort_keys=True), str(cwd.resolve()), tuple(map(str, denied_roots)))
+        if reuse_session and self._single_server is not None:
+            if self._single_binding != binding:
+                raise RuntimeFailure("single-agent App Server binding changed; no replay", None, None)
+            server = self._single_server
+            server.transcript = transcript
+            server._transcript_bytes = 0
+            server._response_timeout = timeout
+            server._end_time = time.monotonic() + timeout
+            server.token_limit = token_limit
+        else:
+            server = FactoryAppServer(profile, cwd, transcript, timeout, denied_roots,
+                                      role in ("plan", "review"), role == "review", token_limit,
+                                      protected_paths=protected)
+            if reuse_session:
+                self._single_server, self._single_binding = server, binding
         self.current_process = server.proc
         try:
             schema = REVIEW_SCHEMA if role == "review" else PLAN_SCHEMA if role == "plan" else WORK_SCHEMA
-            return server.execute(json.dumps(payload, ensure_ascii=False), schema)
+            result = server.execute(json.dumps(payload, ensure_ascii=False), schema,
+                                    thread_id=thread_id, return_thread=return_thread)
+            if not return_thread:
+                result.pop("thread_id", None)
+            return result
         except Exception as exc:
             if server._proxy_relay:
                 try:
@@ -483,7 +527,8 @@ class LocalRuntime:
                 raise RuntimeFailure("explicit CLI proxy run failed; no retry or fallback", server.usage, server.runtime_identity) from exc
             raise RuntimeFailure(str(exc), server.usage, server.runtime_identity) from exc
         finally:
-            server.close()
+            if not reuse_session:
+                server.close()
             self.current_process = None
 
     def second_review(self, profile, cwd, payload, transcript, timeout):
