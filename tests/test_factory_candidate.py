@@ -83,20 +83,110 @@ class LocalCandidateTests(unittest.TestCase):
 
     def authorize(self):
         config = validate_config(self.config)
-        self.spec["local_candidate_authorization"] = {
+        worktree = self.f.root / "candidates/feature"
+        if "project_contract" in config:
+            worktree /= "source"
+        authorization = {
             "approval_id": "OFFLINE-FIXTURE-ONLY", "mission_id": "feature",
             "repository": str(self.repo), "base": self.base,
-            "worktree": str(self.f.root / "candidates/feature"),
+            "worktree": str(worktree),
             "allowed_paths": self.spec["scope"], "acceptance": self.spec["acceptance"],
             "executor_identity": self.f.profile_identities["developer"],
             **{k: config[k] for k in ("checks", "ci", "budget", "max_rounds", "timeout_seconds", "simulation")},
             "billing": BILLING, "remote_write": "FORBIDDEN", "formal_review": "NOT_AUTHORIZED",
             "executor_permissions": "ISOLATED_CANDIDATE_ONLY_NO_NETWORK",
             "expires_at": "2099-01-01T00:00:00+00:00"}
+        if "local_acceptance" in config:
+            authorization["local_acceptance"] = config["local_acceptance"]
+        self.spec["local_candidate_authorization"] = authorization
+
+    def configure_project_candidate(self):
+        self.f.close()
+        self.config = copy.deepcopy(self.config)
+        self.config.update({
+            "project_contract": "footballprediction",
+            "checks": [["make", "verify-targeted"]],
+            "ci": [["make", "verify-pr"]],
+            "trusted_validation": {
+                "image": "fixture@sha256:" + "a" * 64,
+                "postgres_image": "fixture-postgres@sha256:" + "b" * 64,
+                "cpus": 2, "memory_mb": 4096, "pids": 256, "tmpfs_mb": 2048},
+            "local_acceptance": {"profile": "targeted", "test_paths": ["tests/test_score.py"]},
+        })
+        self.f = Factory(self.root / "project-local-state", self.config, self.runtime)
+        self.spec["scope"] = list(self.scope["authorized_paths"])
+        self.spec["approved_mission_scope"] = self.approval()
+        self.authorize()
 
     def run_candidate(self):
         self.f.submit(self.spec)
         return self.f.run("feature")
+
+    def test_project_local_candidate_submits_materializes_and_binds_approved_scope(self):
+        self.configure_project_candidate()
+        with patch.object(self.runtime, "project_policy", wraps=self.runtime.project_policy) as policy:
+            self.f.submit(self.spec)
+            spec, cwd = self.f.prepare("feature")
+            target = self.f.target(spec, cwd)
+
+        self.assertEqual(policy.call_count, 2)
+        self.assertEqual(policy.call_args_list[0].args[2], self.spec["scope"])
+        self.assertEqual(policy.call_args_list[1].args[2], target["files"])
+        self.assertEqual((cwd / self.path).read_bytes(), self.spec["approved_mission_scope"]["content"].encode())
+        self.assertEqual(target["mission_scope_sha256"], self.spec["approved_mission_scope"]["sha256"])
+        self.assertEqual(target["scope_approval_id"], self.spec["approved_mission_scope"]["approval_id"])
+        self.assertEqual(target["files"], [self.path])
+        self.assertEqual(git(cwd, "remote"), "")
+        self.assertEqual(self.runtime.calls, [])
+        self.assertEqual(self.runtime.final_calls, 0)
+        self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM operations").fetchone()[0], 0)
+
+    def test_project_scope_and_local_authority_mismatches_reject_before_dispatch(self):
+        self.configure_project_candidate()
+        original = copy.deepcopy(self.spec)
+        wrong_content = json.loads(original["approved_mission_scope"]["content"])
+        wrong_content["authorized_paths"].remove("tests/test_score.py")
+        wrong_content = json.dumps(wrong_content, ensure_ascii=False, indent=2) + "\n"
+        cases = {
+            "mission": lambda spec: spec["approved_mission_scope"].update(mission_id="other"),
+            "base": lambda spec: spec["approved_mission_scope"].update(base="0" * 40),
+            "project_paths": lambda spec: spec["approved_mission_scope"].update(
+                content=wrong_content, sha256=hashlib.sha256(wrong_content.encode()).hexdigest()),
+            "repository": lambda spec: spec["local_candidate_authorization"].update(repository="/tmp/other"),
+            "candidate_paths": lambda spec: spec["local_candidate_authorization"].update(allowed_paths=["**"]),
+            "missing_scope": lambda spec: spec.pop("approved_mission_scope"),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                self.spec = copy.deepcopy(original)
+                mutate(self.spec)
+                with self.assertRaises(ValueError):
+                    self.f.submit(self.spec)
+                self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM missions").fetchone()[0], 0)
+                self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM operations").fetchone()[0], 0)
+                self.assertEqual(self.runtime.calls, [])
+
+    def test_project_scope_approval_is_rejected_without_project_contract(self):
+        self.spec["approved_mission_scope"] = self.approval()
+        self.authorize()
+        with self.assertRaisesRegex(ValueError, "explicit project_contract mode"):
+            self.f.submit(self.spec)
+        self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM missions").fetchone()[0], 0)
+        self.assertEqual(self.runtime.calls, [])
+
+    def test_project_contract_requires_its_scope_approval_and_rejects_unknown_contract(self):
+        self.configure_project_candidate()
+        self.spec.pop("approved_mission_scope")
+        self.authorize()
+        with self.assertRaisesRegex(ValueError, "approved_mission_scope is required"):
+            self.f.submit(self.spec)
+        self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM missions").fetchone()[0], 0)
+        self.assertEqual(self.runtime.calls, [])
+
+        invalid = copy.deepcopy(self.config)
+        invalid["project_contract"] = "footballprediction-unknown"
+        with self.assertRaisesRegex(ValueError, "project mode is explicit"):
+            validate_config(invalid)
 
     def ready(self):
         report = self.run_candidate()

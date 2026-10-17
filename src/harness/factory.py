@@ -407,9 +407,13 @@ class Factory:
         spec = validate_mission(raw)
         if candidate_stage.requested(spec):
             candidate_stage.authorize(spec, self.config)
-        if self.project and not candidate_stage.requested(spec):
+        if self.project:
             approved_scope(spec)
-            if "project_pr_ci" in self.config:
+            if candidate_stage.requested(spec):
+                # Project scope is still an authorization boundary for local
+                # candidates; validate it before any execution can be dispatched.
+                self.runtime.project_policy(spec, Path(spec["repository"]), spec["scope"])
+            elif "project_pr_ci" in self.config:
                 from .factory_pr_ci import repository_identity
                 repository_identity(spec, self.config["project_pr_ci"])
         elif "approved_mission_scope" in spec:
@@ -479,10 +483,13 @@ class Factory:
         target = {"repository": spec["repository"], "base": spec["base"], "head": head,
                 "commit": head, "tree": git(cwd, "rev-parse", "HEAD^{tree}"),
                 "scope": spec["scope"], "files": files, "diff_sha256": hashlib.sha256(diff.encode()).hexdigest()}
-        if self.project and not candidate_stage.requested(spec):
+        if self.project:
             try:
                 target.update(scope_binding(spec, cwd, head, git))
-                target["review_range"] = review_manifest(cwd, target, git)
+                if not candidate_stage.requested(spec):
+                    target["review_range"] = review_manifest(cwd, target, git)
+                # Local candidates keep the project scope boundary without
+                # entering the formal review path.
                 target["project_policy"] = self.runtime.project_policy(spec, cwd, files)
             except (ValueError, OSError, UnicodeError, subprocess.SubprocessError) as exc:
                 raise FactoryBlocked("BLOCKED_SCOPE", str(exc)) from exc
