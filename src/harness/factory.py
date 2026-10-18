@@ -106,7 +106,7 @@ def validate_config(raw: dict) -> dict:
     """Operator policy is separate from the customer's product requirement."""
     allowed = {"version", "simulation", "budget", "max_rounds", "timeout_seconds", "checks", "ci",
                "profiles", "independent_review_required", "max_review_bytes", "max_context_bytes", "repository", "hosted_ci", "project_contract",
-               "trusted_validation", "project_pr_ci", "local_acceptance"}
+               "trusted_validation", "project_pr_ci", "local_acceptance", "model_routing"}
     if not isinstance(raw, dict) or set(raw) - allowed or type(raw.get("version")) is not int or raw.get("version") != 1:
         raise ValueError("invalid factory configuration")
     config = json.loads(encoded(raw))
@@ -201,6 +201,9 @@ def validate_config(raw: dict) -> dict:
             if not profile.get("model") or not Path(profile.get("token_file", "")).is_absolute():
                 raise ValueError("DeepSeek requires a model and an absolute private token file")
             bounded_int(profile.get("max_output_tokens", 8192), "max_output_tokens", 1, 32768)
+    if "model_routing" in config:
+        from .factory_routing import validate_pool
+        validate_pool(config["model_routing"])
     return config
 
 
@@ -211,10 +214,13 @@ def policy_identity(config):
 
 
 def validate_mission(raw):
-    keys = {"version", "mission_id", "repository", "objective", "acceptance", "constraints", "scope", "base", "mission_scope_file", "approved_mission_scope", "delivery_mode", "local_candidate_authorization"}
+    keys = {"version", "mission_id", "repository", "objective", "acceptance", "constraints", "scope", "base", "mission_scope_file", "approved_mission_scope", "delivery_mode", "local_candidate_authorization", "model_routing"}
     if not isinstance(raw, dict) or set(raw) - keys or type(raw.get("version")) is not int or raw.get("version") != 2:
         raise ValueError("factory missions require version 2")
     mission = json.loads(encoded(raw))
+    if "model_routing" in mission:
+        from .factory_routing import validate_request
+        validate_request(mission["model_routing"])
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}", mission.get("mission_id", "")):
         raise ValueError("invalid mission_id")
     repo = Path(mission["repository"]).resolve(strict=True)
@@ -331,7 +337,9 @@ class Factory:
             self.runtime.resource_policy = self.config["budget"]
         self.project = self.config.get("project_contract") == PROJECT
         self.profile_identities = {lane: self.runtime.profile_identity(profile) if hasattr(self.runtime, "profile_identity") else {"configured": profile, "fixture": True}
-                                   for lane, profile in self.config["profiles"].items() if not self.project or lane == "developer"}
+                                   for lane, profile in self.config["profiles"].items()
+                                   if (not self.project or lane == "developer") and not (lane == "developer" and "model_routing" in self.config)}
+        self._routing_identities = {}
         requested_root = Path(root).absolute()
         metadata = [parent / ".git" for parent in (requested_root, *requested_root.parents)]
         if any(p.is_file() or p.is_symlink() or ((p / "HEAD").is_file() and (p / "config").is_file()) for p in metadata):
@@ -402,6 +410,26 @@ class Factory:
             raise ValueError("operator policy/budget differs from the immutable mission authority")
         return row
 
+    def developer_binding(self, spec):
+        """Resolve once per identity; the submitted route cannot change on resume."""
+        if "model_routing" not in self.config:
+            if "model_routing" in spec:
+                raise ValueError("task routing requires an explicit operator model pool")
+            return self.config["profiles"]["developer"], self.profile_identities["developer"]
+        from .factory_routing import select
+        profile, decision = select(self.config["model_routing"], spec.get("model_routing"))
+        key = digest({"profile": profile, "selection": decision})
+        if key not in self._routing_identities:
+            identity = (self.runtime.profile_identity(profile) if hasattr(self.runtime, "profile_identity")
+                        else {"configured": profile, "fixture": True})
+            self._routing_identities[key] = {**identity, "model_selection": decision}
+        identity = self._routing_identities[key]
+        submitted = self.db.execute("SELECT payload FROM events WHERE mission=? AND kind='submitted'",
+                                    (spec["mission_id"],)).fetchone()
+        if submitted and json.loads(submitted[0]).get("routing_executor") != identity:
+            raise ValueError("bound task route changed; new task authorization required")
+        return profile, identity
+
     def state(self, mission, status, reason=""):
         self.db.execute("UPDATE missions SET status=?,reason=? WHERE id=?", (status, reason, mission))
         self.event(mission, "state", {"status": status, "reason": reason})
@@ -414,6 +442,7 @@ class Factory:
 
     def submit(self, raw):
         spec = validate_mission(raw)
+        _, executor = self.developer_binding(spec)
         if candidate_stage.requested(spec):
             candidate_stage.authorize(spec, self.config)
         if self.project:
@@ -445,10 +474,11 @@ class Factory:
         if candidate.exists():
             raise ValueError("unowned candidate path already exists")
         if candidate_stage.requested(spec):
-            candidate_stage.authorize(spec, self.config, candidate, self.profile_identities["developer"])
+            candidate_stage.authorize(spec, self.config, candidate, executor)
         self.db.execute("INSERT INTO missions(id,spec,policy,status,candidate) VALUES(?,?,?,?,?)",
                         (mission, encoded(spec), encoded(policy_identity(self.config)), "CREATED", str(candidate)))
-        self.event(mission, "submitted", {"spec": spec, "profiles": self.config["profiles"]})
+        self.event(mission, "submitted", {"spec": spec, "profiles": self.config["profiles"],
+                   **({"routing_executor": executor} if "model_routing" in self.config else {})})
         self.db.commit()
         return mission
 
@@ -535,6 +565,13 @@ class Factory:
     def operation(self, mission, key, stage, lane, identity, payload, paid, invoke, prepare=None):
         """Reserve before dispatch. A lost response is never replayed under a new guise."""
         candidate_stage.check_dispatch(self, mission, stage)
+        routing_decision = None
+        if paid and lane == "developer" and "model_routing" in self.config:
+            spec = json.loads(self.row(mission)["spec"])
+            _, expected = self.developer_binding(spec)
+            if identity.get("profile") != expected:
+                raise FactoryBlocked("BLOCKED_LOCAL_AUTHORITY", "dispatch differs from bound task model/route")
+            routing_decision = expected["model_selection"]
         old = self.db.execute("SELECT * FROM operations WHERE mission=? AND key=?", (mission, key)).fetchone()
         if old:
             if old["status"] != "COMPLETE":
@@ -598,6 +635,12 @@ class Factory:
             result = invoke(transcript, prepared) if prepare is not None else invoke(transcript)
             if not isinstance(result, dict):
                 raise ValueError("runtime returned a non-object result")
+            if routing_decision is not None and not self.config["simulation"]:
+                actual = result.get("runtime_identity") or {}
+                if (actual.get("route_identity") != expected.get("route_identity") or
+                        actual.get("reported_model") != routing_decision["requested_model"] or
+                        result.get("usage_complete") is not True):
+                    raise RuntimeFailure("task route/model/usage evidence differs from authorization", result.get("usage"), actual)
             result.setdefault("usage_complete", observed_usage(result.get("usage"), self.config["simulation"]) is not None)
             status = "UNKNOWN" if result.get("status") == "UNKNOWN" else "COMPLETE"
             if status == "UNKNOWN":
@@ -654,13 +697,16 @@ class Factory:
             approval = approved_scope(spec)
             payload = {**payload, "mission_scope_file": approval["path"], "mission_scope_sha256": approval["sha256"]}
         lane = "developer"
-        profile = self.config["profiles"][lane]
-        identity = {"profile": self.profile_identities[lane], "engine": "codex-app-server", "stage": stage,
+        profile, profile_identity = self.developer_binding(spec)
+        identity = {"profile": profile_identity, "engine": "codex-app-server", "stage": stage,
                     "repository": spec["repository"], "base": spec["base"], "dispatch_head": git(cwd, "rev-parse", "HEAD"),
                     "scope": spec["scope"]}
-        key = digest({"stage": stage, "round": round_, "profile": self.profile_identities[lane], "payload": payload})
+        key = digest({"stage": stage, "round": round_, "profile": profile_identity, "payload": payload})
+        call_payload = dict(payload)
+        if "model_selection" in profile_identity and not self.config["simulation"]:
+            call_payload["_authorized_route"] = profile_identity["route_identity"]
         return self.operation(spec["mission_id"], key, stage, lane, identity, payload, True,
-                              lambda transcript: self.runtime.agent(stage, profile, cwd, payload, transcript,
+                              lambda transcript: self.runtime.agent(stage, profile, cwd, call_payload, transcript,
                                                                     self.operation_timeout(spec["mission_id"]),
                                                                     [self.root, Path(spec["repository"])]))
 
@@ -940,6 +986,16 @@ class Factory:
         return results
 
     def report(self, mission):
+        report = self._report(mission)
+        if "model_routing" in self.config:
+            from .factory_routing import observation
+            event = self.db.execute("SELECT payload FROM events WHERE mission=? AND kind='submitted'", (mission,)).fetchone()
+            decision = json.loads(event[0])["routing_executor"]["model_selection"]
+            operations = self.db.execute("SELECT * FROM operations WHERE mission=? ORDER BY started", (mission,)).fetchall()
+            report["MODEL_ROUTING"] = observation(decision, operations)
+        return report
+
+    def _report(self, mission):
         row = self.row(mission)
         operations = self.db.execute("SELECT * FROM operations WHERE mission=? ORDER BY started", (mission,)).fetchall()
         events = self.db.execute("SELECT kind,payload FROM events WHERE mission=? ORDER BY sequence", (mission,)).fetchall()
@@ -1219,7 +1275,7 @@ class Factory:
         self._local_started = time.monotonic()
         try:
             candidate_stage.authorize(spec, self.config, Path(row["candidate"]),
-                                      self.profile_identities["developer"])
+                                      self.developer_binding(spec)[1])
             if row["status"] in ("UNKNOWN", "BLOCKED_BUDGET", "BLOCKED_SCOPE", "BLOCKED_LIMIT",
                                  "BLOCKED_LOCAL_AUTHORITY", candidate_stage.LOCAL_READY):
                 return self.report(mission)
@@ -1343,13 +1399,13 @@ class Factory:
         return feedback
 
     def _verify_local_resume(self, spec, cwd, target):
-        candidate_stage.authorize(spec, self.config, cwd, self.profile_identities["developer"])
+        candidate_stage.authorize(spec, self.config, cwd, self.developer_binding(spec)[1])
         if self.target(spec, cwd) != target or git(cwd, "remote"):
             raise FactoryBlocked("BLOCKED_SCOPE", "candidate identity, HEAD, scope, or remote boundary changed")
 
     def _single_agent_operation(self, spec, cwd, payload, stage, round_, thread_id):
         lane = "developer"
-        profile = self.config["profiles"][lane]
+        profile, profile_identity = self.developer_binding(spec)
         token_limit = operation_token_limit(self.config["budget"], stage, local_candidate=True)
         target = self.target(spec, cwd)
         branch = git(cwd, "branch", "--show-current")
@@ -1361,16 +1417,18 @@ class Factory:
             "PROJECT_ROOT": str(cwd), "CURRENT_BRANCH": branch,
             "CURRENT_HEAD": target["head"], "CURRENT_DIRTY_STATE": "clean",
             "BASE_SHA": spec["base"], "REMOTES": []}}
-        identity = {"profile": self.profile_identities[lane], "engine": "codex-app-server",
+        identity = {"profile": profile_identity, "engine": "codex-app-server",
                     "stage": stage, "repository": spec["repository"], "base": spec["base"],
                     "dispatch_head": git(cwd, "rev-parse", "HEAD"), "scope": spec["scope"],
                     "operation_token_limit": token_limit,
                     "thread_id": thread_id}
-        key = digest({"stage": stage, "round": round_, "profile": self.profile_identities[lane], "payload": payload})
+        key = digest({"stage": stage, "round": round_, "profile": profile_identity, "payload": payload})
         self._single_thread_id = thread_id
         def invoke(transcript):
             call_payload = {**payload, "_thread_id": thread_id, "_return_thread": True,
                             "_reuse_session": True, "_operation_token_limit": token_limit}
+            if "model_selection" in profile_identity and not self.config["simulation"]:
+                call_payload["_authorized_route"] = profile_identity["route_identity"]
             if self.project:
                 approval = approved_scope(spec)
                 call_payload.update(mission_scope_file=approval["path"],

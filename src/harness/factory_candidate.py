@@ -160,7 +160,7 @@ def check_dispatch(factory, mission, stage):
     spec = json.loads(row["spec"])
     if not requested(spec):
         return
-    authorize(spec, factory.config, Path(row["candidate"]), factory.profile_identities["developer"])
+    authorize(spec, factory.config, Path(row["candidate"]), factory.developer_binding(spec)[1])
     stopped = factory.db.execute(
         "SELECT 1 FROM events WHERE mission=? AND kind='local_candidate'", (mission,)).fetchone()
     if stage not in LOCAL_STAGES or stopped or targeted(spec, factory.config) and stage == "ci" or stage == "rework" and factory.db.execute(
@@ -183,7 +183,7 @@ def complete(factory, spec, cwd, target, work, tests, ci):
             os.fsync(stream.fileno())
         path.chmod(0o400)
     evidence = {"task_id": mission, "target": target, "worktree": str(cwd),
-                "executor_identity": factory.profile_identities["developer"],
+                "executor_identity": factory.developer_binding(spec)[1],
                 "execution_status": "SIMULATED_EXECUTION_COMPLETE" if factory.config["simulation"] else "COMPLETE",
                 "simulation": factory.config["simulation"], "repair_attempts": factory.db.execute(
                     "SELECT COUNT(*) FROM operations WHERE mission=? AND stage='rework'", (mission,)).fetchone()[0],
@@ -201,9 +201,8 @@ def complete(factory, spec, cwd, target, work, tests, ci):
     evidence["execution_operations"] = evidence["evidence_keys"]
     records = [json.loads(r[0]) for r in factory.db.execute(
         "SELECT result FROM operations WHERE mission=? AND paid=1 ORDER BY started", (mission,)).fetchall()]
-    evidence["observed_token_usage"] = {"total": sum(
-        (r.get("usage_delta", {}).get("totalTokens", r.get("usage_delta", {}).get("total", 0))
-         if isinstance(r.get("usage_delta"), dict) else 0) for r in records),
+    from .factory_budget import tokens
+    evidence["observed_token_usage"] = {"total": sum(tokens(r.get("usage")) or 0 for r in records),
         "snapshots": [r.get("usage_snapshot") for r in records],
         "operation_deltas": [r.get("usage_delta") for r in records], "money": "UNKNOWN"}
     evidence["wall_clock_time"] = round(__import__("time").monotonic() - getattr(factory, "_local_started", __import__("time").monotonic()), 3)
@@ -221,7 +220,7 @@ def verify(factory, spec, cwd, evidence):
     def require(ok, reason):
         if not ok:
             raise FactoryBlocked("UNKNOWN", reason)
-    authorize(spec, factory.config, cwd, factory.profile_identities["developer"], executing=False)
+    authorize(spec, factory.config, cwd, factory.developer_binding(spec)[1], executing=False)
     require(cwd.resolve() == cwd and (cwd / ".git").is_dir() and not (cwd / ".git").is_symlink()
             and not (cwd / ".git/objects/info/alternates").exists()
             and git(cwd, "branch", "--show-current") == "factory/" + spec["mission_id"]
@@ -232,7 +231,7 @@ def verify(factory, spec, cwd, evidence):
     require(bool(set(target["files"]) - {spec.get("mission_scope_file")}) and
             bool(evidence.get("implemented", "").strip()), "local implementation evidence missing")
     require(evidence.get("budget_authorization") == spec["local_candidate_authorization"] and
-            evidence.get("executor_identity") == factory.profile_identities["developer"] and
+            evidence.get("executor_identity") == factory.developer_binding(spec)[1] and
             evidence.get("simulation") is factory.config["simulation"], "local authority/identity changed")
     patch = evidence.get("patch", {})
     path = Path(patch.get("path", ""))
@@ -248,7 +247,7 @@ def verify(factory, spec, cwd, evidence):
         factory.verify_evidence(op)
         result = json.loads(op["result"])
         if op["paid"]:
-            require(json.loads(op["identity"])["profile"] == factory.profile_identities["developer"] and
+            require(json.loads(op["identity"])["profile"] == factory.developer_binding(spec)[1] and
                     isinstance(result.get("runtime_identity"), dict) and bool(result["runtime_identity"]) and
                     result.get("status") in {None, "COMPLETE"}, "executor success/identity missing")
         indexed[op["key"]] = op

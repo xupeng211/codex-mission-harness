@@ -78,3 +78,14 @@ without dispatching again. Changing just the official reviewer home/model refres
 that lane's evidence; developer and DeepSeek historical receipts remain intact.
 An official authentication failure stops delivery instead of using the proxy.
 Merge and release always remain explicit human decisions.
+
+## Optional task model routing
+
+The developer lane can opt into a small operator-declared CLIProxyAPI model pool.
+See [MODEL_ROUTING.md](MODEL_ROUTING.md) and
+[factory.routing.example.json](../config/factory.routing.example.json). Explicit
+mission attributes select capability before price; missing attributes select
+conservatively. Models/routes are bound before dispatch and remain fixed during
+QA repair. Official reviewer and direct DeepSeek review profiles, local-candidate
+authorization, Controller QA and publication boundaries continue to apply.
+The sample has no enabled or verified actual models and makes no pricing claim.

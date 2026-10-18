@@ -378,7 +378,7 @@ class FactoryAppServer(AppServerCodex):
         return resumed
 
     def execute(self, prompt: str, schema: dict, thread_id: str | None = None, return_thread: bool = False) -> dict:
-        self._turn_usage_baseline = self.usage
+        self._turn_usage_baseline = getattr(self, "_native_usage_snapshot", self.usage)
         self._usage_complete = False
         self._active_thread_id = None
         self._budget_exceeded = False
@@ -432,6 +432,7 @@ class FactoryAppServer(AppServerCodex):
                 raise RuntimeFailure("turn usage telemetry regressed or changed shape; no replay", value, self.runtime_identity)
             previous = value
         self.usage = turn_usage[-1]
+        self._native_usage_snapshot = self.usage
         self._usage_complete = not getattr(self, "_proxy_relay", None)
         text = [i["text"] for i in items.values() if i.get("type") == "agentMessage"
                 and i.get("phase") in (None, "final_answer")]
@@ -464,9 +465,12 @@ class FactoryAppServer(AppServerCodex):
         relay = getattr(self, "_proxy_relay", None)
         if relay:
             relay.close()
-            error = self.transcript.with_suffix(".stderr")
-            if error.exists():
-                error.write_bytes(error.read_bytes().replace(relay.nonce.encode(), b"[REDACTED]"))
+            sources = {self.transcript.with_suffix(".stderr")}
+            if hasattr(self, "_session_stderr"):
+                sources.add(self._session_stderr)
+            for error in sources:
+                if error.exists():
+                    error.write_bytes(error.read_bytes().replace(relay.nonce.encode(), b"[REDACTED]"))
             self._proxy_relay = None
         home = getattr(self, "_proxy_home", None)
         if home:
@@ -541,11 +545,14 @@ class LocalRuntime:
             identity["route_identity"] = route
             identity["qualification_identity"] = route_digest(route)
         identity["adapter_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-        dependencies = ["codex.py", "factory_proxy.py"] if profile["provider"] == "openai" else ["factory_http.py", "model_registry.py"]
+        dependencies = ["codex.py", "factory_proxy.py", "factory_routing.py"] if profile["provider"] == "openai" else ["factory_http.py", "model_registry.py"]
         identity["transport_hashes"] = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in dependencies}
         return identity
 
     def agent(self, role, profile, cwd, payload, transcript, timeout, denied_roots):
+        authorized_route = payload.pop("_authorized_route", None)
+        if authorized_route is not None and self.profile_identity(profile).get("route_identity") != authorized_route:
+            raise RuntimeFailure("task route differs from authorization; no dispatch", None, None)
         thread_id = payload.pop("_thread_id", None)
         return_thread = bool(payload.pop("_return_thread", False))
         reuse_session = bool(payload.pop("_reuse_session", False))
@@ -575,6 +582,8 @@ class LocalRuntime:
             server._response_timeout = timeout
             server._end_time = time.monotonic() + timeout
             server.token_limit = token_limit
+            if server._proxy_relay:
+                server._proxy_relay.start_turn(transcript, timeout, token_limit)
             if hasattr(server, "_native_identity"):
                 server._native_identity["execution_limits"]["token_limit"] = token_limit
         else:
@@ -583,6 +592,17 @@ class LocalRuntime:
                                       protected_paths=protected)
             if reuse_session:
                 self._single_server, self._single_binding = server, binding
+                errors = transcript.with_suffix(".stderr")
+                if errors.exists():
+                    # The child keeps this inode open across turns. Snapshot
+                    # it per operation so repair cannot alter first-turn hashes.
+                    server._session_stderr = transcript.with_suffix(".process-stderr")
+                    errors.rename(server._session_stderr)
+                    server._stderr_offset = 0
+        if authorized_route is not None and (not server._proxy_relay or
+                server._proxy_relay.policy.identity != authorized_route.get("runtime")):
+            server.close()
+            raise RuntimeFailure("proxy runtime changed before dispatch; new authorization required", None, None)
         self.current_process = server.proc
         server._reuse_session = reuse_session
         try:
@@ -607,6 +627,15 @@ class LocalRuntime:
             raise RuntimeFailure(str(exc), server.usage, server.runtime_identity,
                                  usage_complete=getattr(server, "_usage_complete", False)) from exc
         finally:
+            if reuse_session and hasattr(server, "_session_stderr"):
+                data = server._session_stderr.read_bytes()
+                chunk = data[server._stderr_offset:]
+                server._stderr_offset = len(data)
+                if server._proxy_relay:
+                    chunk = chunk.replace(server._proxy_relay.nonce.encode(), b"[REDACTED]")
+                with transcript.with_suffix(".stderr").open("xb") as errors:
+                    os.fchmod(errors.fileno(), 0o600)
+                    errors.write(chunk)
             if not reuse_session:
                 server.close()
             self.current_process = None

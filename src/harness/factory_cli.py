@@ -23,8 +23,11 @@ COMMANDS = {"setup", "submit", "status", "delivery", "resume", "cancel", "approv
 
 
 def readable(result):
+    selection = result.get("MODEL_ROUTING", {}).get("selection")
+    route_line = (f"模型：{selection['requested_model']}；档位：{selection['selected_tier']}；"
+                  f"路由：{selection['route_id']}；原因：{selection['reason']}；实际账单：UNKNOWN\n") if selection else ""
     if result.get("DELIVERY_STATUS") == "LOCAL_CANDIDATE_READY":
-        return ("LOCAL_CANDIDATE_READY\n"
+        return ("LOCAL_CANDIDATE_READY\n" + route_line +
                 f"MISSION_ID={result['MISSION']}\nAUTHORIZATION_IDENTITY={result['AUTHORIZATION_IDENTITY']}\n"
                 f"CANDIDATE_PATH={result['CANDIDATE']}\nBASE_SHA={result['BASE_SHA']}\n"
                 f"FINAL_HEAD_SHA={result['FINAL_HEAD_SHA']}\nFINAL_TREE_SHA={result['FINAL_TREE_SHA']}\n"
@@ -45,6 +48,8 @@ def readable(result):
     lines = [f"任务：{result['MISSION']}", f"状态：{result['DELIVERY_STATUS']}",
              f"执行次数：{budget['agent_runs']}/{budget['limit']}；已观察 token：{budget['observed_tokens']}；未知 usage：{budget['unknown_usage_runs'] + budget['partial_usage_runs']}",
              f"未知 token 保留额：{budget['unknown_token_reservation']}；金额：{budget['money']}"]
+    if route_line:
+        lines.append(route_line.rstrip())
     if result['DELIVERY_STATUS'] == 'READY_FOR_USER_ACCEPTANCE':
         lines += [f"测试：{result['TEST_RESULT']}；本地 CI：{result['LOCAL_CI']}；GitHub CI：{result['HOSTED_CI']}",
                   f"候选版本：{result['TARGET_HEAD']}", f"候选源码：{result['CANDIDATE']}",
@@ -72,6 +77,13 @@ def main(argv=None):
     submit.add_argument("--scope", action="append", default=None)
     submit.add_argument("--base", default="HEAD")
     submit.add_argument("--mission-scope-file", help="optional committed project governance contract")
+    from .factory_routing import CATEGORIES, EFFORTS, TIERS
+    submit.add_argument("--task-category", choices=sorted(CATEGORIES))
+    submit.add_argument("--task-complexity", choices=["low", "normal", "complex"])
+    submit.add_argument("--task-risk", choices=["low", "normal", "high"])
+    submit.add_argument("--pool-model", help="explicit operator pool entry id")
+    submit.add_argument("--model-tier", choices=list(TIERS))
+    submit.add_argument("--model-effort", choices=sorted(EFFORTS))
     for command in ("factory-run", "factory-resume"):
         child = sub.add_parser(command, aliases=["resume"] if command == "factory-resume" else [])
         child.add_argument("mission", type=Path if command == "factory-run" else str, nargs=None if command == "factory-run" else "?")
@@ -127,6 +139,9 @@ def main(argv=None):
                 official_rubric()
                 lanes = {}
                 for lane, profile in config["profiles"].items():
+                    if lane == "developer" and "model_routing" in config:
+                        lanes[lane] = "TASK_ROUTED; pool declarations only; use factory_routing preview"
+                        continue
                     try:
                         if profile["provider"] == "openai":
                             LocalRuntime().profile_identity(profile)
@@ -150,6 +165,12 @@ def main(argv=None):
                         spec = {"version": 2, "mission_id": args.mission_id or "delivery-" + uuid.uuid4().hex[:12],
                                 "repository": str(repository), "objective": request, "acceptance": args.acceptance,
                                 "constraints": args.constraint, "scope": args.scope or ["**"], "base": args.base}
+                        routing = {field: value for field, value in (
+                            ("category", args.task_category), ("complexity", args.task_complexity),
+                            ("risk", args.task_risk), ("model", args.pool_model),
+                            ("tier", args.model_tier), ("effort", args.model_effort)) if value is not None}
+                        if routing:
+                            spec["model_routing"] = routing
                         if args.mission_scope_file:
                             spec["mission_scope_file"] = args.mission_scope_file
                         result = factory.run(factory.submit(spec))
