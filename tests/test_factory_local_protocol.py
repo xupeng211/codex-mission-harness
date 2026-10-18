@@ -171,6 +171,18 @@ class NativeProtocolTests(unittest.TestCase):
         self.assertEqual(repair["sampling_token_weight"], 1.0)
         self.assertEqual(repair["prefill_token_weight"], 1.0)
 
+    def test_efficiency_guidance_preserves_native_repository_instruction_loading(self):
+        instructions = self.cwd / "AGENTS.md"
+        instructions.write_text("# Repository policy\nNever bypass regression tests or independent QA.\n")
+        server = self.server(False)
+        result = next(e["result"] for e in server.events
+                      if isinstance(e.get("result"), dict) and "thread" in e["result"])
+        self.assertIn(str(instructions), result["instructionSources"])
+        params = server._thread_policy_params(str(self.cwd))
+        self.assertNotIn("baseInstructions", params)
+        self.assertNotIn("project_doc_max_bytes", params["config"])
+        self.assertFalse(any(e.get("method") == "turn/started" for e in server.events))
+
     def test_reviewer_official_permissions_deny_code_edits(self):
         server = self.server(True)
         paths = {"source": str(self.cwd / "score.py"), "auth": str(self.auth / "private-sentinel"),

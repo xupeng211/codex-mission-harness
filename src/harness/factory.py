@@ -1236,6 +1236,20 @@ class Factory:
             payload = {"objective": spec["objective"], "acceptance": spec["acceptance"],
                        "constraints": spec["constraints"], "scope": spec["scope"],
                        "authorization": instruction,
+                       "execution_guidance": (
+                           "Follow repository instructions already supplied in the conversation; do not fetch or print "
+                           "the same unchanged instructions again. If instructions are missing or changed, read them. "
+                           "Still read required workflow documents and applicable nested instructions. "
+                           "Use the Controller workspace facts below to record the required pre-edit Git identity; "
+                           "this isolated clone has no remotes, so use BASE_SHA rather than origin/main and never fetch. "
+                           "Batch independent instruction/document reads, focused source/test reads and one tool-availability "
+                           "probe where possible. Read relevant excerpts; do not dump unrelated configuration or test "
+                           "bootstrap files merely to investigate tools/dependencies that are unavailable. "
+                           "Once the defect is understood, implement it and its required regression tests. "
+                           "Batch independent post-edit checks and diff inspection in one tool round where possible. "
+                           "If dependencies are unavailable, report unrun checks and finish with the required JSON; "
+                           "the Controller still runs independent formal QA. Never omit needed source/context, "
+                           "regression coverage or required project checks to save tokens."),
                        "instruction": "You are the sole Codex execution agent. Understand the repository, plan and implement the complete task, add regression coverage, and make ordinary fixes. Do not ask for a separate planner or reviewer. Do not commit, merge, publish, push, deploy, contact external services, or change files outside scope. Return JSON with summary and known_risks."}
             self.state(mission, "IMPLEMENT")
             self._single_thread_id = None
@@ -1337,6 +1351,16 @@ class Factory:
         lane = "developer"
         profile = self.config["profiles"][lane]
         token_limit = operation_token_limit(self.config["budget"], stage, local_candidate=True)
+        target = self.target(spec, cwd)
+        branch = git(cwd, "branch", "--show-current")
+        if branch != "factory/" + spec["mission_id"] or git(cwd, "remote"):
+            raise FactoryBlocked("BLOCKED_SCOPE", "local candidate branch or remote identity changed")
+        # Refresh on both turns: QA may have checkpointed a different HEAD.
+        # These facts complement the immutable authorization, never replace it.
+        payload = {**payload, "workspace": {
+            "PROJECT_ROOT": str(cwd), "CURRENT_BRANCH": branch,
+            "CURRENT_HEAD": target["head"], "CURRENT_DIRTY_STATE": "clean",
+            "BASE_SHA": spec["base"], "REMOTES": []}}
         identity = {"profile": self.profile_identities[lane], "engine": "codex-app-server",
                     "stage": stage, "repository": spec["repository"], "base": spec["base"],
                     "dispatch_head": git(cwd, "rev-parse", "HEAD"), "scope": spec["scope"],

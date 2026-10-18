@@ -168,6 +168,56 @@ class LocalCandidateTests(unittest.TestCase):
         self.assertEqual(limits["max_total_tokens"], 96000)
         self.assertNotIn("max_run_tokens", limits)
 
+    def test_workspace_handoff_matches_git_and_refreshes_on_same_thread_repair(self):
+        self.runtime.failure = "repair"
+        original = self.runtime.agent
+        received = []
+        def agent(role, profile, cwd, payload, *args):
+            context = payload["workspace"]
+            self.assertEqual(context, {
+                "PROJECT_ROOT": str(cwd), "CURRENT_BRANCH": git(cwd, "branch", "--show-current"),
+                "CURRENT_HEAD": git(cwd, "rev-parse", "HEAD"), "CURRENT_DIRTY_STATE": "clean",
+                "BASE_SHA": self.base, "REMOTES": []})
+            self.assertEqual(git(cwd, "status", "--porcelain=v1", "-uall"), "")
+            self.assertEqual(payload["authorization"],
+                             self.f._authorization_summary(self.spec, cwd))
+            self.assertEqual(payload["acceptance"], self.spec["acceptance"])
+            self.assertEqual(payload["constraints"], self.spec.get("constraints", []))
+            self.assertEqual(payload["scope"], self.spec["scope"])
+            received.append((role, copy.deepcopy(context), payload.get("_thread_id")))
+            return original(role, profile, cwd, payload, *args)
+        with patch.object(self.runtime, "agent", side_effect=agent):
+            self.ready()
+        self.assertEqual([r[0] for r in received], ["implement", "rework"])
+        self.assertNotEqual(received[0][1]["CURRENT_HEAD"], received[1][1]["CURRENT_HEAD"])
+        self.assertEqual([r[2] for r in received], [None, "fixture-thread"])
+
+    def test_dirty_candidate_cannot_be_described_as_clean_or_dispatched(self):
+        self.f.submit(self.spec)
+        spec, cwd = self.f.prepare("feature")
+        (cwd / "score.py").write_text("uncommitted user work\n")
+        with self.assertRaises(FactoryBlocked) as stopped:
+            self.f._single_agent_operation(spec, cwd, {}, "implement", 0, None)
+        self.assertEqual(stopped.exception.status, "UNKNOWN")
+        self.assertEqual(self.runtime.calls, [])
+        self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM operations").fetchone()[0], 0)
+        self.assertEqual((cwd / "score.py").read_text(), "uncommitted user work\n")
+
+    def test_branch_or_remote_drift_blocks_before_workspace_handoff_and_dispatch(self):
+        self.f.submit(self.spec)
+        spec, cwd = self.f.prepare("feature")
+        git(cwd, "branch", "-m", "unapproved")
+        with self.assertRaises(FactoryBlocked) as stopped:
+            self.f._single_agent_operation(spec, cwd, {}, "implement", 0, None)
+        self.assertEqual(stopped.exception.status, "BLOCKED_SCOPE")
+        git(cwd, "branch", "-m", "factory/feature")
+        git(cwd, "remote", "add", "unapproved", "https://example.invalid/no-network-request")
+        with self.assertRaises(FactoryBlocked) as stopped:
+            self.f._single_agent_operation(spec, cwd, {}, "implement", 0, None)
+        self.assertEqual(stopped.exception.status, "BLOCKED_SCOPE")
+        self.assertEqual(self.runtime.calls, [])
+        self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM operations").fetchone()[0], 0)
+
     def test_project_scope_and_local_authority_mismatches_reject_before_dispatch(self):
         self.configure_project_candidate()
         original = copy.deepcopy(self.spec)
