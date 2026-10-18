@@ -1,5 +1,8 @@
 # PR B 最终交付准备（2026-10-18）
 
+最新状态：E2E_08 已真实交付成功，CLI 退出码已在后续本地提交中修复；见
+[PRB_REVIEW_READINESS.md](PRB_REVIEW_READINESS.md)。以下保留 E2E_08 授权前的工程记录。
+
 **尚未达成真实 `LOCAL_CANDIDATE_READY`。唯一待授权步骤是新的真实 E2E_08。**
 本轮未派发收费模型任务，未恢复历史 Mission，未进行远端写操作。
 工程起点为 `89752f1502f569d0d7da4192ce3d31c160694e82`，

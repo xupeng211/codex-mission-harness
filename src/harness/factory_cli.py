@@ -173,7 +173,7 @@ def main(argv=None):
                 finally:
                     factory.close()
         print(readable(result) if friendly and not args.json else json.dumps(result, ensure_ascii=False, indent=2))
-        if args.command in ("submit", "factory-run", "factory-resume") and result.get("DELIVERY_STATUS") != "READY_FOR_USER_ACCEPTANCE":
+        if args.command in ("submit", "factory-run", "factory-resume") and result.get("DELIVERY_STATUS") not in {"READY_FOR_USER_ACCEPTANCE", "LOCAL_CANDIDATE_READY"}:
             # A shell caller must not mistake UNKNOWN or stopped work for a
             # successfully delivered candidate. Read-only status still exits 0.
             raise SystemExit(1)
