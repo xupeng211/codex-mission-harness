@@ -7,8 +7,10 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from harness.factory import Factory, git
+from harness.codex import AppServerCodex
 from harness.factory_budget import planning_limits
 from harness.factory_fixture import AcceptanceRuntime, fixture_config
 from harness.factory_runtime import FactoryAppServer, LocalRuntime
@@ -80,6 +82,33 @@ class NativeProtocolTests(unittest.TestCase):
             "try:p.write_text('changed');r['write']='WRITABLE'\n"
             "except OSError:r['write']='DENIED'\nprint(json.dumps(r))")
         self.assertEqual(result, {"readable": '{"controller":"owned"}\n', "write": "DENIED"})
+
+    def test_same_thread_resume_applies_overrides_after_unsubscribe_without_inference(self):
+        server = self.server(False, 120000, reuse_session=True,
+                             model="gpt-6.1-sol", effort="high")
+        thread_id = next(e["result"]["thread"]["id"] for e in server.events
+                         if "thread" in e.get("result", {}))
+        server._request("thread/inject_items", {"threadId": thread_id, "items": [
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "offline resume configuration regression"}]}]})
+        server.token_limit = 36000
+        # Effort is an observable witness that resume config was applied. No
+        # model turn runs; production still pins the authorized effort unchanged.
+        server.REASONING_EFFORT = "low"
+        original = server._thread_policy_params
+        def policy(cwd):
+            params = original(cwd)
+            params["config"]["model_reasoning_effort"] = "low"
+            return params
+        with patch.object(server, "_thread_policy_params", side_effect=policy):
+            # Negative control: bypass the Factory unsubscribe fix.
+            with self.assertRaisesRegex(RuntimeError, "different configured reasoning effort"):
+                AppServerCodex.start_or_resume(server, thread_id, str(self.cwd))
+            self.assertEqual(server.runtime_identity["effort"], "high")
+            self.assertEqual(server.start_or_resume(thread_id, str(self.cwd)), thread_id)
+        self.assertEqual(server.runtime_identity["effort"], "low")
+        self.assertEqual(self.exec(server, "import json;from score import add;print(json.dumps(add(2,3)))"), 5)
+        self.assertFalse(any(e.get("method") == "turn/started" for e in server.events))
 
     def test_ephemeral_history_cannot_resume_for_repair_without_inference(self):
         server = self.server(False)

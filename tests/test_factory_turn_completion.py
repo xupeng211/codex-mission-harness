@@ -85,6 +85,74 @@ class TurnCompletionTests(unittest.TestCase):
                               {"id": 2, "result": {}}, ACCEPTED])
         self.assertTrue(self.execute(server)["usage_complete"])
 
+    def test_e2e07_observed_prefix_exhausts_original_authority_before_completion(self):
+        # Sanitized cumulative counts from E2E_07, not a replay of inference.
+        counts = [19802, 42887, 71858, 104320, 138717]
+        server = self.server([ACCEPTED, *map(usage, counts), completed("interrupted")],
+                             limit=120000)
+        with self.assertRaises(RuntimeFailure) as stopped:
+            self.execute(server)
+        self.assertEqual(stopped.exception.usage["total"]["totalTokens"], 138717)
+        self.assertFalse(stopped.exception.usage_complete)
+        requests = [json.loads(line) for line in server.proc.stdin.getvalue().splitlines()]
+        self.assertEqual([r["method"] for r in requests], ["turn/start", "turn/interrupt"])
+
+    def test_larger_explicit_authority_still_requires_a_real_completion_event(self):
+        # The suffix is synthetic: this proves protocol behavior, not that a
+        # future Agent will finish at 174000 tokens (or within any given cap).
+        counts = [19802, 42887, 71858, 104320, 138717, 174000]
+        for terminal in ([], [completed()]):
+            with self.subTest(terminal=bool(terminal)):
+                server = self.server([ACCEPTED, *map(usage, counts), final(), *terminal],
+                                     limit=300000)
+                if terminal:
+                    result = self.execute(server)
+                    self.assertTrue(result["usage_complete"])
+                    self.assertEqual(result["usage"]["total"]["totalTokens"], 174000)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "exited before"):
+                        self.execute(server)
+                    self.assertFalse(server._usage_complete)
+                requests = [json.loads(line) for line in server.proc.stdin.getvalue().splitlines()]
+                self.assertEqual([r["method"] for r in requests], ["turn/start"])
+
+    def test_repair_authority_applies_to_increment_with_large_thread_history(self):
+        # A repair must neither be interrupted by the first turn's tokens nor
+        # escape its own limit. Both totals below are synthetic wire fixtures.
+        for total, terminal in ((310000, "completed"), (354001, "interrupted")):
+            with self.subTest(total=total):
+                server = self.server([ACCEPTED, usage(total), final(), completed(terminal)],
+                                     limit=180000)
+                server.usage = usage(174000)["params"]["tokenUsage"]
+                if terminal == "completed":
+                    result = self.execute(server)
+                    self.assertTrue(result["usage_complete"])
+                    self.assertFalse(server._budget_exceeded)
+                else:
+                    with self.assertRaises(RuntimeFailure):
+                        self.execute(server)
+                    self.assertTrue(server._budget_exceeded)
+                    self.assertFalse(server._usage_complete)
+
+    def test_unconfirmed_unsubscribe_prevents_resume_or_replacement_thread(self):
+        for status in (None, "unexpected"):
+            with self.subTest(status=status):
+                server = self.server([])
+                server._reuse_session = True
+                with patch.object(server, "_request", return_value={"status": status}) as request:
+                    with self.assertRaisesRegex(RuntimeError, "unsubscribe was not confirmed"):
+                        FactoryAppServer.start_or_resume(server, "t", "/tmp/synthetic")
+                request.assert_called_once_with("thread/unsubscribe", {"threadId": "t"})
+
+    def test_changed_thread_identity_is_rejected_before_starting_repair_turn(self):
+        server = self.server([])
+        server._reuse_session = True
+        with patch.object(server, "_request", return_value={"status": "unsubscribed"}) as request, \
+                patch("harness.codex.AppServerCodex.start_or_resume", return_value="replacement"):
+            with self.assertRaisesRegex(RuntimeError, "changed the execution thread"):
+                FactoryAppServer.start_or_resume(server, "t", "/tmp/synthetic")
+        request.assert_called_once_with("thread/unsubscribe", {"threadId": "t"})
+
     def test_budget_interrupt_ack_is_not_completion_or_final_usage(self):
         server = self.server([ACCEPTED, usage(101), {"id": 2, "result": {}},
                               completed("interrupted")])

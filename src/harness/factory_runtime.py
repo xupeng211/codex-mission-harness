@@ -363,6 +363,20 @@ class FactoryAppServer(AppServerCodex):
         params["config"]["project_root_markers"] = []
         return params
 
+    def start_or_resume(self, thread_id, cwd):
+        if thread_id and getattr(self, "_reuse_session", False):
+            # A subscribed loaded thread ignores resume config overrides. Drop
+            # this connection's subscription so the idle thread can be rebuilt
+            # from its stored history with the repair budget/permissions. Keep
+            # the same thread ID and process; never start a replacement thread.
+            result = self._request("thread/unsubscribe", {"threadId": thread_id})
+            if not isinstance(result, dict) or result.get("status") not in {"unsubscribed", "notSubscribed", "notLoaded"}:
+                raise RuntimeError("Codex thread unsubscribe was not confirmed; no repair dispatch")
+        resumed = super().start_or_resume(thread_id, cwd)
+        if thread_id and resumed != thread_id:
+            raise RuntimeError("Codex changed the execution thread; no repair dispatch")
+        return resumed
+
     def execute(self, prompt: str, schema: dict, thread_id: str | None = None, return_thread: bool = False) -> dict:
         self._turn_usage_baseline = self.usage
         self._usage_complete = False

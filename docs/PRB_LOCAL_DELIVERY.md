@@ -1,5 +1,8 @@
 # PR B 本地交付状态（2026-10-18）
 
+最新工程结果及 E2E_08 待批执行边界见 [PRB_FINAL_DELIVERY.md](PRB_FINAL_DELIVERY.md)。
+以下保留之前工程迭代的记录；其中的待执行编号与测试数量不代表最新状态。
+
 本地实现已完成，仍缺一次获授权的真实模型验收。**尚未交付真实
 `LOCAL_CANDIDATE_READY`**。本次没有启动 Harness 模型推理，也没有 Push、PR、Merge 或部署。
 
