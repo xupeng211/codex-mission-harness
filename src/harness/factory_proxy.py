@@ -199,8 +199,10 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
         self.timeout = timeout
         self.deadline = time.monotonic()+timeout
         self.token_limit = token_limit
+        self.token_baseline = 0
         self.records = []
         self.failed = False
+        self.accepting = True
         self.lock = threading.RLock()
         self.evidence = transcript.with_suffix(".proxy.jsonl")
         self.evidence.touch(mode=0o600, exist_ok=False)
@@ -219,6 +221,19 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
         self.worker.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_port}/v1"
 
+    def start_turn(self, transcript, timeout, token_limit):
+        """Rotate immutable operation evidence while retaining thread totals."""
+        with self.lock:
+            if self.failed:
+                raise ValueError("uncertain proxy session cannot start a repair")
+            evidence = transcript.with_suffix(".proxy.jsonl")
+            evidence.touch(mode=0o600, exist_ok=False)
+            self.evidence = evidence
+            self.accepting = True
+            self.token_baseline = tokens(self.usage()) or 0
+            self.token_limit = token_limit
+            self.deadline = time.monotonic() + timeout
+
     def persist(self, record):
         with self.evidence.open("a") as stream:
             stream.write(json.dumps(record, sort_keys=True)+"\n")
@@ -229,14 +244,30 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
         known = [r["usage"] for r in self.records if tokens(r.get("usage")) is not None]
         if not known:
             return None
-        return {"input_tokens": sum(x["input_tokens"] for x in known), "output_tokens": sum(x["output_tokens"] for x in known),
-                "total_tokens": sum(x["input_tokens"]+x["output_tokens"] for x in known)}
+        result = {"input_tokens": sum(x["input_tokens"] for x in known), "output_tokens": sum(x["output_tokens"] for x in known),
+                  "total_tokens": sum(x["input_tokens"]+x["output_tokens"] for x in known)}
+        if all("cached_input_tokens" in x for x in known):
+            result["cached_input_tokens"] = sum(x["cached_input_tokens"] for x in known)
+        return result
 
     def observe(self, data, record):
         value = json.loads(data)
         response = value.get("response", value)
         if not isinstance(response, dict):
             raise ValueError("invalid proxy response")
+        # Retain valid usage even when a subsequent identity check fails.
+        usage = response.get("usage")
+        if isinstance(usage, dict):
+            partial = {k: usage[k] for k in ("input_tokens", "output_tokens")
+                       if type(usage.get(k)) is int and usage[k] >= 0}
+            if partial:
+                record["observed_partial_usage"] = partial
+            if tokens(usage) is not None and len(partial) == 2:
+                record["usage"] = partial
+                details = usage.get("input_tokens_details")
+                cached = details.get("cached_tokens") if isinstance(details, dict) else None
+                if type(cached) is int and 0 <= cached <= partial["input_tokens"]:
+                    record["usage"]["cached_input_tokens"] = cached
         model = response.get("model")
         if model:
             record["reported_model"] = model
@@ -244,9 +275,6 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                 raise ValueError("proxy reported a different model")
         if response.get("id"):
             record["response_id"] = response["id"]
-        usage = response.get("usage")
-        if isinstance(usage, dict) and tokens(usage) is not None:
-            record["usage"] = {"input_tokens": usage["input_tokens"], "output_tokens": usage["output_tokens"]}
         terminal = value.get("type")
         if terminal == "response.completed" or response.get("status") == "completed":
             record["status"] = "COMPLETE"
@@ -259,6 +287,8 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
             if handler.headers.get("Authorization") != "Bearer "+self.nonce:
                 handler.send_error(403)
                 return
+            if not self.accepting:
+                self.failed = True
             if self.failed or handler.path != "/v1/responses":
                 handler.send_error(503)
                 return
@@ -275,7 +305,7 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                 current = self.policy.verify()
                 if current != self.policy.identity:
                     raise ValueError("proxy runtime policy changed")
-                if len(self.records) >= 128 or self.token_limit and (tokens(self.usage()) or 0) >= self.token_limit:
+                if len(self.records) >= 128 or self.token_limit and (tokens(self.usage()) or 0) - self.token_baseline >= self.token_limit:
                     raise ValueError("proxy run allowance exhausted")
                 record = {"dispatch_id": self.evidence.stem, "http_request_id": str(uuid.uuid4()), "requested_model": request["model"],
                           "endpoint": self.endpoint, "status": "DISPATCHED", "usage": None,
@@ -320,7 +350,9 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                 record["physical_attempt_count"] = 1
                 if self.policy.verify() != self.policy.identity:
                     raise ValueError("proxy policy changed during dispatch")
-            except Exception:
+            except Exception as exc:
+                if isinstance(exc, urllib.error.HTTPError):
+                    exc.close()  # Do not let GC log upstream reason/error bodies.
                 self.failed = True
                 if record is not None:
                     record["status"] = "UNKNOWN"
@@ -336,8 +368,8 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
         with self.lock:
             return {"logical_run_id": self.evidence.stem, "physical_attempts": list(self.records),
                     "physical_attempt_limit_per_http_request": 1,
-                    "physical_attempt_count": sum(r["physical_attempt_count"] for r in self.records) if self.records and all(type(r["physical_attempt_count"]) is int for r in self.records) else "UNKNOWN",
-                    "usage_complete": bool(self.records) and not self.failed and all(r["status"] == "COMPLETE" for r in self.records),
+                    "physical_attempt_count": sum(r["physical_attempt_count"] for r in self.records) if self.records and not self.failed and all(type(r["physical_attempt_count"]) is int for r in self.records) else "UNKNOWN",
+                    "usage_complete": bool(self.records) and not self.failed and all(r["status"] == "COMPLETE" and len(r.get("proxy_telemetry", [])) == 1 for r in self.records),
                     "upstream_provider_identity": "NOT_PROVABLE", "upstream_model_identity": "NOT_PROVABLE",
                     "money": "UNKNOWN"}
 
@@ -350,24 +382,42 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
         A missing entry remains unknown, not evidence of zero physical attempts.
         """
         with self.lock:
-            rows = self.policy.management("usage-queue?count=256")
-            if not isinstance(rows, list):
-                raise ValueError("proxy usage telemetry is unavailable")
-            fields = ("provider", "executor_type", "model", "response_model", "request_id", "execution_id", "trace_id", "session_id", "auth_type", "failed")
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                matched = next((r for r in self.records if r["http_request_id"] == row.get("session_id")), None)
-                if matched is None:
-                    continue
-                safe = {key: row[key] for key in fields if key in row and isinstance(row[key], (str, bool))}
-                safe["usage"] = {key: row.get("tokens", {}).get(key) for key in ("input_tokens", "output_tokens", "total_tokens")}
-                matched.setdefault("proxy_telemetry", []).append(safe)
-                if len(matched["proxy_telemetry"]) > 1:
+            self.accepting = False  # Only the next authorized turn can reopen dispatch.
+            try:
+                rows = self.policy.management("usage-queue?count=256")
+                if not isinstance(rows, list):
+                    raise ValueError("proxy usage telemetry is unavailable")
+                fields = ("provider", "executor_type", "model", "response_model", "request_id", "execution_id", "trace_id", "session_id", "auth_type", "failed")
+                for row in rows:
+                    if not isinstance(row, dict):
+                        self.failed = True
+                        continue
+                    matched = next((r for r in self.records if r["http_request_id"] == row.get("session_id")), None)
+                    if matched is None:
+                        # A dedicated route must have no unattributed requests.
+                        self.failed = True
+                        continue
+                    safe = {key: row[key] for key in fields if key in row and isinstance(row[key], (str, bool))}
+                    raw_tokens = row.get("tokens")
+                    safe["usage"] = {key: raw_tokens.get(key) for key in ("input_tokens", "output_tokens", "total_tokens")
+                                     if isinstance(raw_tokens, dict) and type(raw_tokens.get(key)) is int and raw_tokens[key] >= 0}
+                    matched.setdefault("proxy_telemetry", []).append(safe)
+                    valid = (len(matched["proxy_telemetry"]) == 1 and safe.get("provider") == "codex"
+                             and safe.get("executor_type") == "CodexExecutor" and safe.get("failed") is False
+                             and safe.get("model") == matched["requested_model"] == safe.get("response_model")
+                             and bool(safe.get("request_id")) and bool(safe.get("execution_id"))
+                             and tokens(safe["usage"]) is not None and matched.get("usage") is not None
+                             and all(safe["usage"].get(k) == matched["usage"].get(k) for k in ("input_tokens", "output_tokens")))
+                    if not valid:
+                        self.failed = True
+                        matched["status"] = "UNKNOWN"
+                        matched["physical_attempt_count"] = "UNKNOWN"
+                    self.persist(matched)
+                if any(len(r.get("proxy_telemetry", [])) != 1 for r in self.records):
                     self.failed = True
-                    matched["status"] = "UNKNOWN"
-                    matched["physical_attempt_count"] = "UNKNOWN"
-                self.persist(matched)
+            except Exception:
+                self.failed = True
+                raise ValueError("proxy telemetry unproven; no retry or fallback") from None
 
     def close(self):
         self.server.shutdown()

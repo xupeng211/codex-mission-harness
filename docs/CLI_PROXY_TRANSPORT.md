@@ -133,3 +133,14 @@ Factory READY. Unknown/truncated reviews remain in their new ledger without
 automatic retries. Native offline tests cover official transport, proxy selection,
 credential isolation and no-fallback; HTTP contract tests cover bounded attempts,
 identity mismatches, partial usage, unknown reservations and immutable receipts.
+
+## Task-level model pool
+
+[MODEL_ROUTING.md](MODEL_ROUTING.md) describes the opt-in deterministic developer
+pool, offline preview, immutable task/model/route binding and conditional token
+cost observations. Pool entries still pass every dedicated-instance check above;
+aliases, hidden retries and multi-credential fallback are not newly authorized.
+Completion also requires exactly one matching queue execution per HTTP dispatch,
+with matching provider/executor/model/token claims and no unattributed queue rows.
+Missing telemetry is UNKNOWN. Same-thread repair rotates immutable relay evidence
+and applies its existing incremental token authority without selecting a new model.

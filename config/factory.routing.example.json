@@ -1,0 +1,152 @@
+{
+  "version": 1,
+  "budget": {
+    "max_agent_runs": 35,
+    "max_total_tokens": 8400000,
+    "max_run_tokens": 240000,
+    "max_wall_seconds": 21600
+  },
+  "max_rounds": 5,
+  "timeout_seconds": 900,
+  "independent_review_required": true,
+  "max_review_bytes": 1048576,
+  "max_context_bytes": 2097152,
+  "checks": [
+    [
+      "make",
+      "verify"
+    ]
+  ],
+  "ci": [
+    [
+      "make",
+      "lint"
+    ]
+  ],
+  "profiles": {
+    "developer": {
+      "provider": "openai",
+      "model": "operator-explicit-official-default",
+      "effort": "high"
+    },
+    "reviewer": {
+      "provider": "openai",
+      "model": "gpt-6.1-sol",
+      "effort": "high",
+      "transport": {
+        "type": "official"
+      },
+      "codex_home": "/absolute/private-official-codex-home"
+    },
+    "second_reviewer": {
+      "provider": "deepseek",
+      "model": "deepseek-flash",
+      "transport": {
+        "type": "direct"
+      },
+      "max_output_tokens": 16384,
+      "token_file": "/absolute/path/to/owner-only-deepseek-token"
+    }
+  },
+  "model_routing": {
+    "version": 1,
+    "models": [
+      {
+        "id": "example-economy",
+        "model": "operator-selected-economy-model",
+        "route_id": "dedicated-codex",
+        "tier": "economy",
+        "efforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ],
+        "categories": [
+          "general",
+          "docs",
+          "tests",
+          "bugfix",
+          "feature",
+          "refactor",
+          "security",
+          "migration"
+        ],
+        "available": false,
+        "auto": false,
+        "protocol": "codex_responses",
+        "price": "UNKNOWN",
+        "transport": {
+          "type": "cli_proxy",
+          "endpoint": "http://127.0.0.1:18317/v1",
+          "configured_provider": "cli_proxy_api",
+          "policy_file": "/absolute/private-factory-proxy/policy.json"
+        }
+      },
+      {
+        "id": "example-balanced",
+        "model": "operator-selected-balanced-model",
+        "route_id": "dedicated-codex",
+        "tier": "balanced",
+        "efforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ],
+        "categories": [
+          "general",
+          "docs",
+          "tests",
+          "bugfix",
+          "feature",
+          "refactor",
+          "security",
+          "migration"
+        ],
+        "available": false,
+        "auto": false,
+        "protocol": "codex_responses",
+        "price": "UNKNOWN",
+        "transport": {
+          "type": "cli_proxy",
+          "endpoint": "http://127.0.0.1:18317/v1",
+          "configured_provider": "cli_proxy_api",
+          "policy_file": "/absolute/private-factory-proxy/policy.json"
+        }
+      },
+      {
+        "id": "example-high",
+        "model": "operator-selected-high-model",
+        "route_id": "dedicated-codex",
+        "tier": "high",
+        "efforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ],
+        "categories": [
+          "general",
+          "docs",
+          "tests",
+          "bugfix",
+          "feature",
+          "refactor",
+          "security",
+          "migration"
+        ],
+        "available": false,
+        "auto": false,
+        "protocol": "codex_responses",
+        "price": "UNKNOWN",
+        "transport": {
+          "type": "cli_proxy",
+          "endpoint": "http://127.0.0.1:18317/v1",
+          "configured_provider": "cli_proxy_api",
+          "policy_file": "/absolute/private-factory-proxy/policy.json"
+        }
+      }
+    ]
+  }
+}

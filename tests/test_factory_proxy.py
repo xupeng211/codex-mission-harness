@@ -1,6 +1,7 @@
 """Transport contracts exercised against real local HTTP, with no paid calls."""
 import copy
 import http.server
+import hashlib
 import json
 import shutil
 import subprocess
@@ -244,6 +245,117 @@ class ProxyContracts(unittest.TestCase):
             self.assertFalse(duplicate.receipt()["usage_complete"])
         finally:
             duplicate.close()
+
+    def test_missing_mismatched_and_unattributed_telemetry_cannot_settle_a_dispatch(self):
+        mutations = {
+            "missing": lambda rows: rows.clear(),
+            "wrong_model": lambda rows: rows[0].update(response_model="other-model"),
+            "wrong_provider": lambda rows: rows[0].update(provider="other-provider"),
+            "wrong_usage": lambda rows: rows[0]["tokens"].update(input_tokens=99),
+            "failed": lambda rows: rows[0].update(failed=True),
+            "extra_request": lambda rows: rows.append({"session_id": "unattributed", "api_key": self.key}),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                relay = ProxyRelay(self.profile, self.root/(name+".raw"), 5)
+                try:
+                    self.post(relay)
+                    self.assertFalse(relay.receipt()["usage_complete"])
+                    mutate(self.telemetry)
+                    relay.collect_telemetry()
+                    self.assertFalse(relay.receipt()["usage_complete"])
+                    self.assertEqual(relay.receipt()["physical_attempt_count"], "UNKNOWN")
+                    self.assertEqual(relay.usage()["total_tokens"], 13)
+                    count = len(self.requests)
+                    self.post(relay)
+                    self.assertEqual(len(self.requests), count)
+                    self.assertNotIn(self.key, relay.evidence.read_text())
+                finally:
+                    relay.close()
+
+    def test_repair_rotates_evidence_and_enforces_incremental_observation_limit(self):
+        relay = ProxyRelay(self.profile, self.root/"first.raw", 5, token_limit=13)
+        try:
+            self.post(relay)
+            relay.collect_telemetry()
+            self.assertTrue(relay.receipt()["usage_complete"])
+            first = relay.evidence
+            before = hashlib.sha256(first.read_bytes()).hexdigest()
+            relay.start_turn(self.root/"repair.raw", 5, 13)
+            self.post(relay)
+            relay.collect_telemetry()
+            self.assertTrue(relay.receipt()["usage_complete"])
+            self.assertEqual(relay.usage()["total_tokens"], 26)
+            self.assertEqual(len(self.requests), 2)
+            self.assertEqual(hashlib.sha256(first.read_bytes()).hexdigest(), before)
+            self.assertNotEqual(first, relay.evidence)
+            self.post(relay)
+            self.assertEqual(len(self.requests), 2)
+            self.assertFalse(relay.receipt()["usage_complete"])
+            with self.assertRaisesRegex(ValueError, "uncertain"):
+                relay.start_turn(self.root/"forbidden.raw", 5, 100)
+        finally:
+            relay.close()
+
+    def test_no_http_dispatch_between_completed_turn_and_authorized_repair(self):
+        relay = self.relay()
+        self.post(relay)
+        relay.collect_telemetry()
+        self.assertTrue(relay.receipt()["usage_complete"])
+        original = relay.evidence.read_bytes()
+        self.post(relay)
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(relay.evidence.read_bytes(), original)
+        self.assertFalse(relay.receipt()["usage_complete"])
+        with self.assertRaises(ValueError):
+            relay.start_turn(self.root/"unauthorized-repair.raw", 5, 100)
+
+    def test_cached_and_partial_usage_are_preserved_even_on_wrong_model(self):
+        relay = self.relay()
+        record = {}
+        relay.observe(json.dumps({"model": "fixture-model", "usage": {"input_tokens": 10, "output_tokens": 3,
+                      "input_tokens_details": {"cached_tokens": 4}}}), record)
+        self.assertEqual(record["usage"]["cached_input_tokens"], 4)
+        relay.records.append(record)
+        self.assertEqual(relay.usage()["cached_input_tokens"], 4)
+        partial = {}
+        with self.assertRaisesRegex(ValueError, "different model"):
+            relay.observe(json.dumps({"model": "wrong-model", "usage": {"input_tokens": 7}}), partial)
+        self.assertEqual(partial["observed_partial_usage"], {"input_tokens": 7})
+        self.assertNotIn("usage", partial)
+        wrong = {}
+        with self.assertRaises(ValueError):
+            relay.observe(json.dumps({"model": "wrong-model", "usage": {"input_tokens": 7, "output_tokens": 1}}), wrong)
+        self.assertEqual(wrong["usage"], {"input_tokens": 7, "output_tokens": 1})
+
+    def test_appserver_two_turn_contract_keeps_native_and_wire_snapshots_separate(self):
+        relay = self.relay()
+        server = FactoryAppServer.__new__(FactoryAppServer)
+        server.usage, server.events, server.runtime_identity = None, [], {}
+        server._proxy_relay, server._policy_cwd = relay, str(self.root)
+        server.MODEL, server.REASONING_EFFORT = "fixture-model", None
+        turn = [0]
+        def request(method, params):
+            self.assertEqual(method, "turn/start")
+            turn[0] += 1
+            return {"turn": {"id": str(turn[0])}}
+        def completed(thread_id, turn_id, require_success):
+            self.post(relay)
+            server.events.append({"method": "thread/tokenUsage/updated", "params": {
+                "threadId": thread_id, "turnId": turn_id, "tokenUsage": {"total": {
+                    "inputTokens": 100*turn[0], "outputTokens": 10*turn[0], "totalTokens": 110*turn[0]}}}})
+            return {"status": "completed", "items": [{"id": "result", "type": "agentMessage",
+                    "text": '{"summary":"fixture","known_risks":[]}'}]}
+        with patch.object(server, "start_or_resume", return_value="fixture-thread"), patch.object(server, "_request", side_effect=request), patch.object(server, "_policy_params", return_value={}), patch.object(server, "_turn_completed", side_effect=completed):
+            first = server.execute("offline contract", {}, return_thread=True)
+            self.assertEqual(first["usage"]["total_tokens"], 13)
+            original = relay.evidence.read_bytes()
+            relay.start_turn(self.root/"second-turn.raw", 5, 13)
+            second = server.execute("offline repair", {}, thread_id="fixture-thread", return_thread=True)
+            self.assertEqual(second["usage"]["total_tokens"], 26)
+            self.assertEqual(second["thread_id"], first["thread_id"])
+            self.assertEqual(server._turn_usage_baseline["total"]["totalTokens"], 110)
+            self.assertEqual((self.root/"run.proxy.jsonl").read_bytes(), original)
 
     def test_unknown_factory_operation_keeps_reservation_and_immutable_evidence(self):
         source = self.root/"source"
