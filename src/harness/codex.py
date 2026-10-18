@@ -566,7 +566,7 @@ class AppServerCodex:
                 return message["result"]
             self._stash(message)
 
-    def _turn_completed(self, thread_id: str, turn_id: str) -> dict:
+    def _turn_completed(self, thread_id: str, turn_id: str, *, require_success=True) -> dict:
         """Wait for the App Server completion notification; acceptance is never turn completion."""
         assert self.proc.stdout
         deadline = self._deadline()
@@ -592,7 +592,7 @@ class AppServerCodex:
                 continue
             params = message.get("params", {})
             turn = params.get("turn", {})
-            if turn.get("status") != "completed":
+            if require_success and turn.get("status") != "completed":
                 raise RuntimeError(f"Codex turn failed: {turn.get('error')}")
             return turn
 

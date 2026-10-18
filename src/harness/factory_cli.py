@@ -23,6 +23,16 @@ COMMANDS = {"setup", "submit", "status", "delivery", "resume", "cancel", "approv
 
 
 def readable(result):
+    if result.get("DELIVERY_STATUS") == "LOCAL_CANDIDATE_READY":
+        return ("LOCAL_CANDIDATE_READY\n"
+                f"MISSION_ID={result['MISSION']}\nAUTHORIZATION_IDENTITY={result['AUTHORIZATION_IDENTITY']}\n"
+                f"CANDIDATE_PATH={result['CANDIDATE']}\nBASE_SHA={result['BASE_SHA']}\n"
+                f"FINAL_HEAD_SHA={result['FINAL_HEAD_SHA']}\nFINAL_TREE_SHA={result['FINAL_TREE_SHA']}\n"
+                f"FULL_DIFF={result['FULL_DIFF']}\nSCOPE_RESULT={result['SCOPE_RESULT']}\n"
+                f"TRUSTED_QA_RESULT={json.dumps(result['TRUSTED_QA_RESULT'], ensure_ascii=False)}\n"
+                f"EXECUTION_OPERATIONS={json.dumps(result['EXECUTION_OPERATIONS'], ensure_ascii=False)}\n"
+                f"OBSERVED_TOKEN_USAGE={json.dumps(result['OBSERVED_TOKEN_USAGE'], ensure_ascii=False)}\n"
+                f"WALL_CLOCK_TIME={result['WALL_CLOCK_TIME']}\nPUSH=NO PR=NO MERGE=NO DEPLOY=NO")
     if "SETUP" in result:
         return f"配置完成。项目：{result['REPOSITORY']}\n下一步：{result['NEXT']}\n真实登录/模型访问会在任务执行时验证。"
     if "CANCELLATION" in result:
@@ -163,7 +173,7 @@ def main(argv=None):
                 finally:
                     factory.close()
         print(readable(result) if friendly and not args.json else json.dumps(result, ensure_ascii=False, indent=2))
-        if args.command in ("submit", "factory-run", "factory-resume") and result.get("DELIVERY_STATUS") != "READY_FOR_USER_ACCEPTANCE":
+        if args.command in ("submit", "factory-run", "factory-resume") and result.get("DELIVERY_STATUS") not in {"READY_FOR_USER_ACCEPTANCE", "LOCAL_CANDIDATE_READY"}:
             # A shell caller must not mistake UNKNOWN or stopped work for a
             # successfully delivered candidate. Read-only status still exits 0.
             raise SystemExit(1)

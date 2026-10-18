@@ -280,18 +280,43 @@ class FactoryAppServer(AppServerCodex):
             os.fsync(stream.fileno())
 
     def _read_message(self, deadline=None):
+        if deadline is not None:
+            deadline = min(deadline, self._deadline())
         message = super()._read_message(deadline)
         self.events.append(message)
-        if message.get("method") == "thread/tokenUsage/updated":
-            self.usage = message.get("params", {}).get("tokenUsage")
+        params = message.get("params", {})
+        if (message.get("method") == "thread/tokenUsage/updated"
+                and params.get("threadId") == getattr(self, "_active_thread_id", None)
+                and params.get("turnId") is not None
+                and params.get("turnId") == getattr(self, "_active_turn_id", params.get("turnId"))):
+            self.usage = params.get("tokenUsage")
             from .factory_budget import tokens
-            if self.token_limit and (tokens(self.usage) or 0) > self.token_limit:
-                raise RuntimeFailure("Codex token telemetry exceeded run allowance", self.usage, self.runtime_identity)
+            measured = tokens(self.usage)
+            baseline = tokens(getattr(self, "_turn_usage_baseline", None)) or 0
+            if measured is None or measured < baseline:
+                raise RuntimeFailure("Codex token telemetry missing or regressed", self.usage, self.runtime_identity)
+            if (self.token_limit and measured - baseline > self.token_limit
+                    and not getattr(self, "_budget_exceeded", False)):
+                # Cancel sampling, but keep reading: the last usage notification
+                # can precede an already-queued successful completion. Neither
+                # an interrupt acknowledgement nor final text settles a turn.
+                self._budget_exceeded = True
+                self._end_time = min(self._end_time, time.monotonic() + 5)
+                self.seq += 1
+                assert self.proc.stdin
+                try:
+                    self.proc.stdin.write(json.dumps({"id": self.seq, "method": "turn/interrupt",
+                        "params": {"threadId": params["threadId"], "turnId": params["turnId"]}}) + "\n")
+                    self.proc.stdin.flush()
+                except OSError:
+                    # A dying process may still have a terminal notification
+                    # buffered on stdout. The same short drain deadline applies.
+                    pass
         return message
 
     def _request(self, method, params):
         result = super()._request(method, params)
-        if method == "thread/start":
+        if method in {"thread/start", "thread/resume"}:
             self.runtime_identity = {"model": result.get("model"), "provider": "openai", "transport_provider": result.get("modelProvider"),
                                      "transport": {"route_type": self.transport["type"], "official_auth": self.transport["type"] == "official", "request_max_retries": 0, "stream_max_retries": 0, "supports_websockets": False},
                                      "effort": result.get("reasoningEffort"), "profile": self.profile}
@@ -310,6 +335,8 @@ class FactoryAppServer(AppServerCodex):
                 raise RuntimeError("Codex runtime provider/model identity is unproven")
             if self.MODEL and result["model"] != self.MODEL:
                 raise RuntimeError("Codex runtime selected a different configured model")
+            if self.REASONING_EFFORT and result.get("reasoningEffort") != self.REASONING_EFFORT:
+                raise RuntimeError("Codex runtime selected a different configured reasoning effort")
         return result
 
     def _thread_policy_params(self, cwd):
@@ -317,17 +344,50 @@ class FactoryAppServer(AppServerCodex):
         if self.MODEL is None:
             params.pop("model")
         params["modelProvider"] = self._transport_provider
-        params["ephemeral"] = True
+        # Native thread/resume requires a stored rollout, including when the
+        # same app-server process stays alive. Single-agent repair must retain
+        # that history; independent one-shot lanes can remain ephemeral.
+        if not getattr(self, "_reuse_session", False):
+            params["ephemeral"] = True
         if self.reviewer:
             params["baseInstructions"] = official_rubric()
         # Disable remote tools; their independent authority is outside this local factory.
         params["config"]["mcp_servers"] = self.disabled_mcp
-        params["config"]["features"] = {"hooks": False, "apps": False, "multi_agent": False, "multi_agent_v2": False}
+        features = {"hooks": False, "apps": False, "multi_agent": False, "multi_agent_v2": False}
+        if self.token_limit:
+            features["rollout_budget"] = {
+                "enabled": True, "limit_tokens": self.token_limit,
+                "reminder_at_remaining_tokens": [max(1, self.token_limit // 4)],
+                "sampling_token_weight": 1.0, "prefill_token_weight": 1.0}
+        params["config"]["features"] = features
         params["config"]["project_root_markers"] = []
         return params
 
-    def execute(self, prompt: str, schema: dict) -> dict:
-        thread_id = self.start_or_resume(None, self._policy_cwd)
+    def start_or_resume(self, thread_id, cwd):
+        if thread_id and getattr(self, "_reuse_session", False):
+            # A subscribed loaded thread ignores resume config overrides. Drop
+            # this connection's subscription so the idle thread can be rebuilt
+            # from its stored history with the repair budget/permissions. Keep
+            # the same thread ID and process; never start a replacement thread.
+            result = self._request("thread/unsubscribe", {"threadId": thread_id})
+            if not isinstance(result, dict) or result.get("status") not in {"unsubscribed", "notSubscribed", "notLoaded"}:
+                raise RuntimeError("Codex thread unsubscribe was not confirmed; no repair dispatch")
+        resumed = super().start_or_resume(thread_id, cwd)
+        if thread_id and resumed != thread_id:
+            raise RuntimeError("Codex changed the execution thread; no repair dispatch")
+        return resumed
+
+    def execute(self, prompt: str, schema: dict, thread_id: str | None = None, return_thread: bool = False) -> dict:
+        self._turn_usage_baseline = self.usage
+        self._usage_complete = False
+        self._active_thread_id = None
+        self._budget_exceeded = False
+        thread_id = self.start_or_resume(thread_id, self._policy_cwd)
+        self._active_thread_id = thread_id
+        # Usage may arrive before the turn/start response. Its explicit turnId
+        # is authoritative until that response binds the accepted turn below.
+        if hasattr(self, "_active_turn_id"):
+            del self._active_turn_id
         params = {"threadId": thread_id, "input": [{"type": "text", "text": prompt}],
                   "outputSchema": schema, **self._policy_params(self._policy_cwd)}
         if self.MODEL:
@@ -336,12 +396,21 @@ class FactoryAppServer(AppServerCodex):
             params["effort"] = self.REASONING_EFFORT
         accepted = self._request("turn/start", params)
         turn_id = accepted["turn"]["id"]
-        completed = self._turn_completed(thread_id, turn_id)
+        self._active_turn_id = turn_id
+        self.runtime_identity.update(thread_id=thread_id, turn_id=turn_id)
+        completed = self._turn_completed(thread_id, turn_id, require_success=False)
+        self.runtime_identity["turn_completion"] = completed
+        if completed.get("status") != "completed":
+            # Cancellation/failed inference may have unreported in-flight usage.
+            # Preserve terminal identity without releasing its unknown reserve.
+            raise RuntimeFailure("Codex turn ended with status " + str(completed.get("status")),
+                                 self.usage, self.runtime_identity)
         routed = [e["params"] for e in self.events if e.get("method") == "model/rerouted" and e.get("params", {}).get("threadId") == thread_id]
         if self.MODEL and any(e.get("toModel") != self.MODEL for e in routed):
             raise RuntimeError("explicit configured model was rerouted; exact model identity changed")
         self.runtime_identity.update(thread_id=thread_id, turn_id=turn_id, model_routing=routed)
         items = {i["id"]: i for i in completed.get("items", []) if "id" in i}
+        turn_usage = []
         for event in self.events:
             p = event.get("params", {})
             if p.get("threadId") == thread_id and p.get("turnId") == turn_id:
@@ -350,7 +419,20 @@ class FactoryAppServer(AppServerCodex):
                     if "id" in item:
                         items[item["id"]] = item
                 if event.get("method") == "thread/tokenUsage/updated":
-                    self.usage = p.get("tokenUsage")
+                    turn_usage.append(p.get("tokenUsage"))
+        if not turn_usage or any(value is None for value in turn_usage):
+            raise RuntimeFailure("turn usage telemetry missing or incomplete; no replay", self.usage, self.runtime_identity)
+        from .factory_budget import tokens
+        if any(tokens(value) is None for value in turn_usage):
+            raise RuntimeFailure("turn usage telemetry invalid; no replay", turn_usage[-1], self.runtime_identity)
+        from .factory_candidate import usage_increment
+        previous = self._turn_usage_baseline
+        for value in turn_usage:
+            if usage_increment(value, previous.get("total", previous) if previous else None) is None:
+                raise RuntimeFailure("turn usage telemetry regressed or changed shape; no replay", value, self.runtime_identity)
+            previous = value
+        self.usage = turn_usage[-1]
+        self._usage_complete = not getattr(self, "_proxy_relay", None)
         text = [i["text"] for i in items.values() if i.get("type") == "agentMessage"
                 and i.get("phase") in (None, "final_answer")]
         if not text:
@@ -365,7 +447,9 @@ class FactoryAppServer(AppServerCodex):
             if not receipt["usage_complete"]:
                 raise RuntimeFailure("explicit proxy result/usage identity is uncertain; no replay", self.usage, self.runtime_identity)
         return {"output": json.loads(text[-1]), "usage": self.usage,
-                "thread_id": thread_id, "turn_id": turn_id,
+                "thread_id": thread_id if return_thread else None, "turn_id": turn_id,
+                "turn_completion": completed, "usage_complete": True,
+                "usage_events": turn_usage,
                 "runtime_identity": self.runtime_identity, "model_routing": routed,
                 **({"physical_accounting": receipt, "usage_complete": receipt["usage_complete"]} if receipt else {})}
 
@@ -399,6 +483,15 @@ class LocalRuntime:
         self.resource_policy = {}
         self.current_process = None
         self._validation_cancelled = False
+        self._single_server = None
+        self._single_binding = None
+
+    def close_session(self):
+        if self._single_server is not None:
+            self._single_server.close()
+        self._single_server = None
+        self._single_binding = None
+        self.current_process = None
 
     def cancel(self):
         self._validation_cancelled = True
@@ -453,7 +546,17 @@ class LocalRuntime:
         return identity
 
     def agent(self, role, profile, cwd, payload, transcript, timeout, denied_roots):
+        thread_id = payload.pop("_thread_id", None)
+        return_thread = bool(payload.pop("_return_thread", False))
+        reuse_session = bool(payload.pop("_reuse_session", False))
         token_limit = self.resource_policy.get("max_run_tokens")
+        operation_limit = payload.pop("_operation_token_limit", None)
+        if operation_limit is not None:
+            from .factory_budget import operation_token_limit
+            expected = operation_token_limit(self.resource_policy, role, local_candidate=True)
+            if operation_limit != expected:
+                raise RuntimeFailure("operation token limit differs from verified stage authority", None, None)
+            token_limit = operation_limit
         if role == "plan":
             from .factory_budget import planning_limits
             limits = planning_limits(self.resource_policy, timeout)
@@ -462,13 +565,33 @@ class LocalRuntime:
                 **limits, "physical_token_ceiling": "NOT_GUARANTEED",
                 "instruction": "Use targeted searches and small excerpts. Do not dump the repository, generated bundles or unrelated documentation. Stop exploring once you can return a bounded actionable plan; if essential information is missing, state the unresolved decision. Do not repeat broad scans."}}
         protected = (cwd / payload["mission_scope_file"],) if payload.get("mission_scope_file") else ()
-        server = FactoryAppServer(profile, cwd, transcript, timeout, denied_roots,
-                                  role in ("plan", "review"), role == "review", token_limit,
-                                  protected_paths=protected)
+        binding = (json.dumps(profile, sort_keys=True), str(cwd.resolve()), tuple(map(str, denied_roots)))
+        if reuse_session and self._single_server is not None:
+            if self._single_binding != binding:
+                raise RuntimeFailure("single-agent App Server binding changed; no replay", None, None)
+            server = self._single_server
+            server.transcript = transcript
+            server._transcript_bytes = 0
+            server._response_timeout = timeout
+            server._end_time = time.monotonic() + timeout
+            server.token_limit = token_limit
+            if hasattr(server, "_native_identity"):
+                server._native_identity["execution_limits"]["token_limit"] = token_limit
+        else:
+            server = FactoryAppServer(profile, cwd, transcript, timeout, denied_roots,
+                                      role in ("plan", "review"), role == "review", token_limit,
+                                      protected_paths=protected)
+            if reuse_session:
+                self._single_server, self._single_binding = server, binding
         self.current_process = server.proc
+        server._reuse_session = reuse_session
         try:
             schema = REVIEW_SCHEMA if role == "review" else PLAN_SCHEMA if role == "plan" else WORK_SCHEMA
-            return server.execute(json.dumps(payload, ensure_ascii=False), schema)
+            result = server.execute(json.dumps(payload, ensure_ascii=False), schema,
+                                    thread_id=thread_id, return_thread=return_thread)
+            if not return_thread:
+                result.pop("thread_id", None)
+            return result
         except Exception as exc:
             if server._proxy_relay:
                 try:
@@ -481,9 +604,11 @@ class LocalRuntime:
                 # Never include upstream error bodies, credentials or transport
                 # exception reprs in a receipt for a proxy failure.
                 raise RuntimeFailure("explicit CLI proxy run failed; no retry or fallback", server.usage, server.runtime_identity) from exc
-            raise RuntimeFailure(str(exc), server.usage, server.runtime_identity) from exc
+            raise RuntimeFailure(str(exc), server.usage, server.runtime_identity,
+                                 usage_complete=getattr(server, "_usage_complete", False)) from exc
         finally:
-            server.close()
+            if not reuse_session:
+                server.close()
             self.current_process = None
 
     def second_review(self, profile, cwd, payload, transcript, timeout):

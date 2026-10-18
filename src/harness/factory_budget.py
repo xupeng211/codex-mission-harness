@@ -25,6 +25,20 @@ def planning_limits(budget, timeout):
             "timeout_seconds": min(timeout, 120)}
 
 
+def operation_token_limit(budget, stage, *, local_candidate=False):
+    """Return the authorized per-operation observation cap for this dispatch."""
+    if not local_candidate:
+        return budget.get("max_run_tokens")
+    fields = {"implement": "max_first_turn_tokens", "rework": "max_repair_incremental_tokens"}
+    field = fields.get(stage)
+    if field is None:
+        raise ValueError(f"local candidate has no token-budget stage for {stage!r}")
+    limit = budget.get(field)
+    if type(limit) is not int or limit <= 0:
+        raise ValueError(f"local candidate requires an explicit positive {field}")
+    return limit
+
+
 def tokens(usage):
     if not isinstance(usage, dict):
         return None
@@ -62,7 +76,18 @@ def accounting(operations, budget):
                 partial += 1
     # Observed partial telemetry is real and retained, but cannot settle an
     # uncertain dispatch. Keep its full reservation, in addition to observation.
-    reserve = (unknown + partial) * budget.get("max_run_tokens", 0)
+    reserve = 0
+    for op in paid:
+        usage = json.loads(op["usage"]) if op["usage"] else None
+        if tokens(usage) is None:
+            incomplete = True
+        else:
+            result = json.loads(op["result"]) if op["result"] else {}
+            incomplete = result.get("usage_complete", op["status"] == "COMPLETE") is not True
+        if incomplete:
+            identity = json.loads(op["identity"]) if op["identity"] else {}
+            limit = identity.get("operation_token_limit", budget.get("max_run_tokens", 0))
+            reserve += limit if type(limit) is int and limit >= 0 else budget.get("max_run_tokens", 0)
     return {"agent_runs": len(paid), "limit": budget["max_agent_runs"],
             "observed_tokens": known, "unknown_usage_runs": unknown, "partial_usage_runs": partial,
             "unknown_token_reservation": reserve, "committed_tokens": known + reserve,

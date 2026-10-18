@@ -539,21 +539,22 @@ class PlanningGuardTests(unittest.TestCase):
         self.assertEqual(args[-1], 32000)
         prompt = json.loads(server.execute.call_args.args[0])
         self.assertEqual(prompt["planning_resource_guard"]["physical_token_ceiling"], "NOT_GUARANTEED")
-        runtime.resource_policy = {"max_run_tokens": 12}
+        runtime.resource_policy = {"max_run_tokens": 12, "max_first_turn_tokens": 60000,
+                                  "max_repair_incremental_tokens": 36000}
         with patch("harness.factory_runtime.FactoryAppServer", return_value=server) as constructor:
             runtime.agent("implement", {}, Path("/fixture"), {}, Path("/fixture.raw"), 9, [])
         self.assertEqual(constructor.call_args.args[3], 9)
         self.assertEqual(constructor.call_args.args[-1], 12)
 
-    def test_token_telemetry_cutoff_preserves_partial_usage(self):
+    def test_foreign_thread_telemetry_cannot_charge_or_interrupt_active_turn(self):
         server = FactoryAppServer.__new__(FactoryAppServer)
         server.events, server.token_limit, server.runtime_identity = [], 32000, {}
         usage = {"total": {"inputTokens": 32001, "outputTokens": 0, "totalTokens": 32001}}
         with patch("harness.codex.AppServerCodex._read_message", return_value={"method": "thread/tokenUsage/updated", "params": {"tokenUsage": usage}}):
-            with self.assertRaises(RuntimeFailure) as failure:
-                server._read_message()
-        self.assertEqual(failure.exception.usage, usage)
-        self.assertFalse(failure.exception.usage_complete)
+            server._active_thread_id = "active"
+            server._read_message()
+        self.assertFalse(hasattr(server, "usage"))
+        self.assertFalse(getattr(server, "_budget_exceeded", False))
 
 
 if __name__ == "__main__":
