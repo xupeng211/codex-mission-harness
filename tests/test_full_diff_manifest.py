@@ -256,14 +256,15 @@ class FullDiffTests(unittest.TestCase):
             spec = openai.load_registry().role(role)
             qualified[spec.provider] = {'role': role, 'mode': 'real_provider', 'identity': spec.identity(),
                                         'offline_test_only': True}
-        def oa(prompt, spec, *, stage, timeout):
+        def oa(prompt, spec, *, stage, timeout, transport_sink=None):
             return full.canonical({'findings': []} if stage == 'chunk' else
                 {'findings': [], 'summary': 'Offline mock reviewed the supplied source completely.',
                  **({'decisions': []} if stage == 'group' else {})})
-        def ds(command, prompt, env, timeout):
+        from direct_deepseek_fixture import envelope
+        def ds(prompt, token, schema, **kwargs):
             result = {'findings': []} if 'Scope=chunk' in prompt else {
                 'findings': [], 'decisions': [], 'summary': 'Offline mock reviewed the supplied source completely.'}
-            return subprocess.CompletedProcess(command, 0, full.canonical({'structured_output': result}), b'')
+            return envelope(result, prompt, schema)
         key = 'offline-fixture-key'
         evidence = Path(self.tmp.name) / 'reviews'
         with (patch.object(openai, 'invoke_codex', side_effect=oa), patch.object(openai, 'preflight'),
@@ -271,7 +272,7 @@ class FullDiffTests(unittest.TestCase):
               patch.object(deepseek, 'validate_qualification_receipt', return_value=qualified['deepseek']),
               patch.object(deepseek.legacy, 'resolve_claude_launcher', return_value=('/bin/true', '/usr/bin:/bin')),
               patch.object(deepseek.legacy, 'read_token_file', return_value=key),
-              patch.object(deepseek.legacy, 'invoke_reviewer', side_effect=ds)):
+              patch.object(deepseek.direct, 'invoke', side_effect=ds)):
             op = openai.run(self.root, self.base, self.head, evidence / 'openai', key,
                 openai.load_registry().role('final_reviewer'), qualification_path='offline-fixture')
             response = deepseek.run(SimpleNamespace(repo=str(self.root), base=self.base, head=self.head,
@@ -363,7 +364,7 @@ class FullDiffTests(unittest.TestCase):
             blockers = json.loads(text)
             decisions = [{'finding_id': b['finding_id'], 'decision': 'UPHELD',
                 'rationale': 'The original blocker persists in this fixture.', 'source_quote': '',
-                'source_id': '', 'quote_start': 0, 'quote_end': 0} for b in blockers]
+                'source_id': ''} for b in blockers]
             return full.canonical({'findings': [], 'decisions': decisions,
                                   'summary': 'The group retains all original blocking findings.'})
         r, _ = openai._assemble(d, self.base, self.head, call)
@@ -377,7 +378,7 @@ class FullDiffTests(unittest.TestCase):
         expected = deepseek.bind_findings([finding], 'C', 0)
         decision = {'finding_id': 'C000F000', 'decision': 'UPHELD',
                     'rationale': 'The original source confirms this fixture blocker.',
-                    'source_quote': '', 'source_id': '', 'quote_start': 0, 'quote_end': 0}
+                    'source_quote': '', 'source_id': ''}
         for decisions in ([], [decision, decision]):
             raw = full.canonical({'findings': [], 'decisions': decisions,
                                   'summary': 'The fixture verifies complete exact once dispositions.'}).decode()
@@ -429,7 +430,7 @@ class FullDiffTests(unittest.TestCase):
         spec = openai.load_registry().role('final_reviewer')
         counts = {}
         interrupted = False
-        def invoke(prompt, model, *, stage, timeout):
+        def invoke(prompt, model, *, stage, timeout, transport_sink=None):
             nonlocal interrupted
             identity = full.sha256(prompt.encode())
             if stage == 'synthesis' and not interrupted:
@@ -459,10 +460,9 @@ class FullDiffTests(unittest.TestCase):
             again = openai.run(self.root, self.base, self.head, evidence, 'fixture-key', spec,
                                qualification_path='offline-fixture')
             self.assertEqual(receipt, again)
-            # Only the explicit structured preflight runs again; reviewed chunks/groups stay committed.
-            repeated = [k for k in counts if counts[k] > committed_counts.get(k, 0)]
-            self.assertEqual(len(repeated), 1)
-            self.assertTrue(all(v == 1 for k, v in counts.items() if k not in repeated))
+            # Structured preflight and all reviewed stages are durable; no model is recalled.
+            self.assertEqual(counts, committed_counts)
+            self.assertTrue(all(v == 1 for v in counts.values()))
 
     def test_qualification_contract_auth_cases_and_runner_binding(self):
         from harness.model_qualification import (QualificationResult, CASES, qualification_receipt,

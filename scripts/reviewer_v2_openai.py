@@ -31,11 +31,13 @@ from harness.model_registry import ModelSpec, load_registry, preflight  # noqa: 
 from harness.model_qualification import validate_qualification_receipt  # noqa: E402
 from harness.openai_invocation import InvocationFailure, invoke_openai  # noqa: E402
 import harness.openai_invocation as invocation_module  # noqa: E402
-from harness.reviewer_v2_contract import bind_findings, validate_source_binding  # noqa: E402
+from harness.reviewer_v2_contract import (FINDING_GUIDANCE, SUPPLIED_CLAIM_GUIDANCE, SourceBindingError, bind_findings,  # noqa: E402
+                                          validate_source_binding, contract_authorization_identity)
 from harness import full_diff_manifest as full
 from harness.review_resume import ReviewRun  # noqa: E402
 
 VERSION = "cmh-reviewer-v2-openai/v2"
+DECISION_RATIONALE_INSTRUCTION = 'Every decision, including UPHELD and DISPUTED, MUST contain a substantive rationale of at least 24 characters after trimming whitespace, explaining why that disposition is supported. Never omit rationale or use empty or template filler text. For UPHELD only source_quote/source_id are empty, not rationale. Example (use the actual required finding_id and source-specific reasoning, not these illustrative values): {"finding_id":"C000F000","decision":"UPHELD","rationale":"The supplied source still permits the invalid input to bypass validation.","source_quote":"","source_id":""}. '
 BLOCKING = frozenset({"P0", "P1", "P2"})
 CHUNK_BYTES = 32000
 GROUP_BYTES = 96000
@@ -83,7 +85,7 @@ def _result(raw: bytes, *, group: bool = False) -> dict:
         for decision in decisions:
             if (not isinstance(decision, dict)
                     or set(decision) != {"finding_id", "decision", "rationale", "source_quote",
-                                         "source_id", "quote_start", "quote_end"}
+                                         "source_id"}
                     or not isinstance(decision["finding_id"], str)
                     or not re.fullmatch(r"C[0-9]{3}F[0-9]{3}", decision["finding_id"])
                     or decision["decision"] not in {"UPHELD", "DISPUTED"}
@@ -91,8 +93,6 @@ def _result(raw: bytes, *, group: bool = False) -> dict:
                     or len(decision["rationale"].strip()) < 24
                     or not isinstance(decision["source_quote"], str)
                     or not isinstance(decision["source_id"], str)
-                    or type(decision["quote_start"]) is not int
-                    or type(decision["quote_end"]) is not int
                     or (decision["decision"] == "UPHELD" and decision["source_quote"] != "")):
                 raise ValueError("invalid blocker decision")
     return value
@@ -103,26 +103,26 @@ def _plan(diff: bytes) -> tuple[list[dict], list[dict]]:
 
 
 def _schema(group: bool, synthesis: bool = False) -> dict:
+    summary = {"type": "string", "minLength": 32, "maxLength": 4000,
+               "pattern": r"^\S[\s\S]*\S$"}
     finding = {"type": "object", "additionalProperties": False,
                "required": ["severity", "title", "evidence"],
                "properties": {"severity": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
                               "title": {"type": "string"}, "evidence": {"type": "string"}}}
     properties = {"findings": {"type": "array", "items": finding}}
     if synthesis:
-        properties["summary"] = {"type": "string"}
+        properties["summary"] = summary
     elif group:
-        properties.update({"summary": {"type": "string"},
+        properties.update({"summary": summary,
                            "decisions": {"type": "array", "items": {
                                "type": "object", "additionalProperties": False,
                                "required": ["finding_id", "decision", "rationale", "source_quote",
-                                            "source_id", "quote_start", "quote_end"],
+                                            "source_id"],
                                "properties": {"finding_id": {"type": "string"},
                                               "decision": {"type": "string", "enum": ["UPHELD", "DISPUTED"]},
                                               "rationale": {"type": "string"},
                                               "source_quote": {"type": "string"},
-                                              "source_id": {"type": "string"},
-                                              "quote_start": {"type": "integer", "minimum": 0},
-                                              "quote_end": {"type": "integer", "minimum": 0}}}}})
+                                              "source_id": {"type": "string"}}}}})
     return {"type": "object", "additionalProperties": False,
             "required": list(properties), "properties": properties}
 
@@ -143,15 +143,17 @@ def _synthesis_result(raw: bytes) -> dict:
 
 
 def _synthesis_prompt(summaries: list[str], base: str, head: str) -> str:
-    return full.bounded_prompt("FINAL CROSS-GROUP REVIEW. Independently inspect interactions between these "
+    return full.bounded_prompt(FINDING_GUIDANCE + SUPPLIED_CLAIM_GUIDANCE + "FINAL CROSS-GROUP REVIEW. Independently inspect interactions between these "
             "bounded source-review summaries. Report any additional cross-group problems. "
             "Existing group blockers are mechanically retained and cannot be removed here. "
             "Reevaluate original disputed findings in disposition_audit for cross-group risks; report a NEW finding if a local dispute is unsound. "
-            "Return JSON with findings and a concrete summary. "
+            "Return JSON with findings and a concrete summary of 32 to 4000 characters, "
+            "with no leading or trailing whitespace. "
             f"Base {base}; head {head}. Group summaries: " + json.dumps(summaries, ensure_ascii=False))
 
 
-def invoke_codex(prompt: str, spec: ModelSpec, *, stage: str, timeout: int = 900) -> bytes:
+def invoke_codex(prompt: str, spec: ModelSpec, *, stage: str, timeout: int = 900,
+                 transport_sink=None) -> bytes:
     """One fresh, isolated model call. No implicit model or provider fallback."""
     if spec.provider != "openai" or not spec.reasoning_effort:
         raise ValueError("OpenAI model role is required")
@@ -159,14 +161,14 @@ def invoke_codex(prompt: str, spec: ModelSpec, *, stage: str, timeout: int = 900
         raise ValueError("invalid OpenAI review stage")
     result = invoke_openai(
         prompt, spec, _schema(stage == "group", stage == "synthesis"),
-        timeout=timeout,
+        timeout=timeout, transport_sink=transport_sink,
     )
     return result.response.encode()
 
 
 def _prompt(kind: str, *, base: str, head: str, diff: bytes, ids: list[dict] | None = None) -> str:
     # Plain text is cheaper for normal diffs; base64 preserves binary patches.
-    introduction = (f"{kind}. You are an independent reviewer of Harness source changes. "
+    introduction = (FINDING_GUIDANCE + SUPPLIED_CLAIM_GUIDANCE + f"{kind}. You are an independent reviewer of Harness source changes. "
                     "No tools, filesystem access, or external requests are needed. "
                     "Analyze the supplied exact diff independently. Report every concrete issue, "
                     "using P0/P1/P2 for merge blockers and P3 for minor issues. "
@@ -174,15 +176,18 @@ def _prompt(kind: str, *, base: str, head: str, diff: bytes, ids: list[dict] | N
     if ids is None:
         introduction += "Return findings only. Do not infer safety from another reviewer. "
     else:
-        introduction += ("For every listed blocker ID return exactly one UPHELD or DISPUTED decision. "
+        introduction += (DECISION_RATIONALE_INSTRUCTION
+                         + "For every listed blocker ID return exactly one UPHELD or DISPUTED decision. "
                          "A DISPUTED decision needs specific reasoning and a verbatim source quote "
                          "from this supplied group diff only. If no exact quote in this group source "
                          "supports a dispute, choose UPHELD. Never quote another group or chunk. "
-                         "For DISPUTED set source_id to GroupSourceId and quote_start/quote_end "
-                         "to UTF-8 byte offsets delimiting source_quote in this group source. "
-                         "For UPHELD use empty source_quote/source_id and zero offsets. "
+                         "For DISPUTED set source_id to GroupSourceId and copy an exact, "
+                         "uniquely occurring source_quote from this group source. "
+                         "The verifier computes UTF-8 byte offsets; do not submit offsets. "
+                         "For UPHELD use empty source_quote/source_id. "
                          "Bind each evidence reference to its finding_id. "
-                         "Also report any additional problems and summarize cross-file impact. "
+                         "Also report any additional problems and summarize cross-file impact "
+                         "in 32 to 4000 characters with no leading or trailing whitespace. "
                          f"GroupSourceId: {_sha(diff)}. "
                          f"Blockers: {json.dumps(ids, ensure_ascii=False)}. ")
     try:
@@ -195,14 +200,25 @@ def _prompt(kind: str, *, base: str, head: str, diff: bytes, ids: list[dict] | N
 def _decide(blockers: list[dict], result: dict, source: bytes) -> list[dict]:
     expected = {item["finding_id"]: item for item in blockers}
     seen = set()
+    bindings = []
+    used = set()
     for item in result["decisions"]:
         identifier = item["finding_id"]
         if identifier not in expected or identifier in seen:
             raise ValueError("unknown or repeated blocker ID")
         seen.add(identifier)
-        validate_source_binding(item, source)
+        binding = validate_source_binding(item, source)
+        if item["decision"] == "DISPUTED":
+            reference = (binding["source_id"], binding["quote_start"], binding["quote_end"])
+            if reference in used:
+                raise ValueError("source quote reused for another finding")
+            used.add(reference)
+        bindings.append(binding)
     if seen != set(expected):
         raise ValueError("missing blocker disposition")
+    if "source_bindings" in result and result["source_bindings"] != bindings:
+        raise ValueError("derived source binding changed")
+    result["source_bindings"] = bindings
     return [expected[item["finding_id"]] for item in result["decisions"]
             if item["decision"] == "UPHELD"]
 
@@ -334,6 +350,7 @@ def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec
              auth_key: str, receipt_path: Path | None = None,
              mission_id: str = "codex-mission-harness",
              registry_path: str | Path | None = None) -> dict:
+    from harness.artifact_lineage import artifact_code_hash, authority_matches, review_history
     if spec.provider != "openai" or not auth_key:
         raise ValueError("invalid OpenAI identity or receipt key")
     repository = secure.repository_identity(
@@ -346,9 +363,10 @@ def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec
             or receipt.get("mission_id") != mission_id
             or receipt.get("repository") != repository
             or receipt.get("registry_sha256") != _sha(registry.path.read_bytes())
-            or receipt.get("runner_sha256") != _sha(Path(__file__).read_bytes())
+            or receipt.get("runner_sha256") != artifact_code_hash(Path(__file__), receipt['source_binding_contract_authorization_sha256'])
             or receipt.get("invocation_sha256") != _sha(Path(invocation_module.__file__).read_bytes())
             or receipt.get("schema_manifest_sha256") != _schema_manifest_sha()
+            or not authority_matches(receipt.get("source_binding_contract_authorization_sha256"), receipt.get("mission_id"))
             or receipt.get("base_sha") != base or receipt.get("head_sha") != head):
         raise ValueError("OpenAI receipt model or exact HEAD mismatch")
     unsigned = dict(receipt)
@@ -377,12 +395,18 @@ def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec
     for actual, expected in zip(receipt["groups"], expected_groups):
         if any(actual.get(key) != value for key, value in expected.items()):
             raise ValueError("OpenAI group source mismatch")
-        result = _result(_canon(actual.get("result")), group=True)
+        stored = actual.get("result")
+        if not isinstance(stored, dict) or "source_bindings" not in stored:
+            raise ValueError("OpenAI source binding evidence missing")
+        result = _result(_canon({key: stored[key] for key in
+                                ("findings", "decisions", "summary")}), group=True)
         blockers = actual.get("source_blockers")
         if not isinstance(blockers, list):
             raise ValueError("OpenAI blocker binding missing")
         source = diff[expected["start"]:expected["end"]]
         _decide(blockers, result, source)
+        if result != stored:
+            raise ValueError("OpenAI derived source binding differs")
     # Recompute the final verdict from the validated, durably bound artifacts.
     findings = []
     for group in receipt["groups"]:
@@ -440,11 +464,18 @@ def validate(receipt: dict, *, root: Path, base: str, head: str, spec: ModelSpec
     if receipt_path is not None:
         _, directory_fd = secure.open_private_directory(Path(receipt_path).parent, root, create=False)
         try:
+            from harness.formal_delivery_gate import NEW_MISSION
+            if receipt['mission_id'] == NEW_MISSION:
+                state = json.loads(secure.read_private_artifact(directory_fd, 'state.json'))
+                review_history(state, lambda name: secure.read_private_artifact(directory_fd, name))
             for item in [*receipt["chunks"], *receipt["groups"], *synthesis]:
                 kind = ("group" if "chunk_indexes" in item else "synthesis" if "source_groups" in item
                         else "chunk")
                 raw = secure.read_private_artifact(directory_fd, f"{kind}-{item['index']:03d}.json")
                 parsed = _synthesis_result(raw) if kind == "synthesis" else _result(raw, group=kind == "group")
+                if kind == "group":
+                    _decide(item["source_blockers"], parsed,
+                            diff[item["start"]:item["end"]])
                 if _sha(raw) != item.get("output_sha256") or parsed != item["result"]:
                     raise ValueError("OpenAI durable artifact mismatch")
         finally:
@@ -469,11 +500,14 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
     registry = load_registry(registry_path)
     if spec != registry.role("final_reviewer"):
         raise ValueError("review model differs from selected registry")
-    call = lambda prompt, group: invoke_codex(
-        prompt, spec, stage="synthesis" if group == "synthesis" else
-        "group" if group else "chunk", timeout=timeout)
+    def call(prompt, group):
+        stage = "synthesis" if group == "synthesis" else "group" if group else "chunk"
+        current = os.environ.get("CMH_RESOURCE_STAGE", "")
+        sink = lambda p, out, err: run_state.capture_transport(current, p, out, err)
+        return invoke_codex(prompt, spec, stage=stage, timeout=timeout,
+                            transport_sink=sink)
     chunks, groups = _plan(diff)
-    stage_plan = [(f"chunk-{i:03d}", "chunk") for i in range(len(chunks))] + [
+    stage_plan = [("structured-preflight", "preflight")] + [(f"chunk-{i:03d}", "chunk") for i in range(len(chunks))] + [
         (f"group-{i:03d}", "group") for i in range(len(groups))]
     stage_plan.extend(full.synthesis_stage_names(len(groups)))
     _, manifest = full.build_manifest(root, base, head, repository)
@@ -488,6 +522,8 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
                 "runner_hash": _sha(Path(__file__).read_bytes()),
                 "invocation_hash": _sha(Path(invocation_module.__file__).read_bytes()),
                 "schema_manifest_hash": _schema_manifest_sha(),
+                "source_binding_contract_authorization_sha256":
+                    contract_authorization_identity(mission_id),
                 "qualification_receipt_identity": qualification_identity,
                 "input_manifest_identity": _sha(_canon({"chunks": chunks, "groups": groups})),
                 "full_manifest_sha256": manifest["manifest_sha256"],
@@ -497,9 +533,11 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
     run_state = ReviewRun(evidence, root, identity, stage_plan, secure,
                           prefix="openai-v2-")
     run_id, child_fd = run_state.state["review_run_id"], run_state.fd
+    os.environ["CMH_RESOURCE_RUN_ID"] = run_id
     path = run_state.path / "receipt.json"
     artifact_hashes = {}
     def stage_run(name, kind, prompt, execute, validate_result):
+        os.environ["CMH_RESOURCE_STAGE"] = name
         raw, result = run_state.stage(name, kind, prompt.encode(), execute, validate_result)
         artifact_hashes[name + ".json"] = _sha(raw)
         return raw, result
@@ -508,18 +546,24 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
         raise KeyboardInterrupt()
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
+    delivery_context = None
     try:
         if qualification_path is None:
             raise ValueError("live OpenAI review requires a final reviewer qualification receipt")
         qualified = validate_qualification_receipt(qualification_path, spec, auth_key=auth_key,
                                        role="final_reviewer", registry_path=registry_path)
+        from harness.formal_delivery_gate import bind_review
+        delivery_context = bind_review(mission_id, root, base, head,
+                                       _sha(registry.path.read_bytes()), spec, qualified)
         # Authenticate first, then exercise the same Codex structured
         # invocation path and chunk schema used by the review lane.
         preflight(spec, probe=False, timeout=min(timeout, 120))
-        invoke_codex(
-            'Return JSON with an empty findings array. Use the exact chunk schema.',
-            spec, stage="chunk", timeout=min(timeout, 120),
-        )
+        prompt = 'Return JSON with an empty findings array. Use the exact chunk schema.'
+        stage_run("structured-preflight", "preflight", prompt,
+                  lambda: invoke_codex(prompt, spec, stage="chunk", timeout=min(timeout, 120),
+                      transport_sink=lambda p, out, err:
+                          run_state.capture_transport("structured-preflight", p, out, err)),
+                  _result)
         receipt, _ = _assemble(diff, base, head, call, stage_run=stage_run, manifest=manifest)
         receipt.update({"model": spec.model, "reasoning_effort": spec.reasoning_effort,
                         "mission_id": mission_id, "repository": repository,
@@ -527,6 +571,8 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
                         "runner_sha256": _sha(Path(__file__).read_bytes()),
                         "invocation_sha256": _sha(Path(invocation_module.__file__).read_bytes()),
                         "schema_manifest_sha256": _schema_manifest_sha()})
+        receipt["source_binding_contract_authorization_sha256"] = identity[
+            "source_binding_contract_authorization_sha256"]
         receipt['task_assignments'] = full.review_tasks(diff, manifest)
         receipt['full_manifest'] = manifest
         receipt['execution_identity'] = expected_execution(receipt, manifest, _sha(_canon(qualified)), spec)
@@ -541,6 +587,10 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
         run_state.receipt(path.name, _canon(receipt), lambda: None)
         return path
     except (Exception, KeyboardInterrupt) as exc:
+        from harness.resource_gate import FundingPause
+        if isinstance(exc, FundingPause):
+            run_state.failure(dict(exc.details, failure_category=exc.details["status"]), auth_key)
+            raise
         failure = {"status": "BLOCKED", "base_sha": base, "head_sha": head,
                    "mission_id": mission_id, "repository": repository,
                    "diff_sha256": _sha(diff), "provider": spec.provider,
@@ -549,13 +599,29 @@ def run(root: Path, base: str, head: str, evidence: Path, auth_key: str,
                    else "CANCELLED" if isinstance(exc, KeyboardInterrupt)
                    else "REVIEW_RESULT_INVALID", "error_type": type(exc).__name__,
                    "artifact_sha256": artifact_hashes,
+                   "failed_raw_model_artifact": getattr(run_state, "last_failed_raw_artifact", None),
+                   "failed_raw_model_artifact_sha256": getattr(run_state, "last_failed_raw_sha256", None),
+                   "transport_artifact": getattr(run_state, "last_transport_artifact", None),
+                   "transport_artifact_sha256": getattr(run_state, "last_transport_sha256", None),
                    "invocation_evidence": dict(exc.evidence) if isinstance(exc, InvocationFailure) else {},
                    "recorded_at": int(time.time())}
+        current_stage = run_state.state.get("next_stage")
+        if (isinstance(exc, SourceBindingError)
+                and current_stage == os.environ.get("CMH_RESOURCE_STAGE")
+                and (current_stage, "group") in stage_plan):
+            # One fresh answer for the same Group may correct a model-supplied
+            # byte reference. ReviewRun keeps every committed prerequisite and
+            # enforces the existing single retry limit.
+            failure["resume_allowed"] = True
+            failure["resume_policy_reason"] = "bounded source binding retry"
+            failure["source_binding_diagnostic"] = exc.details
         failure_path = run_state.failure(failure, auth_key)
         if isinstance(exc, InvocationFailure):
             exc.evidence["failure_record"] = str(failure_path)
         raise
     finally:
+        from harness.formal_delivery_gate import reset_review
+        reset_review(delivery_context)
         signal.signal(signal.SIGTERM, previous_signals[0])
         signal.signal(signal.SIGINT, previous_signals[1])
         run_state.close()

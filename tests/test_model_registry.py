@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -6,14 +7,19 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness.model_qualification import (CASES, QualificationResult, expected_findings,
-                                         evaluate_cases, qualification_receipt,
+                                         qualification_prompt,
+                                         evaluate_cases, qualification_receipt, QualificationEvidence,
+                                         _evaluate_cases,
+                                         _actual_provider_invoke_unmetered,
                                          validate_qualification_receipt,
                                          require_builder_qualification)
-from harness.openai_invocation import InvocationFailure, canonical_environment
+from harness.openai_invocation import InvocationFailure, InvocationResult, canonical_environment
 from trusted_invocation_fixture import canonical_fixture
 from harness.model_registry import load_registry, preflight, trusted_claude_launcher
 from harness.review_failures import ReviewFailureClassification, classify_process_failure
 from harness.reviewer_v2_contract import parse_synthesis
+from direct_deepseek_fixture import envelope, KEY, reserved_transport, response
+from harness.model_qualification import _SCHEMA
 
 
 class RegistryTests(unittest.TestCase):
@@ -152,6 +158,93 @@ class QualificationContractTests(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertIn("single_blocker", result.cases_failed)
 
+    def test_failed_case_keeps_exact_raw_and_verdict_diagnostic(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); root.chmod(0o700)
+            evidence = QualificationEvidence(root / "diagnostics")
+            result = evaluate_cases(load_registry().role("independent_reviewer"),
+                                    lambda _spec, _prompt: self.raw([]), evidence=evidence)
+            self.assertFalse(result.passed)
+            case = json.loads((root / "diagnostics" / "single_blocker.json").read_text())
+            self.assertEqual(case["structured_output_raw"], self.raw([]))
+            self.assertEqual(case["exact_failure_reason"], "missing blocker disposition")
+            self.assertEqual(case["failure_phase"], "PARSER_OR_SOURCE_BINDING")
+            self.assertEqual((root / "diagnostics" / "single_blocker.json").stat().st_mode & 0o777, 0o600)
+            evidence.capture_transport("single_blocker", b'{"structured_output":{}}', b"cli-error", 0)
+            self.assertEqual((root / "diagnostics" / "single_blocker.stdout").read_bytes(),
+                             b'{"structured_output":{}}')
+            self.assertEqual((root / "diagnostics" / "single_blocker.stderr").read_bytes(), b"cli-error")
+
+    def test_false_clean_finding_is_recorded_as_verdict_failure(self):
+        false_finding = {"severity": "P1", "title": "Invented blocker", "evidence": "No support"}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); root.chmod(0o700)
+            evidence = QualificationEvidence(root / "diagnostics")
+            result = evaluate_cases(load_registry().role("independent_reviewer"),
+                                    lambda _spec, _prompt: self.raw([], findings=[false_finding]),
+                                    evidence=evidence)
+            self.assertIn("clean", result.cases_failed)
+            record = json.loads((root / "diagnostics" / "clean.json").read_text())
+            self.assertEqual(record["failure_phase"], "QUALIFICATION_VERDICT")
+            self.assertEqual(record["exact_failure_reason"], "semantic decision mismatch")
+            self.assertEqual(record["parser_result"], "PASS")
+            self.assertEqual(record["parsed_result"]["new_findings"], [false_finding])
+
+    def test_local_direct_transport_bytes_are_preserved_before_parse(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); root.chmod(0o700)
+            evidence = QualificationEvidence(root / "diagnostics")
+            output = {"decisions": [], "findings": [], "summary": self.summary}
+            with reserved_transport(response(output)):
+                result = _actual_provider_invoke_unmetered(
+                    load_registry().role("independent_reviewer"), "fixture prompt",
+                    token=KEY, timeout=5,
+                    transport_sink=lambda stdout, stderr, code:
+                        evidence.capture_transport("clean", stdout, stderr, code))
+            self.assertEqual(json.loads(result.response)["structured_output"]["findings"], [])
+            self.assertEqual((root / "diagnostics" / "clean.stdout").read_bytes(), result.response.encode())
+            self.assertEqual((root / "diagnostics" / "clean.stderr").read_bytes(), b"")
+
+    def test_failed_direct_status_and_request_usage_are_durable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); root.chmod(0o700)
+            evidence = QualificationEvidence(root / "diagnostics")
+            ledger = root / "ledger.json"
+            ledger.write_text(json.dumps({"requests": [{"number": 295,
+                "request_id": "synthetic-295", "status": "FAILED",
+                "reported_usage": {"tokens": {"input": 3, "output": 5}}}]}))
+            with reserved_transport(response({}, finish="length")), \
+                 patch.dict("os.environ", {"CMH_RESOURCE_LEDGER": str(ledger)}):
+                evidence.capture_prompt("clean", qualification_prompt(CASES[0]))
+                evidence.capture_reservation("clean", "synthetic-295")
+                with self.assertRaises(RuntimeError):
+                    _actual_provider_invoke_unmetered(
+                        load_registry().role("independent_reviewer"),
+                        qualification_prompt(CASES[0]), token=KEY,
+                        timeout=5, transport_sink=lambda stdout, stderr, code:
+                            evidence.capture_transport("clean", stdout, stderr, code))
+                evidence.record_case("clean", {"case_id": "clean", "verdict": "FAIL",
+                    "exact_failure_reason": "Direct invocation failed"})
+            record = json.loads((root / "diagnostics" / "clean.json").read_text())
+            self.assertEqual(record["resource_request_number"], 295)
+            self.assertEqual(record["invocation_usage"]["tokens"]["output"], 5)
+            self.assertEqual((root / "diagnostics" / "clean.stdout").read_bytes(), b"")
+            self.assertEqual((root / "diagnostics" / "clean.stderr").read_bytes(), b"INCOMPLETE_COMPLETION")
+            self.assertIn("clean.transport.json", json.loads((root / "diagnostics" / "checkpoint.json").read_text())["files"])
+
+    def test_diagnostic_binds_structured_response_to_usage_and_request(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); root.chmod(0o700)
+            evidence = QualificationEvidence(root / "diagnostics")
+            usage = {"input_tokens": 4, "output_tokens": 7}
+            evaluate_cases(load_registry().role("independent_reviewer"),
+                           lambda _spec, _prompt: InvocationResult(
+                               self.raw([]), {"resource_request_id": "synthetic-request",
+                                              "usage": usage}), evidence=evidence)
+            record = json.loads((root / "diagnostics" / "clean.json").read_text())
+            self.assertEqual(record["resource_request_id"], "synthetic-request")
+            self.assertEqual(record["invocation_usage"], usage)
+
     def test_provider_invocation_failure_stops_remaining_qualification_calls(self):
         calls = []
         def fail_once(_spec, _prompt):
@@ -159,7 +252,7 @@ class QualificationContractTests(unittest.TestCase):
             raise InvocationFailure("AUTHENTICATION_FAILURE", "auth failed", {})
         result = evaluate_cases(load_registry().role("final_reviewer"), fail_once)
         self.assertEqual(len(calls), 1)
-        self.assertEqual(result.cases_failed, tuple(case.name for case in CASES))
+        self.assertEqual(result.cases_failed, ("clean",))
 
     def test_provider_timeout_is_a_failed_qualification_case(self):
         def timeout(_spec, _prompt):
@@ -167,6 +260,60 @@ class QualificationContractTests(unittest.TestCase):
         result = evaluate_cases(load_registry().role("independent_reviewer"), timeout)
         self.assertFalse(result.passed)
         self.assertEqual(result.cases_failed, tuple(case.name for case in CASES))
+
+    def test_real_qualification_failures_stop_and_leave_private_hashed_checkpoint(self):
+        false_finding = {"severity": "P1", "title": "Invented blocker", "evidence": "No support"}
+        scenarios = [
+            ("false_clean", lambda case: self.raw([], findings=[false_finding])),
+            ("missed_blocker", lambda case: self.raw([])),
+            ("schema_invalid", lambda case: '{"decisions":"wrong"}'),
+            ("parser_exception", lambda case: 'not-json'),
+            ("cli_incomplete", lambda case: (_ for _ in ()).throw(RuntimeError("partial CLI output"))),
+            ("source_binding", lambda case: self.raw([self.decision(
+                expected_findings(case)[0]["finding_id"], "DISPUTED",
+                source_quote="not in source")]) if case.name == "single_blocker" else self.raw([])),
+        ]
+        for label, response in scenarios:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary); root.chmod(0o700)
+                evidence = QualificationEvidence(root / "diagnostics")
+                calls = []
+                def invoke(_spec, prompt):
+                    case = next(item for item in CASES if qualification_prompt(item) == prompt)
+                    calls.append(case.name)
+                    return envelope(json.loads(response(case)), prompt, _SCHEMA).decode()
+                # Skip clean only for the blocker and binding cases; a synthetic
+                # clean response is supplied to reach the intended fixture.
+                if label in ("missed_blocker", "source_binding"):
+                    original = invoke
+                    def invoke(_spec, prompt):
+                        case = next(item for item in CASES if qualification_prompt(item) == prompt)
+                        return envelope(json.loads(self.raw([])), prompt, _SCHEMA).decode() if case.name == "clean" else original(_spec, prompt)
+                result = _evaluate_cases(load_registry().role("independent_reviewer"), invoke,
+                                         mode="real_provider", evidence=evidence)
+                self.assertFalse(result.passed)
+                self.assertLessEqual(len(calls), 2)
+                self.assertEqual(len(result.cases_failed), 1)
+                checkpoint = json.loads((root / "diagnostics" / "checkpoint.json").read_text())
+                for filename, sha in checkpoint["files"].items():
+                    self.assertEqual(hashlib.sha256((root / "diagnostics" / filename).read_bytes()).hexdigest(), sha)
+                failed = json.loads((root / "diagnostics" /
+                                     (result.cases_failed[0] + ".json")).read_text())
+                self.assertIsNotNone(failed["exact_failure_reason"])
+                self.assertTrue((root / "diagnostics" /
+                                 (result.cases_failed[0] + ".prompt")).exists())
+
+    def test_interrupted_qualification_preserves_checkpoint_before_reraising(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); root.chmod(0o700)
+            evidence = QualificationEvidence(root / "diagnostics")
+            with self.assertRaises(KeyboardInterrupt):
+                _evaluate_cases(load_registry().role("independent_reviewer"),
+                                lambda _spec, _prompt: (_ for _ in ()).throw(KeyboardInterrupt()),
+                                mode="real_provider", evidence=evidence)
+            record = json.loads((root / "diagnostics" / "clean.json").read_text())
+            self.assertEqual(record["failure_phase"], "INTERRUPTED")
+            self.assertTrue((root / "diagnostics" / "checkpoint.json").exists())
 
     def test_provider_errors_are_not_format_retries(self):
         for message, expected in (("HTTP 401", ReviewFailureClassification.AUTHENTICATION_FAILURE),

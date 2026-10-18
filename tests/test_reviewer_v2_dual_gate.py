@@ -16,16 +16,54 @@ sys.path.insert(0, str(ROOT / "src"))
 import reviewer_v2_gate as gate  # noqa: E402
 import reviewer_v2_openai as review  # noqa: E402
 from harness.model_registry import ModelSpec  # noqa: E402
-from harness.openai_invocation import InvocationFailure  # noqa: E402
+from harness.openai_invocation import InvocationFailure, _matches_schema  # noqa: E402
 
 
 def git(root, *args):
     return subprocess.check_output(["git", "-C", str(root), *args]).decode().strip()
 
 
+class SummaryContractTests(unittest.TestCase):
+    def test_group_and_synthesis_schema_reject_parser_invalid_summaries(self):
+        for group in (False, True):
+            schema = review._schema(group, synthesis=not group)
+            for summary in ("x" * 31, "x" * 4001, " " * 32,
+                            " " + "x" * 32, "x" * 32 + "\n"):
+                value = {"findings": [], "summary": summary}
+                if group:
+                    value["decisions"] = []
+                with self.subTest(group=group, summary_length=len(summary)):
+                    self.assertFalse(_matches_schema(value, schema))
+                    if summary in ("x" * 31, "x" * 4001, " " * 32):
+                        parser = review._result if group else review._synthesis_result
+                        with self.assertRaisesRegex(ValueError, "summary"):
+                            if group:
+                                parser(review._canon(value), group=True)
+                            else:
+                                parser(review._canon(value))
+            for length in (32, 4000):
+                value = {"findings": [], "summary": "x" * length}
+                if group:
+                    value["decisions"] = []
+                with self.subTest(group=group, legal_length=length):
+                    self.assertTrue(_matches_schema(value, schema))
+                    if group:
+                        self.assertEqual(review._result(review._canon(value), group=True), value)
+                    else:
+                        self.assertEqual(review._synthesis_result(review._canon(value)), value)
+
+    def test_prompts_state_summary_length_contract(self):
+        group_prompt = review._prompt("GROUP REVIEW", base="a" * 40, head="b" * 40,
+                                      diff=b"+changed\n", ids=[])
+        synthesis_prompt = review._synthesis_prompt([], "a" * 40, "b" * 40)
+        for prompt in (group_prompt, synthesis_prompt):
+            self.assertIn("32 to 4000", prompt)
+            self.assertIn("no leading or trailing whitespace", prompt)
+
+
 class OpenAIContractTests(unittest.TestCase):
     def test_disputed_originals_survive_all_cross_group_synthesis_levels(self):
-        diff=b'a'*960100
+        diff=b''.join(f'{i:012d}'.encode()+b'a'*(32000-12) for i in range(30))+b'000000000030'+b'a'*88
         observed=[]
         def call(prompt,kind):
             if kind is False:
@@ -35,8 +73,9 @@ class OpenAIContractTests(unittest.TestCase):
                 source=prompt.split('EXACT DIFF TEXT (UTF-8):\n',1)[1].encode()
                 decisions=[{'finding_id':b['finding_id'],'decision':'DISPUTED',
                     'rationale':'Local source appears to refute the original concern.',
-                    'source_quote':'a'*12,'source_id':review._sha(source),
-                    'quote_start':0,'quote_end':12} for b in blockers]
+                    'source_quote':f"{int(b['finding_id'][1:4]):012d}",
+                    'source_id':review._sha(source),
+                    } for b in blockers]
                 return review._canon({'findings':[],'decisions':decisions,
                     'summary':'The bounded group has locally disputed the chunk concerns.'})
             summaries=json.loads(prompt.split('Group summaries: ',1)[1])
@@ -95,7 +134,8 @@ class OpenAIContractTests(unittest.TestCase):
                        registry_sha256=review._sha(review.load_registry().path.read_bytes()),
                        runner_sha256=review._sha(Path(review.__file__).read_bytes()),
                        invocation_sha256=review._sha(Path(review.invocation_module.__file__).read_bytes()),
-                       schema_manifest_sha256=review._schema_manifest_sha())
+                       schema_manifest_sha256=review._schema_manifest_sha(),
+                       source_binding_contract_authorization_sha256="OFFLINE_FIXTURE_ONLY")
         _, manifest = review.full.build_manifest(self.root, self.base, self.head, receipt['repository'])
         receipt['task_assignments'] = review.full.review_tasks(self.diff, manifest)
         receipt['full_manifest'] = manifest
@@ -162,7 +202,7 @@ class OpenAIContractTests(unittest.TestCase):
         evidence = Path(self.temp.name) / "interrupted"
         evidence.mkdir(mode=0o700)
         calls = 0
-        def invoke(_prompt, _spec, *, stage, timeout):
+        def invoke(_prompt, _spec, *, stage, timeout, transport_sink=None):
             nonlocal calls
             calls += 1
             if calls == 1:  # structured preflight
@@ -188,7 +228,7 @@ class OpenAIContractTests(unittest.TestCase):
         self.assertEqual(failure["failure_category"], "CANCELLED")
         self.assertEqual(failure["head_sha"], self.head)
         self.assertTrue(failure["resume_allowed"])
-        self.assertEqual(failure["durable_completed_stages"], ["chunk-000"])
+        self.assertEqual(failure["durable_completed_stages"], ["structured-preflight", "chunk-000"])
         self.assertEqual(failure["next_stage"], "chunk-001")
 
     def test_invalid_group_result_preserves_raw_stage_and_never_publishes_receipt(self):
@@ -199,10 +239,10 @@ class OpenAIContractTests(unittest.TestCase):
             "finding_id": "C000F000", "decision": "DISPUTED",
             "rationale": "This rationale claims the blocker does not apply.",
             "source_quote": "a quotation absent from the diff", "source_id": review._sha(self.diff),
-            "quote_start": 0, "quote_end": 32}],
+            }],
             "summary": "The group was reviewed but its dispute lacks source evidence."}).encode()
         calls = 0
-        def invoke(_prompt, _spec, *, stage, timeout):
+        def invoke(_prompt, _spec, *, stage, timeout, transport_sink=None):
             nonlocal calls
             calls += 1
             if calls == 1:
@@ -220,7 +260,27 @@ class OpenAIContractTests(unittest.TestCase):
         self.assertEqual(failure["status"], "BLOCKED")
         self.assertEqual(failure["failure_category"], "REVIEW_RESULT_INVALID")
         self.assertNotIn("group-000.json", failure["artifact_sha256"])
+        self.assertTrue(failure["resume_allowed"])
+        self.assertEqual(failure["resume_policy_reason"], "bounded source binding retry")
         self.assertFalse((run_dir / "receipt.json").exists())
+        requested = []
+        def retry(_prompt, _spec, *, stage, timeout, transport_sink=None):
+            requested.append(stage)
+            if stage == "chunk":
+                raise AssertionError("committed Chunk must not be recalled")
+            return json.dumps({"findings": [], "decisions": [{
+                "finding_id": "C000F000", "decision": "UPHELD",
+                "rationale": "The original finding remains valid in this exact source.",
+                "source_quote": "", "source_id": ""}],
+                "summary": "The original blocker remains present after source review."}).encode()
+        with patch.object(review, "validate_qualification_receipt", return_value={}), \
+             patch.object(review, "preflight"), \
+             patch.object(review, "invoke_codex", side_effect=retry):
+            receipt = review.run(self.root, self.base, self.head, evidence, "test-key", self.spec,
+                                 qualification_path="fixture-qualification")
+        self.assertEqual(requested, ["group"])
+        self.assertEqual(json.loads(receipt.read_text())["review_result"], "FAIL")
+        self.assertTrue(json.loads((run_dir / "state.json").read_text())["receipt_written"])
 
     def test_preflight_provider_failure_publishes_no_approval_receipt(self):
         evidence = Path(self.temp.name) / "evidence"
@@ -238,6 +298,41 @@ class OpenAIContractTests(unittest.TestCase):
         self.assertEqual(record["failure_category"], "AUTHENTICATION_FAILURE")
         self.assertEqual(record["head_sha"], self.head)
         self.assertFalse(list(evidence.rglob("receipt.json")))
+
+    def test_funding_pause_resumes_without_repeating_structured_preflight(self):
+        from harness.resource_gate import FundingPause
+        evidence = Path(self.temp.name) / "funding-pause"
+        evidence.mkdir(mode=0o700)
+        calls = []
+        def first(prompt, spec, **kwargs):
+            calls.append(kwargs["stage"])
+            if len(calls) == 1:
+                return b'{"findings":[]}'
+            raise FundingPause("OFFLINE funds exhausted", required=2, available=1)
+        with patch.object(review, "validate_qualification_receipt", return_value={}), \
+             patch.object(review, "preflight"), patch.object(review, "invoke_codex", side_effect=first):
+            with self.assertRaises(FundingPause):
+                review.run(self.root, self.base, self.head, evidence, "test-key", self.spec,
+                           qualification_path="fixture-qualification")
+        run_dir, = (item for item in evidence.iterdir() if item.is_dir())
+        state = json.loads((run_dir / "state.json").read_text())
+        self.assertEqual(state["failure_count"], 0)
+        self.assertEqual(state["next_stage"], "chunk-000")
+        self.assertEqual(state["funding_status"], "PAUSED_AWAITING_MANUAL_FUNDING")
+        self.assertFalse((run_dir / "receipt.json").exists())
+        resumed_calls = []
+        def resume(prompt, spec, **kwargs):
+            resumed_calls.append(kwargs["stage"])
+            if kwargs["stage"] == "chunk":
+                return b'{"findings":[]}'
+            return json.dumps({"findings": [], "decisions": [],
+                "summary": "This exact source was fully reviewed without remaining blockers."}).encode()
+        with patch.object(review, "validate_qualification_receipt", return_value={}), \
+             patch.object(review, "preflight"), patch.object(review, "invoke_codex", side_effect=resume):
+            review.run(self.root, self.base, self.head, evidence, "test-key", self.spec,
+                       qualification_path="fixture-qualification")
+        self.assertEqual(resumed_calls, ["chunk", "group"])
+        self.assertEqual(len([item for item in evidence.iterdir() if item.is_dir()]), 1)
 
     def test_live_review_requires_matching_final_reviewer_qualification(self):
         evidence = Path(self.temp.name) / "evidence"
@@ -263,7 +358,7 @@ class OpenAIContractTests(unittest.TestCase):
                     decisions = [{"finding_id": identifier, "decision": "UPHELD",
                                   "rationale": "The changed source makes the issue persist.",
                                   "source_quote": "", "source_id": "",
-                                  "quote_start": 0, "quote_end": 0} for identifier in ids]
+                                  } for identifier in ids]
                     return json.dumps({"findings": [], "decisions": decisions,
                                        "summary": "The source was reviewed with its original finding."}).encode()
                 with self.assertRaises(ValueError):
@@ -276,7 +371,7 @@ class OpenAIContractTests(unittest.TestCase):
                 return json.dumps({"findings": [blocker]}).encode()
             return json.dumps({"findings": [], "decisions": [{"finding_id": "C000F000",
                 "decision": "UPHELD", "rationale": "The changed source makes the issue persist.",
-                "source_quote": "", "source_id": "", "quote_start": 0, "quote_end": 0}],
+                "source_quote": "", "source_id": ""}],
                 "summary": "The blocker remains in the reviewed source."}).encode()
         receipt, _ = review._assemble(self.diff, self.base, self.head, call)
         self.assertEqual(receipt["review_result"], "FAIL")

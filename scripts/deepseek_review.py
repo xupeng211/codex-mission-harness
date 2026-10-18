@@ -20,6 +20,7 @@ from harness.review_failures import (  # noqa: E402
     ReviewFailureDetails,
     classify_process_failure,
 )
+from harness.resource_gate import model_request  # noqa: E402
 
 VERSION = "cmh-deepseek-review/v6"
 MODEL = "deepseek-flash"
@@ -970,7 +971,22 @@ def bounded_prompt_bytes(prompt_text):
         raise ValueError("review request exceeds the configured bounded prompt size")
     return rendered
 
-def invoke_reviewer(command, prompt_text, env, timeout):
+def _invoke_reviewer_unmetered(command, prompt_text, env, timeout):
+    from harness.formal_delivery_gate import NEW_MISSION, OLD_MISSION
+    if os.environ.get("CMH_RESOURCE_MISSION_ID") in {NEW_MISSION, OLD_MISSION}:
+        from harness.resource_gate import ResourceGateDenied
+        raise ResourceGateDenied("formal DeepSeek CLI route is frozen; Direct adapter required")
+    from harness.formal_delivery_gate import require_active_transport
+    model = command[command.index("--model") + 1] if "--model" in command else ""
+    require_active_transport("deepseek", model)
+    from harness.formal_delivery_gate import bounded_delivery_timeout
+    timeout = bounded_delivery_timeout(timeout)
+    from harness.formal_delivery_gate import NEW_MISSION, require_provider_credential
+    if os.environ.get("CMH_RESOURCE_MISSION_ID") == NEW_MISSION:
+        credential = env.get("ANTHROPIC_API_KEY", "")
+        if env.get("ANTHROPIC_AUTH_TOKEN", credential) != credential:
+            raise ValueError("DeepSeek credential routes must agree")
+        require_provider_credential("deepseek", credential.encode())
     # Keep source and synthesis prompts on stdin, not argv. The bounded request
     # limit is enforced before this call, independently of the operating system's
     # argv limit. Claude Code print mode supports prompts on stdin.
@@ -1022,6 +1038,40 @@ def invoke_reviewer(command, prompt_text, env, timeout):
         stdout_file.seek(0); stderr_file.seek(0)
         return subprocess.CompletedProcess(command, process.returncode,
                 stdout_file.read(MAX_REVIEW_OUTPUT_BYTES), stderr_file.read(MAX_REVIEW_OUTPUT_BYTES))
+
+
+class _NonzeroReviewerResult(Exception):
+    def __init__(self, result):
+        self.result = result
+
+
+def invoke_reviewer(command, prompt_text, env, timeout):
+    """Account in the original Mission ledger before spawning the reviewer."""
+    try:
+        index = command.index("--model")
+        model = command[index + 1]
+    except (ValueError, IndexError) as exc:
+        raise ValueError("reviewer command must declare its exact model") from exc
+    try:
+        with model_request(provider="deepseek", model=model, prompt=prompt_text.encode(),
+                           stage=os.environ.get("CMH_RESOURCE_STAGE", "deepseek-invocation")) as reservation:
+            result = _invoke_reviewer_unmetered(command, prompt_text, env, timeout)
+            if result.returncode:
+                raise _NonzeroReviewerResult(result)
+            try:
+                envelope = json.loads(result.stdout)
+                usage = envelope.get("usage")
+            except (ValueError, UnicodeDecodeError, AttributeError):
+                usage = None
+            if isinstance(usage, dict):
+                from harness.resource_gate import normalize_deepseek_usage
+                reservation.observe(normalize_deepseek_usage(
+                    usage, envelope.get("total_cost_usd"),
+                    envelope.get("modelUsage", {}).get(model)
+                    if isinstance(envelope.get("modelUsage"), dict) else None))
+            return result
+    except _NonzeroReviewerResult as exc:
+        return exc.result
 
 
 def bounded_diff(root, base, head, *, max_bytes=MAX_V2_DIFF_BYTES, timeout=30):

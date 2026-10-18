@@ -126,10 +126,12 @@ def run_fixture(root, *, large_diff=False):
     return args, Path(args.evidence)
 
 class DeepSeekReceiptTest(unittest.TestCase):
+    # This transport-only fixture mocks the separately tested live resource gate.
+    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args: None)
     def test_reviewer_output_is_bounded_before_read_or_receipt(self):
         program = f"import sys;sys.stdout.write('x'*{review.MAX_REVIEW_OUTPUT_BYTES + 1})"
         with self.assertRaisesRegex(ValueError, "output exceeds bound"):
-            review.invoke_reviewer([sys.executable, "-c", program], "prompt", os.environ.copy(), 5)
+            review._invoke_reviewer_unmetered([sys.executable, "-c", program], "prompt", os.environ.copy(), 5)
 
     def test_exact_diff_has_byte_ceiling(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -147,6 +149,8 @@ class DeepSeekReceiptTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "bounded source size"):
                 review.bounded_diff(repo, base, head, max_bytes=32)
 
+    # This transport-only fixture mocks the separately tested live resource gate.
+    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args: None)
     def test_invoke_reviewer_timeout_terminates_process_group(self):
         with tempfile.TemporaryDirectory() as directory:
             marker = Path(directory) / "child.pid"
@@ -156,7 +160,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
                        "'import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(30)']);"
                        "pathlib.Path(sys.argv[1]).write_text(str(child.pid));time.sleep(30)")
             with self.assertRaises(subprocess.TimeoutExpired):
-                review.invoke_reviewer([sys.executable, "-c", program, str(marker)],
+                review._invoke_reviewer_unmetered([sys.executable, "-c", program, str(marker)],
                                        "prompt", os.environ.copy(), 1)
             child_pid = int(marker.read_text())
             for _ in range(40):
@@ -165,6 +169,8 @@ class DeepSeekReceiptTest(unittest.TestCase):
                 time.sleep(0.05)
             self.assertFalse(process_is_live(child_pid))
 
+    # This transport-only fixture mocks the separately tested live resource gate.
+    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args: None)
     def test_invoke_reviewer_interrupt_terminates_process_group(self):
         with tempfile.TemporaryDirectory() as directory:
             marker = Path(directory) / "child.pid"
@@ -182,7 +188,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
                 raise KeyboardInterrupt()
             with patch.object(review.time, "sleep", side_effect=interrupt_after_start):
                 with self.assertRaises(KeyboardInterrupt):
-                    review.invoke_reviewer(["/bin/sh", "-c", program, "sh", str(marker)],
+                    review._invoke_reviewer_unmetered(["/bin/sh", "-c", program, "sh", str(marker)],
                                            "prompt", os.environ.copy(), 30)
             child_pid = int(marker.read_text())
             for _ in range(40):
@@ -223,6 +229,8 @@ class DeepSeekReceiptTest(unittest.TestCase):
                 review.bounded_diff(Path('/nonexistent'),'--output=/tmp/unwanted',HEAD)
             process.assert_not_called()
 
+    # This transport-only fixture mocks the separately tested live resource gate.
+    @patch("harness.formal_delivery_gate.require_active_transport", new=lambda *_args: None)
     def test_timeout_kills_descendant_even_if_leader_exits_on_term(self):
         with tempfile.TemporaryDirectory() as directory:
             marker=Path(directory)/'child.pid'
@@ -231,7 +239,7 @@ class DeepSeekReceiptTest(unittest.TestCase):
                      "'import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(30)']);"
                      "pathlib.Path(sys.argv[1]).write_text(str(child.pid));time.sleep(30)")
             with self.assertRaises(subprocess.TimeoutExpired):
-                review.invoke_reviewer([sys.executable,'-c',program,str(marker)],'prompt',os.environ.copy(),1)
+                review._invoke_reviewer_unmetered([sys.executable,'-c',program,str(marker)],'prompt',os.environ.copy(),1)
             pid=int(marker.read_text())
             for _ in range(40):
                 if not process_is_live(pid):break

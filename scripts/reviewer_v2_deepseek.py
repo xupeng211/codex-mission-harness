@@ -10,9 +10,7 @@ import json
 import os
 import re
 import signal
-import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -23,18 +21,20 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import deepseek_review as legacy  # noqa: E402
 from harness.reviewer_v2_contract import (  # noqa: E402
-    SourceBindingError, bind_findings, canonical, parse_chunk, parse_synthesis, sha256,
-    validate_bound_result,
+    FINDING_GUIDANCE, SUPPLIED_CLAIM_GUIDANCE, SourceBindingError, bind_findings, canonical, parse_chunk, parse_synthesis, sha256,
+    validate_bound_result, contract_authorization_identity,
 )
 from harness.model_registry import load_registry  # noqa: E402
 from harness.model_qualification import validate_qualification_receipt  # noqa: E402
 from harness import full_diff_manifest as full
-from harness.review_resume import ReviewRun  # noqa: E402
+from harness.review_resume import ReviewRun
+from harness import deepseek_direct as direct  # noqa: E402
 from harness.review_failure_diagnostics import (  # noqa: E402
-    classify_nonzero, cli_wrapper_summary, command_identity, environment_identity, stream_metadata,
+    command_identity, environment_identity, stream_metadata,
 )
 
 VERSION = "cmh-reviewer-v2-deepseek/v2"
+DECISION_RATIONALE_INSTRUCTION = 'Every decision, including UPHELD and DISPUTED, MUST contain a substantive rationale of at least 24 characters after trimming whitespace, explaining why that disposition is supported. Never omit rationale or use empty or template filler text. For UPHELD only source_quote/source_id are empty, not rationale. Example (use the actual required finding_id and source-specific reasoning, not these illustrative values): {"finding_id":"C000F000","decision":"UPHELD","rationale":"The supplied source still permits the invalid input to bypass validation.","source_quote":"","source_id":""}. '
 FAILURE_CATEGORIES = frozenset({
     "CHILD_PROCESS_TIMEOUT", "MODEL_TIMEOUT", "TRANSPORT_ERROR", "AUTH_ERROR",
     "CLI_USAGE_ERROR", "INVALID_ARGUMENT", "RATE_LIMIT", "QUOTA_ERROR",
@@ -64,7 +64,22 @@ def _stderr_markers(stderr: bytes | str | None) -> dict[str, bool]:
             "rate_limit": bool(re.search(r"\b429\b|rate.limit", value))}
 
 
-def _parse_stage(raw: str, parser, state: dict):
+def _validate_completion_artifact(raw, mission_id=None, prompt=None):
+    from harness.formal_delivery_gate import NEW_MISSION
+    try:
+        value = json.loads(raw)
+    except (ValueError, UnicodeError):
+        return  # Existing parser reports malformed/empty output.
+    formal = (mission_id == NEW_MISSION or os.environ.get("CMH_RESOURCE_MISSION_ID") == NEW_MISSION)
+    if formal or isinstance(value, dict) and "direct_completion" in value:
+        try:
+            schema = CHUNK_SCHEMA if set(value.get("structured_output", {})) == {"findings"} else SYNTHESIS_SCHEMA
+            direct.validate_envelope(raw, schema=schema, prompt=prompt)
+        except direct.DirectFailure:
+            raise ValueError("invalid Direct completion evidence") from None
+
+
+def _parse_stage(raw: str, parser, state: dict, *, prompt=None):
     state["parser_entered"] = True
     state["parser_result"] = "FAIL"
     try:
@@ -75,6 +90,7 @@ def _parse_stage(raw: str, parser, state: dict):
         state["schema_validation_entered"] = True
         state["schema_validation_result"] = "FAIL"
     try:
+        _validate_completion_artifact(raw, prompt=prompt)
         result = parser(raw)
         state["parser_result"] = "PASS"
         state["schema_validation_result"] = "PASS"
@@ -87,6 +103,8 @@ def _parse_stage(raw: str, parser, state: dict):
                 "parser_entered": state["parser_entered"],
                 "schema_validation_entered": state["schema_validation_entered"],
                 "validation_result": "FAIL"}
+        state["resume_allowed"] = False
+        state["resume_policy_reason"] = "invalid Direct result cannot trigger automatic resend"
         if not raw.strip():
             category = "EMPTY_OUTPUT"
         else:
@@ -112,14 +130,12 @@ FINDING_SCHEMA = {"type": "object", "additionalProperties": False,
                       "evidence": {"type": "string", "minLength": 1}}}
 DECISION_SCHEMA = {"type": "object", "additionalProperties": False,
                    "required": ["finding_id", "decision", "rationale", "source_quote",
-                                "source_id", "quote_start", "quote_end"],
+                                "source_id"],
                    "properties": {"finding_id": {"type": "string"},
                                   "decision": {"enum": ["UPHELD", "DISPUTED"]},
                                   "rationale": {"type": "string", "minLength": 24},
                                   "source_quote": {"type": "string"},
-                                  "source_id": {"type": "string"},
-                                  "quote_start": {"type": "integer", "minimum": 0},
-                                  "quote_end": {"type": "integer", "minimum": 0}}}
+                                  "source_id": {"type": "string"}}}
 CHUNK_SCHEMA = {"type": "object", "additionalProperties": False,
                 "required": ["findings"], "properties": {
                     "findings": {"type": "array", "items": FINDING_SCHEMA}}}
@@ -145,7 +161,8 @@ def _bounded(prompt: str) -> str:
 
 def _invoke(command: list[str], prompt: str, env: dict, timeout: int, token: str,
             *, stage: str, evidence_fd: int, artifact: str,
-            state: dict | None = None, persist: bool = True) -> tuple[str, str]:
+            state: dict | None = None, persist: bool = True,
+            transport_sink=None) -> tuple[str, str]:
     state = {} if state is None else state
     state.pop("timeout_at", None)
     state.pop("output_sha256", None)
@@ -165,54 +182,31 @@ def _invoke(command: list[str], prompt: str, env: dict, timeout: int, token: str
                  schema_validation_entered=False, schema_validation_result="NOT_ENTERED",
                  parser_error_class=None, schema_validation_error_class=None,
                  schema_validation_reason=None, source_binding_diagnostic=None)
+    os.environ["CMH_RESOURCE_STAGE"] = artifact
     try:
-        completed = legacy.invoke_reviewer(command, _bounded(prompt), env, timeout)
-    except subprocess.TimeoutExpired as exc:
-        state.update(timeout_at=int(time.time()), finished_at=int(time.time()),
+        schema = json.loads(command[command.index("--json-schema") + 1])
+        raw = direct.invoke(_bounded(prompt), token, schema, timeout=timeout, stage=artifact)
+        state.update(exit_code=0, output_sha256=sha256(raw),
+                     finished_at=int(time.time()),
                      duration_seconds=round(time.monotonic() - started_monotonic, 3),
-                     stderr_markers=_stderr_markers(exc.stderr),
-                     sanitized_error_class="CHILD_PROCESS_TIMEOUT",
-                     resume_allowed=True, resume_policy_reason="bounded child timeout",
-                     **stream_metadata(exc.output, exc.stderr))
-        raise ReviewStageFailure("CHILD_PROCESS_TIMEOUT", stage) from exc
-    except OSError as exc:
-        state.update(finished_at=int(time.time()),
+                     **stream_metadata(raw, b""))
+        if transport_sink is not None:
+            transport_sink(prompt.encode(), raw, b"")
+        if persist:
+            legacy.write_private_artifact(evidence_fd, artifact, raw, uuid.uuid4().hex)
+        return raw.decode(), sha256(raw)
+    except direct.DirectFailure as exc:
+        state.update(sanitized_error_class=exc.code, resume_allowed=False,
+                     finished_at=int(time.time()),
                      duration_seconds=round(time.monotonic() - started_monotonic, 3),
-                     sanitized_error_class="LOCAL_LAUNCHER_ERROR",
-                     resume_policy_reason="local launcher failure")
-        raise ReviewStageFailure("LOCAL_LAUNCHER_ERROR", stage) from exc
-    except KeyboardInterrupt:
-        state.update(finished_at=int(time.time()),
-                     duration_seconds=round(time.monotonic() - started_monotonic, 3),
-                     sanitized_error_class="CANCELLED", resume_allowed=True,
-                     resume_policy_reason="runner cancellation")
-        raise
-    state.update(finished_at=int(time.time()), exit_code=completed.returncode,
-                 duration_seconds=round(time.monotonic() - started_monotonic, 3),
-                 signal_if_any=-completed.returncode if completed.returncode < 0 else None,
-                 **stream_metadata(completed.stdout, completed.stderr),
-                 cli_wrapper=cli_wrapper_summary(completed.stdout),
-                 stderr_markers=_stderr_markers(completed.stderr))
-    if legacy._credential_echoed(completed.stdout, completed.stderr, token):
-        state.update(sanitized_error_class="AUTH_ERROR", resume_policy_reason="credential echoed")
-        raise ReviewStageFailure("AUTH_ERROR", stage)
-    if completed.returncode:
-        category, markers, allowed, reason = classify_nonzero(
-            completed.stdout, completed.stderr, completed.returncode)
-        state.update(sanitized_error_class=category, sanitized_error_markers=markers,
-                     resume_allowed=allowed, resume_policy_reason=reason)
-        raise ReviewStageFailure(category, stage)
-    raw = legacy._captured_bytes(completed.stdout)
-    if not raw.strip():
-        raise ReviewStageFailure("EMPTY_OUTPUT", stage)
-    if persist:
-        legacy.write_private_artifact(evidence_fd, artifact, raw, uuid.uuid4().hex)
-    state["output_sha256"] = sha256(raw)
-    return raw.decode("utf-8"), sha256(raw)
+                     resume_policy_reason="Direct failure cannot trigger automatic resend")
+        if transport_sink is not None:
+            transport_sink(prompt.encode(), None, exc.code.encode())
+        raise ReviewStageFailure("MODEL_TIMEOUT" if exc.code == "REQUEST_TIMEOUT" else "SCHEMA_VALIDATION_FAILED", stage) from None
 
 
 def _prompt_head(base: str, head: str, diff_hash: str, scope: str) -> str:
-    return ("Independent restricted code review. Do not use tools or filesystem. "
+    return (FINDING_GUIDANCE + SUPPLIED_CLAIM_GUIDANCE + "Independent restricted code review. Do not use tools or filesystem. "
             "Return only schema JSON. Report all P0/P1/P2 findings. "
             f"Base={base} Head={head} DiffSHA256={diff_hash} Scope={scope}\n")
 
@@ -247,9 +241,9 @@ def run(args: argparse.Namespace) -> dict:
     if model.provider != "deepseek":
         raise ValueError("independent reviewer provider is not DeepSeek")
     run = None
-    settings = None
     token = ""
     auth_key = ""
+    delivery_context = None
     stage_state: dict = {"stage": "setup", "stage_id": "setup", "input_sha256": diff_hash,
                          "started_at": int(time.time()), "stdout_present": False,
                          "exit_code": None, "stderr_markers": {},
@@ -260,10 +254,12 @@ def run(args: argparse.Namespace) -> dict:
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
     try:
-        executable, safe_path = legacy.resolve_claude_launcher(root, os.environ.get("PATH", ""))
+        executable = "DIRECT_DEEPSEEK_API"
         token = legacy.read_token_file(args.token_file, root)
         if not token:
             raise ValueError("missing DeepSeek credential")
+        if token.encode() in diff:
+            raise ValueError("credential appears in reviewed source; evidence publication blocked")
         auth_key_file = getattr(args, "auth_key_file", None)
         auth_key = legacy.read_token_file(auth_key_file, root) if auth_key_file else token
         if not auth_key:
@@ -273,15 +269,20 @@ def run(args: argparse.Namespace) -> dict:
             raise ValueError("live DeepSeek review requires an independent reviewer qualification receipt")
         qualified = validate_qualification_receipt(qualification, model, auth_key=auth_key,
                                        role="independent_reviewer", registry_path=registry_path)
+        from harness.formal_delivery_gate import bind_review
+        delivery_context = bind_review(args.mission_id, root, base, head,
+                                       sha256(registry.path.read_bytes()), model, qualified)
+        contract_auth_sha = contract_authorization_identity(args.mission_id)
         identity = {"provider": model.provider, "role": "independent_reviewer",
                     "model": model.model, "model_configuration": model.identity(),
                     "repository": repository, "mission_id": args.mission_id,
                     "base_sha": base, "head_sha": head, "diff_hash": diff_hash,
                     "registry_hash": sha256(registry.path.read_bytes()),
                     "runner_hash": sha256(Path(__file__).read_bytes()),
-                    "invocation_hash": sha256(Path(legacy.__file__).read_bytes()),
+                    "invocation_hash": sha256(Path(direct.__file__).read_bytes()),
                     "schema_manifest_hash": sha256(canonical({"chunk": CHUNK_SCHEMA,
                                                              "synthesis": SYNTHESIS_SCHEMA})),
+                    "source_binding_contract_authorization_sha256": contract_auth_sha,
                     "qualification_receipt_identity": sha256(Path(qualification).read_bytes())
                     if Path(qualification).exists() else sha256(str(qualification).encode()),
                     "input_manifest_identity": sha256(canonical({"chunks": chunks, "groups": groups})),
@@ -293,18 +294,9 @@ def run(args: argparse.Namespace) -> dict:
             (f"group-{i:03d}", "group") for i in range(len(groups))] + [("aggregate", "cross-group")]
         run = ReviewRun(Path(args.evidence), root, identity, stages, legacy, prefix="deepseek-v2-")
         run_id, evidence, evidence_fd = run.state["review_run_id"], run.path, run.fd
-        settings = tempfile.NamedTemporaryFile(mode="w", delete=False)
-        settings.write('{"permissions":{"allow":[],"deny":["Bash","Edit","Write",'
-                       '"Read","Glob","Grep","WebFetch","WebSearch"]}}')
-        settings.close()
-        command = [executable, "--bare", "--restricted", "--print", "--model",
-                   model.model, "--settings", settings.name, "--tools", "",
-                   "--disallowed-tools", "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch",
-                   "--output-format", "json"]
-        env = {"HOME": "/nonexistent", "PATH": safe_path, "LANG": "C.UTF-8",
-               "ANTHROPIC_API_KEY": token, "ANTHROPIC_AUTH_TOKEN": token,
-               "ANTHROPIC_BASE_URL": legacy.ENDPOINT, "CLAUDE_CODE_SIMPLE": "1",
-               **legacy.reviewer_transport_environment()}
+        os.environ["CMH_RESOURCE_RUN_ID"] = run_id
+        command = [executable, "--model", model.model]
+        env = {}  # Credentials never enter argv or captured environment metadata.
         chunk_command = command + ["--json-schema", json.dumps(CHUNK_SCHEMA, separators=(",", ":"))]
         synthesis_command = command + ["--json-schema", json.dumps(SYNTHESIS_SCHEMA, separators=(",", ":"))]
         for chunk in chunks:
@@ -317,8 +309,11 @@ def run(args: argparse.Namespace) -> dict:
             raw_bytes, findings = run.stage(name, "chunk", prompt.encode(),
                 lambda: _invoke(chunk_command, prompt, env, args.timeout, token,
                                 stage="chunk", evidence_fd=evidence_fd,
-                                artifact=name + ".json", state=stage_state, persist=False)[0].encode(),
-                lambda data: _parse_stage(data.decode(), parse_chunk, stage_state))
+                                artifact=name + ".json", state=stage_state, persist=False,
+                                transport_sink=lambda p, out, err, secret_echo=False:
+                                    run.capture_transport(name, p, out, err,
+                                                          secret_echo=secret_echo))[0].encode(),
+                lambda data: _parse_stage(data.decode(), parse_chunk, stage_state, prompt=prompt))
             output_hash = sha256(raw_bytes)
             chunk["bound_findings"] = bind_findings(findings, "C", chunk["index"])
             chunk["output_sha256"] = output_hash
@@ -334,11 +329,13 @@ def run(args: argparse.Namespace) -> dict:
                       "P0/P1/P2 finding needs exactly one decision keyed by finding_id. "
                       "Output decisions for RequiredFindingIds only; never decide P3 findings. "
                       "Do not invent, omit, or repeat finding_id values. "
-                      "UPHELD preserves the original finding automatically. DISPUTED requires "
+                      + DECISION_RATIONALE_INSTRUCTION
+                      + "UPHELD preserves the original finding automatically. DISPUTED requires "
                       "a specific rationale and source_quote copied exactly from this source. "
-                      "For DISPUTED, source_id must equal GroupSourceId and quote_start/quote_end "
-                      "must delimit the exact UTF-8 bytes of source_quote in this group source. "
-                      "For UPHELD use empty source_quote/source_id and zero offsets. "
+                      "For DISPUTED, source_id must equal GroupSourceId and source_quote "
+                      "must be a verbatim, uniquely occurring quote in this group source. "
+                      "The verifier computes UTF-8 byte offsets; do not submit offsets. "
+                      "For UPHELD use empty source_quote/source_id. "
                       "Each evidence reference belongs to its decision finding_id. "
                       "findings contains only NEW findings; "
                       "never copy supplied findings into it. Summarize interactions for cross-group review.\n"
@@ -350,9 +347,12 @@ def run(args: argparse.Namespace) -> dict:
             raw_bytes, result = run.stage(name, "group", prompt.encode(),
                 lambda: _invoke(synthesis_command, prompt, env, args.timeout, token,
                                 stage="group", evidence_fd=evidence_fd,
-                                artifact=name + ".json", state=stage_state, persist=False)[0].encode(),
+                                artifact=name + ".json", state=stage_state, persist=False,
+                                transport_sink=lambda p, out, err, secret_echo=False:
+                                    run.capture_transport(name, p, out, err,
+                                                          secret_echo=secret_echo))[0].encode(),
                 lambda data: _parse_stage(data.decode(), lambda value: parse_synthesis(
-                    value, expected, source=source, structured_evidence=True), stage_state))
+                    value, expected, source=source, structured_evidence=True), stage_state, prompt=prompt))
             output_hash = sha256(raw_bytes)
             group["result"] = result
             # Preserve original C identities for carried P3 and UPHELD blockers;
@@ -376,23 +376,28 @@ def run(args: argparse.Namespace) -> dict:
                   + "Reevaluate all original disputed findings and their group decisions for cross-group risks; add NEW findings if local disputes are unsound. "
                   "Analyze cross-group interactions using bounded summaries. You have no exact "
                   "source at this stage and must UPHOLD every supplied P0/P1/P2 finding. "
-                  "Use empty source_quote/source_id and zero quote offsets. "
+                  "Use empty source_quote/source_id; do not submit quote offsets. "
                   "findings contains only NEW cross-group findings. "
                   "Every blocker needs one decision keyed by finding_id.\n"
-                  "Decide RequiredFindingIds exactly once; no P3 IDs, invented IDs, or repeats.\n"
+                  + DECISION_RATIONALE_INSTRUCTION
+                  + "Decide RequiredFindingIds exactly once; no P3 IDs, invented IDs, or repeats.\n"
                   + f"RequiredFindingIds={json.dumps([item['finding_id'] for item in required])}\n"
                   + f"GroupSummaries={json.dumps(summaries, sort_keys=True)}")
         raw_bytes, result = run.stage("aggregate", "cross-group", prompt.encode(),
             lambda: _invoke(synthesis_command, prompt, env, args.timeout, token,
                             stage="cross-group", evidence_fd=evidence_fd,
-                            artifact="aggregate.json", state=stage_state, persist=False)[0].encode(),
+                            artifact="aggregate.json", state=stage_state, persist=False,
+                            transport_sink=lambda p, out, err, secret_echo=False:
+                                run.capture_transport("aggregate", p, out, err,
+                                                      secret_echo=secret_echo))[0].encode(),
             lambda data: _parse_stage(data.decode(), lambda value: parse_synthesis(
-                value, expected, source=None, structured_evidence=True), stage_state))
+                value, expected, source=None, structured_evidence=True), stage_state, prompt=prompt))
         output_hash = sha256(raw_bytes)
         receipt = {"version": VERSION, "repository": repository,
                    "mission_id": args.mission_id, "base_sha": base, "head_sha": head,
                    "registry_sha256": sha256(registry.path.read_bytes()),
                    "runner_sha256": sha256(Path(__file__).read_bytes()),
+                   "source_binding_contract_authorization_sha256": contract_auth_sha,
                    "diff_sha256": diff_hash, "provider": model.provider, "model": model.model,
                    "reasoning_effort": model.reasoning_effort, "chunks": chunks, "groups": groups,
                    "aggregate_result": result, "aggregate_output_sha256": output_hash,
@@ -420,13 +425,18 @@ def run(args: argparse.Namespace) -> dict:
         return {"status": receipt["review_result"], "review_receipt": str(path),
                 "head_sha": head}
     except (Exception, KeyboardInterrupt) as exc:
+        from harness.resource_gate import FundingPause
+        if isinstance(exc, FundingPause):
+            if run is not None:
+                run.failure(dict(exc.details, failure_category="PAUSED_AWAITING_MANUAL_FUNDING"), auth_key)
+            raise
         category = (exc.category if isinstance(exc, ReviewStageFailure) else
                     "CANCELLED" if isinstance(exc, KeyboardInterrupt) else "INTERNAL_EXCEPTION")
         failure = {"status": "BLOCKED", "failure_category": category,
                    "base_sha": base, "head_sha": head, "diff_sha256": diff_hash,
                    "runner_sha256": sha256(Path(__file__).read_bytes()),
                    "registry_sha256": identity["registry_hash"] if run is not None else sha256(registry.path.read_bytes()),
-                   "invocation_sha256": identity["invocation_hash"] if run is not None else sha256(Path(legacy.__file__).read_bytes()),
+                   "invocation_sha256": identity["invocation_hash"] if run is not None else sha256(Path(direct.__file__).read_bytes()),
                    "schema_manifest_sha256": identity["schema_manifest_hash"] if run is not None else sha256(canonical({"chunk": CHUNK_SCHEMA, "synthesis": SYNTHESIS_SCHEMA})),
                    "qualification_receipt_identity": identity["qualification_receipt_identity"] if run is not None else None,
                    "provider": model.provider, "model": model.model,
@@ -465,7 +475,11 @@ def run(args: argparse.Namespace) -> dict:
                    "schema_validation_error_class": stage_state.get("schema_validation_error_class"),
                    "schema_validation_reason": stage_state.get("schema_validation_reason"),
                    "source_binding_diagnostic": stage_state.get("source_binding_diagnostic"),
-                   "output_sha256": stage_state.get("output_sha256")}
+                   "output_sha256": stage_state.get("output_sha256"),
+                   "failed_raw_model_artifact": getattr(run, "last_failed_raw_artifact", None),
+                   "failed_raw_model_artifact_sha256": getattr(run, "last_failed_raw_sha256", None)}
+        failure["transport_artifact"] = getattr(run, "last_transport_artifact", None)
+        failure["transport_artifact_sha256"] = getattr(run, "last_transport_sha256", None)
         failure["integrity_sha256"] = sha256(canonical(failure))
         if auth_key:
             failure["auth_hmac_sha256"] = _receipt_hmac(failure, auth_key)
@@ -477,10 +491,10 @@ def run(args: argparse.Namespace) -> dict:
         wrapped.failure_artifact = str(failure_path) if failure_path else None
         raise wrapped from exc
     finally:
+        from harness.formal_delivery_gate import reset_review
+        reset_review(delivery_context)
         signal.signal(signal.SIGTERM, previous_signals[0])
         signal.signal(signal.SIGINT, previous_signals[1])
-        if settings is not None:
-            Path(settings.name).unlink(missing_ok=True)
         token = ""
         auth_key = ""
         if run is not None:
@@ -491,7 +505,7 @@ def expected_execution(receipt, manifest, qualification_hash, spec):
     return full.execution_identity(manifest, receipt['mission_id'], qualification_hash,
         role='independent_reviewer', provider=spec.provider, model=spec.model, configuration=spec.identity(),
         registry_hash=receipt['registry_sha256'], runner_hash=receipt['runner_sha256'],
-        invocation_hash=sha256(Path(legacy.__file__).read_bytes()),
+        invocation_hash=sha256(Path(direct.__file__).read_bytes()),
         schema_hash=sha256(canonical({'chunk': CHUNK_SCHEMA, 'synthesis': SYNTHESIS_SCHEMA})))
 
 
@@ -499,11 +513,13 @@ def validate(receipt: dict, base: str, head: str, root: Path | None = None,
              receipt_path: Path | None = None, mission_id: str | None = None,
              repository: str | None = None, secret: str | None = None,
              registry_path: str | Path | None = None) -> dict:
+    from harness.artifact_lineage import artifact_code_hash, authority_matches, review_history
     required = {"version", "repository", "mission_id", "base_sha", "head_sha", "diff_sha256",
                 "registry_sha256", "runner_sha256",
                 "provider", "model", "reasoning_effort", "chunks", "groups", "aggregate_result",
                 "aggregate_output_sha256", "review_result", "findings", "command_sha256",
                 "completed_at", "integrity_sha256", "auth_hmac_sha256", "full_manifest", "execution_identity", "task_assignments"}
+    required.add("source_binding_contract_authorization_sha256")
     if not isinstance(receipt, dict) or set(receipt) != required:
         raise ValueError("invalid V2 receipt shape")
     if (receipt["version"] != VERSION or receipt["base_sha"] != base
@@ -514,10 +530,12 @@ def validate(receipt: dict, base: str, head: str, root: Path | None = None,
     if (spec.provider != "deepseek" or receipt["model"] != spec.model
             or receipt["reasoning_effort"] != spec.reasoning_effort
             or receipt["registry_sha256"] != sha256(registry.path.read_bytes())
-            or receipt["runner_sha256"] != sha256(Path(__file__).read_bytes())):
+            or receipt["runner_sha256"] != artifact_code_hash(Path(__file__), receipt['source_binding_contract_authorization_sha256'])):
         raise ValueError("receipt model mismatch")
     if mission_id is not None and receipt["mission_id"] != mission_id:
         raise ValueError("receipt mission mismatch")
+    if not authority_matches(receipt["source_binding_contract_authorization_sha256"], receipt["mission_id"]):
+        raise ValueError("source binding contract authorization mismatch")
     if repository is not None and receipt["repository"] != repository:
         raise ValueError("receipt repository mismatch")
     unsigned = dict(receipt)
@@ -576,11 +594,16 @@ def validate(receipt: dict, base: str, head: str, root: Path | None = None,
     if receipt_path is not None:
         _, fd = legacy.open_private_directory(receipt_path.parent, root, create=False)
         try:
+            from harness.formal_delivery_gate import NEW_MISSION
+            if receipt['mission_id'] == NEW_MISSION:
+                state = json.loads(legacy.read_private_artifact(fd, 'state.json'))
+                review_history(state, lambda name: legacy.read_private_artifact(fd, name))
             for record, stage in [(item, "chunk") for item in chunks] + [
                     (item, "group") for item in groups]:
                 raw = legacy.read_private_artifact(fd, f"{stage}-{record['index']:03d}.json")
                 if sha256(raw) != record["output_sha256"]:
                     raise ValueError("review artifact hash mismatch")
+                _validate_completion_artifact(raw, receipt["mission_id"])
                 if stage == "chunk":
                     if bind_findings(parse_chunk(raw.decode()), "C", record["index"]) != record["bound_findings"]:
                         raise ValueError("chunk artifact differs from receipt")
@@ -591,6 +614,7 @@ def validate(receipt: dict, base: str, head: str, root: Path | None = None,
                                        structured_evidence=True) != record["result"]:
                         raise ValueError("group artifact differs from receipt")
             raw = legacy.read_private_artifact(fd, "aggregate.json")
+            _validate_completion_artifact(raw, receipt["mission_id"])
             if (sha256(raw) != receipt["aggregate_output_sha256"]
                     or parse_synthesis(raw.decode(), _expected(groups), source=None,
                                        structured_evidence=True)

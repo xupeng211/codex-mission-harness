@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import reviewer_v2_deepseek as reviewer
+from direct_deepseek_fixture import envelope
 
 
 class DeepSeekV2ReceiptTests(unittest.TestCase):
@@ -19,7 +20,7 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
         raw = json.dumps({"findings": [], "decisions": [{
             "finding_id": expected[0]["finding_id"], "decision": "UPHELD",
             "rationale": "This source confirms the original minor issue.",
-            "source_quote": "", "source_id": "", "quote_start": 0, "quote_end": 0}],
+            "source_quote": "", "source_id": ""}],
             "summary": "The change contains one nonblocking finding only."})
         state = {"stage": "group"}
         with self.assertRaises(reviewer.ReviewStageFailure):
@@ -45,69 +46,38 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
             git("add", ".")
             git("commit", "-qm", "head")
             head = git("rev-parse", "HEAD")
-            good_chunk = subprocess.CompletedProcess([], 0,
-                json.dumps({"structured_output": {"findings": [{"severity": "P1",
-                    "title": "Synthetic blocker", "evidence": "source.py changed"}]}}).encode(), b"")
-            cases = {
-                "CHILD_PROCESS_TIMEOUT": subprocess.TimeoutExpired("claude", 1,
-                    output=b"partial output", stderr=b"fixture-token should stay private"),
-                "UNKNOWN_NONZERO_EXIT": subprocess.CompletedProcess([], 1, b"partial result", b"unknown failure"),
-                "MALFORMED_JSON": subprocess.CompletedProcess([], 0, b"not json", b""),
-                "EMPTY_OUTPUT": subprocess.CompletedProcess([], 0, b"", b""),
-                "SCHEMA_VALIDATION_FAILED": subprocess.CompletedProcess([], 0,
-                    json.dumps({"structured_output": {"findings": [], "decisions": [{
-                        "finding_id": "C000F000", "decision": "DISPUTED",
-                        "rationale": "Synthetic rationale with enough length for this decision.",
-                        "source_quote": "diff --git a/source.py", "source_id": "0" * 64,
-                        "quote_start": 0, "quote_end": 22}],
-                        "summary": "This synthetic group response has an invalid source identity."}}).encode(), b""),
-            }
-            for category, group_response in cases.items():
-                with self.subTest(category=category):
-                    evidence = Path(temporary) / category.lower()
+            good_chunk = {"findings": [{"severity": "P1", "title": "Synthetic blocker",
+                                        "evidence": "source.py changed"}]}
+            for code in ("REQUEST_TIMEOUT", "HTTP_429", "INCOMPLETE_COMPLETION", "INVALID_SCHEMA"):
+                with self.subTest(code=code):
+                    evidence = Path(temporary) / code.lower()
                     args = SimpleNamespace(repo=str(root), base=base, head=head,
                         evidence=str(evidence), token_file=str(Path(temporary) / "token"),
                         mission_id="test", timeout=1, qualification="fixture-qualification")
-                    def invoke(_command, prompt, _env, _timeout):
+                    calls = []
+                    def invoke(prompt, token, schema, **kwargs):
+                        calls.append(prompt)
                         if "Scope=chunk" in prompt:
-                            return good_chunk
-                        if isinstance(group_response, Exception):
-                            raise group_response
-                        return group_response
-                    with (patch.object(reviewer.legacy, "resolve_claude_launcher",
-                                       return_value=("/bin/true", "/usr/bin:/bin")),
-                          patch.object(reviewer.legacy, "read_token_file", return_value="fixture-token"),
+                            return envelope(good_chunk, prompt, schema)
+                        raise reviewer.direct.DirectFailure(code)
+                    with (patch.object(reviewer.legacy, "read_token_file", return_value="fixture-token"),
                           patch.object(reviewer, "validate_qualification_receipt", return_value={}),
-                          patch.object(reviewer.legacy, "invoke_reviewer", side_effect=invoke)):
+                          patch.object(reviewer.direct, "invoke", side_effect=invoke)):
                         with self.assertRaises(reviewer.ReviewStageFailure) as caught:
                             reviewer.run(args)
-                    self.assertEqual(caught.exception.category, category)
+                    self.assertEqual(len(calls), 2)  # chunk + one group, no automatic resend
                     failure_path = Path(caught.exception.failure_artifact)
                     failure = json.loads(failure_path.read_text())
                     self.assertEqual(failure["stage"], "group-000")
-                    self.assertEqual(failure["head_sha"], head)
-                    self.assertEqual(failure["failure_category"], category)
-                    self.assertEqual(len(failure["runner_sha256"]), 64)
-                    self.assertEqual(failure["role"], "independent_reviewer")
-                    self.assertEqual(len(failure["command_identity_hash"]), 64)
-                    self.assertEqual(len(failure["environment_identity_hash"]), 64)
-                    if category == "UNKNOWN_NONZERO_EXIT":
-                        self.assertFalse(failure["parser_entered"])
-                        self.assertFalse(failure["schema_validation_entered"])
-                        self.assertFalse(failure["resume_allowed"])
-                        self.assertTrue(failure["stdout_present"])
-                        self.assertEqual(failure["stdout_sha256"], reviewer.sha256(b"partial result"))
-                        self.assertEqual(failure["stderr_sha256"], reviewer.sha256(b"unknown failure"))
-                        self.assertEqual(failure["sanitized_error_class"], category)
-                    if category == "SCHEMA_VALIDATION_FAILED":
-                        detail = failure["source_binding_diagnostic"]
-                        self.assertEqual(detail["error_subclass"], "SOURCE_ID_MISMATCH")
-                        self.assertEqual(detail["finding_id"], "C000F000")
-                        self.assertEqual(detail["stage_id"], "group-000.json")
-                        self.assertEqual(detail["validation_rule"], "GROUP_SOURCE_HASH_MATCH")
-                        self.assertEqual(detail["validation_result"], "FAIL")
+                    self.assertEqual(failure["sanitized_error_class"], code)
+                    self.assertEqual(failure["failure_category"], "MODEL_TIMEOUT" if code == "REQUEST_TIMEOUT" else "SCHEMA_VALIDATION_FAILED")
+                    self.assertFalse(failure["resume_allowed"])
+                    self.assertFalse(failure["parser_entered"])
                     self.assertNotIn("fixture-token", failure_path.read_text())
                     self.assertFalse(list(evidence.rglob("deepseek-v2-receipt-*.json")))
+                    state = json.loads((failure_path.parent / "state.json").read_bytes())
+                    self.assertFalse(state['receipt_written'])
+                    self.assertEqual(state['completed_chunk_ids'], ['chunk-000'])
 
     def test_commit_last_receipt_and_exact_source_validation(self):
         self._exercise_receipt()
@@ -115,7 +85,13 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
     def test_separate_signing_key_never_replaces_provider_credential(self):
         self._exercise_receipt(separate_auth=True)
 
-    def _exercise_receipt(self, separate_auth=False):
+    def test_funding_pause_keeps_completed_chunk_and_same_run(self):
+        self._exercise_receipt(funding_pause=True)
+
+    def test_credential_in_source_cannot_enter_failure_evidence(self):
+        self._exercise_receipt(secret_in_source=True)
+
+    def _exercise_receipt(self, separate_auth=False, funding_pause=False, secret_in_source=False):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "repo"
             root.mkdir()
@@ -129,7 +105,7 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
             git("add", ".")
             git("commit", "-qm", "base")
             base = git("rev-parse", "HEAD")
-            (root / "source.py").write_text("value = 2\n")
+            (root / "source.py").write_text("value = 2\n" + ("fixture-token\n" if secret_in_source else ""))
             git("add", ".")
             git("commit", "-qm", "head")
             head = git("rev-parse", "HEAD")
@@ -141,23 +117,48 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
             if separate_auth:args.auth_key_file=str(signing_file)
             receipt_key="fixture-signing-key" if separate_auth else "fixture-token"
             summary = "The source change preserves the relevant contract and control flow."
-            def invoke(command, prompt, env, timeout):
-                self.assertEqual(env["ANTHROPIC_API_KEY"],"fixture-token")
-                self.assertNotIn("fixture-signing-key",repr(env))
+            paused, chunk_calls = [], []
+            def invoke(prompt, token, schema, **kwargs):
+                if funding_pause and "Scope=group" in prompt and not paused:
+                    from harness.resource_gate import FundingPause
+                    paused.append(True)
+                    raise FundingPause("OFFLINE funds exhausted", required=2, available=1)
+                if "Scope=chunk" in prompt:
+                    chunk_calls.append(True)
+                self.assertEqual(token, "fixture-token")
                 if "Scope=cross-group" in prompt:
                     self.assertIn("original_chunk_findings",prompt)
                     self.assertIn("chunk_dispositions",prompt)
                     self.assertIn("Reevaluate all original disputed findings",prompt)
                 result = ({"findings": []} if "Scope=chunk" in prompt else
                           {"findings": [], "decisions": [], "summary": summary})
-                return subprocess.CompletedProcess(command, 0, json.dumps({
-                    "structured_output": result}).encode(), b"")
+                return envelope(result, prompt, schema)
             with (patch.object(reviewer.legacy, "resolve_claude_launcher",
                                return_value=("/bin/true", "/usr/bin:/bin")),
                   patch.object(reviewer.legacy, "read_token_file", side_effect=lambda path,_root: "fixture-signing-key" if str(path)==str(signing_file) else "fixture-token"),
                   patch.object(reviewer, "validate_qualification_receipt", return_value={}) as qualified,
-                  patch.object(reviewer.legacy, "invoke_reviewer", side_effect=invoke)):
+                  patch.object(reviewer.direct, "invoke", side_effect=invoke) as transport):
+                if secret_in_source:
+                    with self.assertRaises(reviewer.ReviewStageFailure) as caught:
+                        reviewer.run(args)
+                    self.assertNotIn("fixture-token", str(caught.exception))
+                    self.assertIsNone(caught.exception.failure_artifact)
+                    self.assertFalse(evidence.exists())
+                    transport.assert_not_called()
+                    qualified.assert_not_called()
+                    return
+                if funding_pause:
+                    from harness.resource_gate import FundingPause
+                    with self.assertRaises(FundingPause): reviewer.run(args)
+                    state_path, = evidence.glob("*/state.json")
+                    funding_state = json.loads(state_path.read_bytes())
+                    self.assertEqual(funding_state['failure_count'], 0)
+                    self.assertEqual(funding_state['funding_status'], 'PAUSED_AWAITING_MANUAL_FUNDING')
+                    self.assertEqual(funding_state['next_stage'], 'group-000')
                 response = reviewer.run(args)
+                if funding_pause:
+                    self.assertEqual(len(chunk_calls), 1)
+                    self.assertEqual(len(list(evidence.glob("*/state.json"))), 1)
             self.assertEqual(qualified.call_args.kwargs["auth_key"],receipt_key)
             receipt_path = Path(response["review_receipt"])
             self.assertEqual(response["status"], "PASS")
@@ -173,6 +174,20 @@ class DeepSeekV2ReceiptTests(unittest.TestCase):
             receipt = json.loads(receipt_path.read_text())
             reviewer.validate(receipt, base, head, root, receipt_path, "test",
                               "ssh://github.com/example/harness.git", receipt_key)
+            original_chunk = (receipt_path.parent / "chunk-000.json").read_bytes()
+            bad_chunk = json.loads(original_chunk)
+            bad_chunk["direct_completion"]["finish_reason"] = "length"
+            bad_raw = reviewer.canonical(bad_chunk)
+            (receipt_path.parent / "chunk-000.json").write_bytes(bad_raw)
+            bad_receipt = json.loads(json.dumps(receipt))
+            bad_receipt["chunks"][0]["output_sha256"] = reviewer.sha256(bad_raw)
+            bad_receipt.pop("integrity_sha256"); bad_receipt.pop("auth_hmac_sha256")
+            bad_receipt["integrity_sha256"] = reviewer.sha256(reviewer.canonical(bad_receipt))
+            bad_receipt["auth_hmac_sha256"] = reviewer._receipt_hmac(bad_receipt, receipt_key)
+            with self.assertRaisesRegex(ValueError, "Direct completion"):
+                reviewer.validate(bad_receipt, base, head, root, receipt_path, "test",
+                                  "ssh://github.com/example/harness.git", receipt_key)
+            (receipt_path.parent / "chunk-000.json").write_bytes(original_chunk)
             original_read = Path.read_bytes
             def changed_runner(path):
                 return b"changed runner" if path == Path(reviewer.__file__) else original_read(path)

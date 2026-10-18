@@ -8,6 +8,7 @@ is the recovery authority.
 """
 from __future__ import annotations
 
+import base64
 import fcntl
 import hashlib
 import json
@@ -62,6 +63,9 @@ class ReviewRun:
 
     def __init__(self, evidence: Path, repository_root: Path, identity: dict,
                  stages: list[tuple[str, str]], storage, *, prefix: str):
+        if os.environ.get('CMH_RESOURCE_MISSION_ID') == 'HARNESS_CURRENT_VERSION_DELIVERY':
+            from .formal_delivery_gate import load_authorization, require_review_authority
+            require_review_authority(load_authorization())
         self.storage = storage
         self.evidence, self.parent_fd = storage.open_private_directory(evidence, repository_root)
         self.lock_fd = os.open(".review-v2.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600,
@@ -104,6 +108,19 @@ class ReviewRun:
         for _, name, state in sorted(candidates, reverse=True):
             if state.get("invalidated"):
                 continue
+            if state.get("identity") != self.identity and os.environ.get("CMH_RESOURCE_MISSION_ID") == "HARNESS_CURRENT_VERSION_DELIVERY":
+                from .artifact_lineage import reusable_review_identity, review_history
+                try:
+                    reusable_review_identity(state['identity'], self.identity)
+                    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.parent_fd)
+                    try:
+                        review_history(state, lambda path: self.storage.read_private_artifact(fd, path))
+                    finally:
+                        os.close(fd)
+                except (ValueError, KeyError):
+                    pass  # Ineligible state takes the existing invalidation path.
+                else:
+                    self.identity = dict(state['identity'])  # Original provenance is never rewritten.
             if state.get("identity") != self.identity:
                 fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.parent_fd)
                 try:
@@ -143,8 +160,12 @@ class ReviewRun:
                       "completed_chunk_ids": [], "completed_group_ids": [],
                       "cross_group_completed": False, "final_completed": False,
                       "receipt_written": False, "created_at": time.time_ns(),
+                      "diagnostic_artifacts": [],
                       "failure_count": 0, "last_failure": None,
                       "lease": {"pid": os.getpid(), "start_ticks": _start_ticks(), "run_id": run_id}}
+        if (self.identity.get('provider') == 'openai' and
+                os.environ.get('CMH_RESOURCE_MISSION_ID') == 'HARNESS_CURRENT_VERSION_DELIVERY'):
+            self.state['accepted_request_binding_version'] = 1
         _atomic_state(self.fd, self.state)
 
     @property
@@ -171,6 +192,17 @@ class ReviewRun:
             raw = self.storage.read_private_artifact(self.fd, record["artifact_path"])
             if sha256(raw) != record.get("artifact_sha256") or sha256(raw) != record["output_hash"]:
                 raise ValueError("committed review artifact changed")
+            if (self.state.get('accepted_request_binding_version') == 1 and
+                    not isinstance(record.get('accepted_request'), dict)):
+                raise ValueError('committed review request binding missing')
+        for diagnostic in self.state.get("diagnostic_artifacts", []):
+            raw = self.storage.read_private_artifact(self.fd, diagnostic["path"])
+            if sha256(raw) != diagnostic["sha256"]:
+                raise ValueError("review diagnostic artifact changed")
+        if (completed and self.identity.get('provider') == 'openai' and
+                os.environ.get('CMH_RESOURCE_MISSION_ID') == 'HARNESS_CURRENT_VERSION_DELIVERY'):
+            from .artifact_lineage import review_history
+            review_history(self.state, lambda name: self.storage.read_private_artifact(self.fd, name))
 
     def stage(self, name: str, kind: str, input_bytes: bytes, execute: Callable[[], bytes],
               validate: Callable[[bytes], object]) -> tuple[bytes, object]:
@@ -196,16 +228,47 @@ class ReviewRun:
         else:
             os.unlink(artifact, dir_fd=self.fd)
             os.fsync(self.fd)
-        raw = execute()
-        result = validate(raw)
-        self.storage.write_private_artifact(self.fd, artifact, raw, uuid.uuid4().hex)
-        self.state["completed"][name] = {
+        diagnostic_start = len(self.state.get("diagnostic_artifacts", []))
+        try:
+            raw = execute()
+        except BaseException as exc:
+            from .resource_gate import FundingPause
+            if not isinstance(exc, FundingPause) and kind in {"chunk", "group", "cross-group"}:
+                self._failed_response(name, kind, input_bytes, None, exc, diagnostic_start)
+            raise
+        try:
+            result = validate(raw)
+        except BaseException as exc:
+            if kind in {"chunk", "group", "cross-group"}:
+                self._failed_response(name, kind, input_bytes, raw, exc, diagnostic_start)
+            raise
+        record = {
             "artifact_path": artifact, "artifact_sha256": sha256(raw),
             "input_hash": input_hash, "output_hash": sha256(raw),
             "completed_at": int(time.time()), "validator_result": "PASS"}
+        if (self.identity.get('provider') == 'openai' and
+                os.environ.get('CMH_RESOURCE_MISSION_ID') == 'HARNESS_CURRENT_VERSION_DELIVERY'):
+            transports = [json.loads(self.storage.read_private_artifact(self.fd, d['path']))
+                          for d in self.state['diagnostic_artifacts'][diagnostic_start:]
+                          if d['path'].startswith(name + '-transport-')]
+            if len(transports) != 1 or not isinstance(transports[0].get('resource_request'), dict):
+                raise ValueError('accepted OpenAI invocation binding missing or ambiguous')
+            transport = transports[0]
+            request = transport['resource_request']
+            if (transport.get('stage') != name or transport.get('prompt_sha256') != input_hash
+                    or transport.get('resource_run_id') != self.state['review_run_id']):
+                raise ValueError('accepted OpenAI transport identity mismatch')
+            record['accepted_request'] = {key: request.get(key) for key in
+                ('request_id', 'authorization_sha256', 'provider', 'run_id', 'stage', 'prompt_sha256')}
+            record['accepted_request']['response_sha256'] = sha256(raw)
+            from .artifact_lineage import review_history
+            review_history(dict(self.state, completed={name: record}), lambda _: raw)
+        self.storage.write_private_artifact(self.fd, artifact, raw, uuid.uuid4().hex)
+        self.state["completed"][name] = record
         self.state["completed_order"].append(name)
         self.state["failure_count"] = 0
         self.state["last_failure"] = None
+        self.state["funding_status"] = None
         next_index = index + 1
         self.state["current_stage"] = name
         self.state["next_stage"] = self.stages[next_index][0] if next_index < len(self.stages) else "receipt"
@@ -215,6 +278,110 @@ class ReviewRun:
         self.state["final_completed"] = next_index == len(self.stages)
         _atomic_state(self.fd, self.state)
         return raw, result
+
+    def _failed_response(self, name: str, kind: str, prompt: bytes,
+                         raw: bytes | None, exc: BaseException,
+                         diagnostic_start: int) -> None:
+        """Append private diagnostics before a failing stage can be retried."""
+        label = f"{name}-failed-raw-{uuid.uuid4().hex}.json"
+        structured = None
+        if raw is not None:
+            try:
+                envelope = json.loads(raw)
+                if isinstance(envelope, dict):
+                    structured = envelope.get("structured_output", envelope)
+            except (ValueError, UnicodeError):
+                pass
+        source_error = getattr(exc, "__cause__", None) or exc
+        request = self._resource_request(name, prompt)
+        transport = next((item for item in reversed(self.state.get("diagnostic_artifacts", [])[diagnostic_start:])
+                          if item["path"].startswith(name + "-transport-")), None)
+        stream_status = "OUTPUT_PRESERVED" if raw is not None else "OUTPUT_NOT_PRODUCED"
+        if transport is not None and raw is None:
+            captured = json.loads(self.storage.read_private_artifact(self.fd, transport["path"]))
+            if captured.get("stdout_size") or captured.get("stderr_size"):
+                stream_status = "OUTPUT_PARTIAL"
+        record = {"version": "cmh-failed-review-response/v1", "stage": name,
+                  "kind": kind, "identity": self.identity,
+                  "prompt_sha256": sha256(prompt), "prompt_base64": base64.b64encode(prompt).decode(),
+                  "prompt_utf8": prompt.decode("utf-8", "replace"),
+                  "raw_model_output_status": "OUTPUT_NOT_PRODUCED" if raw is None else "RETURNED",
+                  "stream_status": stream_status, "transport_artifact": transport,
+                  "raw_model_output_sha256": sha256(raw) if raw is not None else None,
+                  "raw_model_output_base64": base64.b64encode(raw).decode() if raw is not None else None,
+                  "raw_model_output_utf8": raw.decode("utf-8", "replace") if raw is not None else None,
+                  "structured_output": structured,
+                  "parser_error_class": type(source_error).__name__,
+                  "parser_error": str(source_error),
+                  "source_binding_diagnostic": getattr(source_error, "details", None),
+                  "resource_request": request,
+                  "resource_stage": os.environ.get("CMH_RESOURCE_STAGE"),
+                  "resource_run_id": self.state["review_run_id"]}
+        rendered = canonical(record)
+        self.storage.write_private_artifact(self.fd, label, rendered, uuid.uuid4().hex)
+        self._index_diagnostic(label, rendered)
+        self.last_failed_raw_artifact = label
+        self.last_failed_raw_sha256 = sha256(rendered)
+
+    def _resource_request(self, name: str, prompt: bytes) -> dict | None:
+        request = None
+        ledger_path = os.environ.get("CMH_RESOURCE_LEDGER")
+        if ledger_path:
+            try:
+                rows = json.loads(Path(ledger_path).read_bytes())["requests"]
+                matches = [row for row in rows
+                           if row.get("run_id") == self.state["review_run_id"]
+                           and row.get("stage") in {name, name + ".json"}
+                           and row.get("prompt_sha256") == sha256(prompt)]
+                # Capture the physical invocation while its reservation is active,
+                # including on retries. Never infer the accepted request by recency.
+                from .resource_gate import _active_reservation
+                active = _active_reservation.get()
+                if active is not None:
+                    matches = [row for row in matches if row.get('request_id') == active.request_id
+                               and row.get('authorization_sha256') == active.authorization_sha256]
+                if len(matches) == 1:
+                    row = matches[0]
+                    request = {key: row.get(key) for key in
+                               ("number", "request_id", "status", "reported_usage", "authorization_sha256",
+                                "provider", "run_id", "stage", "prompt_sha256")}
+            except (OSError, ValueError, KeyError):
+                pass
+        return request
+
+    def _index_diagnostic(self, label: str, rendered: bytes) -> None:
+        # If interrupted between the two fsyncs, the uniquely named private
+        # artifact remains discoverable but never becomes a completed stage.
+        self.state.setdefault("diagnostic_artifacts", []).append(
+            {"path": label, "sha256": sha256(rendered)})
+        _atomic_state(self.fd, self.state)
+
+    def capture_transport(self, name: str, prompt: bytes, stdout: bytes | None,
+                          stderr: bytes | None, *, secret_echo: bool = False) -> None:
+        """Append a private transport snapshot before parsing can discard streams."""
+        if secret_echo:
+            stdout = stderr = None
+        label = f"{name}-transport-{uuid.uuid4().hex}.json"
+        record = {"version": "cmh-review-transport/v1", "stage": name,
+                  "identity": self.identity, "prompt_sha256": sha256(prompt),
+                  "prompt_base64": base64.b64encode(prompt).decode(),
+                  "stdout_status": "REDACTED_CREDENTIAL_ECHO" if secret_echo else
+                                   "OUTPUT_NOT_PRODUCED" if stdout is None else "CAPTURED",
+                  "stdout_sha256": sha256(stdout) if stdout is not None else None,
+                  "stdout_size": len(stdout) if stdout is not None else None,
+                  "stdout_base64": base64.b64encode(stdout).decode() if stdout is not None else None,
+                  "stderr_status": "REDACTED_CREDENTIAL_ECHO" if secret_echo else
+                                   "OUTPUT_NOT_PRODUCED" if stderr is None else "CAPTURED",
+                  "stderr_sha256": sha256(stderr) if stderr is not None else None,
+                  "stderr_size": len(stderr) if stderr is not None else None,
+                  "stderr_base64": base64.b64encode(stderr).decode() if stderr is not None else None,
+                  "resource_request": self._resource_request(name, prompt),
+                  "resource_run_id": self.state["review_run_id"]}
+        rendered = canonical(record)
+        self.storage.write_private_artifact(self.fd, label, rendered, uuid.uuid4().hex)
+        self._index_diagnostic(label, rendered)
+        self.last_transport_artifact = label
+        self.last_transport_sha256 = sha256(rendered)
 
     def receipt(self, name: str, raw: bytes, validate: Callable[[], object]) -> Path:
         if not self.state["final_completed"]:
@@ -239,14 +406,15 @@ class ReviewRun:
         return path
 
     def failure(self, failure: dict, auth_key: str | None = None) -> Path:
+        funding = failure.get("failure_category") in {"PAUSED_AWAITING_MANUAL_FUNDING", "PAUSED_SUBSCRIPTION_UNAVAILABLE"}
         failure.pop("integrity_sha256", None)
         failure.pop("auth_hmac_sha256", None)
-        attempt = self.state.get("failure_count", 0) + 1
+        attempt = self.state.get("failure_count", 0) + (0 if funding else 1)
         inferred = failure.get("failure_category") in {
             "CANCELLED", "CHILD_PROCESS_TIMEOUT", "MODEL_TIMEOUT", "TRANSPORT_ERROR",
             "TURN_TIMEOUT_UNDIAGNOSED", "TRANSIENT_CAPACITY", "TRANSIENT_TRANSPORT",
             "RATE_LIMIT", "PROVIDER_ERROR"}
-        allowed = bool(failure.get("resume_allowed", inferred)) and attempt <= 1
+        allowed = funding or (bool(failure.get("resume_allowed", inferred)) and attempt <= 1)
         reason = failure.get("resume_policy_reason", "category policy")
         if not allowed and attempt > 1:
             reason = "bounded stage retry exhausted"
@@ -269,6 +437,7 @@ class ReviewRun:
             name = f"failure-{uuid.uuid4().hex}.json"
         self.storage.write_private_artifact(self.fd, name, canonical(failure), uuid.uuid4().hex)
         self.state["failure_count"] = attempt
+        self.state["funding_status"] = failure["failure_category"] if funding else None
         self.state["last_failure"] = {"artifact_path": name, "resume_allowed": allowed,
                                       "stage": self.state["next_stage"]}
         _atomic_state(self.fd, self.state)
