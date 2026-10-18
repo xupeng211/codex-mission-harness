@@ -9,7 +9,6 @@ import hashlib
 import json
 import os
 import re
-import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,6 +29,8 @@ def usage_increment(snapshot, previous):
     if not isinstance(snapshot, dict) or tokens(snapshot) is None:
         return None
     fields = snapshot.get("total", snapshot)
+    if any(type(value) is not int or value < 0 for value in fields.values()):
+        return None
     total = tokens(snapshot)
     if previous is None:
         delta = dict(fields)

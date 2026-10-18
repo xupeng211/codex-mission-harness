@@ -19,7 +19,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .factory_runtime import LocalRuntime, official_rubric, VENDOR
+from .factory_runtime import LocalRuntime, RuntimeFailure, official_rubric, VENDOR
 from .sandbox import SAFE_PATH
 from .factory_budget import accounting, operation_token_limit, planning_limits
 from .factory_project import (PROJECT, OFFLINE_PASS, LANES, BACKENDS, approved_scope,
@@ -1257,7 +1257,7 @@ class Factory:
                 if self._single_thread_id is None:
                     raise FactoryBlocked("UNKNOWN", "same-thread repair unavailable; no new thread authorized")
                 self._verify_local_resume(spec, cwd, target)
-                repair_payload = {**payload, "diagnostics": failed,
+                repair_payload = {**payload, "diagnostics": self._local_qa_feedback(mission, failed),
                     "instruction": "The trusted Controller QA below failed. Fix only these concrete failures, add/update regression tests as needed, and return summary and known_risks. This is the one authorized ordinary repair; do not start another task or take external actions."}
                 self.state(mission, "REWORK")
                 result = self._single_agent_operation(spec, cwd, repair_payload, "rework", 1, self._single_thread_id)
@@ -1303,6 +1303,31 @@ class Factory:
                 "FORBIDDEN_ACTIONS": ["network", "push", "pull", "PR", "merge", "release", "deployment", "external API"],
                 "EXECUTION_LIMITS": {"max_turns": 2, "max_repairs": 1, **limits}}
 
+    def _local_qa_feedback(self, mission, failed):
+        """Copy bounded, verified QA output across the Controller read boundary."""
+        feedback = []
+        for result in failed:
+            op = self.db.execute("SELECT * FROM operations WHERE mission=? AND key=?",
+                                 (mission, result["evidence_key"])).fetchone()
+            if op is None or op["stage"] not in {"checks", "ci"}:
+                raise FactoryBlocked("UNKNOWN", "repair diagnostics have no QA operation")
+            self.verify_evidence(op)
+            recorded = json.loads(op["result"])
+            if {k: v for k, v in result.items() if k != "evidence_key"} != recorded:
+                raise FactoryBlocked("UNKNOWN", "repair diagnostics differ from QA evidence")
+            excerpts = []
+            for evidence in recorded.get("raw_evidence", []):
+                path = Path(evidence["path"])
+                if path.suffix != ".raw":
+                    continue
+                with path.open("rb") as stream:
+                    stream.seek(max(0, path.stat().st_size - 16384))
+                    excerpts.append(stream.read(16384).decode("utf-8", errors="replace"))
+            feedback.append({"command": json.loads(op["input"])["command"],
+                             "status": result["status"], "exit_code": result.get("exit_code"),
+                             "log_tail": "\n".join(excerpts), "evidence_key": result["evidence_key"]})
+        return feedback
+
     def _verify_local_resume(self, spec, cwd, target):
         candidate_stage.authorize(spec, self.config, cwd, self.profile_identities["developer"])
         if self.target(spec, cwd) != target or git(cwd, "remote"):
@@ -1322,8 +1347,21 @@ class Factory:
         def invoke(transcript):
             call_payload = {**payload, "_thread_id": thread_id, "_return_thread": True,
                             "_reuse_session": True, "_operation_token_limit": token_limit}
-            result = self.runtime.agent(stage, profile, cwd, call_payload, transcript,
-                    self.operation_timeout(spec["mission_id"]), [self.root, Path(spec["repository"])])
+            if self.project:
+                approval = approved_scope(spec)
+                call_payload.update(mission_scope_file=approval["path"],
+                                    mission_scope_sha256=approval["sha256"])
+            try:
+                result = self.runtime.agent(stage, profile, cwd, call_payload, transcript,
+                        self.operation_timeout(spec["mission_id"]), [self.root, Path(spec["repository"])])
+            except RuntimeFailure as exc:
+                # Even uncertain repair telemetry is cumulative thread usage;
+                # retain only this operation's observed increment, plus its
+                # permanent UNKNOWN reservation in the existing ledger.
+                if self._single_usage_snapshot is not None:
+                    measured = candidate_stage.usage_increment(exc.usage, self._single_usage_snapshot)
+                    exc.usage = {"total": measured[0]} if measured else None
+                raise
             if result.get("thread_id"):
                 if thread_id is not None and result["thread_id"] != thread_id:
                     raise FactoryBlocked("UNKNOWN", "runtime changed execution thread between turns")

@@ -35,14 +35,62 @@ class NativeProtocolTests(unittest.TestCase):
         (self.auth / "private-sentinel").write_text("not-a-real-credential")
         (self.root / "state/control/private-sentinel").write_text("not-visible-to-agent")
 
-    def server(self, read_only, token_limit=None, timeout=30):
-        server = FactoryAppServer({"provider": "openai", "model": "offline-protocol-no-inference", "codex_home": str(self.auth)},
+    def server(self, read_only, token_limit=None, timeout=30, reuse_session=False, **selection):
+        server = FactoryAppServer({"provider": "openai", "model": "offline-protocol-no-inference", "codex_home": str(self.auth), **selection},
                                   self.cwd, self.root / ("review.raw" if read_only else "develop.raw"),
                                   timeout, [self.root / "state", self.source], read_only, read_only, token_limit)
         self.addCleanup(server.close)
+        server._reuse_session = reuse_session
         server.start_or_resume(None, str(self.cwd))
         self.assertEqual(server.runtime_identity["provider"], "openai")
         return server
+
+    def test_stronger_model_and_high_effort_bind_start_and_same_thread_resume_without_inference(self):
+        server = self.server(False, 120000, reuse_session=True, model="gpt-6.1-sol", effort="high")
+        # start_or_resume returns the native thread ID; thread/start itself is
+        # metadata configuration and does not establish inference entitlement.
+        thread_id = next(e["result"]["thread"]["id"] for e in server.events
+                         if "result" in e and "thread" in e["result"])
+        server._request("thread/inject_items", {"threadId": thread_id, "items": [
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "offline synthetic history; no inference"}]}]})
+        server.token_limit = 36000
+        self.assertEqual(server.start_or_resume(thread_id, str(self.cwd)), thread_id)
+        self.assertEqual(server.runtime_identity["model"], "gpt-6.1-sol")
+        self.assertEqual(server.runtime_identity["effort"], "high")
+        effective = server._request("config/read", {"includeLayers": False})["config"]
+        self.assertEqual(effective["model"], "gpt-6.1-sol")
+        self.assertEqual(effective["model_reasoning_effort"], "high")
+        # config/read describes process configuration, not resumed-thread
+        # overrides. Assert the submitted stage cap without claiming a physical
+        # provider cap or inference access from metadata alone.
+        self.assertEqual(server._thread_policy_params(str(self.cwd))["config"]["features"]["rollout_budget"]["limit_tokens"], 36000)
+        self.assertFalse(any(e.get("method") == "turn/started" for e in server.events))
+
+    def test_developer_cannot_edit_controller_scope_without_inference(self):
+        scope = self.cwd / "mission-scope.json"
+        scope.write_text('{"controller":"owned"}\n')
+        server = FactoryAppServer({"provider": "openai", "model": "offline-protocol-no-inference",
+            "codex_home": str(self.auth)}, self.cwd, self.root / "scope.raw", 30,
+            [self.root / "state", self.source], False, protected_paths=(scope,))
+        self.addCleanup(server.close)
+        server.start_or_resume(None, str(self.cwd))
+        result = self.exec(server, "import pathlib,json\np=pathlib.Path('mission-scope.json')\n"
+            "r={'readable':p.read_text()}\n"
+            "try:p.write_text('changed');r['write']='WRITABLE'\n"
+            "except OSError:r['write']='DENIED'\nprint(json.dumps(r))")
+        self.assertEqual(result, {"readable": '{"controller":"owned"}\n', "write": "DENIED"})
+
+    def test_ephemeral_history_cannot_resume_for_repair_without_inference(self):
+        server = self.server(False)
+        thread_id = next(e["result"]["thread"]["id"] for e in server.events
+                         if "result" in e and "thread" in e["result"])
+        server._request("thread/inject_items", {"threadId": thread_id, "items": [
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "offline synthetic ephemeral history"}]}]})
+        with self.assertRaisesRegex(RuntimeError, "no rollout found"):
+            server.start_or_resume(thread_id, str(self.cwd))
+        self.assertFalse(any(e.get("method") == "turn/started" for e in server.events))
 
     def exec(self, server, code):
         result = server._request("command/exec", {"command": ["/usr/bin/python3", "-c", code], "cwd": str(self.cwd),

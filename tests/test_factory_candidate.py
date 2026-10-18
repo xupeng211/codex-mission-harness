@@ -6,6 +6,9 @@ import hashlib
 import json
 import socket
 import tempfile
+import time
+import io
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -345,17 +348,51 @@ class LocalCandidateTests(unittest.TestCase):
     def test_runtime_observer_applies_repair_cap_to_cumulative_thread_snapshot(self):
         server = FactoryAppServer.__new__(FactoryAppServer)
         server.events, server.token_limit, server.runtime_identity = [], 36000, {}
+        server._active_thread_id, server._active_turn_id = "t", "repair"
+        server._end_time, server.seq = time.monotonic() + 30, 0
+        server.proc = SimpleNamespace(stdin=io.StringIO())
         server._turn_usage_baseline = {"total": {"inputTokens": 58000, "outputTokens": 0,
                                                   "totalTokens": 58000}}
         cumulative = {"total": {"inputTokens": 76000, "outputTokens": 0, "totalTokens": 76000}}
         with patch("harness.codex.AppServerCodex._read_message", return_value={
-                "method": "thread/tokenUsage/updated", "params": {"tokenUsage": cumulative}}):
+                "method": "thread/tokenUsage/updated", "params": {"threadId": "t", "turnId": "repair", "tokenUsage": cumulative}}):
             self.assertEqual(server._read_message()["params"]["tokenUsage"], cumulative)
         over = {"total": {"inputTokens": 94001, "outputTokens": 0, "totalTokens": 94001}}
         with patch("harness.codex.AppServerCodex._read_message", return_value={
-                "method": "thread/tokenUsage/updated", "params": {"tokenUsage": over}}):
-            with self.assertRaises(RuntimeFailure):
-                server._read_message()
+                "method": "thread/tokenUsage/updated", "params": {"threadId": "t", "turnId": "repair", "tokenUsage": over}}):
+            server._read_message()
+        self.assertTrue(server._budget_exceeded)
+        self.assertIn('"method": "turn/interrupt"', server.proc.stdin.getvalue())
+
+    def test_repair_receives_actual_qa_failure_text_without_controller_file_access(self):
+        self.runtime.failure = "repair"
+        original = self.runtime.agent
+        diagnostics = []
+        def agent(role, profile, cwd, payload, *args):
+            if role == "rework":
+                diagnostics.extend(payload["diagnostics"])
+            return original(role, profile, cwd, payload, *args)
+        with patch.object(self.runtime, "agent", side_effect=agent):
+            self.ready()
+        self.assertTrue(diagnostics)
+        self.assertIn("AssertionError", diagnostics[0]["log_tail"])
+        self.assertEqual(diagnostics[0]["status"], "FAIL")
+        self.assertNotIn("log_path", diagnostics[0])
+
+    def test_uncertain_repair_failure_accounts_increment_without_losing_reservation(self):
+        self.runtime.failure = "repair"
+        original = self.runtime.agent
+        def agent(role, *args):
+            if role == "rework":
+                raise RuntimeFailure("lost terminal event", {"total": {
+                    "inputTokens": 15000, "outputTokens": 0, "totalTokens": 15000}})
+            return original(role, *args)
+        with patch.object(self.runtime, "agent", side_effect=agent):
+            report = self.run_candidate()
+        self.assertEqual(report["DELIVERY_STATUS"], "UNKNOWN")
+        self.assertEqual(report["BUDGET_USED"]["observed_tokens"], 15000)
+        self.assertEqual(report["BUDGET_USED"]["unknown_token_reservation"], 36000)
+        self.assertEqual(report["BUDGET_USED"]["partial_usage_runs"], 1)
 
     def test_authorized_summary_resolves_pending_draft_but_real_scope_conflict_blocks(self):
         self.spec.setdefault("constraints", []).append("Model execution is pending approval before implementation")
