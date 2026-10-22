@@ -19,6 +19,7 @@ LOCAL_READY = "LOCAL_CANDIDATE_READY"
 LOCAL_MODE = "local_candidate"
 LOCAL_STAGES = {"implement", "rework", "checks", "ci"}
 BILLING = "USER_APPROVED_USAGE_WITH_UNPROVEN_MONETARY_CAP"
+STRICT_DIRECT_MARKER = "CMH_LOCAL_STRICT_DIRECT_TESTS"
 
 
 def requested(spec):
@@ -60,31 +61,40 @@ def validate_policy(config):
     if policy is None:
         return
     if (not isinstance(policy, dict) or set(policy) != {"profile", "test_paths"}
-            or policy["profile"] != "targeted" or not config.get("trusted_validation")
+            or policy["profile"] not in {"targeted", "strict"} or not config.get("trusted_validation")
             or config.get("project_contract") != "footballprediction"
-            or config["checks"] != [["make", "verify-targeted"]]
+            or config["checks"] != [["make", "verify-" + policy["profile"]]]
             or not isinstance(policy["test_paths"], list) or not policy["test_paths"]
             or any(not re.fullmatch(r"tests/[A-Za-z0-9_/]+\.py", p) for p in policy["test_paths"])
             or len(set(policy["test_paths"]) ) != len(policy["test_paths"])):
-        raise ValueError("local acceptance requires trusted targeted validation and explicit Python tests")
+        raise ValueError("local acceptance requires a matching trusted targeted/strict profile and explicit Python tests")
 
 
-def targeted(spec, config):
+def checks_only(spec, config):
     return requested(spec) and "local_acceptance" in config
 
 
 def acceptance(spec, config, target, results):
-    if not targeted(spec, config):
+    if not checks_only(spec, config):
         return None
+    profile = config["local_acceptance"]["profile"]
     tests = config["local_acceptance"]["test_paths"]
     changed = set(target["files"]) - {spec.get("mission_scope_file")}
     if (not set(tests) <= changed or not any(p.startswith("src/") and p.endswith(".py") for p in changed)
             or any(not p.endswith(".py") for p in changed) or len(results) != 1):
-        raise ValueError("local targeted requires changed Python source and all authorized direct tests")
+        raise ValueError("local acceptance requires changed Python source and all authorized direct tests")
     result = results[0]
     log = Path(result["log_path"])
     data = log.read_bytes()
     text = re.sub(r"\x1b\[[0-9;]*m", "", data.decode("utf-8", errors="replace"))
+    if profile == "strict":
+        strict, boundary, direct = text.partition(STRICT_DIRECT_MARKER + "\n")
+        if (not boundary or result.get("identity", {}).get("profile") != "strict"
+                or "[Validation] profile=strict changed_files=" not in strict
+                or "[Validation] full Production Gate implementation: bash scripts/devops/gatekeeper.sh --mode=push" not in strict
+                or "[Gatekeeper] 门禁通过（mode=push）。" not in strict):
+            raise ValueError("local strict lacks full strict gate PASS before direct business tests")
+        text = direct
     command = "[Validation] changed Python tests: /usr/local/bin/python3 -m pytest -q " + " ".join(sorted(tests))
     if (result.get("status") != "PASS" or result.get("exit_code") != 0
             or hashlib.sha256(data).hexdigest() != result.get("log_sha256")
@@ -94,7 +104,7 @@ def acceptance(spec, config, target, results):
             or not re.search(r"\b[1-9][0-9]* passed\b", text)
             or re.search(r"\b[1-9][0-9]* (?:skipped|deselected|xfailed|xpassed)\b", text)):
         raise ValueError("local targeted lacks executed static/format/business-test PASS evidence")
-    return {"mode": "targeted", "status": "PASS", "target": target, "test_paths": tests,
+    return {"mode": profile, "status": "PASS", "target": target, "test_paths": tests,
             "exit_code": 0, "log_sha256": result["log_sha256"], "evidence_key": result["evidence_key"]}
 
 
@@ -170,7 +180,7 @@ def check_dispatch(factory, mission, stage):
     authorize(spec, factory.config, Path(row["candidate"]), factory.developer_binding(spec)[1])
     stopped = factory.db.execute(
         "SELECT 1 FROM events WHERE mission=? AND kind='local_candidate'", (mission,)).fetchone()
-    if stage not in LOCAL_STAGES or stopped or targeted(spec, factory.config) and stage == "ci" or not progress_policy.enabled(factory.config) and stage == "rework" and factory.db.execute(
+    if stage not in LOCAL_STAGES or stopped or checks_only(spec, factory.config) and stage == "ci" or not progress_policy.enabled(factory.config) and stage == "rework" and factory.db.execute(
             "SELECT COUNT(*) FROM operations WHERE mission=? AND stage='rework'", (mission,)).fetchone()[0] >= 1:
         raise FactoryBlocked("BLOCKED_LOCAL_AUTHORITY", "local candidate has no formal/remote/resume dispatch authority")
 
@@ -213,7 +223,7 @@ def complete(factory, spec, cwd, target, work, tests, ci):
         "snapshots": [r.get("usage_snapshot") for r in records],
         "operation_deltas": [r.get("usage_delta") for r in records], "money": "UNKNOWN"}
     evidence["wall_clock_time"] = round(__import__("time").monotonic() - getattr(factory, "_local_started", __import__("time").monotonic()), 3)
-    if targeted(spec, factory.config):
+    if checks_only(spec, factory.config):
         evidence["local_acceptance"] = acceptance(spec, factory.config, target, tests)
     if progress_policy.enabled(factory.config):
         evidence["progress_authorization"] = spec["progress_authorization"]
@@ -264,9 +274,9 @@ def verify(factory, spec, cwd, evidence):
                     result.get("status") in {None, "COMPLETE"}, "executor success/identity missing")
         indexed[op["key"]] = op
     require(any(op["stage"] == "implement" for op in operations), "actual execution required")
-    local = targeted(spec, factory.config)
+    local = checks_only(spec, factory.config)
     if local:
-        require(evidence.get("validation_results", {}).get("ci") == [], "local targeted cannot claim formal CI")
+        require(evidence.get("validation_results", {}).get("ci") == [], "local acceptance cannot claim formal CI")
         try:
             expected = acceptance(spec, factory.config, target, evidence["validation_results"]["checks"])
         except (ValueError, KeyError, OSError) as exc:
@@ -320,8 +330,8 @@ def report(factory, row, operations, preflights, events):
             "SIMULATION": factory.config["simulation"], "DONE": False,
             "IMPLEMENTED": evidence.get("implemented", "UNKNOWN"),
             "TEST_RESULT": ("OFFLINE_FIXTURE_PASS" if factory.config["simulation"] else "PASS") if ready else "UNKNOWN",
-            "CI_RESULT": "NOT_EXECUTED" if targeted(json.loads(row["spec"]), factory.config) else "LOCAL_ONLY_PASS" if ready else "UNKNOWN",
-            "LOCAL_CI": "NOT_EXECUTED" if targeted(json.loads(row["spec"]), factory.config) else "PASS" if ready else "UNKNOWN",
+            "CI_RESULT": "NOT_EXECUTED" if checks_only(json.loads(row["spec"]), factory.config) else "LOCAL_ONLY_PASS" if ready else "UNKNOWN",
+            "LOCAL_CI": "NOT_EXECUTED" if checks_only(json.loads(row["spec"]), factory.config) else "PASS" if ready else "UNKNOWN",
             "LOCAL_ACCEPTANCE": evidence.get("local_acceptance", "NOT_RUN"),
             "HOSTED_CI": "NOT_EXECUTED", "REVIEW_RESULT": "NOT_EXECUTED",
             "FORMAL_REVIEW": "NOT_EXECUTED", "QUALIFICATION": "NOT_EXECUTED", "DUAL_RECEIPT": "PENDING",

@@ -302,6 +302,12 @@ def run(policy, spec, cwd, target, command, transcript, timeout, executor=None, 
         raise ValueError("invalid validation idle timeout")
     executor = executor or DockerExecutor()
     profile = profile_for(command)
+    # This supplement is selected only by the immutable local authorization.
+    # STRICT remains the complete project gate; targeted additionally executes
+    # the changed direct Python tests that the full gate does not guarantee.
+    from .factory_candidate import requested, STRICT_DIRECT_MARKER
+    strict_local = (requested(spec) and profile == "strict" and
+                    spec.get("local_candidate_authorization", {}).get("local_acceptance", {}).get("profile") == "strict")
     result = {"status": "RUNNING", "fixture": executor.fixture,
               "identity": {"mission_id": spec["mission_id"], "head": target["head"], "tree": target["tree"],
                            "profile": profile, "config_sha256": digest(policy), "image_digest": policy["image"]},
@@ -404,6 +410,11 @@ def run(policy, spec, cwd, target, command, transcript, timeout, executor=None, 
         # Share only the temporary DB's network=none namespace. Source is copied
         # into bounded tmpfs so normal coverage/temp artifacts work. Its Git
         # objects remain a separate read-only mount, and tracked edits fail closed.
+        dispatcher = QA_PYTHON + " -I " + qa_root + "/scripts/devops/validation_profiles.py "
+        execute_profile = dispatcher + profile + " || status=$?; "
+        if strict_local:
+            execute_profile += ("if test \"$status\" -eq 0; then printf '%s\\n' " + STRICT_DIRECT_MARKER +
+                                "; " + dispatcher + "targeted || status=$?; fi; ")
         call("create", "--pull=never", "--name", container, "--network", "container:" + db, "--user=65534:65534",
              *limits(policy), "--mount", f"type=bind,src={snapshot},dst=/snapshot,readonly",
              "--tmpfs", f"/app:rw,noexec,nosuid,size={policy['tmpfs_mb']}m,uid=65534,gid=65534",
@@ -429,7 +440,7 @@ def run(policy, spec, cwd, target, command, transcript, timeout, executor=None, 
              "cp -as /opt/cmh/node_modules/. /app/node_modules/; " +
              "sha256sum package-lock.json | cut -d ' ' -f1 > node_modules/.package-lock.sha256; "
              "before=$(git status --porcelain=v1 -uall); test -z \"$before\"; "
-             "printf '%s\\n' " + marker + "; status=0; " + QA_PYTHON + " -I " + qa_root + "/scripts/devops/validation_profiles.py " + profile + " || status=$?; "
+             "printf '%s\\n' " + marker + "; status=0; " + execute_profile +
              "after=$(git status --porcelain=v1 -uall); "
              "if test \"$before\" != \"$after\"; then echo CMH_SOURCE_INTEGRITY_FAILURE; exit 125; fi; exit \"$status\"")
         profile_info = json.loads(call("inspect", container))[0]

@@ -6,6 +6,8 @@ the real FootballPrediction image, static checks, reviewers, or provider lanes.
 from __future__ import annotations
 
 import copy
+import hashlib
+import shlex
 import json
 import os
 import re
@@ -20,7 +22,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from harness.factory import Factory, FactoryBlocked, digest, git, policy_identity
-from harness.factory_candidate import BILLING, LOCAL_READY
+from harness.factory_candidate import BILLING, LOCAL_READY, STRICT_DIRECT_MARKER, acceptance, validate_policy
 from harness.factory_progress import ProgressGuard, check_dispatch
 from harness.factory_runtime import LocalRuntime
 from harness.factory_validation import DockerExecutor, preflight
@@ -34,6 +36,7 @@ class BusinessDocker(FakeDocker):
         super().__init__()
         self.on_capture = lambda: None
         self.captures = []
+        self.strict_failures = 0
 
     def capture(self, container, path, timeout, cancelled, **control):
         self.captures.append(control)
@@ -45,21 +48,42 @@ class BusinessDocker(FakeDocker):
             raise InterruptedError("fixture validation cancelled")
         created = self.containers[container]
         snapshot = Path(re.search(r"src=([^,]+)", created[created.index("--mount") + 1])[1])
-        # Run the actual generated business regression on the frozen snapshot.
-        # Profile static/format markers below remain simulated contract output.
-        result = subprocess.run([sys.executable, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests/test_score.py"],
-                                cwd=snapshot, capture_output=True, timeout=10,
-                                env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent",
-                                     "PYTHONPATH": str(snapshot / "src"), "PYTHONDONTWRITEBYTECODE": "1",
-                                     "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"})
+        # Exercise the generated shell's status propagation and strict-before-
+        # targeted ordering. The dispatcher is an explicit offline double; its
+        # targeted branch runs real pytest on the frozen temporary business repo.
+        dispatcher = r"""
+import subprocess, sys
+profile = sys.argv[1]
+print('[Validation] profile=' + profile + ' changed_files=2', flush=True)
+if profile == 'strict':
+    print('[Validation] full Production Gate implementation: bash scripts/devops/gatekeeper.sh --mode=push', flush=True)
+    if sys.argv[2] == 'fail':
+        print('fixture strict gate failed', flush=True)
+        sys.exit(1)
+    print('[Gatekeeper] 门禁通过（mode=push）。', flush=True)
+else:
+    print('[Validation] Python changed-line static check: fixture', flush=True)
+    print('[Validation] Python format check: fixture', flush=True)
+    print('[Validation] changed Python tests: /usr/local/bin/python3 -m pytest -q tests/test_score.py', flush=True)
+    sys.exit(subprocess.call([sys.executable, '-B', '-m', 'pytest', '-q', '-p', 'no:cacheprovider', 'tests/test_score.py']))
+"""
+        script = created[-1]
+        script = 'status=0; ' + script.split('; status=0; ', 1)[1].split('after=$(git status', 1)[0] + 'exit "$status"'
+        strict = 'validation_profiles.py strict' in script
+        fail = strict and self.strict_failures > 0
+        if fail:
+            self.strict_failures -= 1
+        with tempfile.TemporaryDirectory() as directory:
+            stub = Path(directory) / 'fixture_dispatcher.py'
+            stub.write_text(dispatcher)
+            script = re.sub(r'/usr/local/bin/python3 -I /(?:snapshot|app)/scripts/devops/validation_profiles.py (strict|targeted)',
+                            lambda m: shlex.quote(sys.executable) + ' ' + shlex.quote(str(stub)) + ' ' + m[1] + (' fail' if fail else ' pass'), script)
+            result = subprocess.run(['/bin/sh', '-ec', script], cwd=snapshot, capture_output=True, timeout=10,
+                                    env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent",
+                                         "PYTHONPATH": str(snapshot / "src"), "PYTHONDONTWRITEBYTECODE": "1",
+                                         "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"})
         self.exit_code = result.returncode
-        log = self.call("logs", container)
-        log += ("[Validation] profile=targeted changed_files=2\n"
-                "[Validation] Python changed-line static check: fixture\n"
-                "[Validation] Python format check: fixture\n"
-                "[Validation] changed Python tests: /usr/local/bin/python3 -m pytest -q tests/test_score.py\n").encode()
-        log += result.stdout + result.stderr
-        Path(path).write_bytes(log)
+        Path(path).write_bytes(self.call("logs", container) + result.stdout + result.stderr)
         return result.returncode
 
 
@@ -259,6 +283,158 @@ class ProgressLocalTests(unittest.TestCase):
         self.assertTrue(result["interrupted"])
         self.assertEqual(result["cleanup"], "COMPLETE")
         self.assertTrue(any(c[0] == "kill" for c in self.runtime.docker.calls))
+
+
+class StrictLocalTests(unittest.TestCase):
+    approval = ProgressLocalTests.approval
+    authorize = ProgressLocalTests.authorize
+    run_local = ProgressLocalTests.run_local
+
+    def setUp(self):
+        ProgressLocalTests.setUp(self)
+        self.f.close()
+        self.scope["workflow_class"] = "STRICT"
+        self.spec["approved_mission_scope"] = self.approval()
+        self.config.update(checks=[["make", "verify-strict"]],
+                           local_acceptance={"profile": "strict", "test_paths": ["tests/test_score.py"]})
+        self.f = Factory(self.root / "strict-local-state", self.config, self.runtime)
+        self.authorize()
+
+    def test_developer_checkpoint_full_strict_then_direct_tests_no_formal_claim(self):
+        report = self.run_local()
+        self.assertEqual(report["DELIVERY_STATUS"], LOCAL_READY, report)
+        result = report["TRUSTED_QA_RESULT"]["checks"][0]
+        log = Path(result["log_path"]).read_text()
+        self.assertLess(log.index("profile=strict"), log.index(STRICT_DIRECT_MARKER))
+        self.assertLess(log.index("门禁通过"), log.index("profile=targeted"))
+        self.assertIn("passed", log)
+        self.assertEqual(result["identity"]["profile"], "strict")
+        self.assertEqual(report["LOCAL_ACCEPTANCE"]["mode"], "strict")
+        self.assertEqual(report["BUDGET_USED"]["observed_tokens"], 150001)
+        self.assertEqual(self.runtime.operation_limits, [("implement", None)])
+        self.assertEqual(report["EXACT_TARGET"]["project_policy"]["workflow_class"], "STRICT")
+        self.assertNotEqual(report["FINAL_HEAD_SHA"], self.base)
+        self.assertEqual(git(Path(report["CANDIDATE"]), "status", "--porcelain"), "")
+        self.assertEqual([r[0] for r in self.f.db.execute("SELECT stage FROM operations ORDER BY started")], ["implement", "checks"])
+        for key in ("FORMAL_REVIEW", "CI_RESULT", "LOCAL_CI", "HOSTED_CI", "REMOTE_WRITE_STATUS"):
+            self.assertEqual(report[key], "NOT_EXECUTED")
+        self.assertFalse(report["READY_FOR_MERGE"])
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+
+    def test_strict_gate_failure_skips_supplement_then_same_thread_repair(self):
+        self.runtime.docker.strict_failures = 1
+        report = self.run_local()
+        self.assertEqual(report["DELIVERY_STATUS"], LOCAL_READY, report)
+        results = [json.loads(r[0]) for r in self.f.db.execute("SELECT result FROM operations WHERE stage='checks' ORDER BY started")]
+        self.assertEqual([r["status"] for r in results], ["FAIL", "PASS"])
+        self.assertNotIn(STRICT_DIRECT_MARKER, Path(results[0]["log_path"]).read_text())
+        self.assertIn("fixture strict gate failed", Path(results[0]["log_path"]).read_text())
+        self.assertNotEqual(results[0]["identity"]["head"], results[1]["identity"]["head"])
+        self.assertEqual(self.runtime.threads, [None, "fixture-thread"])
+        self.assertEqual(report["FORMAL_REVIEW"], "NOT_EXECUTED")
+
+    def test_direct_business_test_failure_requires_repair_and_full_strict_rerun(self):
+        self.runtime.failure = "repair"
+        report = self.run_local()
+        self.assertEqual(report["DELIVERY_STATUS"], LOCAL_READY, report)
+        results = [json.loads(r[0]) for r in self.f.db.execute("SELECT result FROM operations WHERE stage='checks' ORDER BY started")]
+        self.assertEqual([r["status"] for r in results], ["FAIL", "PASS"])
+        for result in results:
+            log = Path(result["log_path"]).read_text()
+            self.assertIn("profile=strict", log)
+            self.assertIn(STRICT_DIRECT_MARKER, log)
+        self.assertIn("AssertionError", Path(results[0]["log_path"]).read_text())
+        self.assertEqual(self.runtime.threads, [None, "fixture-thread"])
+
+    def test_matching_profile_and_immutable_authorization_required(self):
+        config = copy.deepcopy(self.config)
+        config["checks"] = [["make", "verify-targeted"]]
+        with self.assertRaises(ValueError):
+            validate_policy(config)
+        self.spec["local_candidate_authorization"]["local_acceptance"] = {"profile": "targeted", "test_paths": ["tests/test_score.py"]}
+        with self.assertRaisesRegex(ValueError, "differs"):
+            self.f.submit(self.spec)
+        self.assertFalse(self.runtime.calls)
+
+    def test_missing_or_failed_strict_or_direct_evidence_never_passes(self):
+        report = self.run_local()
+        result = report["TRUSTED_QA_RESULT"]["checks"][0]
+        text = Path(result["log_path"]).read_text()
+        bound_spec = json.loads(self.f.row("feature")["spec"])
+        cases = [text.replace("[Gatekeeper] 门禁通过（mode=push）。", ""),
+                 text.replace("profile=strict", "profile=targeted"),
+                 text.replace(STRICT_DIRECT_MARKER, "absent"),
+                 text.split(STRICT_DIRECT_MARKER)[0],
+                 text + "1 skipped\n"]
+        for number, value in enumerate(cases):
+            path = self.root / ("tampered-" + str(number))
+            path.write_text(value)
+            tampered = {**result, "log_path": str(path), "log_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            with self.subTest(number=number), self.assertRaises(ValueError):
+                acceptance(bound_spec, self.f.config, report["EXACT_TARGET"], [tampered])
+        # Canonical strict may have its own permitted skips; the supplemental
+        # direct test still must actually execute without skips/deselection.
+        path = self.root / "canonical-skip"
+        path.write_text(text.replace(STRICT_DIRECT_MARKER, "1 skipped\n" + STRICT_DIRECT_MARKER))
+        accepted = {**result, "log_path": str(path), "log_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        self.assertEqual(acceptance(bound_spec, self.f.config, report["EXACT_TARGET"], [accepted])["mode"], "strict")
+
+    def test_strict_unknown_retained_without_replay(self):
+        ProgressLocalTests.test_unknown_validation_retained_without_automatic_repair_or_replay(self)
+
+    def test_legacy_budget_local_strict_keeps_limits_and_acceptance(self):
+        import test_factory_candidate as legacy
+        self.f.close()
+        self.config.pop("execution_policy")
+        self.config.update(max_rounds=2, budget={"max_agent_runs": 5, "max_run_tokens": 36000,
+                           "max_first_turn_tokens": 60000, "max_repair_incremental_tokens": 36000,
+                           "max_total_tokens": 96000, "max_wall_seconds": 300})
+        self.runtime.usage_totals = [11000, 22000]
+        self.f = Factory(self.root / "legacy-strict-local", self.config, self.runtime)
+        self.spec.pop("progress_authorization")
+        legacy.LocalCandidateTests.authorize(self)
+        report = self.run_local()
+        self.assertEqual(report["DELIVERY_STATUS"], LOCAL_READY, report)
+        self.assertEqual(report["LOCAL_ACCEPTANCE"]["mode"], "strict")
+        self.assertEqual(self.runtime.operation_limits, [("implement", 60000)])
+        result = report["TRUSTED_QA_RESULT"]["checks"][0]
+        self.assertNotIn("execution_control", result)
+        self.assertEqual(self.runtime.docker.captures, [{}])
+
+    def test_source_with_base_only_on_remote_tracking_ref_stops_before_developer(self):
+        # Reproduce the real startup cause without touching a project repository.
+        tree = git(self.repo, "rev-parse", self.base + "^{tree}")
+        self.base = git(self.repo, "-c", "user.name=Fixture", "-c", "user.email=f@localhost",
+                        "commit-tree", tree, "-m", "unadvertised exact baseline")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", self.base)
+        self.spec["base"] = self.base
+        self.spec["approved_mission_scope"] = self.approval()
+        self.authorize()
+        report = self.run_local()
+        self.assertEqual(report["DELIVERY_STATUS"], "UNKNOWN", report)
+        self.assertFalse(self.runtime.calls)
+        self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM operations").fetchone()[0], 0)
+        self.assertEqual(self.f.run("feature")["DELIVERY_STATUS"], "UNKNOWN")
+        self.assertFalse(self.runtime.calls)
+
+    def test_candidate_object_isolation_failure_stops_before_developer(self):
+        self.f.submit(self.spec)
+        _, cwd = self.f.prepare("feature")
+        (cwd / ".git/objects/info/alternates").write_text(str(self.repo / ".git/objects") + "\n")
+        report = self.f.run("feature")
+        self.assertEqual(report["DELIVERY_STATUS"], "UNKNOWN", report)
+        self.assertFalse(self.runtime.calls)
+        self.assertEqual(self.runtime.docker.captures, [])
+
+    def test_ci_review_and_remote_dispatch_remain_forbidden(self):
+        from harness.factory_candidate import check_dispatch as local_dispatch
+        self.f.submit(self.spec)
+        for stage in ("ci", "review", "second_review", "push", "merge", "deploy"):
+            with self.subTest(stage=stage), self.assertRaises(FactoryBlocked) as stopped:
+                local_dispatch(self.f, "feature", stage)
+            self.assertEqual(stopped.exception.status, "BLOCKED_LOCAL_AUTHORITY")
+        self.assertFalse(self.runtime.calls)
 
 
 class CaptureTests(unittest.TestCase):

@@ -56,7 +56,7 @@
 
 2026-10-23 的本地交付兼容修复允许 `trusted_validation`。仅在 Controller 显式选择进展模式时，`LocalRuntime.project_validation()` 才给原验证器传递静默窗口。`factory_validation.run()` 不再把准备、测试及退出取证共用一个总倒计时；单次 Docker 命令仍有 30 秒上限，镜像/依赖探测和数据库就绪探测各自有界，attachment 完成后 30 秒内必须证明容器终止。`capture()` 以日志字节增长刷新静默计时，Python 输出采用无缓冲模式；保留原 64 MiB 完整日志边界、取消、进程组终止、容器 kill/rm 和清理失败 UNKNOWN。没有输出无法证明持续进展时停止并保留部分日志和 activity 诊断，不自动重放。持续输出是可观察活动证据，不是语义正确性证明；应为安静的正常测试配置合适的授权静默窗口。严格模式没有传递这个可选参数，仍使用原总截止时间。
 
-本地 targeted 路径为：批准 scope 和进展/本地授权 → 受信任环境预检 → Developer → Controller checkpoint → `make verify-targeted` → 必要时同线程返修并重新 checkpoint/QA → `LOCAL_CANDIDATE_READY`。项目 `project_policy()` 规范/范围检查仍必经；正式 GPT/DeepSeek reviewer 和 `verify-pr` 不属于该明确授权的本地 targeted 合同。NORMAL 范围才适用 targeted；STRICT/CRITICAL 不能降级，原 strict profile 门禁继续阻断。直接业务测试、changed-line static、format 和完整证据检查没有跳过。最终结果保持 `FORMAL_REVIEW=NOT_EXECUTED`、`CI_RESULT=NOT_EXECUTED`、`READY_FOR_MERGE=false`。
+本地 targeted 路径为：批准 scope 和进展/本地授权 → 受信任环境预检 → Developer → Controller checkpoint → `make verify-targeted` → 必要时同线程返修并重新 checkpoint/QA → `LOCAL_CANDIDATE_READY`。项目 `project_policy()` 规范/范围检查仍必经；正式 GPT/DeepSeek reviewer 和 `verify-pr` 不属于该明确授权的本地 targeted 合同。NORMAL 范围适用 targeted；STRICT/CRITICAL 不能降级，必须使用下述显式 strict 本地验收配置。直接业务测试、changed-line static、format 和完整证据检查没有跳过。最终结果保持 `FORMAL_REVIEW=NOT_EXECUTED`、`CI_RESULT=NOT_EXECUTED`、`READY_FOR_MERGE=false`。
 
 新模式不接受 `hosted_ci` / `project_pr_ci` 的自动远程写入组合，直接 Push/Merge/部署 stage 也阻断。Owner 的发布和每次 Merge 权限未转交。原有严格模式的项目验证、真实双审、财务门禁及单独发布授权保持独立。
 
@@ -75,3 +75,36 @@ UNKNOWN 的已观测 Token 按原值保留。进展模式没有虚构有限 Toke
 证据目录：`/home/xupeng/codex-mission-harness-evidence/progress-driven-execution-20261022-2qlyvv5f`。在本工作树运行 `PYTHONPATH=.:src:tests python3 /home/xupeng/codex-mission-harness-evidence/progress-driven-execution-20261022-2qlyvv5f/run_offline.py` 可复现带外连拦截的全量测试；新增直接测试为 `PYTHONPATH=.:src:tests python3 -m unittest test_factory_progress`。
 
 本轮本地交付修复：779 项全量测试通过（95.049 秒，含新增 10 项），`EXTERNAL_CONNECTION_ATTEMPTS=0`，`git diff --check` 通过。证据目录为 `/home/xupeng/codex-mission-harness-evidence/progress-driven-local-20261023-C4mbwo`，保留全量测试日志、离线 runner，以及 targeted 成功和同线程返修两种场景的报告、checkpoint diff、原始 QA 日志和原路径到归档文件的 hash 映射。该目录的 `capture_local_evidence.py` 仅运行明确的临时项目 fixture，不运行真实模型或 Docker。
+
+
+## STRICT 本地候选启动兼容（2026-10-23）
+
+本次只解除真实启动时的两个前置问题，不启动新的真实 Developer，也不改变正式审核合同。
+
+Git 源必须实际在可克隆的本地分支或 tag 上持有批准的完整 base SHA。只存在于源仓库的 `refs/remotes/origin/main` 不保证被普通 clone 带入；这是源目录选择问题，不修改 Factory 的独立克隆实现。下一次 Controller 可使用已验证的独立源：
+
+`/home/xupeng/codex-mission-harness-evidence/football-startup-two-blockers-20261023-yIfZWS/pinned-local-source/source`
+
+其 HEAD 和本地分支 `offline/pinned-approved-base` 均绑定 `ebfd841164dc8fac1556932e726f95568b87d268`。快照和 Factory 候选均经 `git fsck --full --strict`、exact SHA/tree、无 remotes、无 alternates、无对象 hardlinks 检查；不依赖原业务仓库的对象存储。未修改原源仓库的分支或历史，没有远端 fetch。
+
+当项目批准 scope 是 STRICT 时，本地候选可显式配置：
+
+```json
+{
+  "checks": [["make", "verify-strict"]],
+  "local_acceptance": {
+    "profile": "strict",
+    "test_paths": ["tests/unit/ml/test_canonical_closing_retrospective.py"]
+  }
+}
+```
+
+仍需原有完整本地/进展授权，将以上字段及新源路径、新 mission/base/worktree 精确绑定；不能重用旧 mission 或旧授权。本地授权中的 `formal_review=NOT_AUTHORIZED`、`remote_write=FORBIDDEN` 不变。STRICT 来自批准 scope，真实基线的 canonical policy 已实测返回 STRICT，未改项目分类。
+
+Controller 在同一个受信任冻结快照和容器内先完整运行 `make verify-strict` 对应的 canonical strict dispatcher（完整 `gatekeeper.sh --mode=push`，无 local-hook/local-CI 降级）。只有退出成功，才补跑原 canonical targeted dispatcher，保证直接变更的 Python 测试、静态和格式检查确实执行：完整 strict gate 本身并不保证包含该业务测试文件。strict 失败不运行补充；任一阶段失败均按原本地 QA 返修规则处理，返修后重新 checkpoint 并重跑整个严格本地 QA。日志保留完整严格门禁成功证据和独立的直接测试段；缺失任一证据不得验收。原 NORMAL targeted 路径不变，旧严格预算仍保留原 Token/总时限/返修限制。
+
+本地验收结果为 `LOCAL_ACCEPTANCE.mode=strict`，`CI_RESULT=NOT_EXECUTED`、`FORMAL_REVIEW=NOT_EXECUTED`、`READY_FOR_MERGE=false`。这里的 strict 是项目验证 profile，和 `strict_budget` 资源策略是两回事。不会调用 Reviewer、不需要 Push 或远端 PR。实际项目 strict 容器全量 QA 尚未执行；临时项目的模拟门禁/真实 pytest 不能冒充该结果。
+
+直接回归见 `StrictLocalTests`：模拟 Developer → 真实 Git checkpoint → 完整 strict 调度 → 真实临时业务 pytest、strict 失败/直接测试失败后的同线程返修、缺失证据拒绝、UNKNOWN 不重放、禁止 CI/审核/远程派发、旧严格预算兼容，以及缺失 base/共享对象异常停止。证据目录见上述路径的父级；离线验证完成后停止，真实业务运行须有新的 Owner 授权。
+
+本次全量离线回归：789 项通过（94.249 秒），`EXTERNAL_CONNECTION_ATTEMPTS=0`；包含新增 10 项 STRICT/源初始化回归。完整日志、六个模拟场景报告和 QA 原始日志、真实基线 Factory.prepare/Git 完整性证据保存在 `/home/xupeng/codex-mission-harness-evidence/football-startup-two-blockers-20261023-yIfZWS`。

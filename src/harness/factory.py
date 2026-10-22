@@ -1334,7 +1334,7 @@ class Factory:
             self.state(mission, "TEST")
             checks = self.gates(spec, cwd, target, "checks", 0)
             ci = []
-            if not candidate_stage.targeted(spec, self.config):
+            if not candidate_stage.checks_only(spec, self.config):
                 self.state(mission, "CI")
                 ci = self.gates(spec, cwd, target, "ci", 0)
             failed = [r for r in checks + ci if r["status"] != "PASS"]
@@ -1359,7 +1359,7 @@ class Factory:
                 self._single_qa_round = repair_round
                 checks = self.gates(spec, cwd, target, "checks", repair_round)
                 ci = []
-                if not candidate_stage.targeted(spec, self.config):
+                if not candidate_stage.checks_only(spec, self.config):
                     self.state(mission, "CI")
                     ci = self.gates(spec, cwd, target, "ci", repair_round)
                 failed = [r for r in checks + ci if r["status"] != "PASS"]
@@ -1369,7 +1369,7 @@ class Factory:
                     raise FactoryBlocked("BLOCKED_LIMIT", "trusted QA still fails after the one authorized same-thread repair")
                 target = self.checkpoint(spec, cwd)
                 checks = self.gates(spec, cwd, target, "checks", repair_round)
-                if not candidate_stage.targeted(spec, self.config):
+                if not candidate_stage.checks_only(spec, self.config):
                     ci = self.gates(spec, cwd, target, "ci", repair_round)
                 if any(r["status"] != "PASS" for r in checks + ci):
                     raise FactoryBlocked("BLOCKED_LIMIT", "post-repair full QA failed")
