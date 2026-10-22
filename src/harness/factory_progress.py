@@ -36,8 +36,6 @@ def validate(config):
         raise ValueError("progress mode requires budget={} to avoid ambiguous legacy ceilings")
     if "max_rounds" in config:
         raise ValueError("progress mode uses evidence-based rework, not max_rounds")
-    if "trusted_validation" in config:
-        raise ValueError("trusted container validation has fixed wall-clock interface; progress compatibility unsupported")
     if {"hosted_ci", "project_pr_ci"} & set(config):
         raise ValueError("progress mode has no remote write authority")
     if config.get("independent_review_required", True) is not True:
@@ -68,7 +66,10 @@ def authorize(factory, spec, candidate, *, executing=True):
     financial = value["financial"]
     if (not isinstance(financial, dict) or set(financial) != set(identities)
             or any(v not in ("prepaid_only", "not_authorized") for v in financial.values())
-            or financial.get("second_reviewer") != "not_authorized"):
+            # Project mode binds only Developer profiles here. A missing
+            # canonical reviewer lane grants no authority (check_dispatch
+            # requires an explicit prepaid lane and always denies DeepSeek).
+            or financial.get("second_reviewer", "not_authorized") != "not_authorized"):
         raise ValueError("extra paid lanes need separate proven financial admission; unsupported here")
     if not isinstance(value["expires_at"], str):
         raise ValueError("progress expiry must be an explicit timestamp")

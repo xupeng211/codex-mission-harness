@@ -29,7 +29,7 @@
 - `policy_sha256`：`digest(policy_identity(validate_config(config)))`。
 - `lane_identities`：Factory 计算的执行身份字典；developer 使用 `developer_binding(spec)[1]`，包括已选择路由。不能凭模型标签代替实际路由绑定。
 - `expires_at`：带时区的授权到期时间；这是授权有效期，不是默认执行时长预算。
-- `financial`：逐 lane 的 `prepaid_only` 或 `not_authorized`。本实现要求 `second_reviewer` 为 `not_authorized`，真实额外付费调用不能通过此策略取得准入。
+- `financial`：逐绑定 lane 的 `prepaid_only` 或 `not_authorized`。若 profile 绑定包含 `second_reviewer`，必须为 `not_authorized`。项目模式的 profile 表仅绑定 Developer；未列出的 canonical reviewer 没有财务授权，不能因省略字段取得准入。真实额外付费调用不能通过此策略取得准入。
 
 通用 full-delivery 模式仍执行计划、开发、业务测试、CI、独立 GPT/DeepSeek 双审及审核驱动返工。模拟双审只能证明离线编排合同，不是实际 Provider 资格证明。local_candidate 仍要求原有完整 `local_candidate_authorization`；新模式用绑定的 `execution_policy` 替代其中的 `max_rounds`，不要求旧 Token 字段。其业务测试不变，多轮同线程返修可继续；交付仍仅为本地候选，不能取得正式双审或 Merge 资格。
 
@@ -52,7 +52,11 @@
 
 额外付费 DeepSeek、API、Credits 和审核必须另走既有可证明的财务准入。本次没有添加或降低该准入：进展模式真实 `second_reviewer` 调用明确阻断。因此真实 full-delivery 尚不就绪，不能把离线模拟双审 PASS 当成收费放行。
 
-现有 `factory_runtime.prepare_project_review()` 和 `factory_validation.run()/capture()` 使用固定总时限接口。为了避免暗中保留冲突，进展模式明确拒绝 `trusted_validation` 配置和项目 canonical review 派发。兼容这些接口需要另行针对性工程与证据；本次不修改项目审核器、Reviewer V3 或 Model Routing。
+`factory_runtime.prepare_project_review()` 仍使用固定总时限接口，进展模式继续明确拒绝项目 canonical review 派发。这属于未来正式双审的阻断，不是 local-candidate targeted 的必经环节；本轮不修改项目审核器、Reviewer V3 或 Model Routing。
+
+2026-10-23 的本地交付兼容修复允许 `trusted_validation`。仅在 Controller 显式选择进展模式时，`LocalRuntime.project_validation()` 才给原验证器传递静默窗口。`factory_validation.run()` 不再把准备、测试及退出取证共用一个总倒计时；单次 Docker 命令仍有 30 秒上限，镜像/依赖探测和数据库就绪探测各自有界，attachment 完成后 30 秒内必须证明容器终止。`capture()` 以日志字节增长刷新静默计时，Python 输出采用无缓冲模式；保留原 64 MiB 完整日志边界、取消、进程组终止、容器 kill/rm 和清理失败 UNKNOWN。没有输出无法证明持续进展时停止并保留部分日志和 activity 诊断，不自动重放。持续输出是可观察活动证据，不是语义正确性证明；应为安静的正常测试配置合适的授权静默窗口。严格模式没有传递这个可选参数，仍使用原总截止时间。
+
+本地 targeted 路径为：批准 scope 和进展/本地授权 → 受信任环境预检 → Developer → Controller checkpoint → `make verify-targeted` → 必要时同线程返修并重新 checkpoint/QA → `LOCAL_CANDIDATE_READY`。项目 `project_policy()` 规范/范围检查仍必经；正式 GPT/DeepSeek reviewer 和 `verify-pr` 不属于该明确授权的本地 targeted 合同。NORMAL 范围才适用 targeted；STRICT/CRITICAL 不能降级，原 strict profile 门禁继续阻断。直接业务测试、changed-line static、format 和完整证据检查没有跳过。最终结果保持 `FORMAL_REVIEW=NOT_EXECUTED`、`CI_RESULT=NOT_EXECUTED`、`READY_FOR_MERGE=false`。
 
 新模式不接受 `hosted_ci` / `project_pr_ci` 的自动远程写入组合，直接 Push/Merge/部署 stage 也阻断。Owner 的发布和每次 Merge 权限未转交。原有严格模式的项目验证、真实双审、财务门禁及单独发布授权保持独立。
 
@@ -62,8 +66,12 @@ UNKNOWN 的已观测 Token 按原值保留。进展模式没有虚构有限 Toke
 
 `tests/test_factory_progress.py` 使用模拟生成、临时 Git 仓库、loopback HTTP、原生 Codex 元数据/沙箱协议（不发起 turn inference）以及独立进程看门狗。覆盖超历史阈值开发、必要重读、重复错误/重启、范围越界、多轮返修、静默/Controller 失联、UNKNOWN 重启锁定、旧策略隔离、收费和远程动作阻断。
 
-旧 Factory 测试和 Reviewer V2 测试仍需通过；最终任务报告记录实际命令、数量和结果。没有真实模型、真实项目开发、真实付费审核、购买/充值、远程 Push/PR/Merge/部署的证据。本轮验收完成即停止；重新开展真实业务开发仍需补足上述接口/财务证据及 Owner 新授权。
+旧 Factory 测试和 Reviewer V2 测试仍需通过；最终任务报告记录实际命令、数量和结果。没有真实模型、真实项目开发、真实付费审核、购买/充值、远程 Push/PR/Merge/部署的证据。本地 Developer 不依赖未来正式双审的兼容/财务工作；可以在离线验收通过后申请新的单次本地任务授权，执行前仍需通过真实环境预检和指定套餐身份/财务门禁。本轮验收完成即停止，不启动业务试运行。
 
-最终离线结果：769 项全量测试通过（86.693 秒），其中新增进展策略验收 30 项通过；`git diff --check` 通过。最终全量测试使用 socket 外连拦截器，`EXTERNAL_CONNECTION_ATTEMPTS=0`。原生协议测试仅使用元数据和本地沙箱，不启动真实推理。日志中的 CLI 负向用例报错和弃用提示是预期用例输出，不改变 unittest 的 OK。
+`tests/test_factory_progress_local.py` 直接验证项目 targeted 编排，使用临时 Git 仓库和模拟 Developer，多次读取/超过 150,000 Token 后实际 checkpoint，实际运行生成的业务 pytest，验证失败后的同线程返修、冻结目标和证据绑定、静默 UNKNOWN 不重放、STRICT 不降级以及未列审核 lane 的收费拒绝。Docker、项目规范和 static/format 输出是明确标注的 fixture，不能当作真实 FootballPrediction 容器或正式 QA PASS。另以真实本地子进程验证 capture 的持续输出、静默、取消和严格总截止时间。真实容器信号/清理、Controller 崩溃后的 Docker 生命周期、真实长业务测试、Provider 和正式双审仍未验证。
+
+上一轮策略实现的离线结果：769 项全量测试通过（86.693 秒），其中新增进展策略验收 30 项通过；`git diff --check` 通过。该次全量测试使用 socket 外连拦截器，`EXTERNAL_CONNECTION_ATTEMPTS=0`。原生协议测试仅使用元数据和本地沙箱，不启动真实推理。日志中的 CLI 负向用例报错和弃用提示是预期用例输出，不改变 unittest 的 OK。本地交付兼容修复的新增结果另见本轮任务报告及独立证据目录。
 
 证据目录：`/home/xupeng/codex-mission-harness-evidence/progress-driven-execution-20261022-2qlyvv5f`。在本工作树运行 `PYTHONPATH=.:src:tests python3 /home/xupeng/codex-mission-harness-evidence/progress-driven-execution-20261022-2qlyvv5f/run_offline.py` 可复现带外连拦截的全量测试；新增直接测试为 `PYTHONPATH=.:src:tests python3 -m unittest test_factory_progress`。
+
+本轮本地交付修复：779 项全量测试通过（95.049 秒，含新增 10 项），`EXTERNAL_CONNECTION_ATTEMPTS=0`，`git diff --check` 通过。证据目录为 `/home/xupeng/codex-mission-harness-evidence/progress-driven-local-20261023-C4mbwo`，保留全量测试日志、离线 runner，以及 targeted 成功和同线程返修两种场景的报告、checkpoint diff、原始 QA 日志和原路径到归档文件的 hash 映射。该目录的 `capture_local_evidence.py` 仅运行明确的临时项目 fixture，不运行真实模型或 Docker。

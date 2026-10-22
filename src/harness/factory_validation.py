@@ -60,10 +60,14 @@ class DockerExecutor:
             env={"PATH": SAFE_PATH, "HOME": "/nonexistent", "LANG": "C.UTF-8"},
             stderr=subprocess.STDOUT if args[0] == "logs" else subprocess.PIPE, timeout=timeout)
 
-    def capture(self, container, path, timeout, cancelled):
+    def capture(self, container, path, timeout, cancelled, *, idle_timeout=None):
         # Direct attachment avoids daemon log rotation silently losing earlier
         # output. Only a completed stream can establish complete logs.
+        path = Path(path)
         deadline = time.monotonic() + timeout
+        last_activity, size, updates = time.monotonic(), 0, 0
+        activity = {"mode": "progress_driven", "idle_timeout_seconds": idle_timeout,
+                    "output_updates": 0, "observed_bytes": 0, "stop_reason": None}
         with Path(path).open("xb") as log:
             proc = subprocess.Popen(["/usr/bin/docker", "--host", "unix:///var/run/docker.sock", "start", "--attach", container],
                 env={"PATH": SAFE_PATH, "HOME": "/nonexistent", "LANG": "C.UTF-8"}, stdout=log,
@@ -71,10 +75,17 @@ class DockerExecutor:
             try:
                 while proc.poll() is None:
                     if cancelled():
+                        activity["stop_reason"] = "CANCELLED"
                         raise InterruptedError("validation cancelled")
-                    if time.monotonic() >= deadline:
+                    observed = Path(path).stat().st_size
+                    if observed > size:
+                        last_activity, size, updates = time.monotonic(), observed, updates + 1
+                    if idle_timeout is not None and time.monotonic() - last_activity >= idle_timeout:
+                        activity["stop_reason"] = "NO_OUTPUT_PROGRESS"
+                        raise TimeoutError("validation output silent; progress unverified")
+                    if idle_timeout is None and time.monotonic() >= deadline:
                         raise TimeoutError("validation execution timed out")
-                    if Path(path).stat().st_size > 64 * 1024 * 1024:
+                    if observed > 64 * 1024 * 1024:
                         raise RuntimeError("validation log bound exceeded; output is incomplete")
                     time.sleep(0.1)
                 if Path(path).stat().st_size > 64 * 1024 * 1024:
@@ -87,6 +98,9 @@ class DockerExecutor:
                     proc.wait()
                 log.flush()
                 os.fsync(log.fileno())
+                if idle_timeout is not None:
+                    activity.update(output_updates=updates, observed_bytes=Path(path).stat().st_size)
+                    path.with_suffix(".activity.json").write_text(json.dumps(activity, sort_keys=True))
 
 
 def limits(policy):
@@ -281,8 +295,11 @@ def validate_result(result, policy, spec, target, profile, simulation):
         raise ValueError("complete validation log missing or changed")
 
 
-def run(policy, spec, cwd, target, command, transcript, timeout, executor=None, cancelled=lambda: False):
+def run(policy, spec, cwd, target, command, transcript, timeout, executor=None, cancelled=lambda: False,
+        *, idle_timeout=None):
     validate_policy(policy)
+    if idle_timeout is not None and (type(idle_timeout) is not int or not 1 <= idle_timeout <= 86400):
+        raise ValueError("invalid validation idle timeout")
     executor = executor or DockerExecutor()
     profile = profile_for(command)
     result = {"status": "RUNNING", "fixture": executor.fixture,
@@ -291,7 +308,12 @@ def run(policy, spec, cwd, target, command, transcript, timeout, executor=None, 
               "started": time.time(), "ended": None, "interrupted": None, "exit_code": None,
               "cleanup": "INCOMPLETE", "logs_complete": False, "environment_ready": False,
               "log_path": str(transcript), "log_sha256": None}
-    deadline = time.monotonic() + timeout
+    # Legacy contracts retain their one absolute deadline. Progress execution
+    # bounds each control command/readiness phase; the profile uses output
+    # activity instead of total age. No mission fields can select this mode.
+    deadline = time.monotonic() + timeout if idle_timeout is None else None
+    if idle_timeout is not None:
+        result["execution_control"] = {"mode": "progress_driven", "idle_timeout_seconds": idle_timeout}
     token = "cmh-validation-" + uuid.uuid4().hex
     marker = "CMH_ENVIRONMENT_READY_" + uuid.uuid4().hex
     db, container = token + "-db", token + "-profile"
@@ -310,7 +332,7 @@ def run(policy, spec, cwd, target, command, transcript, timeout, executor=None, 
     def call(*args):
         if cancelled():
             raise InterruptedError("validation cancelled")
-        remaining = deadline - time.monotonic()
+        remaining = deadline - time.monotonic() if deadline is not None else 30
         if remaining <= 0:
             raise TimeoutError("validation deadline exhausted")
         return executor.call(*args, timeout=min(30, remaining))
@@ -357,13 +379,14 @@ def run(policy, spec, cwd, target, command, transcript, timeout, executor=None, 
             raise ValueError("temporary database does not have an isolated loopback-only namespace")
         same_environment()
         call("start", db)
+        readiness_deadline = deadline if deadline is not None else time.monotonic() + timeout
         while True:
             try:
                 call("exec", db, "pg_isready", "-h", "127.0.0.1", "-p", "5432",
                      "-U", "validation", "-d", DATABASE_NAME)
                 break
             except subprocess.CalledProcessError:
-                if time.monotonic() >= deadline or cancelled():
+                if time.monotonic() >= readiness_deadline or cancelled():
                     raise TimeoutError("temporary database did not become ready")
                 time.sleep(0.2)
         # pg_isready 不验证库名、认证或权限。用与 profile 相同的 TCP 参数
@@ -391,6 +414,7 @@ def run(policy, spec, cwd, target, command, transcript, timeout, executor=None, 
              "--tmpfs", "/tmp:rw,nosuid,size=256m,mode=1777", "--workdir=/app", "--entrypoint=/usr/bin/env",
              policy["image"], "-i", "PATH=" + SAFE_PATH, "HOME=/tmp", "LANG=C.UTF-8",
              "PYTHONDONTWRITEBYTECODE=1", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
+             *(["PYTHONUNBUFFERED=1"] if idle_timeout is not None else []),
              "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=safe.directory", "GIT_CONFIG_VALUE_0=/app", "GITHUB_BASE_REF=main",
              "GIT_NO_REPLACE_OBJECTS=1", "GIT_OPTIONAL_LOCKS=0", "GATEKEEPER_IN_CONTAINER=1",
              "GATEKEEPER_WORKSPACE_ROOT=/app", "DB_HOST=127.0.0.1", "DB_PORT=5432", "DB_NAME=" + DATABASE_NAME,
@@ -411,8 +435,16 @@ def run(policy, spec, cwd, target, command, transcript, timeout, executor=None, 
         profile_info = json.loads(call("inspect", container))[0]
         result["container_resources"]["validation"] = check_container_resources(profile_info, policy)
         same_environment()
-        stream_exit = executor.capture(container, transcript, max(0, deadline - time.monotonic()), cancelled)
+        capture_control = {"idle_timeout": idle_timeout} if idle_timeout is not None else {}
+        stream_exit = executor.capture(container, transcript,
+                                      max(0, deadline - time.monotonic()) if deadline is not None else timeout,
+                                      cancelled, **capture_control)
+        # An attachment claiming completion while its container keeps running
+        # is a control-plane anomaly, not continuing business-test progress.
+        exit_deadline = deadline if deadline is not None else time.monotonic() + 30
         while True:
+            if time.monotonic() >= exit_deadline:
+                raise TimeoutError("container did not establish a terminal state after attachment")
             inspected = json.loads(call("inspect", container))[0]
             check_container_resources(inspected, policy)
             state = inspected["State"]
@@ -483,4 +515,8 @@ def run(policy, spec, cwd, target, command, transcript, timeout, executor=None, 
         metadata.write_text(json.dumps(result, sort_keys=True))
         metadata.chmod(0o400)
         result["project_evidence"] = [{"path": str(metadata), "sha256": hashlib.sha256(metadata.read_bytes()).hexdigest()}]
+        activity = transcript.with_suffix(".activity.json")
+        if idle_timeout is not None and activity.is_file():
+            activity.chmod(0o400)
+            result["project_evidence"].append({"path": str(activity), "sha256": hashlib.sha256(activity.read_bytes()).hexdigest()})
     return result

@@ -773,8 +773,11 @@ class LocalRuntime:
 
     def project_validation(self, policy, spec, command, cwd, target, transcript, timeout):
         from .factory_validation import run
+        resource_policy = getattr(self, "resource_policy", {})
+        control = ({"idle_timeout": resource_policy["execution_policy"]["idle_timeout_seconds"]}
+                   if progress_policy.enabled(resource_policy) else {})
         return run(policy, spec, cwd, target, command, transcript, timeout,
-                   cancelled=lambda: self._validation_cancelled)
+                   cancelled=lambda: self._validation_cancelled, **control)
 
     def project_ci(self, policy, spec, cwd, target, approval, transcript, timeout):
         from .factory_pr_ci import run

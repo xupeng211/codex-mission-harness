@@ -189,8 +189,9 @@ class ProgressTests(unittest.TestCase):
         progress.check_rework(self.f,'feature',target,[{'status':'FAIL','error':'different'}])
 
     def test_incompatible_canonical_timeouts_fail_explicitly_before_dispatch(self):
-        with self.assertRaisesRegex(ValueError,'fixed wall-clock interface'):
-            progress.validate({**self.config,'trusted_validation':{}})
+        # Local validation now supports progress; canonical review remains an
+        # independent, deliberately unsupported interface in this mode.
+        progress.validate({**self.config,'trusted_validation':{}})
         self.f.submit(self.spec)
         self.f.project=True
         try:
