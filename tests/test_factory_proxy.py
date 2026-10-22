@@ -29,6 +29,7 @@ class ProxyContracts(unittest.TestCase):
         self.management_key = "not-a-real-management-credential-sentinel"
         self.requests = []
         self.telemetry = []
+        self.response_usages = []
         self.mode = "complete"
         fixture = self
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -57,12 +58,14 @@ class ProxyContracts(unittest.TestCase):
                     return
                 model = "different-model" if fixture.mode == "model_mismatch" else body["model"]
                 status = "incomplete" if fixture.mode == "partial" else "completed"
+                usage = fixture.response_usages.pop(0) if fixture.response_usages else {
+                    "input_tokens": 10, "output_tokens": 3, "total_tokens": 13}
                 terminal = {"type": "response."+status,
                             "response": {"id": "resp_fixture", "model": model, "status": status,
-                                         "usage": {"input_tokens": 10, "output_tokens": 3, "total_tokens": 13}}}
+                                         "usage": usage}}
                 fixture.telemetry.append({"provider": "codex", "executor_type": "CodexExecutor", "model": body["model"], "response_model": model,
                                           "session_id": self.headers["Session_id"], "request_id": "proxy-request-fixture", "execution_id": "execution-fixture",
-                                          "tokens": {"input_tokens": 10, "output_tokens": 3, "total_tokens": 13}, "failed": status != "completed",
+                                          "tokens": usage, "failed": status != "completed",
                                           "api_key": fixture.key, "source": "private-account-name", "fail": {"body": fixture.management_key},
                                           "response_headers": {"Set-Cookie": "private-cookie"}})
                 self.send_response(200)
@@ -106,12 +109,14 @@ class ProxyContracts(unittest.TestCase):
         path.chmod(0o600)
 
     def relay(self):
-        relay = ProxyRelay(self.profile, self.root / "run.raw", 5)
+        # Only the offline fixture supplies an exact bounded service contract.
+        relay = ProxyRelay(self.profile, self.root / "run.raw", 5, token_limit=100000)
+        self.enterContext(patch.object(relay.policy, "request_token_bounds", return_value=(10, 3)))
         self.addCleanup(relay.close)
         return relay
 
-    def post(self, relay, model="fixture-model"):
-        request = urllib.request.Request(relay.base_url+"/responses", data=json.dumps({"model": model, "stream": True}).encode(),
+    def post(self, relay, model="fixture-model", **payload):
+        request = urllib.request.Request(relay.base_url+"/responses", data=json.dumps({"model": model, "stream": True, **payload}).encode(),
                                          headers={"Authorization": "Bearer "+relay.nonce})
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
@@ -181,7 +186,8 @@ class ProxyContracts(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.mode = mode
                 transcript = self.root/(mode+".raw")
-                relay = ProxyRelay(self.profile, transcript, 5)
+                relay = ProxyRelay(self.profile, transcript, 5, token_limit=100000)
+                self.enterContext(patch.object(relay.policy, "request_token_bounds", return_value=(10, 3)))
                 before = len(self.requests)
                 try:
                     self.post(relay)
@@ -198,7 +204,8 @@ class ProxyContracts(unittest.TestCase):
         for mode in ("partial", "model_mismatch"):
             with self.subTest(mode=mode):
                 self.mode = mode
-                relay = ProxyRelay(self.profile, self.root/(mode+".raw"), 5)
+                relay = ProxyRelay(self.profile, self.root/(mode+".raw"), 5, token_limit=100000)
+                self.enterContext(patch.object(relay.policy, "request_token_bounds", return_value=(10, 3)))
                 try:
                     self.post(relay)
                     self.assertFalse(relay.receipt()["usage_complete"])
@@ -228,6 +235,7 @@ class ProxyContracts(unittest.TestCase):
 
     def test_relay_budget_stops_new_http_requests_and_duplicate_attempt_telemetry_is_unknown(self):
         relay = ProxyRelay(self.profile, self.root/"bounded.raw", 5, token_limit=13)
+        self.enterContext(patch.object(relay.policy, "request_token_bounds", return_value=(10, 3)))
         try:
             self.post(relay)
             self.post(relay)
@@ -236,7 +244,8 @@ class ProxyContracts(unittest.TestCase):
             self.assertFalse(relay.receipt()["usage_complete"])
         finally:
             relay.close()
-        duplicate = ProxyRelay(self.profile, self.root/"duplicate.raw", 5)
+        duplicate = ProxyRelay(self.profile, self.root/"duplicate.raw", 5, token_limit=100000)
+        self.enterContext(patch.object(duplicate.policy, "request_token_bounds", return_value=(10, 3)))
         try:
             self.post(duplicate)
             self.telemetry.append(dict(self.telemetry[-1], execution_id="second-attempt"))
@@ -257,7 +266,8 @@ class ProxyContracts(unittest.TestCase):
         }
         for name, mutate in mutations.items():
             with self.subTest(name=name):
-                relay = ProxyRelay(self.profile, self.root/(name+".raw"), 5)
+                relay = ProxyRelay(self.profile, self.root/(name+".raw"), 5, token_limit=100000)
+                self.enterContext(patch.object(relay.policy, "request_token_bounds", return_value=(10, 3)))
                 try:
                     self.post(relay)
                     self.assertFalse(relay.receipt()["usage_complete"])
@@ -275,6 +285,7 @@ class ProxyContracts(unittest.TestCase):
 
     def test_repair_rotates_evidence_and_enforces_incremental_observation_limit(self):
         relay = ProxyRelay(self.profile, self.root/"first.raw", 5, token_limit=13)
+        self.enterContext(patch.object(relay.policy, "request_token_bounds", return_value=(10, 3)))
         try:
             self.post(relay)
             relay.collect_telemetry()
@@ -296,6 +307,110 @@ class ProxyContracts(unittest.TestCase):
                 relay.start_turn(self.root/"forbidden.raw", 5, 100)
         finally:
             relay.close()
+
+    def test_attempt4_sequence_rejects_fourth_request_before_upstream_dispatch(self):
+        # Trusted bounds are a test-only contract, NOT a live OAuth capability.
+        bounds = [(19646, 205), (20600, 792), (31571, 674), (45043, 600)]
+        self.response_usages = [{"input_tokens": i, "output_tokens": o,
+                                 "total_tokens": i+o,
+                                 "input_tokens_details": {"cached_tokens": 0 if n < 2 else 21248}}
+                                for n, (i, o) in enumerate(bounds[:3])]
+        relay = ProxyRelay(self.profile, self.root/"attempt4-offline.raw", 5, token_limit=80000)
+        try:
+            with patch.object(relay.policy, "request_token_bounds", side_effect=bounds) as provider:
+                for cumulative in (19851, 41243, 73488):
+                    self.post(relay, input="fixture history", tools=[{"type": "function", "name": "fixture"}])
+                    self.assertEqual(relay.usage()["total_tokens"], cumulative)
+                self.post(relay, input="fourth complete request", previous_response_id="fixture-history")
+                body = json.loads(provider.call_args.args[0])
+                self.assertEqual(body["previous_response_id"], "fixture-history")
+                self.assertEqual(body["input"], "fourth complete request")
+            self.assertEqual(len(self.requests), 3)
+            self.assertEqual(len(relay.records), 3)
+            self.assertTrue(all(r["status"] == "COMPLETE" and r["physical_attempt_count"] == 1 for r in relay.records))
+            self.assertTrue(all(r["body"]["model"] == "fixture-model" and r["auth"] == "Bearer "+self.key for r in self.requests))
+            rejection = relay.receipt()["admission_rejection"]
+            self.assertEqual(rejection["remaining_tokens"], 6512)
+            self.assertEqual(rejection["input_tokens_upper_bound"], 45043)
+            self.assertEqual(rejection["reason_code"], "INSUFFICIENT_OPERATION_TOKENS")
+            self.assertEqual(relay.usage()["cached_input_tokens"], 21248)
+            self.assertEqual(relay.usage()["total_tokens"], 73488)
+            self.post(relay)
+            self.assertEqual(len(self.requests), 3)
+            self.assertFalse(relay.receipt()["usage_complete"])
+            rows = [json.loads(line) for line in relay.evidence.read_text().splitlines()]
+            self.assertEqual(rows[-1]["event"], "REQUEST_NOT_DISPATCHED")
+            self.assertNotIn("usage", rows[-1])
+            self.assertNotIn("physical_attempt_count", rows[-1])
+            self.assertNotIn("fourth complete request", relay.evidence.read_text())
+        finally:
+            relay.close()
+
+    def test_unproven_live_bounds_cannot_be_supplied_by_caller(self):
+        relay = ProxyRelay(self.profile, self.root/"unproven.raw", 5, token_limit=80000)
+        try:
+            self.post(relay, input="fixture", max_output_tokens=1,
+                      metadata={"input_tokens_upper_bound": 1, "output_tokens_upper_bound": 1})
+            self.assertEqual(self.requests, [])
+            self.assertEqual(relay.records, [])
+            self.assertIsNone(relay.usage())
+            self.assertEqual(relay.receipt()["admission_rejection"]["reason_code"], "REQUEST_TOKEN_BOUNDS_UNPROVEN")
+            self.assertFalse(relay.receipt()["usage_complete"])
+            self.assertEqual(relay.receipt()["money"], "UNKNOWN")
+            evidence = relay.evidence.read_bytes()
+            self.post(relay, model="other-model")
+            self.assertEqual(relay.evidence.read_bytes(), evidence)
+            self.assertEqual(self.requests, [])
+            with self.assertRaisesRegex(ValueError, "uncertain"):
+                relay.start_turn(self.root/"forbidden.raw", 5, 80000)
+        finally:
+            relay.close()
+
+    def test_trusted_bounds_need_both_input_and_output_and_fit_remaining(self):
+        cases = [(None, 3), (10, None), (True, 3), (10, False), (-1, 3),
+                 (10, 0), (1.0, 3), (14, 1), (10, 4)]
+        for n, bounds in enumerate(cases):
+            with self.subTest(bounds=bounds):
+                relay = ProxyRelay(self.profile, self.root/f"deny-{n}.raw", 5, token_limit=13)
+                try:
+                    with patch.object(relay.policy, "request_token_bounds", return_value=bounds):
+                        self.post(relay)
+                        self.post(relay)
+                    self.assertEqual(self.requests, [])
+                    self.assertEqual(relay.records, [])
+                    self.assertTrue(relay.failed)
+                finally:
+                    relay.close()
+
+    def test_bound_violation_after_dispatch_retains_observation_and_unknown(self):
+        for n, bounds in enumerate(((9, 3), (10, 2))):
+            with self.subTest(bounds=bounds):
+                relay = ProxyRelay(self.profile, self.root/f"violated-{n}.raw", 5, token_limit=100)
+                before = len(self.requests)
+                try:
+                    with patch.object(relay.policy, "request_token_bounds", return_value=bounds):
+                        self.post(relay)
+                        self.post(relay)
+                    self.assertEqual(len(self.requests)-before, 1)
+                    self.assertEqual(relay.usage()["total_tokens"], 13)
+                    self.assertEqual(relay.records[0]["status"], "UNKNOWN")
+                    self.assertEqual(relay.receipt()["physical_attempt_count"], "UNKNOWN")
+                    self.assertIsNone(relay.receipt()["admission_rejection"])
+                finally:
+                    relay.close()
+
+    def test_missing_or_invalid_allowance_cannot_bypass_admission(self):
+        for n, limit in enumerate((None, 0, False, -1, "80000")):
+            with self.subTest(limit=limit):
+                relay = ProxyRelay(self.profile, self.root/f"invalid-limit-{n}.raw", 5, token_limit=limit)
+                try:
+                    with patch.object(relay.policy, "request_token_bounds", return_value=(10, 3)):
+                        self.post(relay)
+                    self.assertEqual(self.requests, [])
+                    self.assertEqual(relay.records, [])
+                    self.assertEqual(relay.receipt()["admission_rejection"]["reason_code"], "INVALID_OPERATION_TOKEN_ALLOWANCE")
+                finally:
+                    relay.close()
 
     def test_no_http_dispatch_between_completed_turn_and_authorized_repair(self):
         relay = self.relay()

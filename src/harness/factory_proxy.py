@@ -114,6 +114,19 @@ class ProxyPolicy:
             raise ValueError("proxy management response limit exceeded")
         return json.loads(data)
 
+    def request_token_bounds(self, body):
+        """Return trusted full-input/total-output upper bounds, or unknown.
+
+        This managed Codex OAuth route has no verified bounds contract. Local
+        token counts are estimates, and a caller's max_output_tokens is not
+        proof the translated upstream request enforces it (including reasoning).
+        Do not trust request metadata, subtract cache hits, or use byte/character
+        counts as tokens. Any future implementation must cover the exact body,
+        tools, history/server-side state and proxy transformations for this pinned
+        route/model. There is deliberately no configuration opt-out.
+        """
+        return None, None
+
     def verify(self):
         p = self.policy
         for key in ("config_file", "auth_file", "credential_file", "management_token_file"):
@@ -201,6 +214,7 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
         self.token_limit = token_limit
         self.token_baseline = 0
         self.records = []
+        self.admission_rejection = None
         self.failed = False
         self.accepting = True
         self.lock = threading.RLock()
@@ -281,6 +295,39 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
         if terminal in ("response.failed", "response.incomplete", "error"):
             raise ValueError("proxy generation failed or incomplete")
 
+    def admit_request(self, body):
+        """Check the next whole request before creating a dispatch record.
+
+        Called under the forwarding lock, so an admitted request cannot race
+        another reservation. Unknown sent requests already latch this relay shut.
+        Bounds count cached input once within input and all output, unweighted.
+        """
+        used = (tokens(self.usage()) or 0) - self.token_baseline
+        valid = type(self.token_limit) is int and self.token_limit > 0 and used >= 0
+        remaining = self.token_limit - used if valid else None
+        admission = {"request_sha256": hashlib.sha256(body).hexdigest(),
+                     "request_bytes": len(body), "observed_operation_tokens": used,
+                     "operation_token_limit": self.token_limit, "remaining_tokens": remaining}
+        input_bound, output_bound = self.policy.request_token_bounds(body)
+        bounds_known = (type(input_bound) is int and input_bound >= 0
+                        and type(output_bound) is int and output_bound > 0)
+        reason = None
+        if not valid:
+            reason = "INVALID_OPERATION_TOKEN_ALLOWANCE"
+        elif not bounds_known:
+            reason = "REQUEST_TOKEN_BOUNDS_UNPROVEN"
+        else:
+            admission.update(input_tokens_upper_bound=input_bound, output_tokens_upper_bound=output_bound)
+            if input_bound + output_bound > remaining:
+                reason = "INSUFFICIENT_OPERATION_TOKENS"
+        if reason:
+            # A refusal is not a physical attempt or a zero-cost paid receipt.
+            # Existing dispatched/unknown records and reservations stay untouched.
+            self.admission_rejection = {**admission, "event": "REQUEST_NOT_DISPATCHED", "reason_code": reason}
+            self.persist(self.admission_rejection)
+            raise ValueError(reason)
+        return admission
+
     def forward(self, handler):
         # Serializing makes each HTTP request's physical attempt/usage unambiguous.
         with self.lock:
@@ -305,11 +352,14 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                 current = self.policy.verify()
                 if current != self.policy.identity:
                     raise ValueError("proxy runtime policy changed")
-                if len(self.records) >= 128 or self.token_limit and (tokens(self.usage()) or 0) - self.token_baseline >= self.token_limit:
+                if len(self.records) >= 128:
                     raise ValueError("proxy run allowance exhausted")
+                admission = self.admit_request(body)
                 record = {"dispatch_id": self.evidence.stem, "http_request_id": str(uuid.uuid4()), "requested_model": request["model"],
                           "endpoint": self.endpoint, "status": "DISPATCHED", "usage": None,
                           "physical_attempt_limit": 1, "physical_attempt_count": "UNKNOWN", "money": "UNKNOWN"}
+                if admission is not None:
+                    record["budget_admission"] = admission
                 self.records.append(record)
                 self.persist(record)
                 req = urllib.request.Request(self.endpoint+"/responses", data=body,
@@ -345,6 +395,9 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                         handler.wfile.write(data)
                 if record["status"] != "COMPLETE" or record.get("reported_model") != request["model"] or not record.get("response_id") or tokens(record["usage"]) is None:
                     raise ValueError("proxy completion/model/usage unproven")
+                if admission is not None and (record["usage"]["input_tokens"] > admission["input_tokens_upper_bound"]
+                                              or record["usage"]["output_tokens"] > admission["output_tokens_upper_bound"]):
+                    raise ValueError("proxy exceeded admitted token bounds")
                 # A completed response proves one generation in this bounded
                 # policy. On failures it could be zero or one; never guess.
                 record["physical_attempt_count"] = 1
@@ -371,7 +424,7 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                     "physical_attempt_count": sum(r["physical_attempt_count"] for r in self.records) if self.records and not self.failed and all(type(r["physical_attempt_count"]) is int for r in self.records) else "UNKNOWN",
                     "usage_complete": bool(self.records) and not self.failed and all(r["status"] == "COMPLETE" and len(r.get("proxy_telemetry", [])) == 1 for r in self.records),
                     "upstream_provider_identity": "NOT_PROVABLE", "upstream_model_identity": "NOT_PROVABLE",
-                    "money": "UNKNOWN"}
+                    "money": "UNKNOWN", "admission_rejection": self.admission_rejection}
 
     def collect_telemetry(self):
         """Consume only the dedicated pool's queue, persisting an allowlist.
