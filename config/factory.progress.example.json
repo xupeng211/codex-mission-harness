@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "simulation": true,
+  "budget": {},
+  "timeout_seconds": 30,
+  "independent_review_required": true,
+  "checks": [
+    [
+      "python3",
+      "-m",
+      "unittest",
+      "discover",
+      "-s",
+      "tests"
+    ]
+  ],
+  "ci": [
+    [
+      "python3",
+      "-m",
+      "compileall",
+      "-q",
+      "."
+    ]
+  ],
+  "profiles": {
+    "developer": {
+      "provider": "openai",
+      "model": "fixture-developer"
+    },
+    "reviewer": {
+      "provider": "openai",
+      "model": "fixture-reviewer"
+    },
+    "second_reviewer": {
+      "provider": "deepseek",
+      "model": "fixture-independent",
+      "token_file": "/fixture/not-a-real-token"
+    }
+  },
+  "execution_policy": {
+    "mode": "progress_driven",
+    "idle_timeout_seconds": 900
+  }
+}

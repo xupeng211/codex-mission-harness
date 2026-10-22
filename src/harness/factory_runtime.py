@@ -16,6 +16,7 @@ import tempfile
 from pathlib import Path
 
 from .codex import AppServerCodex
+from . import factory_progress as progress_policy
 from .model_registry import read_private_token
 from .sandbox import project_gate_invocation, preflight_project_gate, SAFE_PATH
 from .factory_proxy import validate_transport, ProxyPolicy, ProxyRelay, digest as route_digest
@@ -81,13 +82,16 @@ class FactoryAppServer(AppServerCodex):
 
     def __init__(self, profile: dict, cwd: Path, transcript: Path, timeout: int,
                  denied_roots: list[Path], read_only: bool, reviewer: bool = False, token_limit: int | None = None,
-                 protected_paths: tuple[Path, ...] = ()):
+                 protected_paths: tuple[Path, ...] = (), progress_scope: list[str] | None = None):
         self._policy_cwd = self._canonical_worktree(str(cwd))
         self._forbidden_actions = self._effective_policy(("release",))
         self._configured_forbidden_actions = self._forbidden_actions
         self._permissions_profile = f"cmh_delegated_{uuid.uuid4().hex}"
         self.MODEL = profile.get("model")
         self.REASONING_EFFORT = profile.get("effort")
+        self.progress_mode = progress_scope is not None
+        if getattr(self, "progress_mode", False) and token_limit is not None:
+            raise ValueError("progress execution cannot inherit a token cutoff")
         self.token_limit = token_limit
         self.profile, self.read_only = profile, read_only
         self.reviewer = reviewer
@@ -104,6 +108,10 @@ class FactoryAppServer(AppServerCodex):
         self.transcript, self._transcript_bytes = transcript, 0
         self._response_timeout = timeout
         self._end_time = time.monotonic() + timeout
+        self._heartbeat = transcript.with_suffix(".activity") if getattr(self, "progress_mode", False) else None
+        if self._heartbeat:
+            self._heartbeat.touch(mode=0o600, exist_ok=False)
+        self._progress_guard = progress_policy.ProgressGuard(cwd, progress_scope, self._progress_event) if getattr(self, "progress_mode", False) else None
         home = None
         self._source_home = str(Path(profile.get("codex_home") or Path.home()/".codex"))
         if self.transport["type"] == "cli_proxy":
@@ -167,6 +175,8 @@ class FactoryAppServer(AppServerCodex):
                      "-c", "plugins={}",
                      "-c", 'shell_environment_policy.filters.CODEX_HOME="exclude"',
                      "-c", 'shell_environment_policy.set.PYTHONDONTWRITEBYTECODE="1"']
+        if getattr(self, "progress_mode", False):
+            overrides.extend(["-c", "features.rollout_budget.enabled=false"])
         if token_limit:
             # Native Codex budget stops its own sampling loop. Controller also
             # checks unweighted telemetry, including cached input tokens.
@@ -214,7 +224,7 @@ class FactoryAppServer(AppServerCodex):
         overrides.extend(["-c", "plugins={" + ",".join(json.dumps(name) + "={enabled=false}" for name in disabled_plugins) + "}"])
         if self.transport["type"] == "cli_proxy":
             try:
-                self._proxy_relay = ProxyRelay(profile, transcript, timeout, token_limit)
+                self._proxy_relay = ProxyRelay(profile, transcript, timeout, token_limit, progress_driven=self.progress_mode)
                 # This exact table has no inherited fields and no real API key.
                 provider = {"name": "Explicit CLI Proxy", "base_url": self._proxy_relay.base_url,
                             "wire_api": "responses", "requires_openai_auth": False,
@@ -241,8 +251,13 @@ class FactoryAppServer(AppServerCodex):
                     # routing belongs to the explicit dedicated proxy config.
                     environment = {k:v for k,v in environment.items() if k.lower() not in {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}}
                     environment["NO_PROXY"] = "127.0.0.1,localhost,::1"
-                self.proc = subprocess.Popen([str(watchdog), "--signal=TERM", "--kill-after=5", str(timeout),
-                                             str(executable), *overrides, "app-server", "--stdio"],
+                command = [str(executable), *overrides, "app-server", "--stdio"]
+                if getattr(self, "progress_mode", False):
+                    command = [sys.executable, str(Path(progress_policy.__file__)), str(timeout),
+                               str(os.getpid()), str(self._heartbeat), *command]
+                else:
+                    command = [str(watchdog), "--signal=TERM", "--kill-after=5", str(timeout), *command]
+                self.proc = subprocess.Popen(command,
                                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                              stderr=stderr, text=True, bufsize=1, cwd=cwd, start_new_session=True,
                                              env=environment)
@@ -263,7 +278,11 @@ class FactoryAppServer(AppServerCodex):
             raise
 
     def _deadline(self) -> float:
-        return self._end_time
+        return time.monotonic() + self._response_timeout if getattr(self, "progress_mode", False) else self._end_time
+
+    def _progress_event(self, event):
+        # Reuse the immutable operation transcript, outside the model sandbox.
+        self._observe_wire_line(json.dumps({"harness_progress": event}) + "\n")
 
     def _observe_wire_line(self, line):
         if getattr(self, "_proxy_relay", None):
@@ -271,7 +290,7 @@ class FactoryAppServer(AppServerCodex):
             line = line.replace(self._proxy_relay.nonce, "[REDACTED]")
         data = line.encode()
         self._transcript_bytes += len(data)
-        if self._transcript_bytes > 16 * 1024 * 1024:
+        if (not getattr(self, "progress_mode", False) and self._transcript_bytes > 16 * 1024 * 1024) or (getattr(self, "progress_mode", False) and len(data) > 2 * 1024 * 1024):
             self.close()
             raise RuntimeError("App Server transcript limit exceeded")
         with self.transcript.open("ab") as stream:
@@ -280,10 +299,22 @@ class FactoryAppServer(AppServerCodex):
             os.fsync(stream.fileno())
 
     def _read_message(self, deadline=None):
-        if deadline is not None:
+        if getattr(self, "progress_mode", False):
+            deadline = self._deadline()
+        elif deadline is not None:
             deadline = min(deadline, self._deadline())
         message = super()._read_message(deadline)
         self.events.append(message)
+        if getattr(self, "progress_mode", False):
+            # Do not let empty heartbeats/status spam keep a hung tool alive.
+            method = message.get("method", "")
+            if "id" in message or method in {"item/started", "item/completed", "turn/completed"} or (method.endswith("Delta") and message.get("params", {}).get("delta")):
+                self._heartbeat.touch()
+            try:
+                self._progress_guard.observe(message)
+            except Exception as exc:
+                self._progress_event({"event": "SAFE_STOP", "reason": str(exc)})
+                raise RuntimeFailure(str(exc), self.usage, self.runtime_identity) from exc
         params = message.get("params", {})
         if (message.get("method") == "thread/tokenUsage/updated"
                 and params.get("threadId") == getattr(self, "_active_thread_id", None)
@@ -354,6 +385,8 @@ class FactoryAppServer(AppServerCodex):
         # Disable remote tools; their independent authority is outside this local factory.
         params["config"]["mcp_servers"] = self.disabled_mcp
         features = {"hooks": False, "apps": False, "multi_agent": False, "multi_agent_v2": False}
+        if getattr(self, "progress_mode", False):
+            features["rollout_budget"] = {"enabled": False}
         if self.token_limit:
             features["rollout_budget"] = {
                 "enabled": True, "limit_tokens": self.token_limit,
@@ -545,7 +578,7 @@ class LocalRuntime:
             identity["route_identity"] = route
             identity["qualification_identity"] = route_digest(route)
         identity["adapter_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-        dependencies = ["codex.py", "factory_proxy.py", "factory_routing.py"] if profile["provider"] == "openai" else ["factory_http.py", "model_registry.py"]
+        dependencies = ["codex.py", "factory_proxy.py", "factory_routing.py", "factory_progress.py"] if profile["provider"] == "openai" else ["factory_http.py", "model_registry.py"]
         identity["transport_hashes"] = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in dependencies}
         return identity
 
@@ -556,15 +589,21 @@ class LocalRuntime:
         thread_id = payload.pop("_thread_id", None)
         return_thread = bool(payload.pop("_return_thread", False))
         reuse_session = bool(payload.pop("_reuse_session", False))
+        progress_mode = progress_policy.enabled(self.resource_policy)
+        progress_scope = payload.pop("_progress_scope", [] if role in {"plan", "review"} else None) if progress_mode else None
+        if progress_mode and progress_scope is None:
+            raise RuntimeFailure("progress execution requires Controller-bound scope", None, None)
         token_limit = self.resource_policy.get("max_run_tokens")
         operation_limit = payload.pop("_operation_token_limit", None)
+        if progress_mode and operation_limit is not None:
+            raise RuntimeFailure("progress execution cannot inherit stage token limit", None, None)
         if operation_limit is not None:
             from .factory_budget import operation_token_limit
             expected = operation_token_limit(self.resource_policy, role, local_candidate=True)
             if operation_limit != expected:
                 raise RuntimeFailure("operation token limit differs from verified stage authority", None, None)
             token_limit = operation_limit
-        if role == "plan":
+        if role == "plan" and not progress_mode:
             from .factory_budget import planning_limits
             limits = planning_limits(self.resource_policy, timeout)
             token_limit, timeout = limits["max_tokens"], limits["timeout_seconds"]
@@ -581,6 +620,8 @@ class LocalRuntime:
             server._transcript_bytes = 0
             server._response_timeout = timeout
             server._end_time = time.monotonic() + timeout
+            if getattr(server, "progress_mode", False):
+                server._heartbeat.write_text("active")
             server.token_limit = token_limit
             if server._proxy_relay:
                 server._proxy_relay.start_turn(transcript, timeout, token_limit)
@@ -589,7 +630,7 @@ class LocalRuntime:
         else:
             server = FactoryAppServer(profile, cwd, transcript, timeout, denied_roots,
                                       role in ("plan", "review"), role == "review", token_limit,
-                                      protected_paths=protected)
+                                      protected_paths=protected, **({"progress_scope": progress_scope} if progress_mode else {}))
             if reuse_session:
                 self._single_server, self._single_binding = server, binding
                 errors = transcript.with_suffix(".stderr")
@@ -611,8 +652,19 @@ class LocalRuntime:
                                     thread_id=thread_id, return_thread=return_thread)
             if not return_thread:
                 result.pop("thread_id", None)
+            if reuse_session and getattr(server, "progress_mode", False):
+                # execute() proved turn completion and complete usage. QA is a
+                # separate watched operation; this parked server is not a tool.
+                server._heartbeat.write_text("idle_between_verified_turns")
             return result
         except Exception as exc:
+            if getattr(server, "progress_mode", False):
+                marker = server._heartbeat.with_suffix(".watchdog.json")
+                current = transcript.with_suffix(".watchdog.json")
+                if marker.is_file() and marker != current:
+                    with current.open("xb") as evidence:
+                        os.fchmod(evidence.fileno(), 0o600)
+                        evidence.write(marker.read_bytes())
             if server._proxy_relay:
                 try:
                     server._proxy_relay.collect_telemetry()
@@ -788,14 +840,36 @@ class LocalRuntime:
                                              transcript.parent / "sandbox", uuid.uuid4().hex)
         preflight_project_gate(invocation)
         with transcript.open("xb") as log:
-            proc = subprocess.Popen(invocation.argv, cwd=invocation.cwd, env=invocation.env,
+            command = invocation.argv
+            heartbeat = transcript.with_suffix(".activity")
+            if progress_policy.enabled(self.resource_policy):
+                heartbeat.touch(mode=0o600, exist_ok=False)
+                command = [sys.executable, str(Path(progress_policy.__file__)), str(timeout),
+                           str(os.getpid()), str(heartbeat), *command]
+            proc = subprocess.Popen(command, cwd=invocation.cwd, env=invocation.env,
                                     stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             self.current_process = proc
             try:
-                code = proc.wait(timeout=timeout)
+                if progress_policy.enabled(self.resource_policy):
+                    size = 0
+                    while proc.poll() is None:
+                        observed = transcript.stat().st_size
+                        if observed != size:
+                            heartbeat.touch()
+                            size = observed
+                        try:
+                            proc.wait(timeout=0.2)
+                        except subprocess.TimeoutExpired:
+                            pass
+                    code = proc.returncode
+                    if transcript.with_suffix(".watchdog.json").exists():
+                        raise RuntimeFailure("gate stopped after silence/controller loss; no automatic retry")
+                else:
+                    code = proc.wait(timeout=timeout)
             except BaseException:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait()
+                if proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait()
                 raise
             finally:
                 self.current_process = None

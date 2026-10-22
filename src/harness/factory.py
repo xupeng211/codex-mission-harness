@@ -22,6 +22,7 @@ from pathlib import Path
 from .factory_runtime import LocalRuntime, RuntimeFailure, official_rubric, VENDOR
 from .sandbox import SAFE_PATH
 from .factory_budget import accounting, operation_token_limit, planning_limits
+from . import factory_progress as progress_policy
 from .factory_project import (PROJECT, OFFLINE_PASS, LANES, BACKENDS, approved_scope,
                               materialize_scope, scope_binding, review_manifest)
 from . import factory_candidate as candidate_stage
@@ -106,7 +107,7 @@ def validate_config(raw: dict) -> dict:
     """Operator policy is separate from the customer's product requirement."""
     allowed = {"version", "simulation", "budget", "max_rounds", "timeout_seconds", "checks", "ci",
                "profiles", "independent_review_required", "max_review_bytes", "max_context_bytes", "repository", "hosted_ci", "project_contract",
-               "trusted_validation", "project_pr_ci", "local_acceptance", "model_routing"}
+               "trusted_validation", "project_pr_ci", "local_acceptance", "model_routing", "execution_policy"}
     if not isinstance(raw, dict) or set(raw) - allowed or type(raw.get("version")) is not int or raw.get("version") != 1:
         raise ValueError("invalid factory configuration")
     config = json.loads(encoded(raw))
@@ -136,10 +137,12 @@ def validate_config(raw: dict) -> dict:
         validate_policy(config["project_pr_ci"])
         if "trusted_validation" not in config:
             raise ValueError("project PR readiness also requires trusted formal validation")
+    progress_policy.validate(config)
+    progress_mode = progress_policy.enabled(config)
     budget = config.get("budget")
     budget_fields = {"max_agent_runs", "max_total_tokens", "max_run_tokens", "max_wall_seconds",
                      "max_first_turn_tokens", "max_repair_incremental_tokens"}
-    if not isinstance(budget, dict) or "max_agent_runs" not in budget or set(budget) - budget_fields:
+    if not isinstance(budget, dict) or (not progress_mode and "max_agent_runs" not in budget) or set(budget) - budget_fields:
         raise ValueError("invalid mission resource authority; monetary usage remains UNKNOWN")
     if ("max_total_tokens" in budget) != ("max_run_tokens" in budget):
         raise ValueError("total and per-run token authority must be specified together")
@@ -157,10 +160,13 @@ def validate_config(raw: dict) -> dict:
         raise ValueError("per-run token reservation exceeds mission token authority")
     if "repository" in config and (not isinstance(config["repository"], str) or not Path(config["repository"]).is_absolute()):
         raise ValueError("configured project must be an absolute repository path")
-    bounded_int(budget["max_agent_runs"], "max_agent_runs", 1, 100)
+    if not progress_mode:
+        bounded_int(budget["max_agent_runs"], "max_agent_runs", 1, 100)
     for key, default, low, high in [("max_rounds", 3, 1, 10), ("timeout_seconds", 900, 1, 3600),
                                    ("max_review_bytes", 1024 * 1024, 1, 8 * 1024 * 1024),
                                    ("max_context_bytes", 2 * 1024 * 1024, 1, 16 * 1024 * 1024)]:
+        if progress_mode and key == "max_rounds":
+            continue
         config[key] = bounded_int(config.get(key, default), key, low, high)
     for kind in ("checks", "ci"):
         commands = config.get(kind)
@@ -214,7 +220,7 @@ def policy_identity(config):
 
 
 def validate_mission(raw):
-    keys = {"version", "mission_id", "repository", "objective", "acceptance", "constraints", "scope", "base", "mission_scope_file", "approved_mission_scope", "delivery_mode", "local_candidate_authorization", "model_routing"}
+    keys = {"version", "mission_id", "repository", "objective", "acceptance", "constraints", "scope", "base", "mission_scope_file", "approved_mission_scope", "delivery_mode", "local_candidate_authorization", "model_routing", "progress_authorization"}
     if not isinstance(raw, dict) or set(raw) - keys or type(raw.get("version")) is not int or raw.get("version") != 2:
         raise ValueError("factory missions require version 2")
     mission = json.loads(encoded(raw))
@@ -334,7 +340,7 @@ class Factory:
         if bool(self.runtime.simulation) != self.config["simulation"]:
             raise ValueError("fixture/live runtime does not match operator policy")
         if hasattr(self.runtime, "resource_policy"):
-            self.runtime.resource_policy = self.config["budget"]
+            self.runtime.resource_policy = ({"execution_policy": self.config["execution_policy"]} if progress_policy.enabled(self.config) else self.config["budget"])
         self.project = self.config.get("project_contract") == PROJECT
         self.profile_identities = {lane: self.runtime.profile_identity(profile) if hasattr(self.runtime, "profile_identity") else {"configured": profile, "fixture": True}
                                    for lane, profile in self.config["profiles"].items()
@@ -471,6 +477,7 @@ class Factory:
             # The existing adapter places trusted-base worktrees next to the
             # candidate. Independent Factory clones need independent parents.
             candidate = candidate / "source"
+        progress_policy.authorize(self, spec, candidate)
         if candidate.exists():
             raise ValueError("unowned candidate path already exists")
         if candidate_stage.requested(spec):
@@ -564,6 +571,7 @@ class Factory:
 
     def operation(self, mission, key, stage, lane, identity, payload, paid, invoke, prepare=None):
         """Reserve before dispatch. A lost response is never replayed under a new guise."""
+        progress_policy.check_dispatch(self, mission, stage, lane, paid)
         candidate_stage.check_dispatch(self, mission, stage)
         routing_decision = None
         if paid and lane == "developer" and "model_routing" in self.config:
@@ -582,9 +590,11 @@ class Factory:
             raise FactoryBlocked("CANCELLED", "user cancelled; completed evidence and all reservations are retained")
         budget = self.config["budget"]
         local_mode = candidate_stage.requested(json.loads(self.row(mission)["spec"])) if paid else False
-        effective_limit = operation_token_limit(budget, stage, local_candidate=local_mode) if paid else None
+        effective_limit = operation_token_limit(budget, stage, local_candidate=local_mode) if paid and not progress_policy.enabled(self.config) else None
         if paid and effective_limit is not None:
             identity = {**identity, "operation_token_limit": effective_limit}
+        if paid:
+            progress_policy.check_restart(self, mission, stage, lane, identity, payload)
         if paid:
             uncertain = self.db.execute("SELECT id FROM operations WHERE mission=? AND status IN ('RUNNING','UNKNOWN') LIMIT 1", (mission,)).fetchone()
             if uncertain:
@@ -621,8 +631,8 @@ class Factory:
                 raise FactoryBlocked("BLOCKED_BUDGET", "token admission exhausted; UNKNOWN reservations are permanent")
             used = self.db.execute("SELECT COUNT(*) FROM operations WHERE mission=? AND paid=1", (mission,)).fetchone()[0]
             local_mode = candidate_stage.requested(json.loads(self.row(mission)["spec"])) if paid else False
-            effective_run_limit = min(self.config["budget"]["max_agent_runs"], 2 if local_mode else self.config["budget"]["max_agent_runs"])
-            if paid and used >= effective_run_limit:
+            effective_run_limit = None if progress_policy.enabled(self.config) else min(self.config["budget"]["max_agent_runs"], 2 if local_mode else self.config["budget"]["max_agent_runs"])
+            if paid and effective_run_limit is not None and used >= effective_run_limit:
                 raise FactoryBlocked("BLOCKED_BUDGET", "authorized agent-run budget exhausted; failures and UNKNOWN remain charged")
             self.db.execute("INSERT INTO operations(id,mission,key,stage,lane,paid,identity,input,status,started) VALUES(?,?,?,?,?,?,?,?,?,?)",
                             (operation_id, mission, key, stage, lane, int(paid), encoded(identity), encoded(payload), "RUNNING", time.time()))
@@ -642,7 +652,7 @@ class Factory:
                         result.get("usage_complete") is not True):
                     raise RuntimeFailure("task route/model/usage evidence differs from authorization", result.get("usage"), actual)
             result.setdefault("usage_complete", observed_usage(result.get("usage"), self.config["simulation"]) is not None)
-            status = "UNKNOWN" if result.get("status") == "UNKNOWN" else "COMPLETE"
+            status = "UNKNOWN" if (result.get("status") == "UNKNOWN" or paid and progress_policy.enabled(self.config) and result["usage_complete"] is not True) else "COMPLETE"
             if status == "UNKNOWN":
                 result.setdefault("error", "runtime result was incomplete or uncertain; no replay authorized")
         except Exception as exc:
@@ -650,7 +660,7 @@ class Factory:
                               "usage": getattr(exc, "usage", None),
                               "runtime_identity": getattr(exc, "identity", None),
                               "usage_complete": getattr(exc, "usage_complete", False)}, "UNKNOWN"
-        raw_paths = [p for p in (transcript, transcript.with_suffix(".stderr"), transcript.with_suffix(".proxy.jsonl")) if p.is_file()]
+        raw_paths = [p for p in (transcript, transcript.with_suffix(".stderr"), transcript.with_suffix(".proxy.jsonl"), transcript.with_suffix(".watchdog.json")) if p.is_file()]
         result["raw_evidence"] = [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in raw_paths]
         data = encoded({"operation": operation_id, "identity": identity, "input": payload, "result": result}).encode()
         with evidence.open("xb") as stream:
@@ -668,7 +678,7 @@ class Factory:
             from .factory_budget import tokens
             if (tokens(usage) or 0) > effective_limit:
                 raise FactoryBlocked("BLOCKED_BUDGET", "run token allowance exceeded; telemetry retained, no further dispatch")
-        if paid and stage == "plan":
+        if paid and stage == "plan" and not progress_policy.enabled(self.config):
             from .factory_budget import tokens
             if (tokens(usage) or 0) > planning_limits(self.config["budget"], self.config["timeout_seconds"])["max_tokens"]:
                 raise FactoryBlocked("BLOCKED_BUDGET", "planning token allowance exceeded; telemetry and UNKNOWN reservations retained")
@@ -703,6 +713,8 @@ class Factory:
                     "scope": spec["scope"]}
         key = digest({"stage": stage, "round": round_, "profile": profile_identity, "payload": payload})
         call_payload = dict(payload)
+        if progress_policy.enabled(self.config):
+            call_payload["_progress_scope"] = spec["scope"]
         if "model_selection" in profile_identity and not self.config["simulation"]:
             call_payload["_authorized_route"] = profile_identity["route_identity"]
         return self.operation(spec["mission_id"], key, stage, lane, identity, payload, True,
@@ -1110,6 +1122,8 @@ class Factory:
                 "NOTE": "Current process is stopped by the controller; reservations are retained."}
 
     def operation_timeout(self, mission):
+        if progress_policy.enabled(self.config):
+            return self.config["execution_policy"]["idle_timeout_seconds"]
         timeout = self.config["timeout_seconds"]
         limit = self.config["budget"].get("max_wall_seconds")
         if limit:
@@ -1132,7 +1146,7 @@ class Factory:
                     if self.cancel_requested(mission) and hasattr(self.runtime, "cancel"):
                         self.runtime.cancel()
             if hasattr(self.runtime, "resource_policy"):
-                self.runtime.resource_policy = self.config["budget"]
+                self.runtime.resource_policy = ({"execution_policy": self.config["execution_policy"]} if progress_policy.enabled(self.config) else self.config["budget"])
             watcher = threading.Thread(target=watch_cancel, daemon=True)
             watcher.start()
             try:
@@ -1186,7 +1200,7 @@ class Factory:
                 # First-paid operation rechecks preflight and appends a fresh
                 # event. Preserve spec, policy, round, submission time and usage.
                 self.state(mission, "PLAN")
-            elif row["status"] in ("UNKNOWN", "BLOCKED_BUDGET", "BLOCKED_SCOPE", "BLOCKED_LIMIT"):
+            elif row["status"] in ("UNKNOWN", "BLOCKED_BUDGET", "BLOCKED_SCOPE", "BLOCKED_LIMIT", "BLOCKED_PROGRESS", "BLOCKED_FINANCIAL"):
                 return self.report(mission)
             planning_payload = {"objective": spec["objective"], "acceptance": spec["acceptance"], "constraints": spec["constraints"],
                                 "scope": spec["scope"], "instruction": "Act as technical lead. Understand the repository, plan a minimal complete solution and acceptance tests. Decide ordinary engineering questions yourself. Only unresolved major product ambiguity, safety, independence, budget or irreversible changes belong in decisions_required. Do not edit files. Return plan, bounded tasks, acceptance and decisions_required."}
@@ -1207,7 +1221,7 @@ class Factory:
             if row["round"]:
                 previous = self.db.execute("SELECT payload FROM events WHERE mission=? AND kind='rework' ORDER BY sequence DESC LIMIT 1", (mission,)).fetchone()
                 feedback = json.loads(previous[0])["feedback"]
-            while self.row(mission)["round"] < self.config["max_rounds"]:
+            while progress_policy.enabled(self.config) or self.row(mission)["round"] < self.config["max_rounds"]:
                 round_ = self.row(mission)["round"]
                 if round_ == 0:
                     payload = {"objective": spec["objective"], "acceptance": spec["acceptance"], "constraints": spec["constraints"],
@@ -1259,6 +1273,7 @@ class Factory:
                     self.event(mission, "delivery", delivery)
                     self.state(mission, OFFLINE_PASS if self.project and self.config["simulation"] else READY)
                     return self.report(mission)
+                progress_policy.check_rework(self, mission, target, feedback)
                 self.db.execute("UPDATE missions SET round=round+1 WHERE id=?", (mission,))
                 self.event(mission, "rework", {"target": target, "feedback": feedback})
                 self.state(mission, "REWORK")
@@ -1276,7 +1291,7 @@ class Factory:
         try:
             candidate_stage.authorize(spec, self.config, Path(row["candidate"]),
                                       self.developer_binding(spec)[1])
-            if row["status"] in ("UNKNOWN", "BLOCKED_BUDGET", "BLOCKED_SCOPE", "BLOCKED_LIMIT",
+            if row["status"] in ("UNKNOWN", "BLOCKED_BUDGET", "BLOCKED_SCOPE", "BLOCKED_LIMIT", "BLOCKED_PROGRESS", "BLOCKED_FINANCIAL",
                                  "BLOCKED_LOCAL_AUTHORITY", candidate_stage.LOCAL_READY):
                 return self.report(mission)
             if row["status"] == "CREATED":
@@ -1323,31 +1338,39 @@ class Factory:
                 self.state(mission, "CI")
                 ci = self.gates(spec, cwd, target, "ci", 0)
             failed = [r for r in checks + ci if r["status"] != "PASS"]
-            if failed:
+            repair_round = 0
+            while failed:
+                progress_policy.check_rework(self, mission, target, failed)
+                repair_round += 1
                 if self._single_thread_id is None:
                     raise FactoryBlocked("UNKNOWN", "same-thread repair unavailable; no new thread authorized")
                 self._verify_local_resume(spec, cwd, target)
                 repair_payload = {**payload, "diagnostics": self._local_qa_feedback(mission, failed),
                     "instruction": "The trusted Controller QA below failed. Fix only these concrete failures, add/update regression tests as needed, and return summary and known_risks. This is the one authorized ordinary repair; do not start another task or take external actions."}
+                if progress_policy.enabled(self.config):
+                    repair_payload["instruction"] = "Fix the concrete trusted QA failures. Change approach after repeated failures; remain within the authorized task and scope. Return summary and known_risks."
                 self.state(mission, "REWORK")
-                result = self._single_agent_operation(spec, cwd, repair_payload, "rework", 1, self._single_thread_id)
+                result = self._single_agent_operation(spec, cwd, repair_payload, "rework", repair_round, self._single_thread_id)
                 work = result["output"]
                 target = self.checkpoint(spec, cwd)
                 if not target["files"]:
                     raise FactoryBlocked("UNKNOWN", "repair removed all candidate changes")
                 self.state(mission, "TEST")
-                self._single_qa_round = 1
-                checks = self.gates(spec, cwd, target, "checks", 1)
+                self._single_qa_round = repair_round
+                checks = self.gates(spec, cwd, target, "checks", repair_round)
                 ci = []
                 if not candidate_stage.targeted(spec, self.config):
                     self.state(mission, "CI")
-                    ci = self.gates(spec, cwd, target, "ci", 1)
+                    ci = self.gates(spec, cwd, target, "ci", repair_round)
+                failed = [r for r in checks + ci if r["status"] != "PASS"]
+                if progress_policy.enabled(self.config) and failed:
+                    continue
                 if any(r["status"] != "PASS" for r in checks + ci):
                     raise FactoryBlocked("BLOCKED_LIMIT", "trusted QA still fails after the one authorized same-thread repair")
                 target = self.checkpoint(spec, cwd)
-                checks = self.gates(spec, cwd, target, "checks", 1)
+                checks = self.gates(spec, cwd, target, "checks", repair_round)
                 if not candidate_stage.targeted(spec, self.config):
-                    ci = self.gates(spec, cwd, target, "ci", 1)
+                    ci = self.gates(spec, cwd, target, "ci", repair_round)
                 if any(r["status"] != "PASS" for r in checks + ci):
                     raise FactoryBlocked("BLOCKED_LIMIT", "post-repair full QA failed")
             if any(r["status"] != "PASS" for r in checks + ci):
@@ -1371,7 +1394,7 @@ class Factory:
                 "AUTHORIZED_TASK": spec["objective"], "REPOSITORY_AND_BASE": {"repository": spec["repository"], "base": spec["base"]},
                 "CANDIDATE_WORKSPACE": str(cwd), "ALLOWED_SCOPE": spec["scope"],
                 "FORBIDDEN_ACTIONS": ["network", "push", "pull", "PR", "merge", "release", "deployment", "external API"],
-                "EXECUTION_LIMITS": {"max_turns": 2, "max_repairs": 1, **limits}}
+                "EXECUTION_LIMITS": ({"mode": "progress_driven", "stop": "unchanged failure, scope, idle, uncertainty or authority"} if progress_policy.enabled(self.config) else {"max_turns": 2, "max_repairs": 1, **limits})}
 
     def _local_qa_feedback(self, mission, failed):
         """Copy bounded, verified QA output across the Controller read boundary."""
@@ -1406,7 +1429,7 @@ class Factory:
     def _single_agent_operation(self, spec, cwd, payload, stage, round_, thread_id):
         lane = "developer"
         profile, profile_identity = self.developer_binding(spec)
-        token_limit = operation_token_limit(self.config["budget"], stage, local_candidate=True)
+        token_limit = None if progress_policy.enabled(self.config) else operation_token_limit(self.config["budget"], stage, local_candidate=True)
         target = self.target(spec, cwd)
         branch = git(cwd, "branch", "--show-current")
         if branch != "factory/" + spec["mission_id"] or git(cwd, "remote"):
@@ -1427,6 +1450,8 @@ class Factory:
         def invoke(transcript):
             call_payload = {**payload, "_thread_id": thread_id, "_return_thread": True,
                             "_reuse_session": True, "_operation_token_limit": token_limit}
+            if progress_policy.enabled(self.config):
+                call_payload["_progress_scope"] = spec["scope"]
             if "model_selection" in profile_identity and not self.config["simulation"]:
                 call_payload["_authorized_route"] = profile_identity["route_identity"]
             if self.project:

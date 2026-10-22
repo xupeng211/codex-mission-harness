@@ -12,6 +12,8 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import factory_progress as progress_policy
+
 
 LOCAL_READY = "LOCAL_CANDIDATE_READY"
 LOCAL_MODE = "local_candidate"
@@ -110,6 +112,9 @@ def authorize(spec, config, candidate=None, executor=None, *, executing=True):
               "acceptance", "executor_identity", "checks", "ci", "budget", "max_rounds",
               "timeout_seconds", "simulation", "billing", "remote_write", "formal_review",
               "executor_permissions", "expires_at"}
+    if progress_policy.enabled(config):
+        fields.add("execution_policy")
+        fields.remove("max_rounds")
     if "local_acceptance" in config:
         fields.add("local_acceptance")
     if not isinstance(value, dict) or set(value) != fields:
@@ -122,11 +127,11 @@ def authorize(spec, config, candidate=None, executor=None, *, executing=True):
     if {"hosted_ci", "project_pr_ci", "task_budget"} & set(config):
         raise ValueError("local candidate cannot authorize publication or a shared task wallet")
     if (not spec.get("acceptance") or not spec.get("scope") or "**" in spec["scope"]
-            or not {"max_agent_runs", "max_run_tokens", "max_total_tokens", "max_wall_seconds",
+            or not progress_policy.enabled(config) and not {"max_agent_runs", "max_run_tokens", "max_total_tokens", "max_wall_seconds",
                     "max_first_turn_tokens", "max_repair_incremental_tokens"}
             <= set(config["budget"])):
         raise ValueError("local candidate requires explicit acceptance, paths and stage-specific resource ceilings")
-    if config["budget"]["max_agent_runs"] < 2:
+    if not progress_policy.enabled(config) and config["budget"]["max_agent_runs"] < 2:
         raise ValueError("local candidate budget must permit initial execution and one repair")
     bindings = {key: spec[key] for key in ("mission_id", "repository", "base", "acceptance")}
     bindings.update(allowed_paths=spec["scope"])
@@ -135,7 +140,9 @@ def authorize(spec, config, candidate=None, executor=None, *, executing=True):
         if not set(config["local_acceptance"]["test_paths"]) <= set(spec["scope"]):
             raise ValueError("local acceptance tests outside authorized scope")
     bindings.update({key: config[key] for key in
-                     ("checks", "ci", "budget", "max_rounds", "timeout_seconds", "simulation")})
+                     ("checks", "ci", "budget", "max_rounds", "timeout_seconds", "simulation") if key in config})
+    if progress_policy.enabled(config):
+        bindings["execution_policy"] = config["execution_policy"]
     if any(json.dumps(value[key], sort_keys=True) != json.dumps(expected, sort_keys=True)
            for key, expected in bindings.items()):
         raise ValueError("local authorization differs from task or resource/test policy")
@@ -163,7 +170,7 @@ def check_dispatch(factory, mission, stage):
     authorize(spec, factory.config, Path(row["candidate"]), factory.developer_binding(spec)[1])
     stopped = factory.db.execute(
         "SELECT 1 FROM events WHERE mission=? AND kind='local_candidate'", (mission,)).fetchone()
-    if stage not in LOCAL_STAGES or stopped or targeted(spec, factory.config) and stage == "ci" or stage == "rework" and factory.db.execute(
+    if stage not in LOCAL_STAGES or stopped or targeted(spec, factory.config) and stage == "ci" or not progress_policy.enabled(factory.config) and stage == "rework" and factory.db.execute(
             "SELECT COUNT(*) FROM operations WHERE mission=? AND stage='rework'", (mission,)).fetchone()[0] >= 1:
         raise FactoryBlocked("BLOCKED_LOCAL_AUTHORITY", "local candidate has no formal/remote/resume dispatch authority")
 
@@ -208,6 +215,8 @@ def complete(factory, spec, cwd, target, work, tests, ci):
     evidence["wall_clock_time"] = round(__import__("time").monotonic() - getattr(factory, "_local_started", __import__("time").monotonic()), 3)
     if targeted(spec, factory.config):
         evidence["local_acceptance"] = acceptance(spec, factory.config, target, tests)
+    if progress_policy.enabled(factory.config):
+        evidence["progress_authorization"] = spec["progress_authorization"]
     verify(factory, spec, cwd, evidence)
     factory.event(mission, "local_candidate", evidence)
     factory.state(mission, LOCAL_READY)
@@ -233,6 +242,9 @@ def verify(factory, spec, cwd, evidence):
     require(evidence.get("budget_authorization") == spec["local_candidate_authorization"] and
             evidence.get("executor_identity") == factory.developer_binding(spec)[1] and
             evidence.get("simulation") is factory.config["simulation"], "local authority/identity changed")
+    if progress_policy.enabled(factory.config):
+        require(evidence.get("progress_authorization") == spec["progress_authorization"], "progress authority evidence changed")
+        progress_policy.authorize(factory, spec, cwd, executing=False)
     patch = evidence.get("patch", {})
     path = Path(patch.get("path", ""))
     require(path.is_file() and not path.is_symlink() and path.resolve() == path and

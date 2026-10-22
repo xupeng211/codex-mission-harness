@@ -185,7 +185,9 @@ A failed/unknown request latches the entire run closed, including native retries
 Reported response models are checked on the actual SSE/JSON, not thread config.
 """
 
-    def __init__(self, profile, transcript, timeout, token_limit=None):
+    def __init__(self, profile, transcript, timeout, token_limit=None, *, progress_driven=False):
+        if progress_driven and token_limit is not None:
+            raise ValueError("progress relay cannot inherit token cutoff")
         self.profile = profile
         self.policy = ProxyPolicy(validate_transport(profile))
         self.lease = (self.policy.path.parent / "factory-run.lock").open("a")
@@ -197,6 +199,7 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
         self.endpoint = self.policy.transport["endpoint"]
         self.nonce = secrets.token_urlsafe(32)
         self.timeout = timeout
+        self.progress_driven = progress_driven
         self.deadline = time.monotonic()+timeout
         self.token_limit = token_limit
         self.token_baseline = 0
@@ -226,6 +229,10 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
         with self.lock:
             if self.failed:
                 raise ValueError("uncertain proxy session cannot start a repair")
+            if self.progress_driven and token_limit is not None:
+                raise ValueError("progress repair cannot inherit token cutoff")
+            if self.progress_driven:
+                self.timeout = timeout
             evidence = transcript.with_suffix(".proxy.jsonl")
             evidence.touch(mode=0o600, exist_ok=False)
             self.evidence = evidence
@@ -293,6 +300,7 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                 handler.send_error(503)
                 return
             record = None
+            body = None
             sent_headers = False
             try:
                 size = int(handler.headers.get("Content-Length", "0"))
@@ -305,7 +313,7 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                 current = self.policy.verify()
                 if current != self.policy.identity:
                     raise ValueError("proxy runtime policy changed")
-                if len(self.records) >= 128 or self.token_limit and (tokens(self.usage()) or 0) - self.token_baseline >= self.token_limit:
+                if not self.progress_driven and (len(self.records) >= 128 or self.token_limit and (tokens(self.usage()) or 0) - self.token_baseline >= self.token_limit):
                     raise ValueError("proxy run allowance exhausted")
                 record = {"dispatch_id": self.evidence.stem, "http_request_id": str(uuid.uuid4()), "requested_model": request["model"],
                           "endpoint": self.endpoint, "status": "DISPATCHED", "usage": None,
@@ -315,7 +323,7 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                 req = urllib.request.Request(self.endpoint+"/responses", data=body,
                       headers={"Authorization": "Bearer "+self.policy.key, "Content-Type": "application/json",
                                "Session_id": record["http_request_id"]})
-                remaining = self.deadline-time.monotonic()
+                remaining = self.timeout if self.progress_driven else self.deadline-time.monotonic()
                 if remaining <= 0:
                     raise ValueError("proxy run deadline exhausted")
                 with self.opener.open(req, timeout=remaining) as response:
@@ -328,7 +336,7 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                     count = 0
                     if "text/event-stream" in response.headers.get("Content-Type", ""):
                         for line in response:
-                            if time.monotonic() >= self.deadline:
+                            if not self.progress_driven and time.monotonic() >= self.deadline:
                                 raise ValueError("proxy run deadline exhausted")
                             count += len(line)
                             if count > 16*1024*1024 or len(line) > 2*1024*1024:
@@ -354,6 +362,10 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                 if isinstance(exc, urllib.error.HTTPError):
                     exc.close()  # Do not let GC log upstream reason/error bodies.
                 self.failed = True
+                if record is None:
+                    self.persist({"event": "REQUEST_NOT_DISPATCHED", "reason_code": "LOCAL_POLICY_REJECTED",
+                                  "request_sha256": hashlib.sha256(body).hexdigest() if body is not None else None,
+                                  "request_bytes": len(body) if body is not None else 0})
                 if record is not None:
                     record["status"] = "UNKNOWN"
                     record["physical_attempt_count"] = "UNKNOWN"

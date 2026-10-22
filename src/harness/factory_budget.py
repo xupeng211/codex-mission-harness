@@ -88,9 +88,10 @@ def accounting(operations, budget):
             identity = json.loads(op["identity"]) if op["identity"] else {}
             limit = identity.get("operation_token_limit", budget.get("max_run_tokens", 0))
             reserve += limit if type(limit) is int and limit >= 0 else budget.get("max_run_tokens", 0)
-    return {"agent_runs": len(paid), "limit": budget["max_agent_runs"],
+    return {"agent_runs": len(paid), "limit": budget.get("max_agent_runs", "PROGRESS_DRIVEN"),
             "observed_tokens": known, "unknown_usage_runs": unknown, "partial_usage_runs": partial,
-            "unknown_token_reservation": reserve, "committed_tokens": known + reserve,
-            "token_limit": budget.get("max_total_tokens", "LEGACY_NOT_CONFIGURED"),
-            "run_token_limit": budget.get("max_run_tokens", "LEGACY_NOT_CONFIGURED"),
-            "wall_limit_seconds": budget.get("max_wall_seconds", "LEGACY_PER_RUN_ONLY")}
+            "unknown_token_reservation": "UNBOUNDED_UNKNOWN" if not budget and unknown + partial else reserve,
+            "committed_tokens": "UNKNOWN" if not budget and unknown + partial else known + reserve,
+            "token_limit": budget.get("max_total_tokens", "PROGRESS_DRIVEN" if not budget else "LEGACY_NOT_CONFIGURED"),
+            "run_token_limit": budget.get("max_run_tokens", "PROGRESS_DRIVEN" if not budget else "LEGACY_NOT_CONFIGURED"),
+            "wall_limit_seconds": budget.get("max_wall_seconds", "IDLE_WATCHDOG" if not budget else "LEGACY_PER_RUN_ONLY")}
