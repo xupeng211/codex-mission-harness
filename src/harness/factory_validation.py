@@ -32,7 +32,7 @@ def digest(value):
 
 def validate_policy(policy):
     fields = {"image", "postgres_image", "cpus", "memory_mb", "pids", "tmpfs_mb"}
-    if not isinstance(policy, dict) or set(policy) != fields:
+    if not isinstance(policy, dict) or not fields <= set(policy) or set(policy) - fields - {"tmp_mb"}:
         raise ValueError("validation requires the fixed Controller container policy")
     for key in ("image", "postgres_image"):
         if not isinstance(policy[key], str) or not re.fullmatch(r"[a-zA-Z0-9./_-]+@sha256:[0-9a-f]{64}", policy[key]):
@@ -40,6 +40,10 @@ def validate_policy(policy):
     for key, low, high in (("cpus", 1, 4), ("memory_mb", 256, 8192), ("pids", 32, 512), ("tmpfs_mb", 64, 4096)):
         if type(policy[key]) is not int or not low <= policy[key] <= high:
             raise ValueError("invalid validation resource limit: " + key)
+    # Optional Controller-only /tmp limit; do not insert a default into legacy
+    # policies, whose digest is also part of historical validation evidence.
+    if "tmp_mb" in policy and (type(policy["tmp_mb"]) is not int or not 64 <= policy["tmp_mb"] <= 4096):
+        raise ValueError("invalid validation resource limit: tmp_mb")
     return policy
 
 
@@ -422,7 +426,7 @@ def run(policy, spec, cwd, target, command, transcript, timeout, executor=None, 
              *[value for name in anchors for value in
                ("--mount", f"type=bind,src={snapshot / name},dst=/app/{name},readonly")],
              *(["--tmpfs", "/app/scripts/ops:rw,noexec,nosuid,size=64m,uid=65534,gid=65534"] if legacy else []),
-             "--tmpfs", "/tmp:rw,nosuid,size=256m,mode=1777", "--workdir=/app", "--entrypoint=/usr/bin/env",
+             "--tmpfs", f"/tmp:rw,noexec,nosuid,nodev,size={policy.get('tmp_mb', 256)}m,mode=1777", "--workdir=/app", "--entrypoint=/usr/bin/env",
              policy["image"], "-i", "PATH=" + SAFE_PATH, "HOME=/tmp", "LANG=C.UTF-8",
              "PYTHONDONTWRITEBYTECODE=1", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
              *(["PYTHONUNBUFFERED=1"] if idle_timeout is not None else []),

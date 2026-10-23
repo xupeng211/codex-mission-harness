@@ -408,6 +408,107 @@ class Phase2Tests(unittest.TestCase):
                 self.assertNotIn("cp -R /opt/cmh/node_modules/", profile[-1])
                 self.assertFalse(self.runtime.docker.containers)
 
+    def test_tmp_capacity_policy_is_optional_bounded_and_does_not_mutate_legacy(self):
+        from harness.factory_validation import validate_policy
+        original = copy.deepcopy(VALIDATION)
+        old_digest = validation_digest(original)
+        self.assertIs(validate_policy(original), original)
+        self.assertEqual(original, VALIDATION)
+        self.assertEqual(validation_digest(original), old_digest)
+        for capacity in (64, 1024, 4096):
+            policy = {**VALIDATION, "tmp_mb": capacity}
+            config = {**self.config, "trusted_validation": policy}
+            validate_config(config)
+            self.assertEqual(policy["tmpfs_mb"], 128)
+            self.assertNotEqual(validation_digest(policy), old_digest)
+        for invalid in (None, True, False, "1024", 1024.0, 0, -1, 63, 4097, [], {}):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "tmp_mb"):
+                validate_config({**self.config, "trusted_validation": {**VALIDATION, "tmp_mb": invalid}})
+        for key in VALIDATION:
+            policy = {**VALIDATION, "tmp_mb": 1024}
+            del policy[key]
+            with self.subTest(missing=key), self.assertRaises(ValueError):
+                validate_policy(policy)
+        with self.assertRaises(ValueError):
+            validate_policy({**VALIDATION, "tmp_mb": 1024, "tmp_size": 2048})
+
+    def test_tmp_capacity_mount_preserves_profiles_resources_and_cleanup(self):
+        from harness.factory_validation import run, validate_result
+        spec, cwd, target = self.candidate()
+        for capacity in (None, 1024):
+            policy = {**VALIDATION, **({"tmp_mb": capacity} if capacity is not None else {})}
+            for profile in ("targeted", "pr", "strict"):
+                with self.subTest(capacity=capacity, profile=profile):
+                    docker = FakeDocker()
+                    log = self.root / f"tmp-{capacity}-{profile}.log"
+                    result = run(policy, spec, cwd, target, ["make", "verify-" + profile], log, 60, docker)
+                    validate_result(result, policy, spec, target, profile, True)
+                    self.assertEqual(result["status"], "PASS")
+                    self.assertEqual(result["cleanup"], "COMPLETE")
+                    self.assertFalse(docker.containers)
+                    creates = [c for c in docker.calls if c[0] == "create"]
+                    qa = next(c for c in creates if c[c.index("--name") + 1].endswith("-profile"))
+                    self.assertIn(f"/tmp:rw,noexec,nosuid,nodev,size={capacity or 256}m,mode=1777", qa)
+                    self.assertIn("/app:rw,noexec,nosuid,size=128m,uid=65534,gid=65534", qa)
+                    self.assertIn("--user=65534:65534", qa)
+                    self.assertTrue(qa[qa.index("--network") + 1].startswith("container:"))
+                    for flag in ("--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--restart=no", "--log-driver=none"):
+                        self.assertIn(flag, qa)
+                    for flag, value in (("--cpus", "1"), ("--memory", "512m"), ("--memory-swap", "512m"), ("--pids-limit", "64")):
+                        self.assertEqual(qa[qa.index(flag) + 1], value)
+                    self.assertIn("/tmp:rw,noexec,nosuid,size=64m,mode=1777", creates[0])
+                    db = next(c for c in creates if c[c.index("--name") + 1].endswith("-db"))
+                    self.assertIn("/tmp:rw,nosuid,size=64m", db)
+                    self.assertIn("--network=none", db)
+                    snapshot = Path(re.search(r"src=([^,]+)", qa[qa.index("--mount") + 1])[1])
+                    self.assertFalse(snapshot.exists())
+                    if capacity is not None:
+                        with self.assertRaisesRegex(ValueError, "identity"):
+                            validate_result(result, VALIDATION, spec, target, profile, True)
+
+    def test_explicit_tmp_capacity_failure_timeout_and_cancellation_cleanup(self):
+        from harness.factory_validation import run
+        spec, cwd, target = self.candidate()
+        for outcome in ("failure", "timeout", "cancelled"):
+            with self.subTest(outcome=outcome):
+                docker = FakeDocker()
+                if outcome == "failure":
+                    docker.exit_code = 1
+                elif outcome == "timeout":
+                    docker.failure = "timeout"
+                else:
+                    def cancel(*args, **kwargs):
+                        raise InterruptedError("fixture user cancellation")
+                    docker.capture = cancel
+                result = run({**VALIDATION, "tmp_mb": 1024}, spec, cwd, target,
+                             ["make", "verify-strict"], self.root / f"tmp-{outcome}.log", 60, docker)
+                self.assertEqual(result["status"], "FAIL" if outcome == "failure" else "UNKNOWN")
+                self.assertEqual(result["interrupted"], outcome != "failure")
+                self.assertEqual(result["cleanup"], "COMPLETE")
+                self.assertFalse(docker.containers)
+                qa = next(c for c in docker.calls if c[0] == "create" and c[c.index("--name") + 1].endswith("-profile"))
+                snapshot = Path(re.search(r"src=([^,]+)", qa[qa.index("--mount") + 1])[1])
+                self.assertFalse(snapshot.exists())
+
+    def test_explicit_tmp_capacity_retains_progress_validation_control(self):
+        from harness.factory_validation import run, validate_result
+        spec, cwd, target = self.candidate()
+        docker = FakeDocker()
+        capture = docker.capture
+        controls = []
+        def progress_capture(*args, idle_timeout=None):
+            controls.append(idle_timeout)
+            return capture(*args)
+        docker.capture = progress_capture
+        policy = {**VALIDATION, "tmp_mb": 1024}
+        result = run(policy, spec, cwd, target, ["make", "verify-strict"],
+                     self.root / "tmp-progress.log", 60, docker, idle_timeout=5)
+        validate_result(result, policy, spec, target, "strict", True)
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(controls, [5])
+        self.assertEqual(result["execution_control"], {"mode": "progress_driven", "idle_timeout_seconds": 5})
+        self.assertFalse(docker.containers)
+
     def test_preflight_requires_exact_isolated_python_and_rejects_failure(self):
         docker = FakeDocker()
         self.assertEqual(preflight(VALIDATION, docker)["status"], "FIXTURE_VERIFIED")

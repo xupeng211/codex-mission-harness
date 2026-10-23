@@ -16,6 +16,12 @@ digest pin；镜像必须不包含凭据，并在 `/opt/cmh` 保存匹配候选�
 预检真实探测本地 daemon、digest、工具、关键依赖和锁文件哈希，字段存在不代表可用。
 锁文件改变需要重新准备可信依赖镜像；Factory 不会联网补依赖。
 
+受信任 Controller 的 `trusted_validation` 可选整数 `tmp_mb` 单独控制验证容器的
+`/tmp`，范围 64–4096 MiB；例如 `"tmp_mb": 1024` 为 1 GiB。省略时仍为 256 MiB，
+不补写字段或改变旧配置哈希。原 `tmpfs_mb` 仍只控制 `/app`，预检和数据库临时空间不变。
+`/tmp` 明确保留 `noexec,nosuid,nodev`，tmpfs 使用仍计入容器内存限制；增大容量不增加
+内存、swap、CPU 或 PID 限额，不关闭覆盖率。配置来自 Controller，候选源码不能覆盖。
+
 ### PR A：可信 QA 输入和临时数据库绑定
 
 本次从 H6 已提交对象提取 QA 改进：`83be6e7cc422d75b094619970dce0f98ff5623bb`
