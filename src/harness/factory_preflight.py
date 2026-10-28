@@ -377,10 +377,12 @@ def inspect_prepaid(spec, config):
                     try:
                         if committed_text(repo, commit, "scripts/devops/validation_profiles.py") is None:
                             raise ValueError("canonical profile dispatcher is missing at approved base")
+                        if profile in {"pr", "strict"} and not config["project_container"].get("postgres_image_id"):
+                            raise ValueError("canonical profile requires an isolated pinned PostgreSQL image")
                         image = inspect_image(config["project_container"])
                         add("WARNING", check, "Controller offline container executor available; candidate behavior remains unverified", image_id=image, profile=profile)
                     except (OSError, ValueError, subprocess.SubprocessError):
-                        add("HARD_BLOCKER", check, "pinned local dev image or Docker daemon is unavailable; no pull/build/host fallback")
+                        add("HARD_BLOCKER", check, "pinned local dev/test-service images, policy or Docker daemon unavailable; no pull/build/host fallback")
                 continue
             name = Path(command[0]).name
             if not shutil.which(command[0], path=SAFE_PATH) and not command[0].startswith("./"):

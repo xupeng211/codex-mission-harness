@@ -22,7 +22,7 @@ import test_factory_project as project_fixtures
 
 
 IMAGE = "sha256:" + "a" * 64
-CONTAINER = {"image_id": IMAGE, "profiles": ["targeted", "pr", "strict"]}
+CONTAINER = {"image_id": IMAGE, "postgres_image_id": IMAGE, "profiles": ["targeted", "pr", "strict"]}
 DELIVERY = {"repository": "fixture/football", "base_branch": "main"}
 LIMITS = {"approval_id": "offline-test-only", "max_deepseek_chunks": 2,
           "max_canonical_diff_bytes": 100000, "allow_unknown_provider_usage": True}
@@ -116,16 +116,19 @@ class ControllerGatesTests(unittest.TestCase):
             (self.cwd / "score.py").write_text("changed\n")
             with self.assertRaises(ValueError): verify_target(self.spec, self.cwd, self.target)
 
-    def execute_container_double(self, mode, *, timeout=5):
+    def execute_container_double(self, mode, *, timeout=5, profile="targeted"):
         runtime = LocalRuntime()
         real_output, real_run, real_popen = subprocess.check_output, subprocess.run, subprocess.Popen
-        stopped, calls = [False], []
+        stopped, calls, containers = [False], [], {}
+        clock = [0.0]
         class Process:
             pid = 99999999
             returncode = None
             def poll(s):
                 if mode not in {"timeout", "cancel"} or stopped[0]:
                     s.returncode = -9 if stopped[0] else 0
+                    if not stopped[0]:
+                        containers.pop(s.name, None)  # Docker --rm on normal exit.
                 return s.returncode
             def wait(s, **kwargs):
                 s.returncode = -9 if stopped[0] else 0
@@ -133,30 +136,81 @@ class ControllerGatesTests(unittest.TestCase):
         def popen(argv, *args, **kwargs):
             if argv[0] != "/usr/bin/docker": return real_popen(argv, *args, **kwargs)
             calls.append(argv)
+            if mode == "timeout": clock[0] = 10.0
+            name = argv[argv.index("--name") + 1]
+            containers[name] = {"cmh.validation.owner": name}
             workspace = Path(next(x.split(",dst=")[0].split("src=")[1] for x in argv if x.startswith("type=bind,") and "dst=/app" in x))
             if mode == "mutate": (workspace / "score.py").write_text("unexpected mutation\n")
             if mode == "mutate_candidate": (self.cwd / "score.py").write_text("unexpected host mutation\n")
             if mode == "cancel": runtime.container_cancel.set()
-            return Process()
+            process = Process()
+            process.name = name
+            return process
         def output(argv, *args, **kwargs):
             if argv[0] == "/usr/bin/docker":
-                return (IMAGE + "\n").encode() if "image" in argv else b""
+                if "image" in argv: return (IMAGE + "\n").encode()
+                if "inspect" in argv: return json.dumps(containers.get(argv[-1], {})).encode()
+                if "ps" in argv:
+                    name = argv[argv.index("--filter") + 1].removeprefix("name=^/").removesuffix("$")
+                    return name.encode() if name in containers else b""
+                return b""
             return real_output(argv, *args, **kwargs)
         def command(argv, *args, **kwargs):
             if argv[0] == "/usr/bin/docker":
                 calls.append(argv)
+                if "create" in argv or "--detach" in argv:
+                    name = argv[argv.index("--name") + 1]
+                    containers[name] = dict(x.split("=", 1) for i, x in enumerate(argv) if i and argv[i - 1] == "--label")
+                    if mode == "pg_start_error" and "--detach" in argv:
+                        raise OSError("OFFLINE lost Docker start response")
+                if "exec" in argv:
+                    if mode == "pg_cancel": runtime.container_cancel.set()
+                    return subprocess.CompletedProcess(argv, 1 if mode == "pg_cancel" else 0, b"" if mode == "pg_cancel" else b"1\n", b"")
+                if "inspect" in argv:
+                    if any("HostConfig.NetworkMode" in a for a in argv):
+                        return subprocess.CompletedProcess(argv, 0, b'{"network":"none","ports":{},"mounts":[],"tmpfs":{}}', b"")
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(containers.get(argv[-1], {})).encode(), b"")
+                if "ps" in argv:
+                    name = argv[argv.index("--filter") + 1].removeprefix("name=^/").removesuffix("$")
+                    return subprocess.CompletedProcess(argv, 0, name.encode() if name in containers else b"", b"")
+                if "rm" in argv:
+                    if mode == "pg_cleanup_failure" and argv[-1].endswith("-postgres"):
+                        return subprocess.CompletedProcess(argv, 1, b"", b"OFFLINE cleanup failed")
+                    containers.pop(argv[-1], None)
                 return subprocess.CompletedProcess(argv, 0, b"", b"")
             return real_run(argv, *args, **kwargs)
         with patch("harness.factory_project.FootballPredictionContract.policy", return_value={}), \
                 patch("harness.factory_container.subprocess.Popen", side_effect=popen), \
                 patch("harness.factory_container.subprocess.check_output", side_effect=output), \
                 patch("harness.factory_container.subprocess.run", side_effect=command), \
+                patch("harness.factory_container.time.monotonic", side_effect=lambda: clock[0]), \
                 patch("harness.factory_container.os.killpg", side_effect=lambda *a: stopped.__setitem__(0, True)):
-            result = container_run(runtime, CONTAINER, self.spec, self.cwd, self.target, ["make", "verify-targeted"],
+            result = container_run(runtime, CONTAINER, self.spec, self.cwd, self.target, ["make", "verify-" + profile],
                                    self.root / "container.log", timeout)
         self.assertTrue(any("rm" in call for call in calls))
         self.assertIsNone(runtime.current_process)
         return result
+
+    def test_pr_service_is_ready_bound_and_removed_by_same_controller(self):
+        result = self.execute_container_double("pass", profile="pr")
+        self.assertEqual(result["status"], "PASS")
+        service = result["services"]["postgres"]
+        self.assertTrue(service["ready"] and service["cleanup_confirmed"])
+        self.assertEqual(service["target"], self.target)
+        self.assertEqual(service["mission_id"], self.spec["mission_id"])
+        self.assertEqual(service["persistent_volumes_created"], [])
+        self.assertIn("--network=container:" + service["container_name"], result["argv"])
+        self.assertTrue(result["temporary_directory_cleanup_confirmed"])
+
+    def test_service_start_error_cancel_and_cleanup_failure_never_pass(self):
+        for mode, status in (("pg_start_error", "BLOCKED_ENVIRONMENT"), ("pg_cancel", "CANCELLED"),
+                             ("pg_cleanup_failure", "BLOCKED_ENVIRONMENT")):
+            with self.subTest(mode=mode):
+                (self.root / "container.log").unlink(missing_ok=True)
+                result = self.execute_container_double(mode, profile="pr")
+                self.assertEqual(result["status"], status)
+                self.assertEqual(result["services"]["postgres"]["cleanup_confirmed"], mode != "pg_cleanup_failure")
+                if mode != "pg_cleanup_failure": self.assertNotIn("argv", result)
 
     def test_container_double_pass_and_temporary_source_isolation(self):
         before = source_fingerprint(self.cwd, self.target["head"])
@@ -170,7 +224,7 @@ class ControllerGatesTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 path = self.root / "container.log"
                 if path.exists(): path.unlink()
-                result = self.execute_container_double(mode, timeout=0 if mode == "timeout" else 5)
+                result = self.execute_container_double(mode, timeout=5)
                 self.assertEqual(result["status"], "CANCELLED" if mode == "cancel" else "TIMEOUT")
                 self.assertEqual(result["exit_code"], -9)
                 self.assertTrue(result["cleanup_confirmed"])

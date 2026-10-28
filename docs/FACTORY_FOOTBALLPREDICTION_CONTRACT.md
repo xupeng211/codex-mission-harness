@@ -28,7 +28,8 @@ base、head 均使用完整 40 字符 SHA。用户源工作区和安装入口不
 {
   "project_container": {
     "image_id": "sha256:<64 lowercase hex of an already-installed trusted dev image>",
-    "profiles": ["targeted", "pr", "strict"]
+    "profiles": ["targeted", "pr", "strict"],
+    "postgres_image_id": "sha256:<64 lowercase hex of the trusted local PostgreSQL 15 image>"
   },
   "checks": [["make", "verify-targeted"]],
   "ci": [["make", "verify-pr"]],
@@ -64,9 +65,20 @@ Controller 克隆一次性验证副本并设置批准 base 的 origin/main ref�
 root-owned anonymous volume 导致非 root 验证无法写缓存。不执行镜像 entrypoint。
 容器使用当前 uid/gid、空白 env、network=none、read-only root、cap-drop=ALL、
 no-new-privileges 和 CPU/memory/pids/tmpfs 限额；不挂 Docker socket、HOME、凭据、
-数据库或外部 evidence。npm offline、pip no-index；依赖不足必须报告，不能联网补装。
+已有数据库或外部 evidence。npm offline、pip no-index；依赖不足必须报告，不能联网补装。
 空白环境仍保留固定的 `/opt/venv/bin:/usr/local/bin:/usr/bin:/bin`，以使用既有 dev
 镜像中的项目 Python 依赖；不继承宿主或 agent 提供的 PATH。
+
+`pr`/`strict` 另要求固定本地 PostgreSQL 15 image ID；预检检查两个镜像，缺失服务配置
+或镜像仍阻断。Controller 创建任务独占 PostgreSQL：network=none、非 root、只读 root、
+cap-drop、临时 tmpfs 数据、无宿主端口/持久卷/业务库；准确 mission/head/scope labels。
+验证容器仅共享该网络命名空间的 loopback，认证 SELECT 1 就绪后才执行原 profile。
+一次性随机密码只存在 0600 临时文件和进程环境，日志不输出；固定 wrapper 读取这个
+单一文件后 env -i，不继承镜像/宿主凭据。PG 自身有截止时间，Controller 丢失也不会
+无限运行；失败/超时/取消/异常都核对 ownership 后销毁资源，清理不明不能 PASS。
+项目冷启动原检查负责临时建库、schema、合成写入回滚及删库。当前 pr 选定测试中
+Redis 为替身，没有无条件真实 Redis 依赖，因此不启动 Redis；不运行原 compose
+或连接已有 dev 服务。只有另行明确的测试数据库授权才能启用这条服务路径。
 
 前后记录 candidate 与临时副本 tracked 源码摘要，意外变化不能 PASS；临时 cache
 和测试产物随副本销毁。保留准确版本、scope、镜像、argv、exit code、原日志、时长、

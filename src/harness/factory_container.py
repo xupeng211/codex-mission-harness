@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import signal
 import subprocess
@@ -11,6 +12,7 @@ import uuid
 from pathlib import Path
 
 from .sandbox import SAFE_PATH
+from .factory_test_service import ProjectPostgres, ExecutionStopped
 
 
 PROFILES = {("make", "verify-" + p): p for p in ("targeted", "pr", "strict")}
@@ -20,8 +22,10 @@ ENV = {"PATH": SAFE_PATH, "HOME": "/nonexistent", "LANG": "C.UTF-8",
 
 
 def validate_policy(policy):
-    if (not isinstance(policy, dict) or set(policy) != {"image_id", "profiles"}
+    if (not isinstance(policy, dict) or set(policy) - {"image_id", "profiles", "postgres_image_id"}
+            or not {"image_id", "profiles"} <= set(policy)
             or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(policy.get("image_id", "")))
+            or ("postgres_image_id" in policy and not re.fullmatch(r"sha256:[0-9a-f]{64}", str(policy["postgres_image_id"])))
             or not isinstance(policy.get("profiles"), list) or not policy["profiles"]
             or any(not isinstance(p, str) for p in policy["profiles"])
             or len(set(policy["profiles"])) != len(policy["profiles"])
@@ -33,11 +37,14 @@ def validate_policy(policy):
 def inspect_image(policy):
     validate_policy(policy)
     # Deliberately do not inspect/output Config.Env or contact a registry.
-    value = subprocess.check_output(["/usr/bin/docker", "image", "inspect", "--format", "{{.Id}}",
-                                     policy["image_id"]], env=ENV, stderr=subprocess.PIPE, timeout=15).decode().strip()
-    if value != policy["image_id"]:
-        raise ValueError("local dev image identity differs from Controller policy")
-    return value
+    for key in ("image_id", "postgres_image_id"):
+        if key not in policy:
+            continue
+        value = subprocess.check_output(["/usr/bin/docker", "image", "inspect", "--format", "{{.Id}}",
+                                         policy[key]], env=ENV, stderr=subprocess.PIPE, timeout=15).decode().strip()
+        if value != policy[key]:
+            raise ValueError("local image identity differs from Controller policy")
+    return policy["image_id"]
 
 
 def source_fingerprint(cwd, head):
@@ -70,17 +77,40 @@ def argv_for(policy, workspace, name, profile):
             "python3", "scripts/devops/validation_profiles.py", profile]
 
 
+def remove_owned(name, owner):
+    """Never delete a different task's container, including after lost responses."""
+    def query(*args):
+        return subprocess.check_output(["/usr/bin/docker", *args], env=ENV, stderr=subprocess.PIPE, timeout=15)
+    try:
+        args = ("ps", "-a", "--filter", "name=^/" + name + "$", "--format", "{{.Names}}")
+        if not query(*args).strip():
+            return True, None
+        labels = json.loads(query("inspect", "--format", "{{json .Config.Labels}}", name))
+        if not isinstance(labels, dict) or labels.get("cmh.validation.owner") != owner:
+            return False, None
+        cleanup = subprocess.run(["/usr/bin/docker", "rm", "--force", "--volumes", name], env=ENV,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+        return not query(*args).strip(), cleanup.returncode
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False, None
+
+
 def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
     from .factory import git
     profile = PROFILES.get(tuple(command))
     if profile is None or profile not in validate_policy(policy)["profiles"]:
         raise ValueError("Controller container executor only accepts approved canonical profiles")
+    needs_postgres = profile in {"pr", "strict"}
+    if needs_postgres and "postgres_image_id" not in policy:
+        raise ValueError("canonical pr/strict requires a pinned isolated test PostgreSQL image")
     image = inspect_image(policy)
     before = binding(spec, cwd, target)
     result = {"target": target, "mission_id": spec["mission_id"], "scope_sha256": target["mission_scope_sha256"],
-              "image_id": image, "profile": profile, "fixture": False, "network": "none"}
+              "image_id": image, "profile": profile, "fixture": False, "network": "none",
+              "container_policy": policy, "services": {}}
     name = "cmh-validate-" + uuid.uuid4().hex
     started = time.monotonic()
+    deadline = started + timeout
     if runtime.container_cancel.is_set():
         raise RuntimeError("container execution cancelled before launch")
     with tempfile.TemporaryDirectory(prefix="cmh-validation-", dir=transcript.parent) as temporary:
@@ -89,75 +119,101 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
         git(workspace, "remote", "remove", "origin")
         git(workspace, "checkout", "--detach", target["head"])
         git(workspace, "update-ref", "refs/remotes/origin/main", target["base"])
-        # Copy only existing image dependencies to this disposable workspace.
-        # Docker copy-out uses the invoking user's uid, unlike root-owned
-        # anonymous volume copy-up. No package installation or image startup.
-        dependency_name = name + "-dependencies"
-        try:
-            subprocess.run(["/usr/bin/docker", "create", "--pull=never", "--name", dependency_name,
-                            "--network=none", "--entrypoint=/usr/bin/true", image], env=ENV, check=True,
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
-            copied = subprocess.run(["/usr/bin/docker", "cp", dependency_name + ":/app/node_modules",
-                                     str(workspace / "node_modules")], env=ENV, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, timeout=max(0.1, min(60, timeout)))
-            result["image_node_dependencies_copied"] = copied.returncode == 0
-        finally:
-            cleanup = subprocess.run(["/usr/bin/docker", "rm", "--force", "--volumes", dependency_name], env=ENV,
-                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
-            result["dependencies_cleanup_confirmed"] = cleanup.returncode == 0
-            if cleanup.returncode:
-                raise RuntimeError("dependency copy container cleanup could not be confirmed")
-        snapshot = source_fingerprint(workspace, target["head"])
-        argv = argv_for(policy, workspace, name, profile)
-        argv[-3:-3] = ["BASE_REF=" + target["base"], "HEAD_REF=" + target["head"],
-                       "MISSION_SCOPE_FILE=/app/" + target["mission_scope_file"]]
-        result.update(argv=argv, container_name=name, source_before=before, snapshot_before=snapshot)
-        with transcript.open("xb") as log:
+        service, proc = None, None
+        outcome = "EXITED"
+        result.update(container_name=name, source_before=before, cleanup_confirmed=False, exit_code=None)
+        with transcript.open("x+b") as log:
             os.fchmod(log.fileno(), 0o600)
-            proc = subprocess.Popen(argv, cwd=temporary, env=ENV, stdout=log, stderr=subprocess.STDOUT,
-                                    start_new_session=True)
-            runtime.current_process = proc
-            outcome = "EXITED"
             try:
+                dependency_name = name + "-dependencies"
+                try:
+                    subprocess.run(["/usr/bin/docker", "create", "--pull=never", "--name", dependency_name,
+                                    "--label", "cmh.validation.owner=" + name,
+                                    "--network=none", "--entrypoint=/usr/bin/true", image], env=ENV, check=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+                    copied = subprocess.run(["/usr/bin/docker", "cp", dependency_name + ":/app/node_modules",
+                                             str(workspace / "node_modules")], env=ENV, stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE, timeout=max(0.1, min(60, timeout)))
+                    result["image_node_dependencies_copied"] = copied.returncode == 0
+                finally:
+                    cleaned, code = remove_owned(dependency_name, name)
+                    result.update(dependencies_cleanup_confirmed=cleaned, dependencies_cleanup_exit_code=code)
+                    if not cleaned:
+                        raise RuntimeError("dependency copy container cleanup could not be confirmed")
+                snapshot = source_fingerprint(workspace, target["head"])
+                result["snapshot_before"] = snapshot
+                argv = argv_for(policy, workspace, name, profile)
+                argv[-3:-3] = ["BASE_REF=" + target["base"], "HEAD_REF=" + target["head"],
+                               "MISSION_SCOPE_FILE=/app/" + target["mission_scope_file"]]
+                index = argv.index("--workdir=/app")
+                argv[index:index] = ["--label", "cmh.validation.owner=" + name,
+                                    "--label", "cmh.validation.head=" + target["head"],
+                                    "--label", "cmh.validation.mission=" + spec["mission_id"]]
+                if needs_postgres:
+                    service = ProjectPostgres(policy["postgres_image_id"], name + "-postgres", Path(temporary),
+                                              target, spec["mission_id"], runtime.container_cancel, deadline, ENV, log)
+                    result["services"]["postgres"] = service.evidence
+                    service.start()
+                    service.check()
+                    argv = service.validation_argv(argv)
+                    result["network"] = "none_shared_loopback"
+                if runtime.container_cancel.is_set():
+                    raise ExecutionStopped("CANCELLED")
+                if time.monotonic() >= deadline:
+                    raise ExecutionStopped("TIMEOUT")
+                result["argv"] = argv
+                proc = subprocess.Popen(argv, cwd=temporary, env=ENV, stdout=log, stderr=subprocess.STDOUT,
+                                        start_new_session=True)
+                runtime.current_process = proc
                 while proc.poll() is None:
                     if runtime.container_cancel.is_set():
-                        outcome = "CANCELLED"
-                        break
-                    if time.monotonic() - started >= timeout:
-                        outcome = "TIMEOUT"
-                        break
-                    time.sleep(0.05)
+                        raise ExecutionStopped("CANCELLED")
+                    if time.monotonic() >= deadline:
+                        raise ExecutionStopped("TIMEOUT")
+                    runtime.container_cancel.wait(0.05)
+            except ExecutionStopped as error:
+                outcome = error.outcome
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                outcome = "BLOCKED_ENVIRONMENT"
+                result["error_type"] = type(error).__name__
+                log.write(("Controller execution failed: " + type(error).__name__ + "\n").encode())
             finally:
-                # Killing a Docker client alone does not stop its container.
-                result.update(cleanup_confirmed=False, cleanup_exit_code=None)
                 try:
-                    if proc.poll() is None:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    proc.wait(timeout=5)
-                    cleanup = subprocess.run(["/usr/bin/docker", "rm", "--force", "--volumes", name], env=ENV,
-                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
-                    result["cleanup_exit_code"] = cleanup.returncode
-                    # A successful daemon query is required to prove absence.
-                    names = subprocess.check_output(["/usr/bin/docker", "ps", "-a", "--filter", "name=^/" + name + "$",
-                                                     "--format", "{{.Names}}"], env=ENV, stderr=subprocess.PIPE, timeout=15)
-                    result["cleanup_confirmed"] = not names.strip()
-                except (OSError, subprocess.SubprocessError):
-                    pass
+                    if proc is not None:
+                        if proc.poll() is None:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        proc.wait(timeout=5)
+                        result["exit_code"] = proc.returncode
                 finally:
-                    if proc.poll() is None:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    proc.wait(timeout=5)
                     runtime.current_process = None
+                    cleaned, code = remove_owned(name, name)
+                    result.update(cleanup_confirmed=cleaned, cleanup_exit_code=code)
+                    if service is not None:
+                        service.close()
+                        result["cleanup_confirmed"] &= service.evidence["cleanup_confirmed"]
+                        log.flush()
+                        log.seek(0)
+                        contents = log.read().replace(service.password.encode(), b"[TEST_PASSWORD_REDACTED]")
+                        log.seek(0)
+                        log.truncate()
+                        log.write(contents)
+                        log.flush()
+                        result["ephemeral_password_redacted"] = True
                 if runtime.container_cancel.is_set():
                     outcome = "CANCELLED"
         try:
             after = binding(spec, cwd, target)
             snapshot_after = source_fingerprint(workspace, target["head"])
-            unchanged = before == after and snapshot == snapshot_after and not git(workspace, "diff", "--name-only", "HEAD")
+            unchanged = (before == after and result.get("snapshot_before") == snapshot_after
+                         and not git(workspace, "diff", "--name-only", "HEAD"))
         except (OSError, ValueError, subprocess.SubprocessError):
             after, snapshot_after, unchanged = "NOT_VERIFIABLE", "NOT_VERIFIABLE", False
-        result.update(exit_code=proc.returncode, outcome=outcome, source_after=after, snapshot_after=snapshot_after,
+        result.update(outcome=outcome, source_after=after, snapshot_after=snapshot_after,
                       source_unchanged=unchanged, elapsed_seconds=round(time.monotonic() - started, 3))
         result["status"] = (outcome if outcome != "EXITED" else "SOURCE_CHANGED" if not unchanged else
-                            "BLOCKED_ENVIRONMENT" if not result["cleanup_confirmed"] else "PASS" if proc.returncode == 0 else "FAIL")
+                            "BLOCKED_ENVIRONMENT" if not result["cleanup_confirmed"] else
+                            "PASS" if result["exit_code"] == 0 else "FAIL")
+    result["temporary_directory_cleanup_confirmed"] = not Path(temporary).exists()
+    if not result["temporary_directory_cleanup_confirmed"] and result["status"] == "PASS":
+        result["status"] = "BLOCKED_ENVIRONMENT"
     return result
