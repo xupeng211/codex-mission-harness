@@ -138,4 +138,3 @@ class TestPostgresLifecycle(unittest.TestCase):
             with patch("harness.factory_container.subprocess.run") as run:
                 self.assertEqual(remove_owned("owned", "this-task"), (False, None))
                 run.assert_not_called()
-

@@ -166,4 +166,3 @@ class ProjectPostgres:
         finally:
             for path in (self.env_file, self.secret_file):
                 path.unlink(missing_ok=True)
-
