@@ -68,6 +68,7 @@ class TestPostgresLifecycle(unittest.TestCase):
         argv = self.service.validation_argv(argv_for(policy, self.root, "validation", "pr"))
         self.assertIn("--network=container:" + self.service.name, argv)
         self.assertIn("DB_USER=" + self.service.user, argv)
+        self.assertIn("DB_NAME=football_db", argv)
         self.assertIn("DB_HOST=127.0.0.1", argv)
         self.assertNotIn(self.service.password, " ".join(argv))
         self.assertIn('exec /usr/bin/env -i DB_PASSWORD="$password" "$@"', " ".join(argv))

@@ -24,6 +24,9 @@ class ProjectPostgres:
         self.cancel, self.deadline, self.env, self.log = cancel, deadline, env, log
         self.owner = name.removeprefix("cmh-validate-")
         self.user = "cmh_" + self.owner[:16]
+        # Existing init_db.sql grants CONNECT on this literal fixture DB.
+        # It lives only in this task's new cluster, never in a user service.
+        self.database = "football_db"
         self.password = secrets.token_hex(24)
         self.secret_file = directory / "test-db-password"
         self.env_file = directory / "postgres.env"
@@ -66,7 +69,7 @@ class ProjectPostgres:
     def start(self):
         self.check()
         for path, content in ((self.secret_file, self.password), (self.env_file,
-                f"POSTGRES_USER={self.user}\nPOSTGRES_DB={self.user}\nPOSTGRES_PASSWORD={self.password}\n"
+                f"POSTGRES_USER={self.user}\nPOSTGRES_DB={self.database}\nPOSTGRES_PASSWORD={self.password}\n"
                 "PGDATA=/var/lib/postgresql/data/pgdata\n"
                 "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 --auth-local=trust\n")):
             with path.open("x") as stream:
@@ -85,7 +88,8 @@ class ProjectPostgres:
             args.extend(["--label", key + "=" + value])
         args.extend(["--entrypoint=/usr/bin/timeout", self.image, "-s", "TERM", "-k", "5", str(lifetime),
                      "/usr/local/bin/docker-entrypoint.sh", "postgres", "-c", "listen_addresses=127.0.0.1",
-                     "-c", "max_connections=50", "-c", "sc002.init_sql_context=development"])
+                     "-c", "max_connections=50", "-c", "log_min_error_statement=panic",
+                     "-c", "sc002.init_sql_context=development"])
         # Mark before dispatch, so a lost Docker response still gets an
         # ownership-checked cleanup attempt, never an unbounded retry.
         self.attempted = True
@@ -105,12 +109,12 @@ class ProjectPostgres:
         while time.monotonic() < ready_deadline:
             self.check()
             result = self.command(["exec", "--user=postgres", "--env", "PGPASSWORD", self.name,
-                                   "psql", "-w", "-h", "127.0.0.1", "-U", self.user, "-d", self.user,
+                                   "psql", "-w", "-h", "127.0.0.1", "-U", self.user, "-d", self.database,
                                    "--set=ON_ERROR_STOP=1", "-Atc", "SELECT 1"], password=True)
             if result.returncode == 0 and result.stdout.strip() == b"1":
                 self.evidence["ready"] = True
                 self.evidence["connection"] = {"host": "127.0.0.1", "port": 5432,
-                                               "user": self.user, "database": self.user,
+                                               "user": self.user, "database": self.database,
                                                "password": "EPHEMERAL_NOT_RECORDED"}
                 return
             # Bounded polling; cancellation interrupts this wait immediately.
@@ -136,7 +140,7 @@ class ProjectPostgres:
         # Insert before the Python program, never after its argv.
         index = argv.index("python3")
         argv[index:index] = ["DB_HOST=127.0.0.1", "DB_PORT=5432", "DB_USER=" + self.user,
-                             "DB_NAME=" + self.user, "DB_ADMIN_NAME=postgres", "DB_BLUEPRINT_DEBUG=1"]
+                             "DB_NAME=" + self.database, "DB_ADMIN_NAME=postgres", "DB_BLUEPRINT_DEBUG=1"]
         return argv
 
     def close(self):
