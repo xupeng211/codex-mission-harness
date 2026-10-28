@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from harness.factory_container import RedactedOutput, resources_for, run as container_run
+from harness.factory_container import RedactedOutput, remove_owned, resources_for, run as container_run
 from harness.factory_runtime import LocalRuntime
 import test_factory_controller_gates as fixtures
 import test_factory_delivery_limits as limits_fixtures
@@ -92,6 +92,16 @@ class CredentialPersistenceTests(unittest.TestCase):
 
 
 class CancelledRecoveryTests(unittest.TestCase):
+    def test_auto_removal_can_finish_after_single_rm_response_without_redeleting(self):
+        labels = {"cmh.validation.owner": "mine"}
+        responses = [b"mine", json.dumps(labels).encode(), b"mine", b""]
+        with patch("harness.factory_container.subprocess.check_output", side_effect=responses), \
+                patch("harness.factory_container.subprocess.run", return_value=subprocess.CompletedProcess([], 1)) as rm:
+            cleaned, code = remove_owned("mine", "mine", labels)
+        self.assertTrue(cleaned, "positive absence evidence, not rm returncode, confirms cleanup")
+        self.assertEqual(code, 1)
+        self.assertEqual(rm.call_count, 1)
+
     def setUp(self):
         self.fx = fixtures.FactoryLiveProtocolTests("test_state_flow_current_delivery_rechecks_ci_and_candidate")
         self.fx.setUp()

@@ -136,8 +136,8 @@ def argv_for(policy, workspace, name, profile, lifetime=900):
 
 def remove_owned(name, owner, expected_labels=None):
     """Never delete a different task's container, including after lost responses."""
-    def query(*args):
-        return subprocess.check_output(["/usr/bin/docker", *args], env=ENV, stderr=subprocess.PIPE, timeout=15)
+    def query(*args, timeout=15):
+        return subprocess.check_output(["/usr/bin/docker", *args], env=ENV, stderr=subprocess.PIPE, timeout=timeout)
     try:
         args = ("ps", "-a", "--filter", "name=^/" + name + "$", "--format", "{{.Names}}")
         if not query(*args).strip():
@@ -148,7 +148,14 @@ def remove_owned(name, owner, expected_labels=None):
             return False, None
         cleanup = subprocess.run(["/usr/bin/docker", "rm", "--force", "--volumes", name], env=ENV,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
-        return not query(*args).strip(), cleanup.returncode
+        # --rm can already be removing this same container after cancellation.
+        # Never repeat deletion; require positive absence within a finite grace.
+        end = time.monotonic() + 2
+        while query(*args, timeout=max(0.05, end - time.monotonic())).strip():
+            if time.monotonic() >= end:
+                return False, cleanup.returncode
+            time.sleep(0.05)
+        return True, cleanup.returncode
     except (OSError, ValueError, subprocess.SubprocessError):
         return False, None
 
