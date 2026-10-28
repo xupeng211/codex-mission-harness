@@ -65,6 +65,8 @@ root-owned anonymous volume 导致非 root 验证无法写缓存。不执行镜�
 容器使用当前 uid/gid、空白 env、network=none、read-only root、cap-drop=ALL、
 no-new-privileges 和 CPU/memory/pids/tmpfs 限额；不挂 Docker socket、HOME、凭据、
 数据库或外部 evidence。npm offline、pip no-index；依赖不足必须报告，不能联网补装。
+空白环境仍保留固定的 `/opt/venv/bin:/usr/local/bin:/usr/bin:/bin`，以使用既有 dev
+镜像中的项目 Python 依赖；不继承宿主或 agent 提供的 PATH。
 
 前后记录 candidate 与临时副本 tracked 源码摘要，意外变化不能 PASS；临时 cache
 和测试产物随副本销毁。保留准确版本、scope、镜像、argv、exit code、原日志、时长、

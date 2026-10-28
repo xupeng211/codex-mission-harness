@@ -62,7 +62,7 @@ def argv_for(policy, workspace, name, profile):
             "--mount", f"type=bind,src={workspace},dst=/app",
             "--mount", f"type=bind,src={workspace / '.git'},dst=/app/.git,readonly",
             "--workdir=/app", "--entrypoint=/usr/bin/env", policy["image_id"], "-i",
-            "PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/tmp", "LANG=C.UTF-8", "TZ=UTC",
+            "PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin", "HOME=/tmp", "LANG=C.UTF-8", "TZ=UTC",
             "PYTHONDONTWRITEBYTECODE=1", "DOCKER_DEV_CONTAINER=true", "GATEKEEPER_IN_CONTAINER=1",
             "npm_config_offline=true", "npm_config_fetch_retries=0", "PIP_NO_INDEX=1",
             "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_NO_REPLACE_OBJECTS=1",
