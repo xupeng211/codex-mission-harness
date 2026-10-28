@@ -572,7 +572,8 @@ class Factory:
                               "usage_complete": getattr(exc, "usage_complete", False)}, "UNKNOWN"
             if getattr(exc, "usage_telemetry", None) is not None:
                 result["usage_telemetry"] = exc.usage_telemetry
-        raw_paths = [p for p in (transcript, transcript.with_suffix(".stderr"), transcript.with_suffix(".proxy.jsonl")) if p.is_file()]
+        raw_paths = [p for p in (transcript, transcript.with_suffix(".stderr"), transcript.with_suffix(".proxy.jsonl"),
+                                transcript.with_suffix(".container.json")) if p.is_file()]
         result["raw_evidence"] = [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in raw_paths]
         data = encoded({"operation": operation_id, "identity": identity, "input": payload, "result": result}).encode()
         with evidence.open("xb") as stream:
@@ -601,7 +602,7 @@ class Factory:
         return result
 
     def uncertain_operations(self, mission):
-        """Keep UNKNOWN rows intact; only proven read-only reconciliation resolves a publication."""
+        """Keep UNKNOWN rows intact; re-derive narrowly bound recovery evidence."""
         resolved = set()
         for event in self.db.execute("SELECT payload FROM events WHERE mission=? AND kind='publication_reconciled'", (mission,)):
             value = json.loads(event[0])
@@ -616,6 +617,12 @@ class Factory:
                     or result.get("fixture") is not False):
                 raise FactoryBlocked("UNKNOWN", "publication reconciliation binding invalid")
             resolved.add(value["operation_id"])
+        for event in self.db.execute("SELECT payload FROM events WHERE mission=? AND kind='remote_observation_recovered'", (mission,)):
+            value = json.loads(event[0])
+            original = self.db.execute("SELECT * FROM operations WHERE mission=? AND id=?", (mission, value["operation_id"])).fetchone()
+            proof = self.db.execute("SELECT * FROM operations WHERE mission=? AND key=?", (mission, value["evidence_key"])).fetchone()
+            self.validate_observation_recovery(mission, original, proof)
+            resolved.add(original["id"])
         return [op for op in self.db.execute("SELECT * FROM operations WHERE mission=? AND status IN ('RUNNING','UNKNOWN')", (mission,))
                 if op["id"] not in resolved]
 
@@ -771,16 +778,91 @@ class Factory:
                 "canonical_receipt": checked.artifact, "canonical_receipt_data": checked.data,
                 "review_range": target["review_range"], "fixture": self.config["simulation"]}
 
-    def project_remote_read(self, action, spec, cwd, target, body, reviews=None):
-        payload = {"target": target, "policy": self.config["project_delivery"], "body": body}
+    def observation_result(self, spec, payload, result):
+        from .factory_remote import identity
+        branch, _ = identity(payload["policy"], spec, payload["target"])
+        expected = payload.get("expected_pr")
+        if (not isinstance(result, dict) or result.get("target") != payload["target"] or result.get("fixture") is not False
+                or result.get("repository") != payload["policy"]["repository"] or result.get("pr_repo") != payload["policy"]["repository"]
+                or result.get("branch") != branch or result.get("pr_base_sha") != payload["target"]["base"]
+                or result.get("body_sha256") != hashlib.sha256(payload["body"].encode()).hexdigest()
+                or type(result.get("pr_number")) is not int or result["pr_number"] <= 0
+                or (expected is not None and expected != {k: result[k] for k in ("pr_number", "pr_repo", "pr_base_sha")})):
+            raise FactoryBlocked("UNKNOWN", "remote observation does not bind the exact repository/PR/candidate/body")
+        return result
+
+    def validate_observation_recovery(self, mission, original, proof):
+        """Re-derive a narrow read-only recovery from immutable operation evidence."""
+        stages = {"project_reconcile": "reconcile", "project_ci": "ci", "project_verify": "verify"}
+        if (not self.project or original is None or proof is None or original["paid"] or proof["paid"]
+                or original["status"] != "UNKNOWN" or proof["status"] != "COMPLETE"
+                or original["stage"] not in stages or original["stage"] != proof["stage"]
+                or original["lane"] != "github" or proof["lane"] != "github"
+                or original["ended"] is None or proof["started"] < original["ended"] or original["id"] == proof["id"]):
+            raise FactoryBlocked("UNKNOWN", "recovery is restricted to ended unpaid remote observations")
+        payload = json.loads(original["input"])
+        if (payload != json.loads(proof["input"]) or payload.get("action") != stages[original["stage"]]
+                or not isinstance(payload.get("expected_pr"), dict)
+                or payload["policy"] != self.config.get("project_delivery")):
+            raise FactoryBlocked("UNKNOWN", "observation kind/policy/known PR binding changed")
+        spec = json.loads(self.row(mission)["spec"])
+        # The new observation checks the current candidate before becoming
+        # COMPLETE. A historical exact-target relation remains evidence about
+        # that target; it does not certify any later candidate's delivery.
+        for operation in (original, proof):
+            self.verify_evidence(operation)
+            envelope = json.loads(Path(operation["evidence"]).read_text())
+            if (envelope != {"operation": operation["id"], "identity": json.loads(operation["identity"]),
+                            "input": payload, "result": json.loads(operation["result"])}
+                    or json.loads(operation["identity"]) != payload):
+                raise FactoryBlocked("UNKNOWN", "observation evidence differs from durable operation binding")
+        result = self.observation_result(spec, payload, json.loads(proof["result"]))
+        if result.get("status") != "PASS":
+            raise FactoryBlocked("UNKNOWN", "fresh observation did not establish successful verification")
+
+    def project_remote_read(self, action, spec, cwd, target, body, reviews=None, expected_pr=None):
+        if action not in {"reconcile", "ci", "verify"}:
+            raise FactoryBlocked("UNKNOWN", "only canonical read-only observation kinds are supported")
+        payload = {"target": target, "policy": self.config["project_delivery"], "body": body,
+                   "action": action, "reviews": reviews or [], "expected_pr": None}
+        # A first discovery may establish a PR, but cannot retroactively prove
+        # an unknown numeric PR. Automatic recovery requires a previously bound PR.
+        if expected_pr is None:
+            for old in self.db.execute("SELECT * FROM operations WHERE mission=? AND paid=0 AND lane='github' AND status='COMPLETE' ORDER BY started DESC", (spec["mission_id"],)):
+                old_payload = json.loads(old["input"])
+                if all(old_payload.get(k) == payload[k] for k in ("target", "policy", "body")):
+                    self.verify_evidence(old)
+                    expected_pr = self.observation_result(spec, payload, json.loads(old["result"]))
+                    break
+        if expected_pr is not None:
+            keys = {"pr_number", "pr_repo", "pr_base_sha"}
+            if set(expected_pr) == keys:
+                if (type(expected_pr["pr_number"]) is not int or expected_pr["pr_number"] <= 0
+                        or expected_pr["pr_repo"] != payload["policy"]["repository"]
+                        or expected_pr["pr_base_sha"] != target["base"]):
+                    raise FactoryBlocked("UNKNOWN", "invalid expected numeric PR binding")
+                payload["expected_pr"] = dict(expected_pr)
+            else:
+                checked = self.observation_result(spec, payload, expected_pr)
+                payload["expected_pr"] = {k: checked[k] for k in keys}
         key = digest({"action": action, **payload, "observation": uuid.uuid4().hex})
+        def observe(transcript):
+            result = self.runtime.project_remote(action, payload["policy"], spec, cwd, target, body, transcript,
+                                                 self.operation_timeout(spec["mission_id"]), reviews=reviews)
+            self.observation_result(spec, payload, result)
+            if self.target(spec, cwd) != target:
+                raise FactoryBlocked("UNKNOWN", "candidate changed during remote operation")
+            return result
         result = self.operation(spec["mission_id"], key, "project_reconcile" if action == "reconcile" else "project_" + action,
-            "github", payload, payload, False, lambda transcript: self.runtime.project_remote(action,
-                payload["policy"], spec, cwd, target, body, transcript, self.operation_timeout(spec["mission_id"]), reviews=reviews))
-        if result.get("target") != target or result.get("fixture") is not False:
-            raise FactoryBlocked("UNKNOWN", "remote observation has no exact live target")
-        if self.target(spec, cwd) != target:
-            raise FactoryBlocked("UNKNOWN", "candidate changed during remote operation")
+            "github", payload, payload, False, observe)
+        if result.get("status") == "PASS" and payload["expected_pr"] is not None:
+            proof = self.db.execute("SELECT * FROM operations WHERE mission=? AND key=?", (spec["mission_id"], key)).fetchone()
+            for original in self.uncertain_operations(spec["mission_id"]):
+                if original["status"] != "UNKNOWN" or original["stage"] != proof["stage"] or original["input"] != encoded(payload):
+                    continue
+                self.validate_observation_recovery(spec["mission_id"], original, proof)
+                self.event(spec["mission_id"], "remote_observation_recovered", {"operation_id": original["id"], "evidence_key": key})
+            self.db.commit()
         return {**result, "evidence_key": key}
 
     def recover_publication(self, spec, cwd, operation):
@@ -820,8 +902,8 @@ class Factory:
             if publication.get("status") != "PASS" or publication.get("target") != target or publication.get("fixture") is not False:
                 raise FactoryBlocked("UNKNOWN", "publication did not establish exact live PR identity")
             # Cached success is never current remote truth.
-            publication = self.project_remote_read("reconcile", spec, cwd, target, body)
-        ci = self.project_remote_read("ci", spec, cwd, target, body)
+            publication = self.project_remote_read("reconcile", spec, cwd, target, body, expected_pr=publication)
+        ci = self.project_remote_read("ci", spec, cwd, target, body, expected_pr=publication)
         if ci["status"] not in {"PASS", "FAIL"}:
             raise FactoryBlocked("BLOCKED_CI", ci.get("reason", "required exact PR checks are unfinished/unknown"))
         return {"publication": publication, "ci": ci, "body": body}
@@ -832,7 +914,7 @@ class Factory:
         if not self.config["simulation"]:
             if remote is None or remote["ci"]["status"] != "PASS":
                 raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "exact live PR/CI context missing")
-            checked = self.project_remote_read("verify", spec, cwd, target, remote["body"], reviews)
+            checked = self.project_remote_read("verify", spec, cwd, target, remote["body"], reviews, expected_pr=remote["publication"])
             if checked["status"] != "PASS":
                 raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", checked.get("reason", "canonical final gate rejected delivery"))
             return checked
@@ -951,7 +1033,7 @@ class Factory:
                             or json.loads(op["result"]).get("target") != delivery["target"]):
                         raise FactoryBlocked("UNKNOWN", "project final gate evidence is missing or rejected")
                     if not self.config["simulation"]:
-                        fresh = self.project_remote_read("verify", spec, cwd, delivery["target"], delivery["remote"]["body"], delivery["reviews"])
+                        fresh = self.project_remote_read("verify", spec, cwd, delivery["target"], delivery["remote"]["body"], delivery["reviews"], expected_pr=delivery["remote"]["publication"])
                         if fresh["status"] != "PASS":
                             raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", fresh.get("reason", "remote PR/CI/final gate is no longer current"))
             except FactoryBlocked as exc:
@@ -1036,10 +1118,31 @@ class Factory:
             spec, cwd = self.prepare(mission)
             row = self.row(mission)
             for pending in self.uncertain_operations(mission):
+                if pending["id"] not in {p["id"] for p in self.uncertain_operations(mission)}:
+                    continue
                 if self.project and pending["stage"] == "project_publish":
                     self.recover_publication(spec, cwd, pending)
                     self.state(mission, "PR_CI", "publication observed; original UNKNOWN/reservation retained")
                     row = self.row(mission)
+            for pending in self.uncertain_operations(mission):
+                if pending["id"] not in {p["id"] for p in self.uncertain_operations(mission)}:
+                    continue
+                payload = json.loads(pending["input"])
+                if self.project and not self.config["simulation"] and not pending["paid"] and pending["stage"] in {"checks", "ci"}:
+                    transcript = self.root / "evidence" / mission / (pending["id"] + ".raw")
+                    cleanup = self.runtime.recover_container(self.config["project_container"], spec, payload["target"], payload["command"], transcript)
+                    self.event(mission, "container_cleanup_recovered", {"operation_id": pending["id"], "cleanup": cleanup})
+                    self.db.commit()  # Cleanup does not authorize replay or change the original row.
+                if (self.project and pending["status"] == "UNKNOWN" and not pending["paid"]
+                        and pending["stage"] in {"project_reconcile", "project_ci", "project_verify"}
+                        and payload.get("expected_pr") and payload.get("action")
+                        and payload.get("policy") == self.config.get("project_delivery")
+                        and self.target(spec, cwd) == payload.get("target")):
+                    proof = self.project_remote_read(payload["action"], spec, cwd, payload["target"], payload["body"],
+                                                     payload["reviews"], expected_pr=payload["expected_pr"])
+                    if proof["status"] == "PASS" and row["status"] == "UNKNOWN":
+                        self.state(mission, "PR_CI", "fresh exact read-only evidence; original UNKNOWN retained")
+                        row = self.row(mission)
             uncertain = self.uncertain_operations(mission)
             if uncertain:
                 raise FactoryBlocked("UNKNOWN", f"unresolved operation {uncertain[0]['id']}; no duplicate paid dispatch was authorized")

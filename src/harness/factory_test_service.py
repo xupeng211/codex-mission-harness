@@ -137,8 +137,8 @@ class ProjectPostgres:
         argv[index:index] = ["-c", 'password="$(cat /run/cmh-test-db-password)" || exit 125; '
                             'exec /usr/bin/env -i DB_PASSWORD="$password" "$@"', "cmh-qa"]
         argv.pop(index + 3)  # env -i is already in the fixed wrapper, not in its arguments.
-        # Insert before the Python program, never after its argv.
-        index = argv.index("python3")
+        # env assignments precede the independent lifetime executable as well.
+        index = argv.index("/usr/bin/timeout") if "/usr/bin/timeout" in argv else argv.index("python3")
         argv[index:index] = ["DB_HOST=127.0.0.1", "DB_PORT=5432", "DB_USER=" + self.user,
                              "DB_NAME=" + self.database, "DB_ADMIN_NAME=postgres", "DB_BLUEPRINT_DEBUG=1"]
         return argv

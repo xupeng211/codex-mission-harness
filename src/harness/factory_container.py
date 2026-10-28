@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import os
 import json
+import math
 import re
+import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import time
@@ -58,9 +61,9 @@ def binding(spec, cwd, target):
     return source_fingerprint(cwd, target["head"])
 
 
-def argv_for(policy, workspace, name, profile):
+def argv_for(policy, workspace, name, profile, lifetime=900):
     validate_policy(policy)
-    if profile not in policy["profiles"]:
+    if profile not in policy["profiles"] or type(lifetime) is not int or not 1 <= lifetime <= 86400:
         raise ValueError("canonical validation profile is not authorized")
     return ["/usr/bin/docker", "run", "--pull=never", "--rm", "--name", name,
             "--network=none", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
@@ -74,10 +77,11 @@ def argv_for(policy, workspace, name, profile):
             "npm_config_offline=true", "npm_config_fetch_retries=0", "PIP_NO_INDEX=1",
             "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_NO_REPLACE_OBJECTS=1",
             "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=safe.directory", "GIT_CONFIG_VALUE_0=/app",
+            "/usr/bin/timeout", "--signal=TERM", "--kill-after=5", str(lifetime),
             "python3", "scripts/devops/validation_profiles.py", profile]
 
 
-def remove_owned(name, owner):
+def remove_owned(name, owner, expected_labels=None):
     """Never delete a different task's container, including after lost responses."""
     def query(*args):
         return subprocess.check_output(["/usr/bin/docker", *args], env=ENV, stderr=subprocess.PIPE, timeout=15)
@@ -86,13 +90,69 @@ def remove_owned(name, owner):
         if not query(*args).strip():
             return True, None
         labels = json.loads(query("inspect", "--format", "{{json .Config.Labels}}", name))
-        if not isinstance(labels, dict) or labels.get("cmh.validation.owner") != owner:
+        expected = expected_labels or {"cmh.validation.owner": owner}
+        if not isinstance(labels, dict) or any(labels.get(k) != v for k, v in expected.items()):
             return False, None
         cleanup = subprocess.run(["/usr/bin/docker", "rm", "--force", "--volumes", name], env=ENV,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
         return not query(*args).strip(), cleanup.returncode
     except (OSError, ValueError, subprocess.SubprocessError):
         return False, None
+
+
+def resources_for(name, spec, target, needs_postgres):
+    labels = {"cmh.validation.owner": name, "cmh.validation.mission": spec["mission_id"],
+              "cmh.validation.head": target["head"], "cmh.validation.scope": target["mission_scope_sha256"]}
+    resources = [{"name": n, "labels": labels} for n in (name, name + "-dependencies")]
+    if needs_postgres:
+        resources.append({"name": name + "-postgres", "labels": {
+            "cmh.qa.owner": (name + "-postgres").removeprefix("cmh-validate-"),
+            "cmh.qa.mission": spec["mission_id"], "cmh.qa.head": target["head"],
+            "cmh.qa.scope": target["mission_scope_sha256"]}})
+    return resources
+
+
+def recover(policy, spec, target, command, transcript):
+    """One-shot cleanup on resume; never retry validation or settle its UNKNOWN."""
+    path = Path(transcript).with_suffix(".container.json")
+    result = {"target": target, "mission_id": spec["mission_id"], "cleanup_confirmed": False,
+              "operation_replayed": False, "resources": []}
+    try:
+        info = path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or path.is_symlink() or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) & 0o077 or info.st_size > 65536):
+            raise ValueError("untrusted container lifecycle record")
+        record = json.loads(path.read_text())
+        name = record["container_name"]
+        profile = PROFILES.get(tuple(command))
+        if (not re.fullmatch(r"cmh-validate-[a-f0-9]{32}", name)
+                or record["target"] != target or record["mission_id"] != spec["mission_id"]
+                or record["policy"] != validate_policy(policy) or record["profile"] != profile
+                or profile not in policy["profiles"]):
+            raise ValueError("container recovery task/candidate/policy mismatch")
+        expected = resources_for(name, spec, target, profile in {"pr", "strict"})
+        if record["resources"] != expected:
+            raise ValueError("container recovery resource binding mismatch")
+        temporary = Path(record["temporary_directory"])
+        if (temporary.parent != path.parent or not re.fullmatch(r"cmh-validation-[a-z0-9_]{8}", temporary.name)
+                or temporary.is_symlink()):
+            raise ValueError("temporary directory escaped operation evidence root")
+        # Check directory ownership before any deletion, including parent cleanup.
+        if temporary.exists():
+            info = temporary.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+                raise ValueError("temporary directory ownership mismatch")
+        for resource in expected:
+            cleaned, code = remove_owned(resource["name"], name, resource["labels"])
+            result["resources"].append({"name": resource["name"], "cleanup_confirmed": cleaned, "exit_code": code})
+        result["cleanup_confirmed"] = all(r["cleanup_confirmed"] for r in result["resources"])
+        if result["cleanup_confirmed"] and temporary.exists():
+            shutil.rmtree(temporary)
+        result["temporary_directory_cleanup_confirmed"] = not temporary.exists()
+        result["cleanup_confirmed"] &= result["temporary_directory_cleanup_confirmed"]
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        result["error_type"] = type(error).__name__
+    return result
 
 
 def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
@@ -109,6 +169,7 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
               "image_id": image, "profile": profile, "fixture": False, "network": "none",
               "container_policy": policy, "services": {}}
     name = "cmh-validate-" + uuid.uuid4().hex
+    resources = resources_for(name, spec, target, needs_postgres)
     started = time.monotonic()
     deadline = started + timeout
     if runtime.container_cancel.is_set():
@@ -124,11 +185,23 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
         result.update(container_name=name, source_before=before, cleanup_confirmed=False, exit_code=None)
         with transcript.open("x+b") as log:
             os.fchmod(log.fileno(), 0o600)
+            # Durable plan precedes the first Docker dispatch. An interrupted
+            # Controller can identify only its exact operation's resources.
+            record = {"target": target, "mission_id": spec["mission_id"], "policy": policy,
+                      "profile": profile, "container_name": name, "resources": resources,
+                      "temporary_directory": temporary}
+            lifecycle = transcript.with_suffix(".container.json")
+            with lifecycle.open("xb") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(json.dumps(record, sort_keys=True).encode())
+                stream.flush()
+                os.fsync(stream.fileno())
+            result["lifecycle_record"] = str(lifecycle)
             try:
                 dependency_name = name + "-dependencies"
                 try:
-                    subprocess.run(["/usr/bin/docker", "create", "--pull=never", "--name", dependency_name,
-                                    "--label", "cmh.validation.owner=" + name,
+                    labels = [v for k, value in resources[1]["labels"].items() for v in ("--label", k + "=" + value)]
+                    subprocess.run(["/usr/bin/docker", "create", "--pull=never", "--name", dependency_name, *labels,
                                     "--network=none", "--entrypoint=/usr/bin/true", image], env=ENV, check=True,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
                     copied = subprocess.run(["/usr/bin/docker", "cp", dependency_name + ":/app/node_modules",
@@ -136,19 +209,20 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                                             stderr=subprocess.PIPE, timeout=max(0.1, min(60, timeout)))
                     result["image_node_dependencies_copied"] = copied.returncode == 0
                 finally:
-                    cleaned, code = remove_owned(dependency_name, name)
+                    cleaned, code = remove_owned(dependency_name, name, resources[1]["labels"])
                     result.update(dependencies_cleanup_confirmed=cleaned, dependencies_cleanup_exit_code=code)
                     if not cleaned:
                         raise RuntimeError("dependency copy container cleanup could not be confirmed")
                 snapshot = source_fingerprint(workspace, target["head"])
                 result["snapshot_before"] = snapshot
-                argv = argv_for(policy, workspace, name, profile)
-                argv[-3:-3] = ["BASE_REF=" + target["base"], "HEAD_REF=" + target["head"],
+                lifetime = max(1, math.ceil(deadline - time.monotonic()))
+                result.update(lifetime_limit_seconds=lifetime, lifetime_kill_grace_seconds=5)
+                argv = argv_for(policy, workspace, name, profile, lifetime)
+                index = argv.index("/usr/bin/timeout")
+                argv[index:index] = ["BASE_REF=" + target["base"], "HEAD_REF=" + target["head"],
                                "MISSION_SCOPE_FILE=/app/" + target["mission_scope_file"]]
                 index = argv.index("--workdir=/app")
-                argv[index:index] = ["--label", "cmh.validation.owner=" + name,
-                                    "--label", "cmh.validation.head=" + target["head"],
-                                    "--label", "cmh.validation.mission=" + spec["mission_id"]]
+                argv[index:index] = [v for k, value in resources[0]["labels"].items() for v in ("--label", k + "=" + value)]
                 if needs_postgres:
                     service = ProjectPostgres(policy["postgres_image_id"], name + "-postgres", Path(temporary),
                                               target, spec["mission_id"], runtime.container_cancel, deadline, ENV, log)
@@ -161,6 +235,9 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                     raise ExecutionStopped("CANCELLED")
                 if time.monotonic() >= deadline:
                     raise ExecutionStopped("TIMEOUT")
+                lifetime = max(1, math.ceil(deadline - time.monotonic()))
+                argv[argv.index("--kill-after=5") + 1] = str(lifetime)
+                result["lifetime_limit_seconds"] = lifetime
                 result["argv"] = argv
                 proc = subprocess.Popen(argv, cwd=temporary, env=ENV, stdout=log, stderr=subprocess.STDOUT,
                                         start_new_session=True)
@@ -186,7 +263,7 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                         result["exit_code"] = proc.returncode
                 finally:
                     runtime.current_process = None
-                    cleaned, code = remove_owned(name, name)
+                    cleaned, code = remove_owned(name, name, resources[0]["labels"])
                     result.update(cleanup_confirmed=cleaned, cleanup_exit_code=code)
                     if service is not None:
                         service.close()
@@ -208,6 +285,10 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                          and not git(workspace, "diff", "--name-only", "HEAD"))
         except (OSError, ValueError, subprocess.SubprocessError):
             after, snapshot_after, unchanged = "NOT_VERIFIABLE", "NOT_VERIFIABLE", False
+        # 137 can also be OOM or an unrelated SIGKILL; do not invent a
+        # timeout diagnosis without the Controller deadline or exit 124.
+        if outcome == "EXITED" and result["exit_code"] == 124:
+            outcome = "TIMEOUT"
         result.update(outcome=outcome, source_after=after, snapshot_after=snapshot_after,
                       source_unchanged=unchanged, elapsed_seconds=round(time.monotonic() - started, 3))
         result["status"] = (outcome if outcome != "EXITED" else "SOURCE_CHANGED" if not unchanged else

@@ -64,13 +64,8 @@ class Remote:
         self.cwd, self.transcript = str(cwd), Path(transcript)
         self.deadline = time.monotonic() + timeout
         self.adapter = adapter or FootballPredictionAdapter()
-        self.env = {"PATH": SAFE_PATH, "HOME": str(Path.home()), "LANG": "C.UTF-8", "GH_HOST": "github.com",
-                    "GH_PROMPT_DISABLED": "1", "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1",
-                    "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_NO_REPLACE_OBJECTS": "1",
-                    "GIT_SSH_COMMAND": "/usr/bin/ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15"}
-        for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "all_proxy", "no_proxy"):
-            if key in os.environ:
-                self.env[key] = os.environ[key]
+        self.env = self.adapter._trusted_subprocess_environment(env={"LANG": "C.UTF-8"})
+        self.env["GIT_SSH_COMMAND"] = "/usr/bin/ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15"
 
     def command(self, argv, *, data=None, cwd=None):
         remaining = self.deadline - time.monotonic()

@@ -120,6 +120,8 @@ class ControllerGatesTests(unittest.TestCase):
         runtime = LocalRuntime()
         real_output, real_run, real_popen = subprocess.check_output, subprocess.run, subprocess.Popen
         stopped, calls, containers = [False], [], {}
+        # Each operation has a distinct immutable transcript/lifecycle record.
+        transcript = self.root / ("container-" + mode + ".log")
         clock = [0.0]
         class Process:
             pid = 99999999
@@ -138,7 +140,7 @@ class ControllerGatesTests(unittest.TestCase):
             calls.append(argv)
             if mode == "timeout": clock[0] = 10.0
             name = argv[argv.index("--name") + 1]
-            containers[name] = {"cmh.validation.owner": name}
+            containers[name] = dict(x.split("=", 1) for i, x in enumerate(argv) if i and argv[i - 1] == "--label")
             workspace = Path(next(x.split(",dst=")[0].split("src=")[1] for x in argv if x.startswith("type=bind,") and "dst=/app" in x))
             if mode == "mutate": (workspace / "score.py").write_text("unexpected mutation\n")
             if mode == "mutate_candidate": (self.cwd / "score.py").write_text("unexpected host mutation\n")
@@ -186,7 +188,7 @@ class ControllerGatesTests(unittest.TestCase):
                 patch("harness.factory_container.time.monotonic", side_effect=lambda: clock[0]), \
                 patch("harness.factory_container.os.killpg", side_effect=lambda *a: stopped.__setitem__(0, True)):
             result = container_run(runtime, CONTAINER, self.spec, self.cwd, self.target, ["make", "verify-" + profile],
-                                   self.root / "container.log", timeout)
+                                   transcript, timeout)
         self.assertTrue(any("rm" in call for call in calls))
         self.assertIsNone(runtime.current_process)
         return result

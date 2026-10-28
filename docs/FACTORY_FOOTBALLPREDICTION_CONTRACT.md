@@ -88,6 +88,15 @@ Redis 为替身，没有无条件真实 Redis 依赖，因此不启动 Redis；�
 成功 daemon 查询必须证明它已不存在；清理不确定不能 PASS。预检会核实这条专用
 路径及本地 image，缺配置/镜像/daemon 仍明确阻断，不删除普通 Docker sandbox blocker。
 
+所有验证 profile（包括无 PostgreSQL 的 targeted）都在容器内由独立 GNU timeout
+限制进程寿命，TERM 后最多 5 秒再 KILL；`--rm` 只负责退出后删除，并非寿命限制。
+Controller 被强制终止时验证仍会到期。首次 Docker 调用前写入私有、不可覆盖的
+`<operation>.container.json`，绑定 mission、准确 target、policy、profile、随机资源名
+与临时目录。恢复只对该记录列出的资源逐一核对 mission/head/scope/owner labels 后
+清理，绝不按公共前缀批量删除。容器与临时目录的清理结果追加为事件，不能把原
+RUNNING/UNKNOWN 验证改为通过，也不能自动重跑测试。退出码 137 的原因未被证明时
+仅记录失败，不能冒称一定是 timeout。
+
 ## B：专用分支、PR、必需 CI 与交付复核
 
 只有双 receipt 当前有效且无任何 findings、本地 checks/ci PASS 后，Controller
@@ -117,6 +126,20 @@ operation hashes、准确源码以及远端 PR/CI/final gate。新 HEAD、正文
 变化、过期 receipt 或失败 CI 使旧交付失效。READY 只表示合并前证据成立，
 `DONE=false / MERGE_PERFORMED=false`，最终人工授权、Merge 后 exact main Gate 和
 部署均不在本实现。status 现在可能做只读远端调用并追加观察证据。
+
+只读 reconcile/ci/verify 的已结束 UNKNOWN 可以发起新的同目标观察；每次均有
+独立 operation 和原始证据。只有新观察经现有远端检查为 PASS，且 repository、数值
+PR、base/head/tree、scope、policy、正文、观察种类及适用 receipts 的完整输入一致，
+才能追加 `remote_observation_recovered` 关联。读取时复核两个 operation、immutable
+envelope 和 raw hashes；手写 PASS 事件不能解除阻断。旧 UNKNOWN、usage、reservation
+始终不改。没有预先绑定数值 PR 的失败首次发现仍须人工确认，不能猜一个 PR 解除。
+此恢复不适用于仍 RUNNING 的观察、付费审核或发布写入；发布原有只读 reconciliation
+规则保持。历史恢复关系只证明原目标，不给新候选借用 CI 或交付结果。
+
+远端认证只沿 Controller → remote worker → gh/git 的两层路径传递，复用 adapter
+已有可信认证变量白名单；宿主其余变量、Git/loader/Python 注入被过滤。认证变量
+不进入开发或审核 agent 环境、输入包、argv 或普通证据文件，日志只保留非秘密命令
+和输出摘要，不记录认证值。
 
 ## C：收费前范围、分块与授权
 

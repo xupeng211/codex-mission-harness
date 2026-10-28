@@ -296,6 +296,8 @@ class FactoryAppServer(AppServerCodex):
             raise RuntimeError("native execution must use one fresh thread")
         self._usage_thread_id, self._usage_turn_id = thread_id, None
         self._usage_by_thread, self._usage_scope_errors = {}, []
+        self._early_activity = []
+        self._early_activity_bytes = 0
         self.usage = None
 
     def usage_telemetry(self):
@@ -305,6 +307,7 @@ class FactoryAppServer(AppServerCodex):
                 "turn_id": getattr(self, "_usage_turn_id", None),
                 "by_thread": getattr(self, "_usage_by_thread", {}),
                 "scope_errors": getattr(self, "_usage_scope_errors", []),
+                "early_activity": getattr(self, "_early_activity", []),
                 "scope": "one fresh thread and one authorized turn",
                 "provider_total_usage": "UNKNOWN", "cross_thread_aggregation": "NOT_PERFORMED"}
 
@@ -331,6 +334,11 @@ class FactoryAppServer(AppServerCodex):
         self._usage_turn_id = turn_id
         if isinstance(self.runtime_identity, dict):
             self.runtime_identity.update(thread_id=self._usage_thread_id, turn_id=turn_id)
+        for event in self._early_activity:
+            params = event["params"]
+            observed = params.get("turn", {}).get("id") if isinstance(params.get("turn"), dict) else params.get("turnId")
+            if params.get("threadId") != self._usage_thread_id or observed != turn_id:
+                self._usage_failure("early activity belongs to an unauthorized native thread/turn", event)
         # Notifications can precede the turn/start response. Attribute them
         # only after matching the returned turn, never to whichever arrived last.
         for observed_turn, record in self._usage_by_thread.get(self._usage_thread_id, {}).items():
@@ -341,19 +349,35 @@ class FactoryAppServer(AppServerCodex):
 
     def _observe_execution_event(self, message):
         method, params = message.get("method"), message.get("params", {})
+        # Native 0.164 execution notifications in these namespaces carry both
+        # identities, including deltas and errors received before acceptance.
+        activity = isinstance(method, str) and (method.startswith(("turn/", "item/", "model/")) or method == "error")
         if not isinstance(params, dict):
+            if activity:
+                self._usage_failure("native activity has malformed attribution", message)
             return
         item = params.get("item", {})
         if isinstance(item, dict) and item.get("type") in ("subAgentActivity", "collabAgentToolCall"):
             self._usage_failure("native delegation observed although disabled",
                                 {"method": method, "threadId": params.get("threadId"),
                                  "item_type": item["type"], "agentThreadId": item.get("agentThreadId")})
-        if self._usage_thread_id and method in ("turn/started", "turn/completed", "error", "item/started", "item/completed"):
+        if self._usage_thread_id and activity:
             observed_thread = params.get("threadId")
             observed_turn = params.get("turn", {}).get("id") if isinstance(params.get("turn"), dict) else params.get("turnId")
+            if ("turn" in params and (not isinstance(params["turn"], dict)
+                    or ("turnId" in params and params["turnId"] != observed_turn))):
+                self._usage_failure("native activity has conflicting turn attribution", message)
+            if self._usage_turn_id is None:
+                size = len(json.dumps(message).encode())
+                if len(self._early_activity) >= 256 or self._early_activity_bytes + size > 262144:
+                    self._usage_failure("early native activity buffer exceeded", message)
+                self._early_activity.append(message)
+                self._early_activity_bytes += size
+            if not all(isinstance(v, str) and v for v in (observed_thread, observed_turn)):
+                self._usage_failure("native activity has no thread/turn attribution", message)
             if observed_thread != self._usage_thread_id or (self._usage_turn_id and observed_turn != self._usage_turn_id):
                 self._usage_failure("activity belongs to an unauthorized native thread/turn",
-                                    {"method": method, "threadId": observed_thread, "turnId": observed_turn})
+                                    message)
             if method == "turn/started":
                 self._bind_usage_turn(observed_turn)
         if method != "thread/tokenUsage/updated":
@@ -616,6 +640,10 @@ class LocalRuntime:
         from .factory_container import run
         return run(self, policy, spec, cwd, target, command, transcript, timeout)
 
+    def recover_container(self, policy, spec, target, command, transcript):
+        from .factory_container import recover
+        return recover(policy, spec, target, command, transcript)
+
     def prepare_project_review(self, spec, cwd, target, lane, timeout):
         contract = FootballPredictionContract()
         argv, evidence = contract.review_arguments(spec, cwd, target, lane)
@@ -678,11 +706,9 @@ class LocalRuntime:
 
     def project_remote(self, action, policy, spec, cwd, target, body, transcript, timeout, *, reviews=None, previous_head=None):
         # Trusted Controller worker; development agents never receive this env.
-        env = {"PATH": SAFE_PATH, "HOME": str(Path.home()), "LANG": "C.UTF-8",
-               "PYTHONPATH": str(Path(__file__).resolve().parent.parent)}
-        for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "all_proxy", "no_proxy"):
-            if key in os.environ:
-                env[key] = os.environ[key]
+        from .adapters import FootballPredictionAdapter
+        env = FootballPredictionAdapter._trusted_subprocess_environment(env={"LANG": "C.UTF-8"})
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
         stderr = transcript.with_suffix(".stderr")
         with stderr.open("xb") as errors:
             os.fchmod(errors.fileno(), 0o600)
