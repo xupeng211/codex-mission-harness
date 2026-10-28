@@ -97,6 +97,19 @@ Controller 被强制终止时验证仍会到期。首次 Docker 调用前写入�
 RUNNING/UNKNOWN 验证改为通过，也不能自动重跑测试。退出码 137 的原因未被证明时
 仅记录失败，不能冒称一定是 timeout。
 
+验证 stdout/stderr 经 Controller pipe 在写入持久日志之前遮蔽本任务已知的随机测试
+密码；跨读取块保留最多密码长度减一的可能前缀，结束时保守遮蔽未完成前缀。
+验证容器禁用 Docker 日志驱动，避免原始输出在另一处落盘；服务就绪/清理诊断仍保留。
+这不识别任意未知秘密。Controller 被杀时可能丢失尚未写出的短尾部，但不依赖 finally
+重写原日志来保护密码。任务凭据临时文件仍受私有目录/0600 和精确恢复清理保护。
+
+取消后 resume 只允许在既有 RUNNING/UNKNOWN 的非付费 checks/ci 记录上执行精确
+ownership 核验与清理，不准备候选、不重新验证、不查询发布状态或调用模型。
+清理失败明确记为未确认；原 operation、UNKNOWN、usage 和 reservation 保持原样。
+每次 Factory 执行有独立取消事件和不复用的身份；watcher 必须携带该身份，迟到的旧
+取消或结束回调不能影响新任务。相同 LocalRuntime 的重叠执行被拒绝，直接 Controller
+容器调用也建立任务身份；取消直接调用时须传入该次 `container_cancel` 事件。
+
 ## B：专用分支、PR、必需 CI 与交付复核
 
 只有双 receipt 当前有效且无任何 findings、本地 checks/ci PASS 后，Controller

@@ -1097,10 +1097,14 @@ class Factory:
                 return {**self.report(mission), "DELIVERY_STATUS": "RUNNING", "BLOCKERS_REMAINING": ["another controller owns this mission"]}
             import threading
             stopped = threading.Event()
+            execution = self.runtime.begin_execution(mission) if hasattr(self.runtime, "begin_execution") else None
             def watch_cancel():
                 while not stopped.wait(0.2):
                     if self.cancel_requested(mission) and hasattr(self.runtime, "cancel"):
-                        self.runtime.cancel()
+                        if execution is not None:
+                            self.runtime.cancel(execution)
+                        else:
+                            self.runtime.cancel()
             if hasattr(self.runtime, "resource_policy"):
                 self.runtime.resource_policy = self.config["budget"]
             watcher = threading.Thread(target=watch_cancel, daemon=True)
@@ -1110,11 +1114,37 @@ class Factory:
             finally:
                 stopped.set()
                 watcher.join(timeout=1)
+                if execution is not None:
+                    self.runtime.end_execution(execution)
+
+    def recover_interrupted_containers(self, mission):
+        """Cleanup only: no candidate preparation, dispatch replay or settlement."""
+        cleanups = []
+        if not self.project or self.config["simulation"]:
+            return cleanups
+        spec = json.loads(self.row(mission)["spec"])
+        for pending in self.db.execute("SELECT * FROM operations WHERE mission=? AND paid=0 "
+                                       "AND stage IN ('checks','ci') AND status IN ('RUNNING','UNKNOWN')",
+                                       (mission,)).fetchall():
+            try:
+                payload = json.loads(pending["input"])
+                transcript = self.root / "evidence" / mission / (pending["id"] + ".raw")
+                cleanup = self.runtime.recover_container(self.config["project_container"], spec, payload["target"],
+                                                         payload["command"], transcript)
+            except Exception as error:
+                cleanup = {"cleanup_confirmed": False, "operation_replayed": False, "error_type": type(error).__name__}
+            cleanups.append(cleanup)
+            self.event(mission, "container_cleanup_recovered", {"operation_id": pending["id"], "cleanup": cleanup})
+            self.db.commit()  # Append evidence only; the operation/UNKNOWN is immutable.
+        return cleanups
 
     def _run(self, mission):
         try:
+            cleanups = self.recover_interrupted_containers(mission)
             if self.cancel_requested(mission):
-                raise FactoryBlocked("CANCELLED", "user cancelled; no dispatch or resume is authorized")
+                note = ("; cleanup confirmed" if all(c.get("cleanup_confirmed") for c in cleanups)
+                        else "; cleanup not confirmed; see exact operation evidence") if cleanups else ""
+                raise FactoryBlocked("CANCELLED", "user cancelled; no dispatch or validation replay authorized" + note)
             spec, cwd = self.prepare(mission)
             row = self.row(mission)
             for pending in self.uncertain_operations(mission):
@@ -1128,11 +1158,6 @@ class Factory:
                 if pending["id"] not in {p["id"] for p in self.uncertain_operations(mission)}:
                     continue
                 payload = json.loads(pending["input"])
-                if self.project and not self.config["simulation"] and not pending["paid"] and pending["stage"] in {"checks", "ci"}:
-                    transcript = self.root / "evidence" / mission / (pending["id"] + ".raw")
-                    cleanup = self.runtime.recover_container(self.config["project_container"], spec, payload["target"], payload["command"], transcript)
-                    self.event(mission, "container_cleanup_recovered", {"operation_id": pending["id"], "cleanup": cleanup})
-                    self.db.commit()  # Cleanup does not authorize replay or change the original row.
                 if (self.project and pending["status"] == "UNKNOWN" and not pending["paid"]
                         and pending["stage"] in {"project_reconcile", "project_ci", "project_verify"}
                         and payload.get("expected_pr") and payload.get("action")

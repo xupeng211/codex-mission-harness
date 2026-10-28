@@ -147,6 +147,9 @@ class ControllerGatesTests(unittest.TestCase):
             if mode == "cancel": runtime.container_cancel.set()
             process = Process()
             process.name = name
+            read, write = os.pipe()
+            os.close(write)
+            process.stdout = os.fdopen(read, "rb")
             return process
         def output(argv, *args, **kwargs):
             if argv[0] == "/usr/bin/docker":

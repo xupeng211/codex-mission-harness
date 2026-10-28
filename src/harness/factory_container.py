@@ -5,6 +5,7 @@ import os
 import json
 import math
 import re
+import select
 import shutil
 import signal
 import stat
@@ -22,6 +23,57 @@ PROFILES = {("make", "verify-" + p): p for p in ("targeted", "pr", "strict")}
 ENV = {"PATH": SAFE_PATH, "HOME": "/nonexistent", "LANG": "C.UTF-8",
        "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
        "GIT_NO_REPLACE_OBJECTS": "1", "GIT_TERMINAL_PROMPT": "0"}
+
+
+class RedactedOutput:
+    """Persist only sanitized bytes; retain a bounded possible password prefix.
+
+    This handles only the Controller's known ephemeral test password, not
+    arbitrary secrets. SIGKILL can lose a short pending suffix, never persist it.
+    """
+    def __init__(self, stream, password=None):
+        self.stream, self.password, self.pending = stream, password, b""
+
+    def write(self, data):
+        data = self.pending + data
+        self.pending = b""
+        if self.password:
+            while (index := data.find(self.password)) >= 0:
+                self.stream.write(data[:index] + b"[TEST_PASSWORD_REDACTED]")
+                data = data[index + len(self.password):]
+            for size in range(min(len(data), len(self.password) - 1), 0, -1):
+                if data.endswith(self.password[:size]):
+                    self.pending, data = data[-size:], data[:-size]
+                    break
+        self.stream.write(data)
+        self.stream.flush()
+
+    def finish(self):
+        # A truncated final password prefix is not useful diagnostic content.
+        if self.pending:
+            self.stream.write(b"[TEST_PASSWORD_REDACTED]")
+            self.pending = b""
+        self.stream.flush()
+
+
+def consume_output(proc, output, cancel, deadline):
+    """One bounded Controller pipe; the child never receives a log file fd."""
+    eof = False
+    while True:
+        if not eof and select.select([proc.stdout], [], [], 0.05)[0]:
+            data = os.read(proc.stdout.fileno(), 65536)
+            if data:
+                output.write(data)
+            else:
+                eof = True
+        elif eof:
+            cancel.wait(0.05)
+        if cancel.is_set():
+            raise ExecutionStopped("CANCELLED")
+        if time.monotonic() >= deadline:
+            raise ExecutionStopped("TIMEOUT")
+        if eof and proc.poll() is not None:
+            return
 
 
 def validate_policy(policy):
@@ -66,6 +118,7 @@ def argv_for(policy, workspace, name, profile, lifetime=900):
     if profile not in policy["profiles"] or type(lifetime) is not int or not 1 <= lifetime <= 86400:
         raise ValueError("canonical validation profile is not authorized")
     return ["/usr/bin/docker", "run", "--pull=never", "--rm", "--name", name,
+            "--log-driver=none",
             "--network=none", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
             "--user", f"{os.getuid()}:{os.getgid()}", "--pids-limit=256", "--memory=4g", "--cpus=2",
             "--tmpfs", "/tmp:rw,nosuid,nodev,size=1g,mode=1777", "--tmpfs", "/run:rw,nosuid,nodev,size=16m",
@@ -180,7 +233,7 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
         git(workspace, "remote", "remove", "origin")
         git(workspace, "checkout", "--detach", target["head"])
         git(workspace, "update-ref", "refs/remotes/origin/main", target["base"])
-        service, proc = None, None
+        service, proc, output = None, None, None
         outcome = "EXITED"
         result.update(container_name=name, source_before=before, cleanup_confirmed=False, exit_code=None)
         with transcript.open("x+b") as log:
@@ -239,15 +292,11 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                 argv[argv.index("--kill-after=5") + 1] = str(lifetime)
                 result["lifetime_limit_seconds"] = lifetime
                 result["argv"] = argv
-                proc = subprocess.Popen(argv, cwd=temporary, env=ENV, stdout=log, stderr=subprocess.STDOUT,
+                output = RedactedOutput(log, service.password.encode() if service else None)
+                proc = subprocess.Popen(argv, cwd=temporary, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                         start_new_session=True)
                 runtime.current_process = proc
-                while proc.poll() is None:
-                    if runtime.container_cancel.is_set():
-                        raise ExecutionStopped("CANCELLED")
-                    if time.monotonic() >= deadline:
-                        raise ExecutionStopped("TIMEOUT")
-                    runtime.container_cancel.wait(0.05)
+                consume_output(proc, output, runtime.container_cancel, deadline)
             except ExecutionStopped as error:
                 outcome = error.outcome
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
@@ -262,20 +311,19 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                         proc.wait(timeout=5)
                         result["exit_code"] = proc.returncode
                 finally:
-                    runtime.current_process = None
-                    cleaned, code = remove_owned(name, name, resources[0]["labels"])
-                    result.update(cleanup_confirmed=cleaned, cleanup_exit_code=code)
-                    if service is not None:
-                        service.close()
-                        result["cleanup_confirmed"] &= service.evidence["cleanup_confirmed"]
-                        log.flush()
-                        log.seek(0)
-                        contents = log.read().replace(service.password.encode(), b"[TEST_PASSWORD_REDACTED]")
-                        log.seek(0)
-                        log.truncate()
-                        log.write(contents)
-                        log.flush()
-                        result["ephemeral_password_redacted"] = True
+                    try:
+                        if proc is not None and proc.stdout is not None:
+                            proc.stdout.close()
+                        if output is not None:
+                            output.finish()
+                    finally:  # A broken log sink must not bypass resource cleanup.
+                        runtime.current_process = None
+                        cleaned, code = remove_owned(name, name, resources[0]["labels"])
+                        result.update(cleanup_confirmed=cleaned, cleanup_exit_code=code)
+                        if service is not None:
+                            service.close()
+                            result["cleanup_confirmed"] &= service.evidence["cleanup_confirmed"]
+                            result["ephemeral_password_redacted"] = True
                 if runtime.container_cancel.is_set():
                     outcome = "CANCELLED"
         try:

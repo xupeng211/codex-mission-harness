@@ -511,15 +511,42 @@ class LocalRuntime:
         self.resource_policy = {}
         self.current_process = None
         self.container_cancel = threading.Event()
+        self._execution_lock = threading.RLock()
+        self._active_execution = self._active_mission = None
+        self._execution_thread = None
 
-    def cancel(self):
-        self.container_cancel.set()
-        proc = self.current_process
-        if proc is not None and proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+    def begin_execution(self, mission):
+        import threading
+        with self._execution_lock:
+            if self._active_execution is not None or self.current_process is not None:
+                raise RuntimeError("runtime already belongs to an active execution")
+            # A new identity, not clearing an old task's cancellation latch.
+            self.container_cancel = threading.Event()
+            self._active_execution, self._active_mission = self.container_cancel, mission
+            self._execution_thread = threading.get_ident()
+            return self._active_execution
+
+    def end_execution(self, execution):
+        with self._execution_lock:
+            if execution is self._active_execution:
+                self._active_execution = self._active_mission = None
+                self._execution_thread = None
+
+    def cancel(self, execution=None):
+        with self._execution_lock:
+            if execution is None:
+                if self._active_execution is not None:
+                    return False  # Factory watchers must supply their execution identity.
+            elif execution is not self._active_execution:
+                return False  # A delayed callback cannot affect a later mission/run.
+            self.container_cancel.set()
+            proc = self.current_process
+            if proc is not None and proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            return True
 
     def profile_identity(self, profile):
         identity = {"configured": profile}
@@ -637,8 +664,21 @@ class LocalRuntime:
         return FootballPredictionContract().review_admission(spec, cwd, target, limits)
 
     def container_gate(self, policy, spec, cwd, target, command, transcript, timeout):
+        import threading
         from .factory_container import run
-        return run(self, policy, spec, cwd, target, command, transcript, timeout)
+        # Direct Controller gates also receive a new task identity. Factory.run
+        # already owns an identity for its full execution, including agents.
+        with self._execution_lock:
+            standalone = self._active_execution is None
+            if standalone:
+                execution = self.begin_execution(spec["mission_id"])
+            elif self._active_mission != spec["mission_id"] or self._execution_thread != threading.get_ident():
+                raise RuntimeError("container gate belongs to a different active execution")
+        try:
+            return run(self, policy, spec, cwd, target, command, transcript, timeout)
+        finally:
+            if standalone:
+                self.end_execution(execution)
 
     def recover_container(self, policy, spec, target, command, transcript):
         from .factory_container import recover
