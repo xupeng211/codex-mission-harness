@@ -396,10 +396,13 @@ class LocalRuntime:
     simulation = False
 
     def __init__(self):
+        import threading
         self.resource_policy = {}
         self.current_process = None
+        self.container_cancel = threading.Event()
 
     def cancel(self):
+        self.container_cancel.set()
         proc = self.current_process
         if proc is not None and proc.poll() is None:
             try:
@@ -517,6 +520,13 @@ class LocalRuntime:
     def project_policy(self, spec, cwd, paths):
         return FootballPredictionContract().policy(spec, cwd, paths)
 
+    def project_review_admission(self, spec, cwd, target, limits):
+        return FootballPredictionContract().review_admission(spec, cwd, target, limits)
+
+    def container_gate(self, policy, spec, cwd, target, command, transcript, timeout):
+        from .factory_container import run
+        return run(self, policy, spec, cwd, target, command, transcript, timeout)
+
     def prepare_project_review(self, spec, cwd, target, lane, timeout):
         contract = FootballPredictionContract()
         argv, evidence = contract.review_arguments(spec, cwd, target, lane)
@@ -529,6 +539,11 @@ class LocalRuntime:
 
     def project_review(self, spec, cwd, target, lane, transcript, timeout, *, prepared=None):
         contract = FootballPredictionContract()
+        if isinstance(prepared, dict):
+            admission = contract.review_admission(spec, cwd, target, prepared["admission"]["authorization"])
+            if admission != prepared["admission"]:
+                raise ValueError("canonical diff/chunk admission changed before dispatch")
+            prepared = prepared["runner"]
         argv, evidence, environment = prepared if prepared is not None else self.prepare_project_review(
             spec, cwd, target, lane, timeout)
         # Recheck the private directory immediately before launch as well.
@@ -563,11 +578,40 @@ class LocalRuntime:
     def project_validate_review(self, spec, cwd, target, lane, result):
         return FootballPredictionContract().validate_review(spec, cwd, target, lane, result)
 
-    def project_final_gate(self, spec, cwd, target, reviews, transcript, timeout):
+    def project_final_gate(self, spec, cwd, target, reviews, transcript, timeout, context=None):
+        if context is not None:
+            return self.project_remote("verify", context["policy"], spec, cwd, target,
+                                       context["body"], transcript, timeout, reviews=reviews)
         gate = FootballPredictionContract().final_gate()
         result = {"status": gate.status, "reason": gate.evidence, "target": target, "fixture": False}
         transcript.write_text(json.dumps(result))
         return result
+
+    def project_remote(self, action, policy, spec, cwd, target, body, transcript, timeout, *, reviews=None, previous_head=None):
+        # Trusted Controller worker; development agents never receive this env.
+        env = {"PATH": SAFE_PATH, "HOME": str(Path.home()), "LANG": "C.UTF-8",
+               "PYTHONPATH": str(Path(__file__).resolve().parent.parent)}
+        for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "all_proxy", "no_proxy"):
+            if key in os.environ:
+                env[key] = os.environ[key]
+        stderr = transcript.with_suffix(".stderr")
+        with stderr.open("xb") as errors:
+            os.fchmod(errors.fileno(), 0o600)
+            proc = subprocess.Popen([sys.executable, "-m", "harness.factory_remote"], stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=errors, text=True, cwd=transcript.parent, env=env, start_new_session=True)
+            self.current_process = proc
+            try:
+                output, _ = proc.communicate(json.dumps({"action": action, "policy": policy, "spec": spec,
+                    "cwd": str(cwd), "target": target, "body": body, "transcript": str(transcript),
+                    "timeout": timeout, "reviews": reviews, "previous_head": previous_head}), timeout=timeout)
+                if proc.returncode:
+                    raise RuntimeFailure("project PR/CI worker failed; outcome retained as UNKNOWN, no replay")
+                return json.loads(output)
+            finally:
+                if proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait()
+                self.current_process = None
 
     def hosted_ci(self, policy, cwd, target, branch, transcript, timeout):
         watchdog = AppServerCodex._trusted_executable("timeout", str(cwd))

@@ -1,145 +1,137 @@
-# Factory FootballPrediction 合同适配：阶段 1
+# Factory FootballPrediction：Controller 执行与交付桥
 
-本模块只接入项目合同，不提供 Docker executor、PR 发布或 PR CI waiter。
-Fixture 通过为 `OFFLINE_CONTRACT_PASS`，不是真实 `READY_FOR_USER_ACCEPTANCE`、
-`MERGE_READY` 或 `DONE`。真实模式在最终项目门禁返回明确的阶段 2 blocker。
+本模块复用项目 trusted-base policy、canonical profiles、双审核原 runner/validator、
+PR readiness 和 merge-ready。它不提供 Merge、部署、数据采集或业务检查器。
+实现/离线测试不等于真实远端验收。fixture 永远只有 `OFFLINE_CONTRACT_PASS`。
 
-## 显式选择与 Controller 授权
+## 启动与冻结
 
-Operator 配置增加 `"project_contract": "footballprediction"` 才选择项目模式。
-不设置时，普通 Factory 的 OpenAI App Server + direct DeepSeek 双审不变。
-项目模式仍要求 `independent_review_required=true` 和现有三个 profile；只有
-developer profile 用于 App Server，canonical reviewers 的模型、认证及执行器
-由项目受信任 base 的 policy 决定，不能由 reviewer profile 覆盖。
-现有 push-only `hosted_ci` 配置与此阶段项目模式不兼容，显式拒绝。
+真实入口仍为 `harness factory-run <mission-v2.json> --config <operator.json>
+--state-dir <repository-external-private-directory>`。该命令会启动付费任务，**只能在
+Owner 另行批准后执行**。`harness factory-doctor` 不调用模型，但不证明账户可用。
 
-Factory version 2 mission 可通过现有 mission JSON 输入接收
-`approved_mission_scope`，不需要新 CLI 或任务框架。其字段全部必需：
+mission/spec、scope 原始字节、policy、预算与 repository-external 状态存入既有
+immutable SQLite；不复用历史 mission ID、不改写历史 reservation 或 UNKNOWN。
+`approved_mission_scope` 字段仍为 `approval_id / mission_id / base / path / content /
+sha256 / expires_at`，path 必须为 `docs/agentic/missions/<mission-id>.json`。
+Controller 在隔离 clone 提交 scope，Builder 不能修改；scope 自身也须明确授权。
+base、head 均使用完整 40 字符 SHA。用户源工作区和安装入口不会自动改变。
 
-| 字段 | 合同 |
-|---|---|
-| `approval_id` | Controller 提供的非空审批记录引用；不是密码学授权证明 |
-| `mission_id` | 必须等于当前 mission |
-| `base` | 批准绑定的完整 base SHA，必须与实际解析的 mission base 一致 |
-| `path` | 必须是 `docs/agentic/missions/<mission-id>.json` |
-| `content` | 已批准 scope 的原始 UTF-8 文本，最多 64 KiB；不重新序列化 |
-| `sha256` | 上述精确字节的 SHA-256 |
-| `expires_at` | 带 timezone 的到期时间；提交、执行及状态读取均检查到期 |
+项目 mode 配置必须设置 `project_contract=footballprediction` 和
+`independent_review_required=true`，仍保留三个 profiles。只有 developer profile
+用于 App Server；两个 canonical reviewer 的模型、认证、重试和语义由 trusted base
+决定，reviewer profiles 不能覆盖它们。push-only `hosted_ci` 与项目模式互斥。
 
-Scope schema、类别、路径授权/exclude 和 required backend 由项目当前的
-`MissionScope.from_mapping`、`validate_mission_scope`、`required_backends` 与
-active registry 决定。Controller 输入必须也授权 scope 文件自身；缺失并不
-隐式增加授权。审批 envelope 冻结在现有 immutable mission SQLite 记录中。
-输入信任边界仍是 Controller/Owner，Builder 无权提交或改变审批输入。
+新增的 Controller 配置片段（示意值不是执行或费用授权）：
 
-Controller 在隔离 clone 中先加入 scope commit。Builder 获得 scope 的只读
-filesystem permission；checkpoint 在任何 commit 前比较实际字节，target
-再比较 HEAD regular blob。冒用 mission/base、重复 JSON key、冲突 reference、
-过期、缺失、修改或 symlink 均阻断。不会修改原项目仓库或为旧 mission 补授权。
-只有 Controller scope commit、没有业务实现的候选也不能交付。
+```json
+{
+  "project_container": {
+    "image_id": "sha256:<64 lowercase hex of an already-installed trusted dev image>",
+    "profiles": ["targeted", "pr", "strict"]
+  },
+  "checks": [["make", "verify-targeted"]],
+  "ci": [["make", "verify-pr"]],
+  "project_delivery": {"repository": "xupeng211/FootballPrediction", "base_branch": "main"},
+  "project_review_limits": {
+    "approval_id": "<explicit bounded review authorization reference>",
+    "max_deepseek_chunks": 2,
+    "max_canonical_diff_bytes": 64000,
+    "allow_unknown_provider_usage": true
+  }
+}
+```
 
-## 审核、证据与最终门禁
+mission v2 另需 `pr_body_template`：Controller 审定的项目现有 PR 模板正文，包含
+Summary、Scope、Documentation Impact、Tests、Risk、Rollback 和适用的 Strict
+Review Evidence。只支持 `{{candidate_head}}`、`{{review_timestamp}}` 两个占位符，
+后者来自已验证 Codex receipt 的 `review_completed_at`。CRITICAL 的 Provider
+字段按项目规则用逗号列出 `codex-cli, claude-code-deepseek`。正文仍须通过原项目
+trusted-base preflight，不能凭模板或 Factory 自填 PASS 跳过审核。
 
-复用 `FootballPredictionAdapter` 的受信任 base checkout、canonical runner
-argv/environment、Codex classifier 和 DeepSeek 原 receipt consumer。
-新增桥不制造 receipt、不把 App Server/direct HTTP evidence 改写成 CLI evidence。
-受信任代码按 base 验证；候选不能修改 canonical authority 路径，修改它们需要
-另一个显式 policy mission。每个 Factory clone 有独立的相邻受信任 worktree 根。
+## A：受控容器验证
 
-| Workflow class | 项目必需 backend | 此阶段 Factory 额外要求 |
-|---|---|---|
-| NORMAL | 默认 Claude/DeepSeek | 同时收集 Codex receipt |
-| STRICT | Codex | 同时收集 advisory Claude/DeepSeek receipt |
-| CRITICAL | Codex + Claude/DeepSeek | 两份均有效 |
+`factory_container.py` 只由 Controller 调用；只接受上述 canonical make profile，
+实际在容器执行 `python3 scripts/devops/validation_profiles.py <profile>`。候选不能
+修改 Makefile、scripts/devops、scripts/ops/helpers、workflow、schemas/agentic 或
+原 review authority；package/lockfile、QA 配置、config、测试调度器和容器定义也须保持 base
+规则不变，涉及它们须另行明确授权任务。验证前重建准确 base/head/tree、完整 diff、文件集合、scope
+和 policy；还直接校验实际 tracked 源码字节/mode，不能仅依赖 Git stat cache。
 
-**保守策略没有放宽：**任一 finding（包括 P3）仍进入 Factory 返工；基础设施失败
-或缺少有效 receipt 阻断，没有 silent fallback。减少 NORMAL/STRICT 审核数量、
-采用项目的 P3 非阻断策略，均是未批准的 Owner 决策项，本阶段不提供开关。
-最终适配器使用项目默认 policy，不传 CRITICAL 禁止的 backend override。
+固定本地 image ID，`--pull=never`，不 build、不下载、不访问现有业务容器。
+Controller 克隆一次性验证副本并设置批准 base 的 origin/main ref；只把副本挂入
+容器，`.git` 只读。既有镜像 node_modules 经 Docker copy-out 进入临时副本，避免
+root-owned anonymous volume 导致非 root 验证无法写缓存。不执行镜像 entrypoint。
+容器使用当前 uid/gid、空白 env、network=none、read-only root、cap-drop=ALL、
+no-new-privileges 和 CPU/memory/pids/tmpfs 限额；不挂 Docker socket、HOME、凭据、
+数据库或外部 evidence。npm offline、pip no-index；依赖不足必须报告，不能联网补装。
 
-完整 base/head/tree、全部 changed files、每个 hunk 的位置和哈希、base/head
-blob/mode/内容哈希、完整 diff 与 scope 哈希随 target 和 reviewer operation
-保存。完整 diff 超过授权容量直接阻断；binary、非 UTF-8、symlink/gitlink 不
-进入这条文本审核路径。rename 按 delete/add 枚举，mode-only/空文件保留 file
-记录，即使没有 textual hunk。记录真实提交的范围为 exact refs 和可读 detached
-worktree，`semantic_coverage=NOT_MACHINE_PROVEN`，不把范围清单当成模型理解证明。
-Factory diff hash 与项目自身 diff policy/hash 保留各自含义。
+前后记录 candidate 与临时副本 tracked 源码摘要，意外变化不能 PASS；临时 cache
+和测试产物随副本销毁。保留准确版本、scope、镜像、argv、exit code、原日志、时长、
+超时/取消及清理证据。取消/超时会停止 Docker client 并强制移除对应命名容器，
+成功 daemon 查询必须证明它已不存在；清理不确定不能 PASS。预检会核实这条专用
+路径及本地 image，缺配置/镜像/daemon 仍明确阻断，不删除普通 Docker sandbox blocker。
 
-真实 runner argv、原 receipt 与其 provenance 原样引用；原 validator 每次消费
-和 delivery status 读取均重新运行。Factory operation/raw artifact 哈希也必须
-通过。UNKNOWN 不重发，预算、scope 和审批不重置。canonical runner 尚无统一
-可证明完整的 token usage 接口，因此其 usage 为 UNKNOWN，保留原 per-run
-reservation，不宣称免费或退还额度。现有 watchdog 限制时长，不保证物理费用帽。
+## B：专用分支、PR、必需 CI 与交付复核
 
-`final_gate` 可委托现有项目 `agent-merge-ready`，缺少 PR/CI context 时拒绝。
-Factory 主流程本阶段不产生或接受真实 PR/CI context，真实 READY 始终阻断。
-模拟 final gate PASS 只产生离线状态，merge approval 仍要求 live READY 与人工
-exact-head 授权，fixture 永不满足。阶段 2 再接入可信验证和实际远端证据；阶段 3
-才验证业务任务、实际 Provider receipt、MERGE_READY 与合并后的 main Gate。
+只有双 receipt 当前有效且无任何 findings、本地 checks/ci PASS 后，Controller
+才发布。`factory_remote.py` 固定可信 repository/main，以 mission+base 推导专用
+`factory/<mission>-<base12>` 分支，以 scope/repo/base 的 marker 识别所有权。
+它先核实远端 main 等于批准 base；从新建 Controller Git 元数据取准确提交，禁用
+候选 hooks/config，不 force push。只有已证明的上一候选 publication 可更新同一
+PR，其他 HEAD、closed PR、fork、不同 base 或模糊发现均拒绝。正文由 immutable
+Controller template 与已验证 receipt 渲染，准确 HEAD/body/scope 均需绑定。
 
-## 离线验收边界
+发布使用既有非付费 operation/evidence。创建/更新只尝试一次；响应丢失或崩溃后，
+恢复只查询 branch 和 PR。仅当 repo/base/head/body/marker 全匹配时，追加只读
+reconciliation operation 和 event，原 RUNNING/UNKNOWN 行保持不变。无法确认时
+停在 UNKNOWN，不再次 push/create/update。观察到 push、未观察到 PR 也不会自动
+补发；须人工判断外部状态。这是防重复优先的有限恢复，不承诺 exactly-once 网络写。
 
-`tests/test_factory_project.py` 使用独立临时 Git 仓库、标明 fixture 的 runner、
-receipt validator 与项目 API doubles。它验证 Harness 的委托、绑定、阻断和
-状态投影，不证明真实 FootballPrediction runner、账户或 CI 可用。
-已有普通 Factory、adapter 与预算/UNKNOWN 测试继续验证原路径。
-没有新增 reviewer 分块、综合、调度、Provider qualification 或历史任务恢复。
+CI 复用 `adapter.ci` 和 trusted-base `pr_ready_check`，查询 active ruleset 对该
+真实 PR 的 required checks，严格比较准确 base/head。missing/queued/in_progress
+等待到既有 timeout；失败或 skipped 不能 PASS。push workflow 不能替代 PR checks。
+失败 CI 进入既有 rework → 新 checkpoint → 新 tests/reviews → PR update → 新 CI。
 
-另在临时目录读取 FootballPrediction 基线
-`05dc75eb9c2e9e5ec042840d91fee4a3d480ce60` 的 policy 源码进行了离线委托检查：
-三种 workflow class 的 required backends 与当前 `gpt-5.6-terra / medium`
-pin 均正确返回，未授权路径被项目原函数拒绝。此检查没有运行 reviewer，
-没有读取认证内容，也不证明真实 receipt、Provider 或最终 PR gate 可用。
-项目 receipt 的时效/工具漂移判定仍由原 validator 负责；不新增猜测的 TTL。
+最终 `verify` 把实际 PR number/repo/base、两份 codex/deepseek receipt 与当前
+CI status 传给 `adapter.merge_ready(use_project_policy=True)`；不 override backend。
+原 canonical final gate 执行后再次核对 PR/CI。只有真实 mode 可达
+`READY_FOR_USER_ACCEPTANCE`；delivery/status/approve 读取时会重新验证 receipt、
+operation hashes、准确源码以及远端 PR/CI/final gate。新 HEAD、正文编辑、main
+变化、过期 receipt 或失败 CI 使旧交付失效。READY 只表示合并前证据成立，
+`DONE=false / MERGE_PERFORMED=false`，最终人工授权、Merge 后 exact main Gate 和
+部署均不在本实现。status 现在可能做只读远端调用并追加观察证据。
 
-## 目录初始化与真实接口离线集成
+## C：收费前范围、分块与授权
 
-canonical operation 在现有缓存、取消和 RUNNING/UNKNOWN 防重发检查之后，
-付费 reservation 之前执行可信本地准备。Controller 只接受账本中的候选路径，
-收紧自有 candidate/mission 目录权限；Runtime 经 `review_arguments` 从
-mission/reviewer/exact HEAD 推导 `.cmh-review-evidence` 路径，复用已有
-`_private_dir` 检查和创建 owner-only 目录。拒绝路径穿越、symlink、非目录
-冲突和不可信祖先，不接受 Builder 指定的 evidence 路径。argv、environment
-及 watchdog 准备失败不会产生 paid operation；失败后不需要退款或改写 UNKNOWN。
-已 dispatch 的失败仍按原 UNKNOWN 规则保留 reservation，历史任务不补派。
-外层 stdout/stderr 在启动 runner 前设置为 0600。
+每次新的 canonical review 在 reservation 之前重新核对实际 target/scope，并从
+trusted base 调用纯 canonical chunk planner，覆盖完整 canonical diff、每块与
+完整 prompt byte limits。Factory diff policy/hash 和项目 canonical diff policy/hash
+分别保留；不截断或沿用旧候选的 plan。实际 chunk 数或 diff bytes 超过明确授权即
+零派发阻断，两个 lane 都在首个收费审核前检查完整 DeepSeek plan。准备完成到实际
+runner 启动之间再次重算并比较 admission，变化则不启动 provider。
 
-DeepSeek receipt 消费者绑定 scope 时从 Git 读取原始 bytes。CRLF 与 LF 各自
-保留精确 hash，不做换行归一化。Controller 的 Git 字节解码路径同样不做
-universal-newline 转换；修改任何 scope 字节都不能借用原 scope 审批。
+可限制的是每个 DeepSeek outer review 的 backend/chunk 数、canonical diff bytes、
+既有 outer agent-run 数、逻辑 token reservations、每次 timeout、mission wall clock
+与返工轮数。`allow_unknown_provider_usage=true` 必须是 Owner 明确接受剩余未知的
+授权输入，不是默认同意。每个 chunk 创建一个 CLI backend execution，**不等于
+一次 HTTP 请求**。Codex/Claude CLI 内部请求、重试、完整 usage、输出 token 与
+人民币物理硬上限仍 UNKNOWN。`project_review_limits` 拒绝 max_cost_cny、
+max_http_requests、max_output_tokens 等无法执行的限制；不得把它们写成已生效。
+既有 budget token 字段是 admission/reservation，canonical usage UNKNOWN 继续保留。
 
-`tests/test_factory_project_integration.py` 从只读项目仓库的上述固定 SHA
-提取正式源码，使用临时 synthetic base/candidate，执行真实 Controller →
-LocalRuntime → review_arguments → adapter → canonical runner/validator。
-只替换 trusted checkout 的 fixture 定位、认证/环境探测和 Provider backend；
-原项目 CLI 参数、receipt writer、classifier/consumer 仍运行。fake backend
-位于 `tests/fixtures/footballprediction_fake_backend.py`，其回执和模拟身份仅
-用于临时测试，绝非正式执行证据。未找到只读源码会明确 SKIP，不能报告真实
-接口验收 PASS；可用 `FOOTBALLPREDICTION_CONTRACT_REPO` 指定源码位置。
-测试不读取认证内容、不运行真实模型、Docker、CI 或业务 E2E。
+历史 ledger、UNKNOWN、reservation、canonical 模型/认证/重试不变；双审和
+Factory all-findings（包括 P3）返工 barrier 不变。没有新增计费或审核框架。
 
-本次真实接口集成发现额外 P1：当前项目 `classify --json` 返回
-`review_receipt` 路径与 `classification`，没有 adapter 所要求的内嵌 `receipt`。
-Owner 已单独授权最小接口兼容修复。adapter 现在要求原 classifier 返回
-VALID_CURRENT、current_approval_eligible=true 并指向当前原始 receipt；比较
-分类前后的完整字节/hash，再消费原文件。缺失引用、分类拒绝、非私有文件、
-无 verdict 或分类过程中发生变化均阻断。不采用模拟内嵌 receipt 作为替代，
-不修改 canonical argv、模型 pin、双审数量或 P3 策略。
+## 验证证据边界
 
-## 首次付费审核之前的费用条件（仅调查，未实现新计费能力）
+`test_factory_controller_gates.py` 的 Docker/GitHub API 与写入使用明确命名的 doubles，
+即使测试 live 状态转换也不构成真实 PR 或 CI 证据。fixture/live marker 交叉被拒绝。
+`test_factory_project_integration.py` 从准确项目 main
+`a65464d1e5de498a072ed9a8fdf69ce46bcc04c5` 提取原 policy/planner/runner/validator，
+仅替换 Provider 和认证环境探测，验证原接口；所有 fake identity 都只是离线材料。
+设置 `FOOTBALLPREDICTION_CONTRACT_REPO` 指向拥有该 Git object 的只读仓库后运行
+`make verify`。缺失来源是 UNVERIFIED/SKIP，不能冒称真实审核。
 
-在上述项目 SHA，`deepseek_review_chunks.py` 的 diff/prompt 分块上限分别是
-32,000/40,000 bytes，最多 64 chunks。`_run_chunked_review` 对每个 chunk
-执行一次 `backend.run`；小 diff 执行一次。每次 backend 创建一个 Claude CLI
-进程，默认/最大 backend timeout 为 900 秒。Factory 的一个 outer operation
-因此不是一个 Provider HTTP 请求：它可能包含 1～64 次 backend 执行；CLI
-内部请求、重试、输出 token 和物理费用上限尚未证明。两个 reviewer 的 outer
-reservation 也不能当作“两次 HTTP 请求”的证据。Codex CLI 内部请求数同样
-未证明。Factory watchdog 和逻辑 token reservation 都不是物理费用硬上界。
-
-首次真实付费审核必须先明确并批准 exact diff/scope 对应的 chunk 数、两条
-canonical lane 的费用暴露及可接受上限；证明或取得明确有限的请求、输出和
-重试授权，并验证 usage/费用观测及 timeout/cancellation 的实际行为。两个
-必需 backend 的认证、模型 pin、正式 validator 和本地准备需在付费前确认
-可用。计费或结果不确定时继续保留 UNKNOWN，不自动重试、补发或返还预算。
-在这些条件未满足前，本轮离线 PASS 不能支持首次真实付费审核的成本安全结论。
+真实容器检查、离线代码检查、真实远端、正式审核与业务验收必须分别报告。
+本轮真实 PR writes/paid reviews/business mission 为 NOT_RUN，未改变安装入口。

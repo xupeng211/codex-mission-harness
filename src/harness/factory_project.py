@@ -6,7 +6,9 @@ fixtures never acquire live delivery or merge authority.
 from __future__ import annotations
 
 import hashlib
+import fnmatch
 import json
+import os
 import re
 import subprocess
 import uuid
@@ -20,10 +22,27 @@ PROJECT = "footballprediction"
 OFFLINE_PASS = "OFFLINE_CONTRACT_PASS"
 LANES = {"reviewer": "codex", "second_reviewer": "deepseek"}
 BACKENDS = {"codex": "codex-cli", "deepseek": "claude-code-deepseek"}
+VALIDATION_AUTHORITY_PATHS = frozenset({
+    "package.json", "package-lock.json", "pyproject.toml", "pytest.ini", "ruff.toml", ".ruff.toml",
+    "mypy.ini", ".mypy.ini", ".eslintrc.json", ".eslintrc", ".eslintrc.js", ".eslintrc.cjs",
+    "eslint.config.js", "eslint.config.mjs", ".coveragerc", "setup.cfg", "tox.ini",
+})
 
 
 def sha256(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def validate_review_limits(value):
+    keys = {"approval_id", "max_deepseek_chunks", "max_canonical_diff_bytes", "allow_unknown_provider_usage"}
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ValueError("explicit bounded canonical review authorization required; unsupported physical limits cannot be enforced")
+    if (not isinstance(value["approval_id"], str) or not value["approval_id"].strip()
+            or type(value["max_deepseek_chunks"]) is not int or not 1 <= value["max_deepseek_chunks"] <= 64
+            or type(value["max_canonical_diff_bytes"]) is not int or not 1 <= value["max_canonical_diff_bytes"] <= 8 * 1024 * 1024
+            or value["allow_unknown_provider_usage"] is not True):
+        raise ValueError("canonical authorization must bound diff/chunks and explicitly accept UNKNOWN internal requests/usage/cost")
+    return value
 
 
 def approved_scope(spec):
@@ -141,6 +160,45 @@ def review_manifest(cwd, target, git):
             "semantic_coverage": "NOT_MACHINE_PROVEN"}
 
 
+def verify_target(spec, cwd, target):
+    """Reconstruct Controller identity immediately before an external action."""
+    from .factory import git
+    cwd = Path(cwd)
+    if (spec["base"] != target["base"] or git(cwd, "rev-parse", "HEAD") != target["head"]
+            or git(cwd, "rev-parse", "HEAD^{tree}") != target["tree"]
+            or git(cwd, "status", "--porcelain", "--untracked-files=all")):
+        raise ValueError("candidate base/HEAD/tree/cleanliness mismatch")
+    git(cwd, "merge-base", "--is-ancestor", target["base"], target["head"])
+    files = list(filter(None, git(cwd, "diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z",
+                                   "--no-renames", target["base"], target["head"], "--").split("\0")))
+    if files != target["files"] or any(not any(fnmatch.fnmatchcase(p, pattern) for pattern in spec["scope"]) for p in files):
+        raise ValueError("candidate full path inventory/scope mismatch")
+    scope = scope_binding(spec, cwd, target["head"], git)
+    if scope != {k: target[k] for k in scope}:
+        raise ValueError("candidate mission/scope mismatch")
+    review_manifest(cwd, target, git)
+    tracked_source_digest(cwd, target["head"], require_committed=True)
+    return FootballPredictionContract().policy(spec, cwd, files)
+
+
+def tracked_source_digest(cwd, head, *, require_committed=False):
+    from .factory import git
+    result = hashlib.sha256()
+    for entry in filter(None, git(cwd, "ls-tree", "-r", "-z", head).split("\0")):
+        metadata, path = entry.split("\t", 1)
+        mode, kind, blob = metadata.split()
+        if kind != "blob" or mode not in {"100644", "100755", "120000"}:
+            raise ValueError("unsupported source entry in candidate")
+        local = cwd / path
+        value = os.readlink(local).encode() if local.is_symlink() else local.read_bytes()
+        actual_blob = hashlib.sha1(b"blob " + str(len(value)).encode() + b"\0" + value).hexdigest()
+        actual_mode = "120000" if local.is_symlink() else "100755" if local.stat().st_mode & 0o111 else "100644"
+        if require_committed and (actual_blob != blob or mode != actual_mode):
+            raise ValueError("actual candidate source differs from committed HEAD bytes/mode")
+        result.update(json.dumps([path, actual_mode, sha256(value)]).encode())
+    return result.hexdigest()
+
+
 class FootballPredictionContract:
     """Reuse trusted-base execution and original project receipt validators."""
 
@@ -150,7 +208,10 @@ class FootballPredictionContract:
     def policy(self, spec, cwd, paths):
         for path in paths:
             if (path in self.adapter.REVIEW_CONTRACT_PATHS
-                    or path.startswith(("scripts/devops/", "scripts/ops/helpers/", "schemas/agentic/", ".github/workflows/"))):
+                    or path in VALIDATION_AUTHORITY_PATHS
+                    or Path(path).name == "conftest.py" or path.startswith(("requirements", "docker-compose"))
+                    or path.startswith(("scripts/devops/", "scripts/ops/helpers/", "schemas/agentic/", ".github/",
+                                        "scripts/test/", ".githooks/", ".devcontainer/", "config/"))):
                 raise ValueError("candidate changed protected canonical authority; separate policy mission required")
         trusted = self.adapter._trusted_base_checkout(str(cwd), spec["base"])
         # These modules are byte-verified base policy, never candidate code.
@@ -200,6 +261,79 @@ print(json.dumps({'workflow_class': scope.workflow_class, 'required_backends': l
             mission_id=spec["mission_id"], scope_file=str(cwd / target["mission_scope_file"]),
             evidence_dir=str(evidence), attempt_id=uuid.uuid4().hex)
         return argv, evidence
+
+    def review_admission(self, spec, cwd, target, limits):
+        """Run only the base's pure planner, never a provider or candidate module."""
+        validate_review_limits(limits)
+        verify_target(spec, cwd, target)
+        trusted = self.adapter._trusted_base_checkout(str(cwd), target["base"])
+        query = """
+import hashlib, json, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd()))
+from scripts.devops import deepseek_review_chunks as chunks
+v=json.loads(sys.stdin.read()); t=v['target']; root=Path(v['cwd'])
+def git(*args):
+    return subprocess.check_output(['git', '--no-replace-objects', '-c', 'core.hooksPath=/dev/null',
+       '-c', 'core.fsmonitor=false', '-C', str(root), *args], stderr=subprocess.PIPE)
+if git('rev-parse','HEAD').decode().strip()!=t['head'] or git('status','--porcelain','--untracked-files=all'):
+    raise ValueError('admission candidate changed')
+diff=git('diff','--binary','--no-ext-diff',t['base']+'...'+t['head'])
+source_mission=getattr(chunks, 'SOURCE_CONTEXT_MISSION', None)
+chunked=len(diff)>chunks.MAX_CHUNK_DIFF_BYTES or v['mission_id']==source_mission
+kwargs=dict(base_sha=t['base'], head_sha=t['head'], mission_id=v['mission_id'],
+    mission_scope_sha256=t['mission_scope_sha256'])
+if source_mission is not None:
+    kwargs.update(repo_root=root, source_context_version=chunks.SOURCE_CONTEXT_VERSION if v['mission_id']==source_mission else None)
+manifest=chunks.plan(diff, **kwargs)
+sizes=[len(chunks.build_chunk_prompt(chunk=c, source=diff[c.start:c.end], manifest=manifest,
+    scope_sha=t['mission_scope_sha256']).encode()) for c in manifest.chunks] if chunked else []
+if any(n>chunks.MAX_CHUNK_PROMPT_BYTES for n in sizes): raise ValueError('canonical prompt capacity exceeded')
+print(json.dumps({'canonical_diff_sha256':hashlib.sha256(diff).hexdigest(), 'canonical_diff_bytes':len(diff),
+ 'deepseek_backend_runs':len(manifest.chunks) if chunked else 1, 'chunked':chunked,
+ 'chunk_manifest':manifest.payload(), 'chunk_prompt_bytes':sizes}))
+"""
+        result = subprocess.run([self.adapter._trusted_python_interpreter(), "-I", "-B", "-c", query],
+            cwd=trusted, env=self.adapter._trusted_git_environment(), text=True, capture_output=True,
+            input=json.dumps({"target": target, "cwd": str(cwd), "mission_id": spec["mission_id"]}), timeout=30)
+        if result.returncode:
+            raise ValueError("trusted canonical chunk planning failed before dispatch")
+        plan = json.loads(result.stdout)
+        if (plan["deepseek_backend_runs"] > limits["max_deepseek_chunks"]
+                or plan["canonical_diff_bytes"] > limits["max_canonical_diff_bytes"]):
+            raise ValueError("actual canonical diff/chunk count exceeds review authorization; zero dispatch")
+        return {**plan, "target": target, "authorization": limits,
+                "scope_approval_id": target["scope_approval_id"], "codex_outer_operations": 1,
+                "provider_internal_requests": "UNKNOWN", "physical_cost_cap": "UNKNOWN"}
+
+    def validate_pr_body(self, spec, cwd, target, body):
+        trusted = self.adapter._trusted_base_checkout(str(cwd), target["base"])
+        # Same canonical preflight as merge_ready, before any remote mutation.
+        evidence = cwd.parent / ".cmh-publication"
+        self.adapter._private_dir(evidence, private_root=evidence)
+        path = evidence / (sha256(body.encode()) + ".md")
+        if path.exists():
+            if path.is_symlink() or path.read_text() != body:
+                raise ValueError("publication body evidence changed")
+        else:
+            self.adapter._write_private_file(path, body)
+        code = ("import sys; from pathlib import Path; sys.path.insert(0,sys.argv[1]); "
+                "from scripts.devops import agent_workflow_preflight as p; "
+                "from scripts.ops import ai_workflow_gate as g; "
+                "from scripts.ops.helpers import git_change_helpers as h; "
+                "p.ROOT=g.ROOT=h.ROOT_HELPER=Path(sys.argv[2]); "
+                "sys.argv=['agent-preflight','--pr-body-file',sys.argv[3],'--mission-scope-file',sys.argv[4],"
+                "'--base-ref',sys.argv[5],'--head-ref',sys.argv[6],'--require-review','--json']; raise SystemExit(p.main())")
+        checked = self.adapter._call([self.adapter._trusted_python_interpreter(), "-I", "-B", "-c", code,
+            str(trusted), str(cwd), str(path), str(cwd / target["mission_scope_file"]), target["base"], target["head"]],
+            cwd=str(trusted), env={"HOME": "/nonexistent", "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+            inherit_environment=False)
+        document = self.adapter._json_document_prefix(checked.stdout)
+        if checked.returncode or document.get("verdict") != "PASS":
+            failures = [f.get("check", "UNKNOWN") + ": " + str(f.get("message", ""))[:300]
+                        for f in document.get("findings", []) if f.get("status") != "PASS"]
+            raise ValueError("canonical PR body/scope preflight rejected publication: " + "; ".join(failures)[:1600])
+        return path
 
     def validate_review(self, spec, cwd, target, lane, result):
         """Always re-run the original validator, including on cached operations."""

@@ -26,7 +26,7 @@ from harness.factory_project import BACKENDS, LANES, FootballPredictionContract,
 from harness.factory_runtime import LocalRuntime
 
 
-PROJECT_BASE = "05dc75eb9c2e9e5ec042840d91fee4a3d480ce60"
+PROJECT_BASE = "a65464d1e5de498a072ed9a8fdf69ce46bcc04c5"
 DRIVER = Path(__file__).parent / "fixtures/footballprediction_fake_backend.py"
 
 
@@ -66,6 +66,9 @@ class CanonicalRuntimeIntegrationTests(unittest.TestCase):
             "forbidden_side_effects": ["No live providers"]}
         self.runtime = LocalRuntime()
         self.config = {**fixture_config(), "simulation": False, "project_contract": "footballprediction"}
+        self.config["project_review_limits"] = {"approval_id": "offline-fake-provider-test-only",
+            "max_deepseek_chunks": 4, "max_canonical_diff_bytes": 100000,
+            "allow_unknown_provider_usage": True}
         # No developer lane is invoked. Avoid unrelated authenticated profile probes.
         with patch.object(self.runtime, "profile_identity", return_value={"offline_test": True}):
             self.f = Factory(self.root / "state", self.config, self.runtime)
@@ -160,6 +163,73 @@ class CanonicalRuntimeIntegrationTests(unittest.TestCase):
     def test_lf_scope_passes_original_deepseek_validator(self):
         spec, cwd, target = self.candidate()
         self.assertEqual(self.review(spec, cwd, target, "second_reviewer")["status"], "PASS")
+
+    def test_actual_canonical_chunks_exceed_authority_before_reservation_or_fake_backend(self):
+        spec, cwd, target = self.candidate()
+        (cwd / "score.py").write_text("\n".join(f"value_{i} = {i}" for i in range(2600)) + "\n")
+        target = self.f.checkpoint(spec, cwd)
+        limits = {**self.config["project_review_limits"], "max_deepseek_chunks": 8}
+        plan = self.runtime.project_review_admission(spec, cwd, target, limits)
+        self.assertGreater(plan["deepseek_backend_runs"], 1)
+        self.assertEqual(plan["canonical_diff_sha256"], plan["chunk_manifest"]["full_diff_sha256"])
+        with self.assertRaises(ValueError):
+            self.runtime.project_review_admission(spec, cwd, target, {**limits, "max_deepseek_chunks": 1})
+        # Enforce the same rejection through Factory's real prepare-before-reserve path.
+        with patch.object(self.runtime, "project_review_admission", side_effect=lambda s, c, t, ignored:
+                FootballPredictionContract().review_admission(s, c, t, {**limits, "max_deepseek_chunks": 1})):
+            with self.assertRaises(FactoryBlocked): self.review(spec, cwd, target, "second_reviewer")
+        self.assertEqual(self.starts, [])
+        self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM operations WHERE paid=1").fetchone()[0], 0)
+
+    def test_pr_body_uses_original_trusted_preflight(self):
+        spec, cwd, target = self.candidate()
+        body = f"""## Summary
+Offline fixture changes score.
+## Scope
+| Field | Value |
+| --- | --- |
+| Task type | source-code |
+| Workflow class | CRITICAL |
+| Mission ID | feature |
+| Mission scope contract | {self.path} |
+| Changed paths | score.py, {self.path} |
+| Authorized paths | score.py, {self.path} |
+| Excluded paths | none |
+| Runtime behavior changed | yes |
+| Business progress | Offline interface test |
+## Documentation Impact
+| Field | Value |
+| --- | --- |
+| Capability changed? | no |
+| Milestone changed? | no |
+| Canonical entrypoint changed? | no |
+| Current blocker changed? | no |
+| Data/model/authorization contract changed? | no |
+| Repository structure/authority navigation changed? | no |
+| Project vision / target-state changed? | no |
+| Source-of-truth docs updated | no |
+| Updated authoritative docs | none |
+| If not updated, explicit reason | Synthetic score fixture preserves all project contracts and lifecycle boundaries. |
+## Tests
+Offline fixture only.
+## Risk
+No network, DB, model or production operations.
+## Rollback
+Revert the isolated fixture commit.
+## Strict Review Evidence
+| Field | Value |
+| --- | --- |
+| Version | 1 |
+| Task type | CRITICAL |
+| Provider | codex-cli, claude-code-deepseek |
+| Reviewed full SHA | {target['head']} |
+| Result | PASS |
+| Timestamp | 2026-10-28T00:00:00Z |
+"""
+        path = FootballPredictionContract().validate_pr_body(spec, cwd, target, body)
+        self.assertEqual(path.read_text(), body)
+        with self.assertRaises(ValueError):
+            FootballPredictionContract().validate_pr_body(spec, cwd, target, body.replace("CRITICAL", "NORMAL"))
 
     def test_crlf_scope_passes_original_validator_and_one_byte_tamper_rejected(self):
         spec, cwd, target = self.candidate("\r\n")

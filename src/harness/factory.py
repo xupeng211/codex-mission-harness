@@ -23,7 +23,7 @@ from .factory_runtime import LocalRuntime, official_rubric, VENDOR
 from .sandbox import SAFE_PATH
 from .factory_budget import accounting, planning_limits
 from .factory_project import (PROJECT, OFFLINE_PASS, LANES, BACKENDS, approved_scope,
-                              materialize_scope, scope_binding, review_manifest)
+                              materialize_scope, scope_binding, review_manifest, validate_review_limits)
 
 
 READY = "READY_FOR_USER_ACCEPTANCE"
@@ -104,7 +104,8 @@ def bounded_int(value, name, lower, upper):
 def validate_config(raw: dict) -> dict:
     """Operator policy is separate from the customer's product requirement."""
     allowed = {"version", "simulation", "budget", "max_rounds", "timeout_seconds", "checks", "ci",
-               "profiles", "independent_review_required", "max_review_bytes", "max_context_bytes", "repository", "hosted_ci", "project_contract"}
+               "profiles", "independent_review_required", "max_review_bytes", "max_context_bytes", "repository", "hosted_ci", "project_contract",
+               "project_container", "project_delivery", "project_review_limits"}
     if not isinstance(raw, dict) or set(raw) - allowed or type(raw.get("version")) is not int or raw.get("version") != 1:
         raise ValueError("invalid factory configuration")
     config = json.loads(encoded(raw))
@@ -117,7 +118,21 @@ def validate_config(raw: dict) -> dict:
         if config["project_contract"] != PROJECT or not config["independent_review_required"]:
             raise ValueError("project mode is explicit and retains both independent reviewers")
         if "hosted_ci" in config:
-            raise ValueError("project PR/CI integration is deferred to phase 2; push CI is incompatible")
+            raise ValueError("push CI is incompatible with canonical project PR checks")
+    for key in ("project_container", "project_delivery", "project_review_limits"):
+        if key in config and config.get("project_contract") != PROJECT:
+            raise ValueError("project execution policies require explicit FootballPrediction contract")
+    if "project_container" in config:
+        from .factory_container import validate_policy, PROFILES
+        validate_policy(config["project_container"])
+        if any(not isinstance(cmd, list) or any(not isinstance(x, str) for x in cmd) or tuple(cmd) not in PROFILES
+               for kind in ("checks", "ci") for cmd in config.get(kind, [])):
+            raise ValueError("project container gates require exact canonical make profiles")
+    if "project_delivery" in config:
+        from .factory_remote import validate_policy
+        validate_policy(config["project_delivery"])
+    if "project_review_limits" in config:
+        validate_review_limits(config["project_review_limits"])
     budget = config.get("budget")
     if not isinstance(budget, dict) or "max_agent_runs" not in budget or set(budget) - {"max_agent_runs", "max_total_tokens", "max_run_tokens", "max_wall_seconds"}:
         raise ValueError("invalid mission resource authority; monetary usage remains UNKNOWN")
@@ -184,10 +199,13 @@ def policy_identity(config):
 
 
 def validate_mission(raw):
-    keys = {"version", "mission_id", "repository", "objective", "acceptance", "constraints", "scope", "base", "mission_scope_file", "approved_mission_scope"}
+    keys = {"version", "mission_id", "repository", "objective", "acceptance", "constraints", "scope", "base", "mission_scope_file", "approved_mission_scope", "pr_body_template"}
     if not isinstance(raw, dict) or set(raw) - keys or type(raw.get("version")) is not int or raw.get("version") != 2:
         raise ValueError("factory missions require version 2")
     mission = json.loads(encoded(raw))
+    if "pr_body_template" in mission and (not isinstance(mission["pr_body_template"], str)
+            or not mission["pr_body_template"].strip() or len(mission["pr_body_template"].encode()) > 60000):
+        raise ValueError("invalid Controller PR body template")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}", mission.get("mission_id", "")):
         raise ValueError("invalid mission_id")
     repo = Path(mission["repository"]).resolve(strict=True)
@@ -417,6 +435,9 @@ class Factory:
             if cwd.exists():
                 raise FactoryBlocked("UNKNOWN", "candidate preparation interrupted; unverified path was not reused")
             cwd.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if self.project:
+                private_dir(self.root / "candidates")
+                private_dir(cwd.parent)
             git(Path(spec["repository"]), "clone", "--no-local", "--no-hardlinks", "--no-checkout", "--", spec["repository"], str(cwd))
             git(cwd, "remote", "remove", "origin")
             git(cwd, "checkout", "-b", f"factory/{mission}", spec["base"])
@@ -497,7 +518,7 @@ class Factory:
         if self.cancel_requested(mission):
             raise FactoryBlocked("CANCELLED", "user cancelled; completed evidence and all reservations are retained")
         if paid:
-            uncertain = self.db.execute("SELECT id FROM operations WHERE mission=? AND status IN ('RUNNING','UNKNOWN') LIMIT 1", (mission,)).fetchone()
+            uncertain = self.uncertain_operations(mission)
             if uncertain:
                 raise FactoryBlocked("UNKNOWN", "unresolved operation prevents a new paid dispatch; no replay or refund")
             has_paid = self.db.execute("SELECT 1 FROM operations WHERE mission=? AND paid=1 LIMIT 1", (mission,)).fetchone()
@@ -576,6 +597,25 @@ class Factory:
         if status != "COMPLETE":
             raise FactoryBlocked("UNKNOWN", f"{stage} failed; retained raw evidence and consumed run reservation: {result['error']}")
         return result
+
+    def uncertain_operations(self, mission):
+        """Keep UNKNOWN rows intact; only proven read-only reconciliation resolves a publication."""
+        resolved = set()
+        for event in self.db.execute("SELECT payload FROM events WHERE mission=? AND kind='publication_reconciled'", (mission,)):
+            value = json.loads(event[0])
+            proof = self.db.execute("SELECT * FROM operations WHERE mission=? AND key=?", (mission, value["evidence_key"])).fetchone()
+            if proof is None or proof["status"] != "COMPLETE" or proof["stage"] != "project_reconcile":
+                raise FactoryBlocked("UNKNOWN", "publication reconciliation evidence missing")
+            self.verify_evidence(proof)
+            result = json.loads(proof["result"])
+            original = self.db.execute("SELECT * FROM operations WHERE id=? AND mission=?", (value["operation_id"], mission)).fetchone()
+            if (original is None or original["stage"] != "project_publish" or result.get("status") != "PASS"
+                    or result.get("target") != json.loads(original["input"])["target"]
+                    or result.get("fixture") is not False):
+                raise FactoryBlocked("UNKNOWN", "publication reconciliation binding invalid")
+            resolved.add(value["operation_id"])
+        return [op for op in self.db.execute("SELECT * FROM operations WHERE mission=? AND status IN ('RUNNING','UNKNOWN')", (mission,))
+                if op["id"] not in resolved]
 
     def verify_evidence(self, operation):
         evidence = Path(operation["evidence"] or "")
@@ -692,8 +732,15 @@ class Factory:
                 # intermediate directory group-writable under umask 0002.
                 private_dir(self.root / "candidates")
                 private_dir(Path(cwd).parent)
-                return self.runtime.prepare_project_review(spec, cwd, target, lane,
+                if not self.config["simulation"]:
+                    if self.target(spec, cwd) != target:
+                        raise ValueError("candidate changed before review admission")
+                    admission = self.runtime.project_review_admission(spec, cwd, target, self.config.get("project_review_limits"))
+                    self.event(spec["mission_id"], "review_admission", {"lane": lane, "admission": admission})
+                    self.db.commit()
+                runner = self.runtime.prepare_project_review(spec, cwd, target, lane,
                     self.operation_timeout(spec["mission_id"]))
+                return runner if self.config["simulation"] else {"runner": runner, "admission": admission}
             except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
                 raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", f"canonical local preparation failed: {exc}") from exc
         result = self.operation(spec["mission_id"], key, "review", lane, identity, payload, True,
@@ -722,9 +769,71 @@ class Factory:
                 "canonical_receipt": checked.artifact, "canonical_receipt_data": checked.data,
                 "review_range": target["review_range"], "fixture": self.config["simulation"]}
 
-    def project_final_gate(self, spec, cwd, target, reviews):
+    def project_remote_read(self, action, spec, cwd, target, body, reviews=None):
+        payload = {"target": target, "policy": self.config["project_delivery"], "body": body}
+        key = digest({"action": action, **payload, "observation": uuid.uuid4().hex})
+        result = self.operation(spec["mission_id"], key, "project_reconcile" if action == "reconcile" else "project_" + action,
+            "github", payload, payload, False, lambda transcript: self.runtime.project_remote(action,
+                payload["policy"], spec, cwd, target, body, transcript, self.operation_timeout(spec["mission_id"]), reviews=reviews))
+        if result.get("target") != target or result.get("fixture") is not False:
+            raise FactoryBlocked("UNKNOWN", "remote observation has no exact live target")
+        if self.target(spec, cwd) != target:
+            raise FactoryBlocked("UNKNOWN", "candidate changed during remote operation")
+        return {**result, "evidence_key": key}
+
+    def recover_publication(self, spec, cwd, operation):
+        payload = json.loads(operation["input"])
+        if self.target(spec, cwd) != payload["target"] or payload["policy"] != self.config.get("project_delivery"):
+            raise FactoryBlocked("UNKNOWN", "uncertain publication belongs to another candidate/policy; no write retried")
+        proof = self.project_remote_read("reconcile", spec, cwd, payload["target"], payload["body"])
+        if proof["status"] != "PASS":
+            raise FactoryBlocked("UNKNOWN", "uncertain publication could not be observed; no write retried")
+        self.event(spec["mission_id"], "publication_reconciled", {"operation_id": operation["id"], "evidence_key": proof["evidence_key"]})
+        self.db.commit()
+        return proof
+
+    def project_pr_ci(self, spec, cwd, target, reviews, validations):
+        from .factory_remote import render_body
+        policy = self.config.get("project_delivery")
+        if policy is None:
+            raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "Controller project PR publication policy missing")
+        if self.target(spec, cwd) != target:
+            raise FactoryBlocked("UNKNOWN", "candidate changed before PR publication")
+        body = render_body(policy, spec, target, reviews, validations)
+        payload = {"target": target, "policy": policy, "body": body}
+        key = digest({"project_publish": payload})
+        old = self.db.execute("SELECT * FROM operations WHERE mission=? AND key=?", (spec["mission_id"], key)).fetchone()
+        if old is not None and old["status"] != "COMPLETE":
+            publication = self.recover_publication(spec, cwd, old)
+        else:
+            previous_head = None
+            for previous in self.db.execute("SELECT * FROM operations WHERE mission=? AND stage IN ('project_publish','project_reconcile') AND status='COMPLETE' ORDER BY started", (spec["mission_id"],)):
+                self.verify_evidence(previous)
+                value = json.loads(previous["result"])
+                if value.get("status") == "PASS":
+                    previous_head = value["target"]["head"]
+            publication = self.operation(spec["mission_id"], key, "project_publish", "github", payload, payload, False,
+                lambda transcript: self.runtime.project_remote("publish", policy, spec, cwd, target, body, transcript,
+                    self.operation_timeout(spec["mission_id"]), previous_head=previous_head))
+            if publication.get("status") != "PASS" or publication.get("target") != target or publication.get("fixture") is not False:
+                raise FactoryBlocked("UNKNOWN", "publication did not establish exact live PR identity")
+            # Cached success is never current remote truth.
+            publication = self.project_remote_read("reconcile", spec, cwd, target, body)
+        ci = self.project_remote_read("ci", spec, cwd, target, body)
+        if ci["status"] not in {"PASS", "FAIL"}:
+            raise FactoryBlocked("BLOCKED_CI", ci.get("reason", "required exact PR checks are unfinished/unknown"))
+        return {"publication": publication, "ci": ci, "body": body}
+
+    def project_final_gate(self, spec, cwd, target, reviews, remote=None):
         if {r["lane"] for r in reviews} != set(LANES) or any(r["status"] != "PASS" for r in reviews):
             raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "both validated canonical receipts are required")
+        if not self.config["simulation"]:
+            if remote is None or remote["ci"]["status"] != "PASS":
+                raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "exact live PR/CI context missing")
+            checked = self.project_remote_read("verify", spec, cwd, target, remote["body"], reviews)
+            if checked["status"] != "PASS":
+                raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", checked.get("reason", "canonical final gate rejected delivery"))
+            return checked
         payload = {"target": target, "receipts": {r["backend"]: r["canonical_receipt"] for r in reviews}}
         key = digest({"project_final_gate": payload})
         result = self.operation(spec["mission_id"], key, "project_gate", "project", payload, payload, False,
@@ -733,10 +842,6 @@ class Factory:
         if (result.get("status") != "PASS" or result.get("target") != target
                 or result.get("fixture") is not self.config["simulation"]):
             raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", result.get("reason", "project final validator rejected candidate"))
-        # Until actual PR/CI context is integrated, a local/fixture assertion
-        # cannot grant live readiness. This phase intentionally has no bypass.
-        if not self.config["simulation"]:
-            raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "phase-2 canonical PR/CI final gate is not integrated")
         return {**result, "evidence_key": key}
 
     def gates(self, spec, cwd, target, kind, round_):
@@ -744,8 +849,20 @@ class Factory:
         for index, command in enumerate(self.config[kind]):
             payload = {"command": command, "target": target, "round": round_}
             key = digest({"kind": kind, "index": index, **payload})
-            result = self.operation(spec["mission_id"], key, kind, "local", {"target": target}, payload, False,
-                                    lambda transcript: self.runtime.gate(command, cwd, target, transcript, self.operation_timeout(spec["mission_id"])))
+            def invoke(transcript):
+                if self.project and not self.config["simulation"]:
+                    if "project_container" not in self.config:
+                        raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "Controller container policy is required; host fallback forbidden")
+                    return self.runtime.container_gate(self.config["project_container"], spec, cwd, target, command,
+                                                       transcript, self.operation_timeout(spec["mission_id"]))
+                return self.runtime.gate(command, cwd, target, transcript, self.operation_timeout(spec["mission_id"]))
+            result = self.operation(spec["mission_id"], key, kind, "local", {"target": target}, payload, False, invoke)
+            if self.project and not self.config["simulation"]:
+                if (result.get("target") != target or result.get("fixture") is not False
+                        or result.get("image_id") != self.config["project_container"]["image_id"]):
+                    raise FactoryBlocked("UNKNOWN", "container evidence identity mismatch")
+                if result.get("status") not in {"PASS", "FAIL"}:
+                    raise FactoryBlocked("BLOCKED_VALIDATION", result.get("status", "container validation unavailable"))
             if result.get("status") not in ("PASS", "FAIL") or type(result.get("exit_code")) is not int or (result["status"] == "PASS") != (result["exit_code"] == 0):
                 raise FactoryBlocked("UNKNOWN", "test/CI command lacks a proven exit status")
             if self.target(spec, cwd) != target:
@@ -792,11 +909,10 @@ class Factory:
         delivery = deliveries[-1] if deliveries else {}
         preflights = [json.loads(e["payload"]) for e in events if e["kind"] == "prepaid_preflight"]
         status, reason = row["status"], row["reason"]
+        fresh = None
         if status == READY or self.project and status == OFFLINE_PASS:
             try:
                 spec, cwd = json.loads(row["spec"]), Path(row["candidate"])
-                if self.project and status == READY:
-                    raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "live project readiness is not implemented in phase 1")
                 if self.target(spec, cwd) != delivery.get("target"):
                     raise FactoryBlocked("UNKNOWN", "delivery HEAD/tree/scope changed after verification")
                 if not delivery.get("target", {}).get("files") or not isinstance(delivery.get("implemented"), str) or not delivery["implemented"].strip():
@@ -826,32 +942,39 @@ class Factory:
                         raise FactoryBlocked("PENDING_REVIEW", "review lane configuration changed; only that lane requires fresh evidence")
                 if self.project:
                     gate = delivery["project_gate"]
-                    if gate["evidence_key"] not in delivery["evidence_keys"] or gate.get("fixture") is not True:
-                        raise FactoryBlocked("UNKNOWN", "offline project gate evidence is incomplete")
+                    if gate["evidence_key"] not in delivery["evidence_keys"] or gate.get("fixture") is not self.config["simulation"]:
+                        raise FactoryBlocked("UNKNOWN", "project fixture/live gate evidence is incomplete")
                     op = self.db.execute("SELECT * FROM operations WHERE mission=? AND key=?", (mission, gate["evidence_key"])).fetchone()
-                    if (op is None or op["stage"] != "project_gate" or json.loads(op["result"]).get("status") != "PASS"
+                    if (op is None or op["stage"] != ("project_gate" if self.config["simulation"] else "project_verify") or json.loads(op["result"]).get("status") != "PASS"
                             or json.loads(op["result"]).get("target") != delivery["target"]):
                         raise FactoryBlocked("UNKNOWN", "project final gate evidence is missing or rejected")
+                    if not self.config["simulation"]:
+                        fresh = self.project_remote_read("verify", spec, cwd, delivery["target"], delivery["remote"]["body"], delivery["reviews"])
+                        if fresh["status"] != "PASS":
+                            raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", fresh.get("reason", "remote PR/CI/final gate is no longer current"))
             except FactoryBlocked as exc:
                 status, reason = exc.status, exc.reason
             except Exception as exc:
                 status, reason = "UNKNOWN", str(exc)
         verified = status == READY or self.project and status == OFFLINE_PASS
+        operations = self.db.execute("SELECT * FROM operations WHERE mission=? ORDER BY started", (mission,)).fetchall()
         return {"MISSION": mission, "DELIVERY_STATUS": status,
+                "CURRENT_REMOTE_VERIFICATION": fresh if fresh is not None else "NOT_RUN",
                 "PREPAID_PREFLIGHT": preflights[-1] if preflights else "NOT_RUN",
                 "IMPLEMENTED": delivery.get("implemented", "UNKNOWN"),
                 "TEST_RESULT": delivery.get("tests", "UNKNOWN") if verified else "UNKNOWN",
                 "CI_RESULT": delivery.get("ci", "UNKNOWN") if verified else "UNKNOWN",
                 "REVIEW_RESULT": delivery.get("reviews", "UNKNOWN") if verified else "UNKNOWN",
-                "BLOCKERS_REMAINING": ["live validation, exact PR/CI and business delivery are not established"] if self.project and verified else [] if status == READY else [reason or status],
+                "BLOCKERS_REMAINING": ["live validation, exact PR/CI and business delivery are not established"] if self.project and status == OFFLINE_PASS else [] if status == READY else [reason or status],
                 "PROJECT_CONTRACT": PROJECT if self.project else "NOT_CONFIGURED",
-                "PROJECT_ACCEPTANCE": "OFFLINE_FIXTURE_ONLY" if self.project and status == OFFLINE_PASS else "NOT_ESTABLISHED",
+                "PROJECT_ACCEPTANCE": "OFFLINE_FIXTURE_ONLY" if self.project and status == OFFLINE_PASS else "EXACT_PR_PREMERGE_VERIFIED" if self.project and status == READY else "NOT_ESTABLISHED",
                 "DONE": False,
                 "KNOWN_RISKS": delivery.get("risks", []),
                 "BUDGET_USED": {**accounting(operations, self.config["budget"]),
                                 "money": "UNKNOWN" if not self.config["simulation"] else "FIXTURE_NO_PROVIDER_COST"},
                 "LOCAL_CI": delivery.get("ci", "UNKNOWN") if status == READY else "UNKNOWN",
                 "HOSTED_CI": delivery.get("hosted_ci", "NOT_CONFIGURED") if status == READY else "UNKNOWN" if "hosted_ci" in self.config else "NOT_CONFIGURED",
+                "PROJECT_PR": delivery.get("remote", {}).get("publication", "NOT_RUN") if verified else "UNKNOWN",
                 "TARGET_HEAD": delivery.get("target", {}).get("head", "UNKNOWN"),
                 "EXACT_TARGET": delivery.get("target", "UNKNOWN"),
                 "DELIVERY_EVIDENCE": [op["evidence"] for op in operations if op["evidence"]],
@@ -910,9 +1033,14 @@ class Factory:
                 raise FactoryBlocked("CANCELLED", "user cancelled; no dispatch or resume is authorized")
             spec, cwd = self.prepare(mission)
             row = self.row(mission)
-            uncertain = self.db.execute("SELECT id FROM operations WHERE mission=? AND status IN ('RUNNING','UNKNOWN') LIMIT 1", (mission,)).fetchone()
+            for pending in self.uncertain_operations(mission):
+                if self.project and pending["stage"] == "project_publish":
+                    self.recover_publication(spec, cwd, pending)
+                    self.state(mission, "PR_CI", "publication observed; original UNKNOWN/reservation retained")
+                    row = self.row(mission)
+            uncertain = self.uncertain_operations(mission)
             if uncertain:
-                raise FactoryBlocked("UNKNOWN", f"unresolved operation {uncertain[0]}; no duplicate paid dispatch was authorized")
+                raise FactoryBlocked("UNKNOWN", f"unresolved operation {uncertain[0]['id']}; no duplicate paid dispatch was authorized")
             if self.project and row["status"] == OFFLINE_PASS:
                 return self.report(mission)
             if row["status"] == READY:
@@ -1004,16 +1132,27 @@ class Factory:
                         if review["status"] != "PASS":
                             feedback.append({"department": lane, "findings": review["findings"], "explanation": review["output"]["overall_explanation"]})
                 if not feedback:
+                    remote = None
+                    if self.project and not self.config["simulation"]:
+                        self.state(mission, "PR_CI")
+                        remote = self.project_pr_ci(spec, cwd, target, reviews, tests + ci)
+                        if remote["ci"]["status"] != "PASS":
+                            feedback.append({"department": "pr_ci", "result": remote["ci"]})
+                if not feedback:
                     if self.target(spec, cwd) != target:
                         raise FactoryBlocked("UNKNOWN", "final delivery target changed after gates")
-                    project_gate = self.project_final_gate(spec, cwd, target, reviews) if self.project else None
+                    project_gate = self.project_final_gate(spec, cwd, target, reviews, remote) if self.project else None
                     delivery = {"target": target, "implemented": work["summary"], "risks": work["known_risks"],
                                 "tests": "PASS", "ci": "PASS", "hosted_ci": "PASS" if "hosted_ci" in self.config else "NOT_CONFIGURED", "reviews": reviews,
                                 "evidence_keys": [op[0] for op in self.db.execute("SELECT key FROM operations WHERE mission=? AND status='COMPLETE'", (mission,))]}
                     if self.project:
-                        delivery.update(project_gate=project_gate, tests="OFFLINE_FIXTURE_PASS", ci="OFFLINE_FIXTURE_PASS")
+                        delivery.update(project_gate=project_gate)
+                        if self.config["simulation"]:
+                            delivery.update(tests="OFFLINE_FIXTURE_PASS", ci="OFFLINE_FIXTURE_PASS")
+                        else:
+                            delivery.update(remote=remote, hosted_ci="EXACT_PR_CHECKS_PASS")
                     self.event(mission, "delivery", delivery)
-                    self.state(mission, OFFLINE_PASS if self.project else READY)
+                    self.state(mission, OFFLINE_PASS if self.project and self.config["simulation"] else READY)
                     return self.report(mission)
                 self.db.execute("UPDATE missions SET round=round+1 WHERE id=?", (mission,))
                 self.event(mission, "rework", {"target": target, "feedback": feedback})

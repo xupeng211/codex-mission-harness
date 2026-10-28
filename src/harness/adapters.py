@@ -1687,8 +1687,9 @@ class FootballPredictionAdapter:
         preflight_code = (
             "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
             "from scripts.devops import agent_workflow_preflight as p; "
+            "from scripts.ops import ai_workflow_gate as g; "
             "from scripts.ops.helpers import git_change_helpers as h; "
-            "root=Path(sys.argv[2]); p.ROOT=root; h.ROOT_HELPER=root; "
+            "root=Path(sys.argv[2]); p.ROOT=g.ROOT=root; h.ROOT_HELPER=root; "
             "sys.argv=['agent-preflight','--pr-body-file',sys.argv[3],"
             "'--mission-scope-file',sys.argv[4],'--base-ref',sys.argv[5],"
             "'--head-ref',sys.argv[6],'--require-review','--json']; "
