@@ -549,6 +549,8 @@ class Factory:
                               "usage": getattr(exc, "usage", None),
                               "runtime_identity": getattr(exc, "identity", None),
                               "usage_complete": getattr(exc, "usage_complete", False)}, "UNKNOWN"
+            if getattr(exc, "usage_telemetry", None) is not None:
+                result["usage_telemetry"] = exc.usage_telemetry
         raw_paths = [p for p in (transcript, transcript.with_suffix(".stderr"), transcript.with_suffix(".proxy.jsonl")) if p.is_file()]
         result["raw_evidence"] = [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in raw_paths]
         data = encoded({"operation": operation_id, "identity": identity, "input": payload, "result": result}).encode()

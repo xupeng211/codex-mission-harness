@@ -101,6 +101,9 @@ class FactoryAppServer(AppServerCodex):
         self._transport_provider = "cmh_openai_" + uuid.uuid4().hex
         self.events: list[dict] = []
         self.usage = None
+        self._usage_thread_id = self._usage_turn_id = None
+        self._usage_by_thread = {}
+        self._usage_scope_errors = []
         self.transcript, self._transcript_bytes = transcript, 0
         self._response_timeout = timeout
         self._end_time = time.monotonic() + timeout
@@ -158,6 +161,9 @@ class FactoryAppServer(AppServerCodex):
                      "-c", "web_search=\"disabled\"",
                      "-c", "features.multi_agent=false",
                      "-c", "features.multi_agent_v2=false",
+                     # Codex 0.164 keeps the legacy feature keys, but native
+                     # collaboration is controlled by agents.enabled.
+                     "-c", "agents.enabled=false",
                      "-c", "features.apps=false",
                      "-c", "features.hooks=false",
                      # cwd is constructor-verified as the Git repository root;
@@ -282,12 +288,91 @@ class FactoryAppServer(AppServerCodex):
     def _read_message(self, deadline=None):
         message = super()._read_message(deadline)
         self.events.append(message)
-        if message.get("method") == "thread/tokenUsage/updated":
-            self.usage = message.get("params", {}).get("tokenUsage")
-            from .factory_budget import tokens
-            if self.token_limit and (tokens(self.usage) or 0) > self.token_limit:
-                raise RuntimeFailure("Codex token telemetry exceeded run allowance", self.usage, self.runtime_identity)
+        self._observe_execution_event(message)
         return message
+
+    def _bind_usage_thread(self, thread_id):
+        if getattr(self, "_usage_thread_id", None) is not None:
+            raise RuntimeError("native execution must use one fresh thread")
+        self._usage_thread_id, self._usage_turn_id = thread_id, None
+        self._usage_by_thread, self._usage_scope_errors = {}, []
+        self.usage = None
+
+    def usage_telemetry(self):
+        # Each value is a thread-cumulative snapshot associated with a turn,
+        # NOT a turn delta or a separately billable quantity. Never sum them.
+        return {"thread_id": getattr(self, "_usage_thread_id", None),
+                "turn_id": getattr(self, "_usage_turn_id", None),
+                "by_thread": getattr(self, "_usage_by_thread", {}),
+                "scope_errors": getattr(self, "_usage_scope_errors", []),
+                "scope": "one fresh thread and one authorized turn",
+                "provider_total_usage": "UNKNOWN", "cross_thread_aggregation": "NOT_PERFORMED"}
+
+    def _usage_failure(self, reason, attribution=None):
+        if attribution is not None:
+            self._usage_scope_errors.append(attribution)
+        raise RuntimeFailure(reason, self.usage, self.runtime_identity,
+                             usage_telemetry=self.usage_telemetry())
+
+    def _accept_root_usage(self, usage):
+        from .factory_budget import tokens
+        count = tokens(usage)
+        if count is None:
+            self._usage_failure("native usage is not a valid attributed token count")
+        self.usage = usage
+        if self.token_limit and count > self.token_limit:
+            self._usage_failure("Codex token telemetry exceeded run allowance")
+
+    def _bind_usage_turn(self, turn_id):
+        if not isinstance(turn_id, str) or not turn_id:
+            self._usage_failure("native turn identity is missing")
+        if self._usage_turn_id not in (None, turn_id):
+            self._usage_failure("native turn/start response changed the observed turn identity")
+        self._usage_turn_id = turn_id
+        if isinstance(self.runtime_identity, dict):
+            self.runtime_identity.update(thread_id=self._usage_thread_id, turn_id=turn_id)
+        # Notifications can precede the turn/start response. Attribute them
+        # only after matching the returned turn, never to whichever arrived last.
+        for observed_turn, record in self._usage_by_thread.get(self._usage_thread_id, {}).items():
+            if observed_turn != turn_id:
+                self._usage_failure("usage belongs to another native turn",
+                                    {"threadId": self._usage_thread_id, "turnId": observed_turn})
+            self._accept_root_usage(record["last_token_usage"])
+
+    def _observe_execution_event(self, message):
+        method, params = message.get("method"), message.get("params", {})
+        if not isinstance(params, dict):
+            return
+        item = params.get("item", {})
+        if isinstance(item, dict) and item.get("type") in ("subAgentActivity", "collabAgentToolCall"):
+            self._usage_failure("native delegation observed although disabled",
+                                {"method": method, "threadId": params.get("threadId"),
+                                 "item_type": item["type"], "agentThreadId": item.get("agentThreadId")})
+        if self._usage_thread_id and method in ("turn/started", "turn/completed", "error", "item/started", "item/completed"):
+            observed_thread = params.get("threadId")
+            observed_turn = params.get("turn", {}).get("id") if isinstance(params.get("turn"), dict) else params.get("turnId")
+            if observed_thread != self._usage_thread_id or (self._usage_turn_id and observed_turn != self._usage_turn_id):
+                self._usage_failure("activity belongs to an unauthorized native thread/turn",
+                                    {"method": method, "threadId": observed_thread, "turnId": observed_turn})
+            if method == "turn/started":
+                self._bind_usage_turn(observed_turn)
+        if method != "thread/tokenUsage/updated":
+            return
+        thread_id, turn_id = params.get("threadId"), params.get("turnId")
+        if not all(isinstance(v, str) and v for v in (thread_id, turn_id)):
+            self._usage_failure("usage notification has no thread/turn attribution",
+                                {"method": method, "threadId": thread_id, "turnId": turn_id,
+                                 "tokenUsage": params.get("tokenUsage")})
+        record = self._usage_by_thread.setdefault(thread_id, {}).setdefault(turn_id, {"notifications": 0})
+        record.update(notifications=record["notifications"] + 1, last_token_usage=params.get("tokenUsage"))
+        if thread_id != self._usage_thread_id:
+            self._usage_failure("usage belongs to an unauthorized native thread",
+                                {"threadId": thread_id, "turnId": turn_id})
+        if self._usage_turn_id is not None:
+            if turn_id != self._usage_turn_id:
+                self._usage_failure("usage belongs to another native turn",
+                                    {"threadId": thread_id, "turnId": turn_id})
+            self._accept_root_usage(params.get("tokenUsage"))
 
     def _request(self, method, params):
         result = super()._request(method, params)
@@ -323,11 +408,13 @@ class FactoryAppServer(AppServerCodex):
         # Disable remote tools; their independent authority is outside this local factory.
         params["config"]["mcp_servers"] = self.disabled_mcp
         params["config"]["features"] = {"hooks": False, "apps": False, "multi_agent": False, "multi_agent_v2": False}
+        params["config"]["agents"] = {"enabled": False}
         params["config"]["project_root_markers"] = []
         return params
 
     def execute(self, prompt: str, schema: dict) -> dict:
         thread_id = self.start_or_resume(None, self._policy_cwd)
+        self._bind_usage_thread(thread_id)
         params = {"threadId": thread_id, "input": [{"type": "text", "text": prompt}],
                   "outputSchema": schema, **self._policy_params(self._policy_cwd)}
         if self.MODEL:
@@ -336,6 +423,7 @@ class FactoryAppServer(AppServerCodex):
             params["effort"] = self.REASONING_EFFORT
         accepted = self._request("turn/start", params)
         turn_id = accepted["turn"]["id"]
+        self._bind_usage_turn(turn_id)
         completed = self._turn_completed(thread_id, turn_id)
         routed = [e["params"] for e in self.events if e.get("method") == "model/rerouted" and e.get("params", {}).get("threadId") == thread_id]
         if self.MODEL and any(e.get("toModel") != self.MODEL for e in routed):
@@ -349,8 +437,6 @@ class FactoryAppServer(AppServerCodex):
                     item = p.get("item", {})
                     if "id" in item:
                         items[item["id"]] = item
-                if event.get("method") == "thread/tokenUsage/updated":
-                    self.usage = p.get("tokenUsage")
         text = [i["text"] for i in items.values() if i.get("type") == "agentMessage"
                 and i.get("phase") in (None, "final_answer")]
         if not text:
@@ -365,6 +451,7 @@ class FactoryAppServer(AppServerCodex):
             if not receipt["usage_complete"]:
                 raise RuntimeFailure("explicit proxy result/usage identity is uncertain; no replay", self.usage, self.runtime_identity)
         return {"output": json.loads(text[-1]), "usage": self.usage,
+                "usage_telemetry": self.usage_telemetry(),
                 "thread_id": thread_id, "turn_id": turn_id,
                 "runtime_identity": self.runtime_identity, "model_routing": routed,
                 **({"physical_accounting": receipt, "usage_complete": receipt["usage_complete"]} if receipt else {})}
@@ -478,8 +565,10 @@ class LocalRuntime:
                     server.runtime_identity["physical_accounting"] = server._proxy_relay.receipt()
                 # Never include upstream error bodies, credentials or transport
                 # exception reprs in a receipt for a proxy failure.
-                raise RuntimeFailure("explicit CLI proxy run failed; no retry or fallback", server.usage, server.runtime_identity) from exc
-            raise RuntimeFailure(str(exc), server.usage, server.runtime_identity) from exc
+                raise RuntimeFailure("explicit CLI proxy run failed; no retry or fallback", server.usage, server.runtime_identity,
+                                     usage_telemetry=server.usage_telemetry()) from exc
+            raise RuntimeFailure(str(exc), server.usage, server.runtime_identity,
+                                 usage_telemetry=server.usage_telemetry()) from exc
         finally:
             server.close()
             self.current_process = None
@@ -617,7 +706,8 @@ class LocalRuntime:
 
 
 class RuntimeFailure(RuntimeError):
-    def __init__(self, message, usage=None, identity=None, *, usage_complete=False):
+    def __init__(self, message, usage=None, identity=None, *, usage_complete=False, usage_telemetry=None):
         self.usage, self.identity = usage, identity
         self.usage_complete = usage_complete
+        self.usage_telemetry = usage_telemetry
         super().__init__(message)

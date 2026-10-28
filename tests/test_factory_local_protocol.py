@@ -80,8 +80,20 @@ class NativeProtocolTests(unittest.TestCase):
         self.assertEqual(len(identity["qualification_identity"]), 64)
         for feature in ("unbounded_connection_retries", "responses_websockets", "responses_websockets_v2"):
             self.assertFalse(effective["features"][feature])
+        self.assertFalse(effective["agents"]["enabled"])
+        self.assertEqual(server._thread_policy_params(str(self.cwd))["config"]["agents"], {"enabled": False})
         self.assertEqual(server.runtime_identity["transport_provider"], server._transport_provider)
         self.assertFalse(any(e.get("method") == "turn/started" for e in server.events))
+
+    def test_installed_native_delegation_switch_at_both_layers_without_a_turn(self):
+        server = FactoryAppServer({"provider": "openai", "model": "offline-protocol-no-inference", "codex_home": str(self.auth)},
+                                  self.cwd, self.root / "delegation-control.raw", 30,
+                                  [self.root / "state", self.source], True, True)
+        self.addCleanup(server.close)
+        effective = server._request("config/read", {"includeLayers": False})["config"]
+        self.assertFalse(effective["agents"]["enabled"])
+        self.assertEqual(server._thread_policy_params(str(self.cwd))["config"]["agents"], {"enabled": False})
+        self.assertFalse(any(e.get("method") in ("turn/started", "thread/started") for e in server.events))
 
     def test_native_shell_disables_incidental_python_bytecode(self):
         server = self.server(False)

@@ -548,8 +548,10 @@ class PlanningGuardTests(unittest.TestCase):
     def test_token_telemetry_cutoff_preserves_partial_usage(self):
         server = FactoryAppServer.__new__(FactoryAppServer)
         server.events, server.token_limit, server.runtime_identity = [], 32000, {}
+        server._bind_usage_thread("t")
+        server._bind_usage_turn("u")
         usage = {"total": {"inputTokens": 32001, "outputTokens": 0, "totalTokens": 32001}}
-        with patch("harness.codex.AppServerCodex._read_message", return_value={"method": "thread/tokenUsage/updated", "params": {"tokenUsage": usage}}):
+        with patch("harness.codex.AppServerCodex._read_message", return_value={"method": "thread/tokenUsage/updated", "params": {"threadId": "t", "turnId": "u", "tokenUsage": usage}}):
             with self.assertRaises(RuntimeFailure) as failure:
                 server._read_message()
         self.assertEqual(failure.exception.usage, usage)
