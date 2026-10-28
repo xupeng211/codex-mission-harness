@@ -540,7 +540,12 @@ class FactoryRuntimeTests(unittest.TestCase):
             {"method": "item/completed", "params": {"threadId": "t", "turnId": "u", "item": {"id": "final", "type": "agentMessage", "phase": "final_answer", "text": '{"answer":"ok"}'}}},
             {"method": "thread/tokenUsage/updated", "params": {"threadId": "t", "turnId": "u", "tokenUsage": usage}},
         ]
-        with patch.object(server, "start_or_resume", return_value="t"), patch.object(server, "_request", return_value={"turn": {"id": "u"}}) as request, patch.object(server, "_turn_completed", return_value={"items": []}):
+        server.token_limit = 100
+        def complete(*args):
+            for event in server.events:
+                server._observe_execution_event(event)
+            return {"items": []}
+        with patch.object(server, "start_or_resume", return_value="t"), patch.object(server, "_request", return_value={"turn": {"id": "u"}}) as request, patch.object(server, "_turn_completed", side_effect=complete):
             result = server.execute("fixture input", {"type": "object"})
         self.assertEqual(result["output"], {"answer": "ok"})
         self.assertEqual(result["usage"], usage)
