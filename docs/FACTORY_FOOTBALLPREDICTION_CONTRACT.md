@@ -142,6 +142,13 @@ gate 从首次镜像检查之前开始计时，镜像检查、原有源码/策�
 
 ## B：专用分支、PR、必需 CI 与交付复核
 
+发布前预检、首次最终预检与原 `agent_workflow` 内重复预检共用同一段明确的数据绑定：
+规则模块只从已核实的可信 BASE 导入，preflight、gate、Git helper、governance 和
+disposable proof helper 均读取准确候选，Git cwd 也为候选。显式传入批准的完整
+BASE/HEAD，并将 legacy archive scanner 的隐式 base 绑定完整批准 BASE，不退回
+HEAD~1。保留重复预检、原生命周期/归档/证明标记检查与各阶段原有权限和证据职责；
+合法新脚本可用原规则认可的文件头声明，不需要自动补写备用 PR 正文段落。
+
 只有双 receipt 当前有效且无任何 findings、本地 checks/ci PASS 后，Controller
 才发布。`factory_remote.py` 固定可信 repository/main，以 mission+base 推导专用
 `factory/<mission>-<base12>` 分支，以 scope/repo/base 的 marker 识别所有权。

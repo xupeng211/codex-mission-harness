@@ -47,6 +47,23 @@ class FootballPredictionAdapter:
     )
 
     @staticmethod
+    def _preflight_data_binding() -> str:
+        """Bind this fixed preflight's data dependencies, never its rule code.
+
+        Callers import only trusted BASE via sys.argv[1], supply candidate
+        sys.argv[2] and approved_base, and run Git from the candidate cwd.
+        The legacy archive helper otherwise falls back to HEAD~1.
+        """
+        return (
+            "from scripts.devops import agent_workflow_preflight as p; "
+            "from scripts.ops import ai_workflow_gate as g; "
+            "from scripts.ops.helpers import git_change_helpers as h; "
+            "from scripts.ops.helpers import governance_p1_checks as v, disposable_canonical_db_proof_scan as d; "
+            "p.ROOT=g.ROOT=h.ROOT_HELPER=v.ROOT=d.ROOT=Path(sys.argv[2]); "
+            "v._resolve_diff_base=lambda: approved_base; "
+        )
+
+    @staticmethod
     def _safe_mission_id(mission_id: str) -> str:
         if (not isinstance(mission_id, str)
                 or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", mission_id) is None
@@ -1686,10 +1703,7 @@ class FootballPredictionAdapter:
         # candidate worktree is data, never executable authority here.
         preflight_code = (
             "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
-            "from scripts.devops import agent_workflow_preflight as p; "
-            "from scripts.ops import ai_workflow_gate as g; "
-            "from scripts.ops.helpers import git_change_helpers as h; "
-            "root=Path(sys.argv[2]); p.ROOT=g.ROOT=root; h.ROOT_HELPER=root; "
+            "approved_base=sys.argv[5]; " + self._preflight_data_binding() +
             "sys.argv=['agent-preflight','--pr-body-file',sys.argv[3],"
             "'--mission-scope-file',sys.argv[4],'--base-ref',sys.argv[5],"
             "'--head-ref',sys.argv[6],'--require-review','--json']; "
@@ -1697,7 +1711,7 @@ class FootballPredictionAdapter:
         )
         local = self._call(
             [sys.executable, "-I", "-B", "-c", preflight_code, str(trusted), worktree,
-             str(body_path), str(scope), base, head], cwd=str(trusted),
+             str(body_path), str(scope), base, head], cwd=worktree,
             env={"GH_HOST": "github.com", "PYTHONDONTWRITEBYTECODE": "1",
                  "HOME": "/nonexistent", "PATH": os.defpath, "LANG": "C.UTF-8"},
             inherit_environment=False,
@@ -1714,9 +1728,9 @@ class FootballPredictionAdapter:
         except (OSError, RuntimeError) as exc:
             return GateResult("BLOCKED_EXTERNAL", f"cannot safely persist local merge evidence: {exc}")
         code = ("import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
-                "from scripts.devops import agent_workflow as m, agent_workflow_preflight as p, pr_ready_check as r; "
-                "from scripts.ops import ai_workflow_gate as g; from scripts.ops.helpers import git_change_helpers as h; "
-                "p.ROOT=r.ROOT=g.ROOT=Path(sys.argv[2]); h.ROOT_HELPER=Path(sys.argv[2]); "
+                "approved_base=sys.argv[sys.argv.index('--base-sha')+1]; " + self._preflight_data_binding() +
+                "from scripts.devops import agent_workflow as m, pr_ready_check as r; "
+                "r.ROOT=Path(sys.argv[2]); "
                 "sys.argv=['agent-workflow']+sys.argv[3:]; raise SystemExit(m.main())")
         argv = ["python3", "-I", "-B", "-c", code, str(trusted), worktree, "merge-ready",
                 "--repo-root", worktree, "--base-sha", base, "--head-sha", head,
@@ -1740,7 +1754,7 @@ class FootballPredictionAdapter:
                 "--protected-invariants", protected_invariants,
                 "--forbidden-side-effects", forbidden_side_effects,
                 "--required-pr-governance", required_pr_governance, "--json"]
-        result = self._call(argv, cwd=str(trusted), env={"GH_HOST": "github.com", "GH_REPO": pr_repo,
+        result = self._call(argv, cwd=worktree, env={"GH_HOST": "github.com", "GH_REPO": pr_repo,
                                                         "PYTHONDONTWRITEBYTECODE": "1"})
         try:
             data = self._json_document_prefix(result.stdout)

@@ -1,10 +1,12 @@
 """Factory -> Remote -> fixed original PR readiness; all services are offline.
 
 Developer/review/container/final-gate fixtures are NOT real delivery evidence.
-Only the original readiness evaluator and the Harness state flow under test
-are real. GitHub/CI reads and publication writes use explicit local doubles.
+The original readiness evaluator, selected original-rule preflights and the
+Harness state flow are real. GitHub/CI reads and writes use local doubles.
 """
 import copy
+from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -12,9 +14,11 @@ import unittest
 from unittest.mock import patch
 
 from harness.adapters import FootballPredictionAdapter, GateResult
-from harness.factory import READY, git
+from harness.factory import Factory, READY, git
 import test_factory_controller_gates as fixtures
 from test_factory_contract_binding import PROJECT_BASE, evidence, load_contract
+from test_factory_preflight_roots import PreflightProbe
+import test_factory_preflight_inspection as preflight_fixtures
 
 
 class ReadinessRemote(fixtures.FakeRemote):
@@ -72,14 +76,20 @@ class OfflineChainRuntime(fixtures.LiveProtocolDouble):
         super().__init__()
         self.canonical, self.events = canonical, []
         self.mismatch, self.lose_once = False, False
+        self.script = None
 
     def agent(self, role, profile, cwd, payload, transcript, timeout, denied_roots):
         self.events.append({"kind": role, "branch": git(cwd, "branch", "--show-current"),
                             "head": git(cwd, "rev-parse", "HEAD")})
         # Reuse the fixture's correct implementation, without its unrelated
         # deliberate floor-division bug and synthetic reviewer-driven rework.
-        return super().agent("rework" if role == "implement" else role, profile, cwd, payload,
-                             transcript, timeout, denied_roots)
+        result = super().agent("rework" if role == "implement" else role, profile, cwd, payload,
+                               transcript, timeout, denied_roots)
+        if self.script is not None and role in {"implement", "rework"}:
+            path, content = self.script
+            (cwd / path).parent.mkdir(parents=True, exist_ok=True)
+            (cwd / path).write_text(content)
+        return result
 
     def project_remote(self, action, policy, spec, cwd, target, body, transcript, timeout, **kwargs):
         transcript.write_text("OFFLINE chain; no real publication, CI or providers\n")
@@ -91,6 +101,22 @@ class OfflineChainRuntime(fixtures.LiveProtocolDouble):
             self.remote.lose_create_response = self.lose_once
         self.remote.target = target
         try:
+            if self.script is not None and action in {"publish", "verify"}:
+                probe = PreflightProbe(spec, cwd, target, body)
+                try:
+                    probe.publication()
+                    if action == "verify":
+                        actual = probe.final()
+                        # The real gate still says NO without real receipts.
+                        # Only its two original local preflights are asserted;
+                        # review/container/final approval remain state-flow doubles.
+                        if (len(probe.events) != 3 or actual.data is None
+                                or actual.data.get("local_required_checks") != "PASS"):
+                            raise ValueError("original final local preflights rejected fixture")
+                finally:
+                    self.events.append({"kind": "original-preflights", "action": action,
+                        "target": target, "body": body, "events": probe.events,
+                        "remaining_final_authority": "OFFLINE synthetic review/CI/container fixtures"})
             if action == "publish":
                 result = self.remote.publish(policy, spec, target, body, kwargs.get("previous_head"))
             elif action == "reconcile":
@@ -160,6 +186,57 @@ class OfflineReadinessChainTests(unittest.TestCase):
         self.assertEqual(self.runtime.remote.writes, ["push", "create"])
         self.assertEqual(git(Path(report["CANDIDATE"]), "show-ref", "--heads"), branches)
         self.assertEqual(dict(self.f.db.execute("SELECT * FROM operations WHERE id=?", (original["id"],)).fetchone()), original)
+
+    def original_rule_script_chain(self, content):
+        """Keep the existing chain doubles, but run all three real preflights."""
+        preflight_fixtures.PublicationDataRootTests.setUpClass()
+        self.addCleanup(preflight_fixtures.PublicationDataRootTests.doClassCleanups)
+        original = preflight_fixtures.PublicationDataRootTests("test_new_script_lifecycle_header_is_read_from_candidate")
+        original.setUp()
+        self.addCleanup(original.doCleanups)
+        fx = original.fx
+        path = "scripts/ops/offline_chain_probe.py"
+        fx.scope["authorized_paths"].extend(["tests/test_score.py", path])
+        content_scope = json.dumps(fx.scope, indent=2) + "\n"
+        self.f = Factory(fx.root / "original-preflight-offline-chain", {
+            **fx.config, "project_container": fixtures.CONTAINER, "project_delivery": fixtures.DELIVERY,
+            "project_review_limits": fixtures.LIMITS, "checks": [["make", "verify-targeted"]],
+            "ci": [["make", "verify-pr"]]}, self.runtime)
+        self.addCleanup(self.f.close)
+        spec = {"version": 2, "mission_id": "feature", "repository": str(fx.repo),
+            "base": fx.base, "objective": "Offline original-rule script lifecycle chain",
+            "approved_mission_scope": {"approval_id": "offline-script-chain", "mission_id": "feature",
+                "base": fx.base, "path": fx.path, "content": content_scope,
+                "sha256": hashlib.sha256(content_scope.encode()).hexdigest(),
+                "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()},
+            "pr_body_template": preflight_fixtures.publication_body(fx,
+                {"head": "{{candidate_head}}", "files": sorted(fx.scope["authorized_paths"])})}
+        self.runtime.script = (path, content)
+        self.f.submit(spec)
+
+    def test_legal_script_original_three_preflights_reaches_fixture_ready(self):
+        self.original_rule_script_chain("# Owner: offline chain fixture\nprint(1)\n")
+        report = self.f.run("feature")
+        self.save("offline-script-ready", report)
+        self.assertEqual(report["DELIVERY_STATUS"], READY, report)
+        self.assertEqual(self.runtime.remote.writes, ["push", "create"])
+        originals = [e for e in self.runtime.events if e["kind"] == "original-preflights"]
+        self.assertTrue(any(e["action"] == "verify" and len(e["events"]) == 3 for e in originals))
+        for call in originals:
+            self.assertNotIn("## Script Lifecycle", call["body"])
+            self.assertTrue(all(e["facts"]["result"]["verdict"] == "PASS" for e in call["events"]))
+        self.assertFalse(report["MERGE_PERFORMED"])
+
+    def test_illegal_script_original_publication_preflight_stops_fixture_chain(self):
+        self.original_rule_script_chain("print(1)\n")
+        report = self.f.run("feature")
+        self.save("offline-script-rejected", report)
+        self.assertNotEqual(report["DELIVERY_STATUS"], READY, report)
+        self.assertEqual(self.runtime.remote.writes, [])
+        calls = [e for e in self.runtime.events if e["kind"] == "original-preflights"]
+        self.assertTrue(calls)
+        self.assertTrue(all(e["facts"]["result"]["verdict"] == "FAIL" for c in calls for e in c["events"]))
+        self.assertIn("Script lifecycle missing", json.dumps(calls))
 
 
 if __name__ == "__main__":
