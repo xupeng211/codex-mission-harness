@@ -102,7 +102,8 @@ class DockerDouble:
     def hooks(self):
         stack = ExitStack()
         for name, value in (("harness.factory_project.FootballPredictionContract.policy", lambda *a: {}),
-                            ("harness.factory_container.inspect_image", lambda *a: IMAGE),
+                            ("harness.factory_container.source_check", fixtures.local_source_check),
+                            ("harness.factory_container.inspect_image", lambda *a, **kw: IMAGE),
                             ("harness.factory_container.subprocess.Popen", self.popen),
                             ("harness.factory_container.subprocess.run", self.command),
                             ("harness.factory_container.subprocess.check_output", self.output),

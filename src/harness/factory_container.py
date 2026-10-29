@@ -11,6 +11,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -58,23 +59,26 @@ class RedactedOutput:
         self.stream.flush()
 
 
-def consume_output(proc, output, cancel, deadline):
-    """One bounded Controller pipe; the child never receives a log file fd."""
-    eof = False
+def consume_output(proc, output, cancel, deadline, *, stderr_output=None):
+    """Controller-owned pipes; the child never receives a log file fd."""
+    streams = {proc.stdout: output}
+    if stderr_output is not None and getattr(proc, "stderr", None) is not None:
+        streams[proc.stderr] = stderr_output
     while True:
-        if not eof and select.select([proc.stdout], [], [], 0.05)[0]:
-            data = os.read(proc.stdout.fileno(), 65536)
-            if data:
-                output.write(data)
-            else:
-                eof = True
-        elif eof:
+        if streams:
+            for stream in select.select(list(streams), [], [], 0.05)[0]:
+                data = os.read(stream.fileno(), 65536)
+                if data:
+                    streams[stream].write(data)
+                else:
+                    del streams[stream]
+        else:
             cancel.wait(0.05)
         if cancel.is_set():
             raise ExecutionStopped("CANCELLED")
         if time.monotonic() >= deadline:
             raise ExecutionStopped("TIMEOUT")
-        if eof and proc.poll() is not None:
+        if not streams and proc.poll() is not None:
             return
 
 
@@ -85,19 +89,21 @@ def check_stopped(cancel, deadline):
         raise ExecutionStopped("TIMEOUT")
 
 
-def prepare_client(runtime, argv, cwd, log, cancel, deadline, *, env=ENV):
+def prepare_client(runtime, argv, cwd, log, cancel, deadline, *, env=ENV, stderr_log=None):
     """A preparation client belongs to the same execution as validation."""
     with runtime._execution_lock:
         check_stopped(cancel, deadline)
         if runtime.container_cancel is not cancel:
             raise ExecutionStopped("CANCELLED")
         proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, start_new_session=True)
+                                stderr=subprocess.PIPE if stderr_log is not None else subprocess.STDOUT,
+                                start_new_session=True)
         runtime.current_process = proc
     output = RedactedOutput(log)
+    error_output = RedactedOutput(stderr_log) if stderr_log is not None else None
     completed = False
     try:
-        consume_output(proc, output, cancel, deadline)
+        consume_output(proc, output, cancel, deadline, stderr_output=error_output)
         completed = True
     finally:
         try:
@@ -110,12 +116,58 @@ def prepare_client(runtime, argv, cwd, log, cancel, deadline, *, env=ENV):
         finally:
             try:
                 proc.stdout.close()
+                if getattr(proc, "stderr", None) is not None:
+                    proc.stderr.close()
                 output.finish()
+                if error_output is not None:
+                    error_output.finish()
             finally:
                 with runtime._execution_lock:
                     if runtime.current_process is proc:
                         runtime.current_process = None
     return proc.returncode
+
+
+def captured_client(runtime, argv, cwd, cancel, deadline, *, env=ENV):
+    output, error = io.BytesIO(), io.BytesIO()
+    code = prepare_client(runtime, argv, cwd, output, cancel, deadline, env=env, stderr_log=error)
+    return subprocess.CompletedProcess(argv, code, output.getvalue(), error.getvalue())
+
+
+def source_check(runtime, request, phase, log, cancel, deadline):
+    """Keep this gate's existing Git/policy/source checks in its process group.
+
+    The Controller code and original verifiers are unchanged. Running this
+    bounded local query as a tracked client also covers their nested Git and
+    trusted-policy subprocesses, without altering shared Git executors.
+    """
+    code = """
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from harness.factory_container import binding, source_fingerprint
+from harness.factory import git
+v=json.loads(Path(sys.argv[2]).read_text()); phase=sys.argv[3]
+cwd=Path(v['cwd']); workspace=Path(v['workspace']); target=v['target']
+if phase == 'candidate':
+    result={'source': binding(v['spec'], cwd, target)}
+elif phase == 'snapshot':
+    result={'snapshot': source_fingerprint(workspace, target['head'])}
+elif phase == 'final':
+    result={'source': binding(v['spec'], cwd, target),
+            'snapshot': source_fingerprint(workspace, target['head']),
+            'snapshot_dirty': bool(git(workspace, 'diff', '--name-only', 'HEAD'))}
+else:
+    raise ValueError('unknown source-check phase')
+print(json.dumps(result))
+"""
+    result = captured_client(runtime,
+        [sys.executable, "-I", "-B", "-c", code, str(Path(__file__).resolve().parents[1]), str(request), phase],
+        request.parent, cancel, deadline)
+    if result.returncode:
+        log.write(result.stdout + result.stderr)
+        raise ValueError("Controller source verification failed")
+    return json.loads(result.stdout)
 
 
 def validate_policy(policy):
@@ -131,14 +183,21 @@ def validate_policy(policy):
     return policy
 
 
-def inspect_image(policy):
+def inspect_image(policy, *, client=None):
     validate_policy(policy)
     # Deliberately do not inspect/output Config.Env or contact a registry.
     for key in ("image_id", "postgres_image_id"):
         if key not in policy:
             continue
-        value = subprocess.check_output(["/usr/bin/docker", "image", "inspect", "--format", "{{.Id}}",
-                                         policy[key]], env=ENV, stderr=subprocess.PIPE, timeout=15).decode().strip()
+        argv = ["/usr/bin/docker", "image", "inspect", "--format", "{{.Id}}", policy[key]]
+        if client is None:  # Standalone availability probe, outside a gate.
+            raw = subprocess.check_output(argv, env=ENV, stderr=subprocess.PIPE, timeout=15)
+        else:
+            result = client(argv, env=ENV, timeout=15)
+            if result.returncode:
+                raise subprocess.CalledProcessError(result.returncode, argv, result.stdout)
+            raw = result.stdout
+        value = raw.decode().strip()
         if value != policy[key]:
             raise ValueError("local image identity differs from Controller policy")
     return policy["image_id"]
@@ -273,30 +332,28 @@ def recover(policy, spec, target, command, transcript):
 
 
 def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
-    from .factory import digest, git
+    from .factory import digest
+    started = time.monotonic()
+    deadline = started + timeout
+    cancel = runtime.container_cancel
     profile = PROFILES.get(tuple(command))
     if profile is None or profile not in validate_policy(policy)["profiles"]:
         raise ValueError("Controller container executor only accepts approved canonical profiles")
     needs_postgres = profile in {"pr", "strict"}
     if needs_postgres and "postgres_image_id" not in policy:
         raise ValueError("canonical pr/strict requires a pinned isolated test PostgreSQL image")
-    image = inspect_image(policy)
-    before = binding(spec, cwd, target)
     result = {"target": target, "mission_id": spec["mission_id"], "scope_sha256": target["mission_scope_sha256"],
-              "image_id": image, "profile": profile, "fixture": False, "network": "none",
+              "image_id": policy["image_id"], "profile": profile, "fixture": False, "network": "none",
               "container_policy": policy, "services": {}}
     name = "cmh-validate-" + uuid.uuid4().hex
     resources = resources_for(name, spec, target, needs_postgres)
-    started = time.monotonic()
-    deadline = started + timeout
-    cancel = runtime.container_cancel
-    if cancel.is_set():
-        raise RuntimeError("container execution cancelled before launch")
     with tempfile.TemporaryDirectory(prefix="cmh-validation-", dir=transcript.parent) as temporary:
         workspace = Path(temporary) / "source"
         service, proc, output = None, None, None
+        before = after = snapshot_after = "NOT_VERIFIABLE"
+        unchanged, validation_attempted = False, False
         outcome = "EXITED"
-        result.update(container_name=name, source_before=before, cleanup_confirmed=False, exit_code=None)
+        result.update(container_name=name, source_before=before, cleanup_confirmed=True, exit_code=None)
         with transcript.open("x+b") as log:
             os.fchmod(log.fileno(), 0o600)
             # Durable plan precedes the first Docker dispatch. An interrupted
@@ -315,6 +372,17 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                 os.fsync(stream.fileno())
             result["lifecycle_record"] = str(lifecycle)
             try:
+                check_stopped(cancel, deadline)
+                request = Path(temporary) / "source-check.json"
+                with request.open("x") as stream:
+                    os.fchmod(stream.fileno(), 0o600)
+                    json.dump({"spec": spec, "cwd": str(cwd), "target": target, "workspace": str(workspace)}, stream)
+                def client(argv, *, env=ENV, timeout):
+                    return captured_client(runtime, argv, temporary, cancel,
+                                           min(deadline, time.monotonic() + timeout), env=env)
+                image = inspect_image(policy, client=client)
+                before = source_check(runtime, request, "candidate", log, cancel, deadline)["source"]
+                result["source_before"] = before
                 dependency_name = name + "-dependencies"
                 try:
                     # Only this preparation path uses the cancellable client;
@@ -357,7 +425,7 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                     if not cleaned:
                         raise RuntimeError("dependency copy container cleanup could not be confirmed")
                 check_stopped(cancel, deadline)
-                snapshot = source_fingerprint(workspace, target["head"])
+                snapshot = source_check(runtime, request, "snapshot", log, cancel, deadline)["snapshot"]
                 result["snapshot_before"] = snapshot
                 lifetime = max(1, math.ceil(deadline - time.monotonic()))
                 result.update(lifetime_limit_seconds=lifetime, lifetime_kill_grace_seconds=5)
@@ -369,7 +437,7 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                 argv[index:index] = [v for k, value in resources[0]["labels"].items() for v in ("--label", k + "=" + value)]
                 if needs_postgres:
                     service = ProjectPostgres(policy["postgres_image_id"], name + "-postgres", Path(temporary),
-                                              target, spec["mission_id"], cancel, deadline, ENV, log)
+                                              target, spec["mission_id"], cancel, deadline, ENV, log, client=client)
                     result["services"]["postgres"] = service.evidence
                     service.start()
                     service.check()
@@ -385,6 +453,7 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                     check_stopped(cancel, deadline)
                     if runtime.container_cancel is not cancel:
                         raise ExecutionStopped("CANCELLED")
+                    validation_attempted = True
                     proc = subprocess.Popen(argv, cwd=temporary, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                             start_new_session=True)
                     runtime.current_process = proc
@@ -412,33 +481,38 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                         with runtime._execution_lock:
                             if runtime.current_process is proc:
                                 runtime.current_process = None
-                        cleaned, code = remove_owned(name, name, resources[0]["labels"])
+                        cleaned, code = (remove_owned(name, name, resources[0]["labels"])
+                                         if validation_attempted else (True, None))
                         result.update(cleanup_confirmed=cleaned, cleanup_exit_code=code)
                         if service is not None:
                             service.close()
                             result["cleanup_confirmed"] &= service.evidence["cleanup_confirmed"]
                             result["ephemeral_password_redacted"] = True
+                if outcome == "EXITED" and result["exit_code"] == 124:
+                    outcome = "TIMEOUT"
+                if outcome == "EXITED":
+                    # Preserve the original after-cleanup source observation,
+                    # but give ordinary queries only the remaining gate time.
+                    # A stopped execution runs no more source/Git/policy work.
+                    try:
+                        final = source_check(runtime, request, "final", log, cancel, deadline)
+                        after, snapshot_after = final["source"], final["snapshot"]
+                        unchanged = before == after and snapshot == snapshot_after and not final["snapshot_dirty"]
+                    except ExecutionStopped as error:
+                        outcome = error.outcome
+                    except (OSError, ValueError, subprocess.SubprocessError):
+                        pass  # Unverifiable source can never produce PASS.
                 if cancel.is_set():
                     outcome = "CANCELLED"
-        try:
-            if "snapshot_before" not in result:
-                raise ValueError("source preparation did not finish; no snapshot to compare")
-            after = binding(spec, cwd, target)
-            snapshot_after = source_fingerprint(workspace, target["head"])
-            unchanged = (before == after and result.get("snapshot_before") == snapshot_after
-                         and not git(workspace, "diff", "--name-only", "HEAD"))
-        except (OSError, ValueError, subprocess.SubprocessError):
-            after, snapshot_after, unchanged = "NOT_VERIFIABLE", "NOT_VERIFIABLE", False
         # 137 can also be OOM or an unrelated SIGKILL; do not invent a
         # timeout diagnosis without the Controller deadline or exit 124.
-        if outcome == "EXITED" and result["exit_code"] == 124:
-            outcome = "TIMEOUT"
         result.update(outcome=outcome, source_after=after, snapshot_after=snapshot_after,
-                      source_unchanged=unchanged, elapsed_seconds=round(time.monotonic() - started, 3))
+                      source_unchanged=unchanged)
         result["status"] = (outcome if outcome != "EXITED" else "SOURCE_CHANGED" if not unchanged else
                             "BLOCKED_ENVIRONMENT" if not result["cleanup_confirmed"] else
                             "PASS" if result["exit_code"] == 0 else "FAIL")
     result["temporary_directory_cleanup_confirmed"] = not Path(temporary).exists()
     if not result["temporary_directory_cleanup_confirmed"] and result["status"] == "PASS":
         result["status"] = "BLOCKED_ENVIRONMENT"
+    result["elapsed_seconds"] = round(time.monotonic() - started, 3)
     return result

@@ -321,12 +321,21 @@ print(json.dumps({'canonical_diff_sha256':hashlib.sha256(diff).hexdigest(), 'can
                 "from scripts.devops import agent_workflow_preflight as p; "
                 "from scripts.ops import ai_workflow_gate as g; "
                 "from scripts.ops.helpers import git_change_helpers as h; "
-                "p.ROOT=g.ROOT=h.ROOT_HELPER=Path(sys.argv[2]); "
+                "from scripts.ops.helpers import governance_p1_checks as v, disposable_canonical_db_proof_scan as d; "
+                # Explicit data dependencies of this fixed preflight. Imports
+                # stay under trusted BASE; neither candidate rules nor a
+                # blanket module-global rebinding are used.
+                "p.ROOT=g.ROOT=h.ROOT_HELPER=v.ROOT=d.ROOT=Path(sys.argv[2]); "
+                # This helper's legacy input resolver uses implicit cwd and
+                # HEAD~1. Supply the already approved complete comparison,
+                # retaining its original changed-line scanner and rules.
+                "approved_base=sys.argv[5]; v._resolve_diff_base=lambda: approved_base; "
                 "sys.argv=['agent-preflight','--pr-body-file',sys.argv[3],'--mission-scope-file',sys.argv[4],"
                 "'--base-ref',sys.argv[5],'--head-ref',sys.argv[6],'--require-review','--json']; raise SystemExit(p.main())")
         checked = self.adapter._call([self.adapter._trusted_python_interpreter(), "-I", "-B", "-c", code,
             str(trusted), str(cwd), str(path), str(cwd / target["mission_scope_file"]), target["base"], target["head"]],
-            cwd=str(trusted), env={"HOME": "/nonexistent", "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+            # governance_p1_checks also invokes Git without an explicit cwd.
+            cwd=str(cwd), env=self.adapter._trusted_git_environment(),
             inherit_environment=False)
         document = self.adapter._json_document_prefix(checked.stdout)
         if checked.returncode or document.get("verdict") != "PASS":

@@ -5,6 +5,7 @@ import copy
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,7 +13,7 @@ from unittest.mock import patch
 
 from harness.adapters import GateResult
 from harness.factory import Factory, FactoryBlocked, READY, git
-from harness.factory_container import argv_for, run as container_run, source_fingerprint
+from harness.factory_container import argv_for, binding, run as container_run, source_fingerprint
 from harness.factory_project import validate_review_limits, verify_target, FootballPredictionContract
 from harness.factory_remote import Remote, identity
 from harness.factory_runtime import LocalRuntime
@@ -26,6 +27,23 @@ CONTAINER = {"image_id": IMAGE, "postgres_image_id": IMAGE, "profiles": ["target
 DELIVERY = {"repository": "fixture/football", "base_branch": "main"}
 LIMITS = {"approval_id": "offline-test-only", "max_deepseek_chunks": 2,
           "max_canonical_diff_bytes": 100000, "allow_unknown_provider_usage": True}
+
+
+def local_source_check(runtime, request, phase, log, cancel, deadline):
+    """Keep real source checks for fixtures whose policy is an in-process stub.
+
+    Real cancellable source-query clients are tested separately against the
+    original project rules, not replaced by a constant PASS here.
+    """
+    value = json.loads(request.read_text())
+    cwd, workspace, target = Path(value["cwd"]), Path(value["workspace"]), value["target"]
+    if phase == "candidate":
+        return {"source": binding(value["spec"], cwd, target)}
+    if phase == "snapshot":
+        return {"snapshot": source_fingerprint(workspace, target["head"])}
+    return {"source": binding(value["spec"], cwd, target),
+            "snapshot": source_fingerprint(workspace, target["head"]),
+            "snapshot_dirty": bool(git(workspace, "diff", "--name-only", "HEAD"))}
 
 
 class FakeRemote(Remote):
@@ -145,9 +163,11 @@ class ControllerGatesTests(unittest.TestCase):
                 return s.returncode
         def popen(argv, *args, **kwargs):
             if argv[0] != "/usr/bin/docker": return real_popen(argv, *args, **kwargs)
-            if argv[1] in {"create", "cp"}:
-                command(argv, *args, **kwargs)
-                return real_popen(["/usr/bin/true"], **kwargs)
+            if argv[1] in {"image", "create", "cp", "inspect", "exec"} or "--detach" in argv:
+                result = (subprocess.CompletedProcess(argv, 0, (IMAGE + "\n").encode(), b"")
+                          if argv[1] == "image" else command(argv, *args, **kwargs))
+                return real_popen([sys.executable, "-B", "-c",
+                    f"import sys; sys.stdout.buffer.write({result.stdout!r}); sys.exit({result.returncode})"], **kwargs)
             calls.append(argv)
             if mode == "timeout": clock[0] = 10.0
             name = argv[argv.index("--name") + 1]
@@ -196,6 +216,7 @@ class ControllerGatesTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, b"", b"")
             return real_run(argv, *args, **kwargs)
         with patch("harness.factory_project.FootballPredictionContract.policy", return_value={}), \
+                patch("harness.factory_container.source_check", side_effect=local_source_check), \
                 patch("harness.factory_container.subprocess.Popen", side_effect=popen), \
                 patch("harness.factory_container.subprocess.check_output", side_effect=output), \
                 patch("harness.factory_container.subprocess.run", side_effect=command), \

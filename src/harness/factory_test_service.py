@@ -19,9 +19,10 @@ class ExecutionStopped(RuntimeError):
 
 
 class ProjectPostgres:
-    def __init__(self, image, name, directory, target, mission, cancel, deadline, env, log):
+    def __init__(self, image, name, directory, target, mission, cancel, deadline, env, log, *, client=None):
         self.image, self.name, self.directory = image, name, directory
         self.cancel, self.deadline, self.env, self.log = cancel, deadline, env, log
+        self.client = client
         self.owner = name.removeprefix("cmh-validate-")
         self.user = "cmh_" + self.owner[:16]
         # Existing init_db.sql grants CONNECT on this literal fixture DB.
@@ -56,8 +57,14 @@ class ProjectPostgres:
         limit = 15 if cleanup else max(0.05, min(15, self.deadline - time.monotonic()))
         env = {**self.env, **({"PGPASSWORD": self.password} if password else {})}
         try:
-            result = subprocess.run(["/usr/bin/docker", *args], env=env,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=limit)
+            if not cleanup and self.client is not None:
+                # Gate supplies its identity-checked, cancellable client. Only
+                # cleanup may outlive that gate's cancelled/expired deadline.
+                result = self.client(["/usr/bin/docker", *args], env=env, timeout=limit)
+                self.check()
+            else:
+                result = subprocess.run(["/usr/bin/docker", *args], env=env,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=limit)
         except (OSError, subprocess.SubprocessError) as error:
             self.record({"service_command": args, "exit_code": None, "error_type": type(error).__name__})
             raise

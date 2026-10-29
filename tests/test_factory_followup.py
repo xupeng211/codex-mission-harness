@@ -44,7 +44,7 @@ class CredentialPersistenceTests(unittest.TestCase):
         observed, ready = [], threading.Event()
         real_run, real_popen = subprocess.run, subprocess.Popen
         class Service:
-            def __init__(s, *args):
+            def __init__(s, *args, **kwargs):
                 s.password = secret
                 s.evidence = {"cleanup_confirmed": False}
             def start(s): pass
@@ -76,6 +76,7 @@ class CredentialPersistenceTests(unittest.TestCase):
             if argv[0] == "/usr/bin/docker": return subprocess.CompletedProcess(argv, 0, b"", b"")
             return real_run(argv, *args, **kw)
         with patch("harness.factory_project.FootballPredictionContract.policy", return_value={}), \
+                patch("harness.factory_container.source_check", side_effect=fixtures.local_source_check), \
                 patch("harness.factory_container.inspect_image", return_value=fixtures.IMAGE), \
                 patch("harness.factory_container.remove_owned", return_value=(True, 0)), \
                 patch("harness.factory_container.ProjectPostgres", Service), \

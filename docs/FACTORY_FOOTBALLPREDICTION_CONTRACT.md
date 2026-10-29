@@ -49,6 +49,10 @@ Review Evidence。只支持 `{{candidate_head}}`、`{{review_timestamp}}` 两个
 后者来自已验证 Codex receipt 的 `review_completed_at`。CRITICAL 的 Provider
 字段按项目规则用逗号列出 `codex-cli, claude-code-deepseek`。正文仍须通过原项目
 trusted-base preflight，不能凭模板或 Factory 自填 PASS 跳过审核。
+preflight 及委托规则代码均从准确 trusted BASE 导入；其 Git、archive/lifecycle、
+disposable-proof marker 和 scope/config 读取的数据根显式指向候选，archive
+changed-line 输入绑定完整批准 BASE。依赖隐式 cwd 的 Git 也在候选目录读取，
+不执行候选提供的治理代码；任何预检拒绝发生在 push/create/update 之前。
 
 ## A：受控容器验证
 
@@ -128,6 +132,11 @@ COMPLETE 必须通过原操作证据与 lifecycle 摘要、任务和目标绑定
 源码 clone/remote-remove/checkout/update-ref 和依赖 create/cp 客户端同样登记到该执行身份，派发前检查取消和剩余 deadline，
 准备期间可取消且不重新获得原 timeout；停止后仍执行有界、核对归属的 finally 清理。
 源码准备中止时不再派发验证，未建立完整快照不声称源码完整性已确认。
+gate 从首次镜像检查之前开始计时，镜像检查、原有源码/策略核验、源码准备、
+依赖准备、PG 启动/隔离检查/健康检查、验证及结束源码核验共用一次绝对 deadline
+和执行身份。原有源码/Git/策略核验在受跟踪的本地进程组内执行，取消可终止其
+嵌套客户端；不改共享 Git 工具。停止后不派发普通检查，源码不能核实即不能 PASS。
+只有既有有界 ownership 清理允许越过取消/deadline，elapsed 包含镜像及临时目录清理。
 删除只派发一次；Docker 自动删除与取消重叠时，在两秒确认窗口内查询准确资源名，
 只有肯定的不存在证据才能确认清理，原 rm 退出码仍保留。查询失败或未消失仍为未确认。
 
