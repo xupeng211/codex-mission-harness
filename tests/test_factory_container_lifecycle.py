@@ -230,7 +230,7 @@ class CompletedCleanupTests(unittest.TestCase):
             if wrong_record:
                 path = Path(result["lifecycle_record"])
                 record = json.loads(path.read_text())
-                record["target"]["head"] = "0" * 40
+                record["target_sha256"] = "0" * 64
                 path.write_text(json.dumps(record))
             return result
         with self.double.hooks():

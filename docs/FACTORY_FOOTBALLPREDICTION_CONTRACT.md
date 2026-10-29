@@ -97,6 +97,19 @@ Controller 被强制终止时验证仍会到期。首次 Docker 调用前写入�
 RUNNING/UNKNOWN 验证改为通过，也不能自动重跑测试。退出码 137 的原因未被证明时
 仅记录失败，不能冒称一定是 timeout。
 
+新 lifecycle v2 保存完整 target 的规范 JSON SHA256，完整 target 仍在原 operation
+证据中；资源、policy、profile 和临时目录继续显式保存。序列化记录最多 64 KiB，
+写入前核对容量，超限时尚未创建任何容器。旧版内嵌 target 的中断记录保持原字节，
+读取上限为可信 operation 中预期 target 的旧版序列化字节数加 64 KiB 元数据余量；
+只接受完整 target 相等的旧格式。v2 自身仍受 64 KiB 限制。未知版本、损坏或身份
+不匹配的记录不能清理，原证据路径、raw hash 和资源归属检查不变。
+
+干净验证副本显式将 `refs/remotes/origin/main` 写为批准的完整 BASE，并通过同次执行
+的可取消、受剩余 deadline 限制的 Git 客户端回读核实；不匹配时不创建容器。
+`env -i` 同时传入 `BASE_REF`、`HEAD_REF` 和原 helper 所需的 `GITHUB_BASE_REF=main`，
+使 profile 文件选择、静态诊断新增行和 gatekeeper 两条差异入口都使用完整批准范围，
+不依赖来源工作区已有的 main/origin/main，也不修改原 canonical profile 或诊断门槛。
+
 验证 stdout/stderr 经 Controller pipe 在写入持久日志之前遮蔽本任务已知的随机测试
 密码；跨读取块保留最多密码长度减一的可能前缀，结束时保守遮蔽未完成前缀。
 验证容器禁用 Docker 日志驱动，避免原始输出在另一处落盘；服务就绪/清理诊断仍保留。
@@ -123,6 +136,8 @@ COMPLETE 必须通过原操作证据与 lifecycle 摘要、任务和目标绑定
 只有双 receipt 当前有效且无任何 findings、本地 checks/ci PASS 后，Controller
 才发布。`factory_remote.py` 固定可信 repository/main，以 mission+base 推导专用
 `factory/<mission>-<base12>` 分支，以 scope/repo/base 的 marker 识别所有权。
+Factory.prepare、本地报告和发布使用同一分支推导；发布/观察前核对本地分支。
+恢复时同样要求原准确身份，不重命名旧候选或新建替代分支来通过 readiness。
 它先核实远端 main 等于批准 base；从新建 Controller Git 元数据取准确提交，禁用
 候选 hooks/config，不 force push。只有已证明的上一候选 publication 可更新同一
 PR，其他 HEAD、closed PR、fork、不同 base 或模糊发现均拒绝。正文由 immutable
@@ -198,6 +213,12 @@ Factory all-findings（包括 P3）返工 barrier 不变。没有新增计费或
 仅替换 Provider 和认证环境探测，验证原接口；所有 fake identity 都只是离线材料。
 设置 `FOOTBALLPREDICTION_CONTRACT_REPO` 指向拥有该 Git object 的只读仓库后运行
 `make verify`。缺失来源是 UNVERIFIED/SKIP，不能冒称真实审核。
+
+`test_factory_offline_readiness.py` 将真实 Factory.prepare/checkpoint、Remote
+发布/观察/CI 和 adapter.ci 连接到上述固定对象的原 `pr_ready_check.evaluate`。
+仅远端与 CI 响应使用替身，readiness 真实读取本地 Git；正常场景在隔离 fixture 状态
+进入 READY，分支不匹配仍由原规则拒绝。开发者、审核、容器与其他 final-gate 条件
+仍是已标明的离线 fixtures，不构成真实端到端交付、真实审核或正式 READY 授权。
 
 真实容器检查、离线代码检查、真实远端、正式审核与业务验收必须分别报告。
 本轮真实 PR writes/paid reviews/business mission 为 NOT_RUN，未改变安装入口。

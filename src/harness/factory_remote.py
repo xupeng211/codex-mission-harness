@@ -29,16 +29,24 @@ def validate_policy(value):
     return value
 
 
-def identity(policy, spec, target):
-    validate_policy(policy)
+def project_branch(spec):
+    """One dedicated identity for local preparation, publication and resume."""
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}", spec["mission_id"]):
         raise ValueError("invalid publication mission")
+    if not re.fullmatch(r"[0-9a-f]{40}", spec["base"]):
+        raise ValueError("invalid publication base")
+    return f"factory/{spec['mission_id']}-{spec['base'][:12]}"
+
+
+def identity(policy, spec, target):
+    validate_policy(policy)
+    branch = project_branch(spec)
     if spec["base"] != target["base"]:
         raise ValueError("publication base mismatch")
     frozen = {"repository": policy["repository"], "base": target["base"], "mission": spec["mission_id"],
               "scope_sha256": target["mission_scope_sha256"]}
     marker = "<!-- cmh-publication " + hashlib.sha256(json.dumps(frozen, sort_keys=True).encode()).hexdigest() + " -->"
-    return f"factory/{spec['mission_id']}-{target['base'][:12]}", marker
+    return branch, marker
 
 
 def render_body(policy, spec, target, reviews, validations):
@@ -112,8 +120,15 @@ class Remote:
         if exact_body is not None and raw["body"] != exact_body:
             raise ValueError("PR body differs from exact Controller publication")
 
+    def check_local_branch(self, branch):
+        current = self.command(["/usr/bin/git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
+                                "-c", "core.fsmonitor=false", "symbolic-ref", "--quiet", "--short", "HEAD"]).strip()
+        if current != branch:
+            raise ValueError("local candidate branch differs from exact publication identity")
+
     def observe(self, policy, spec, target, body):
         branch, marker = identity(policy, spec, target)
+        self.check_local_branch(branch)
         self.main_head(policy, target)
         pulls = self.pulls(policy, branch)
         if len(pulls) != 1:
@@ -135,6 +150,7 @@ class Remote:
         if not title:
             raise ValueError("publication requires a nonempty PR title")
         branch, marker = identity(policy, spec, target)
+        self.check_local_branch(branch)
         self.main_head(policy, target)
         pulls = self.pulls(policy, branch)
         if pulls:

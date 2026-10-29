@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import io
 import json
 import math
 import re
@@ -23,6 +24,7 @@ PROFILES = {("make", "verify-" + p): p for p in ("targeted", "pr", "strict")}
 ENV = {"PATH": SAFE_PATH, "HOME": "/nonexistent", "LANG": "C.UTF-8",
        "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
        "GIT_NO_REPLACE_OBJECTS": "1", "GIT_TERMINAL_PROMPT": "0"}
+LIFECYCLE_LIMIT = 65536
 
 
 class RedactedOutput:
@@ -214,19 +216,34 @@ def resources_for(name, spec, target, needs_postgres):
 
 def recover(policy, spec, target, command, transcript):
     """One-shot cleanup on resume; never retry validation or settle its UNKNOWN."""
+    from .factory import digest
     path = Path(transcript).with_suffix(".container.json")
     result = {"target": target, "mission_id": spec["mission_id"], "cleanup_confirmed": False,
               "operation_replayed": False, "resources": []}
     try:
+        # Old writers embedded the full target. Admit that exact legacy target
+        # plus bounded metadata, not an unlimited record or a changed target.
+        legacy_limit = len(json.dumps(target, sort_keys=True).encode()) + LIFECYCLE_LIMIT
         info = path.lstat()
         if (not stat.S_ISREG(info.st_mode) or path.is_symlink() or info.st_uid != os.getuid()
-                or stat.S_IMODE(info.st_mode) & 0o077 or info.st_size > 65536):
+                or stat.S_IMODE(info.st_mode) & 0o077 or info.st_size > legacy_limit):
             raise ValueError("untrusted container lifecycle record")
-        record = json.loads(path.read_text())
+        with path.open("rb") as stream:
+            raw = stream.read(legacy_limit + 1)
+        if len(raw) > legacy_limit:
+            raise ValueError("container lifecycle record exceeds bounded recovery capacity")
+        record = json.loads(raw)
+        if not isinstance(record, dict):
+            raise ValueError("invalid container lifecycle record")
+        if "version" not in record:
+            target_matches = record.get("target") == target
+        else:
+            target_matches = (type(record["version"]) is int and record["version"] == 2
+                              and len(raw) <= LIFECYCLE_LIMIT and record.get("target_sha256") == digest(target))
         name = record["container_name"]
         profile = PROFILES.get(tuple(command))
         if (not re.fullmatch(r"cmh-validate-[a-f0-9]{32}", name)
-                or record["target"] != target or record["mission_id"] != spec["mission_id"]
+                or not target_matches or record["mission_id"] != spec["mission_id"]
                 or record["policy"] != validate_policy(policy) or record["profile"] != profile
                 or profile not in policy["profiles"]):
             raise ValueError("container recovery task/candidate/policy mismatch")
@@ -256,7 +273,7 @@ def recover(policy, spec, target, command, transcript):
 
 
 def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
-    from .factory import git
+    from .factory import digest, git
     profile = PROFILES.get(tuple(command))
     if profile is None or profile not in validate_policy(policy)["profiles"]:
         raise ValueError("Controller container executor only accepts approved canonical profiles")
@@ -284,13 +301,16 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
             os.fchmod(log.fileno(), 0o600)
             # Durable plan precedes the first Docker dispatch. An interrupted
             # Controller can identify only its exact operation's resources.
-            record = {"target": target, "mission_id": spec["mission_id"], "policy": policy,
+            record = {"version": 2, "target_sha256": digest(target), "mission_id": spec["mission_id"], "policy": policy,
                       "profile": profile, "container_name": name, "resources": resources,
                       "temporary_directory": temporary}
+            raw = json.dumps(record, sort_keys=True).encode()
+            if len(raw) > LIFECYCLE_LIMIT:
+                raise ValueError("container lifecycle record exceeds recoverable capacity before dispatch")
             lifecycle = transcript.with_suffix(".container.json")
             with lifecycle.open("xb") as stream:
                 os.fchmod(stream.fileno(), 0o600)
-                stream.write(json.dumps(record, sort_keys=True).encode())
+                stream.write(raw)
                 stream.flush()
                 os.fsync(stream.fileno())
             result["lifecycle_record"] = str(lifecycle)
@@ -311,6 +331,16 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                                 "-c", "core.quotePath=false", "-c", "core.fsmonitor=false", "-C", str(repo), *args]
                         if prepare_client(runtime, argv, temporary, log, cancel, deadline, env=git_env):
                             raise RuntimeError("validation source preparation failed")
+                    # All original diff helpers consume GITHUB_BASE_REF, not
+                    # BASE_REF alone. Pin and verify their ref in this snapshot.
+                    base_output = io.BytesIO()
+                    argv = ["git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
+                            "-c", "core.fsmonitor=false", "-C", str(workspace),
+                            "rev-parse", "--verify", "refs/remotes/origin/main^{commit}"]
+                    code = prepare_client(runtime, argv, temporary, base_output, cancel, deadline, env=git_env)
+                    log.write(base_output.getvalue())
+                    if code or base_output.getvalue().strip() != target["base"].encode():
+                        raise ValueError("validation diff reference differs from approved full BASE")
                     labels = [v for k, value in resources[1]["labels"].items() for v in ("--label", k + "=" + value)]
                     create = ["/usr/bin/docker", "create", "--pull=never", "--name", dependency_name, *labels,
                               "--network=none", "--entrypoint=/usr/bin/true", image]
@@ -333,7 +363,7 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                 result.update(lifetime_limit_seconds=lifetime, lifetime_kill_grace_seconds=5)
                 argv = argv_for(policy, workspace, name, profile, lifetime)
                 index = argv.index("/usr/bin/timeout")
-                argv[index:index] = ["BASE_REF=" + target["base"], "HEAD_REF=" + target["head"],
+                argv[index:index] = ["BASE_REF=" + target["base"], "HEAD_REF=" + target["head"], "GITHUB_BASE_REF=main",
                                "MISSION_SCOPE_FILE=/app/" + target["mission_scope_file"]]
                 index = argv.index("--workdir=/app")
                 argv[index:index] = [v for k, value in resources[0]["labels"].items() for v in ("--label", k + "=" + value)]

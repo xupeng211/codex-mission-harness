@@ -431,6 +431,8 @@ class Factory:
     def prepare(self, mission):
         row = self.row(mission)
         spec, cwd = json.loads(row["spec"]), Path(row["candidate"])
+        from .factory_remote import project_branch
+        branch = project_branch(spec) if self.project else f"factory/{mission}"
         if row["status"] == "CREATED":
             if cwd.exists():
                 raise FactoryBlocked("UNKNOWN", "candidate preparation interrupted; unverified path was not reused")
@@ -440,7 +442,7 @@ class Factory:
                 private_dir(cwd.parent)
             git(Path(spec["repository"]), "clone", "--no-local", "--no-hardlinks", "--no-checkout", "--", spec["repository"], str(cwd))
             git(cwd, "remote", "remove", "origin")
-            git(cwd, "checkout", "-b", f"factory/{mission}", spec["base"])
+            git(cwd, "checkout", "-b", branch, spec["base"])
             if self.project:
                 materialize_scope(spec, cwd, git)
                 self.runtime.project_policy(spec, cwd, [spec["mission_scope_file"]])
@@ -449,6 +451,8 @@ class Factory:
             raise FactoryBlocked("UNKNOWN", "candidate isolation identity is invalid")
         if (cwd / ".git" / "objects" / "info" / "alternates").exists():
             raise FactoryBlocked("UNKNOWN", "candidate must not share a writable Git database")
+        if self.project and git(cwd, "branch", "--show-current") != branch:
+            raise FactoryBlocked("UNKNOWN", "candidate branch differs from task publication identity; no branch recreated")
         return spec, cwd
 
     def target(self, spec, cwd):
@@ -986,6 +990,7 @@ class Factory:
         return results
 
     def report(self, mission):
+        from .factory_remote import project_branch
         row = self.row(mission)
         operations = self.db.execute("SELECT * FROM operations WHERE mission=? ORDER BY started", (mission,)).fetchall()
         events = self.db.execute("SELECT kind,payload FROM events WHERE mission=? ORDER BY sequence", (mission,)).fetchall()
@@ -1062,7 +1067,9 @@ class Factory:
                 "TARGET_HEAD": delivery.get("target", {}).get("head", "UNKNOWN"),
                 "EXACT_TARGET": delivery.get("target", "UNKNOWN"),
                 "DELIVERY_EVIDENCE": [op["evidence"] for op in operations if op["evidence"]],
-                "CANDIDATE": row["candidate"], "CANDIDATE_BRANCH": f"factory/{mission}", "SIMULATION": self.config["simulation"],
+                "CANDIDATE": row["candidate"],
+                "CANDIDATE_BRANCH": project_branch(json.loads(row["spec"])) if self.project else f"factory/{mission}",
+                "SIMULATION": self.config["simulation"],
                 "HUMAN_APPROVAL_REQUIRED": ["merge", "release"], "MERGE_PERFORMED": False}
 
     def cancel_requested(self, mission):

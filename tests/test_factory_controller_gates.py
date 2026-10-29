@@ -66,6 +66,8 @@ class FakeRemote(Remote):
         return copy.deepcopy(self.raw)
 
     def command(self, argv, **kwargs):
+        if "symbolic-ref" in argv:
+            return git(Path(self.cwd), "symbolic-ref", "--quiet", "--short", "HEAD") + "\n"
         if "ls-remote" in argv:
             return f"{self.branch_head}\trefs/heads/{self.branch}" if self.branch_head else ""
         if "push" in argv:
