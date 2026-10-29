@@ -277,6 +277,7 @@ class LifetimeAndAuthTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, "{}", "")
             class Worker:
                 returncode = 0
+                stdin = stdout = None
                 def communicate(worker, message, **kwargs):
                     messages.append(message)
                     with patch.dict(os.environ, outer[-1], clear=True), patch("harness.factory_remote.subprocess.run", side_effect=tool):
@@ -284,6 +285,7 @@ class LifetimeAndAuthTests(unittest.TestCase):
                         remote.command(["/usr/bin/gh", "api", "repos/fixture/only-read"])
                     return json.dumps({"status": "PASS", "fixture": "offline-double"}), None
                 def poll(worker): return 0
+                def wait(worker, **kwargs): return 0
             def launch(argv, **kwargs): outer.append(kwargs["env"]); return Worker()
             with patch.dict(os.environ, host, clear=True), patch("harness.factory_runtime.subprocess.Popen", side_effect=launch):
                 LocalRuntime().project_remote("ci", {}, {}, root, {}, "fixture body", transcript, 5)

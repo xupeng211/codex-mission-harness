@@ -747,26 +747,69 @@ class LocalRuntime:
     def project_remote(self, action, policy, spec, cwd, target, body, transcript, timeout, *, reviews=None, previous_head=None):
         # Trusted Controller worker; development agents never receive this env.
         from .adapters import FootballPredictionAdapter
+        from .factory_test_service import ExecutionStopped
+        deadline = time.monotonic() + timeout
+        # Startup, work, result delivery and reaping share the original total.
+        # Only a normally exited worker can confirm a CI waiting TIMEOUT.
+        reserve = min(1.0, timeout / 4)
+        worker_deadline, response_deadline = deadline - reserve, deadline - reserve / 2
+        cancel = self.container_cancel
         env = FootballPredictionAdapter._trusted_subprocess_environment(env={"LANG": "C.UTF-8"})
         env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
         stderr = transcript.with_suffix(".stderr")
+        argv = [sys.executable, "-m", "harness.factory_remote"]
         with stderr.open("xb") as errors:
             os.fchmod(errors.fileno(), 0o600)
-            proc = subprocess.Popen([sys.executable, "-m", "harness.factory_remote"], stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=errors, text=True, cwd=transcript.parent, env=env, start_new_session=True)
-            self.current_process = proc
+            with self._execution_lock:
+                if cancel.is_set() or self.container_cancel is not cancel:
+                    raise ExecutionStopped("CANCELLED")
+                if time.monotonic() >= worker_deadline:
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors,
+                    text=True, cwd=transcript.parent, env=env, start_new_session=True)
+                self.current_process = proc
+            completed = False
             try:
-                output, _ = proc.communicate(json.dumps({"action": action, "policy": policy, "spec": spec,
+                message = json.dumps({"action": action, "policy": policy, "spec": spec,
                     "cwd": str(cwd), "target": target, "body": body, "transcript": str(transcript),
-                    "timeout": timeout, "reviews": reviews, "previous_head": previous_head}), timeout=timeout)
+                    "timeout": timeout, "deadline": worker_deadline, "reviews": reviews, "previous_head": previous_head})
+                while True:
+                    if cancel.is_set() or self.container_cancel is not cancel:
+                        raise ExecutionStopped("CANCELLED")
+                    remaining = response_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(argv, timeout)
+                    try:
+                        output, _ = proc.communicate(message, timeout=min(0.05, remaining))
+                        completed = True
+                        break
+                    except subprocess.TimeoutExpired:
+                        message = None  # communicate retains the unsent input/output.
+                if cancel.is_set():
+                    raise ExecutionStopped("CANCELLED")
                 if proc.returncode:
                     raise RuntimeFailure("project PR/CI worker failed; outcome retained as UNKNOWN, no replay")
                 return json.loads(output)
             finally:
-                if proc.poll() is None:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                    proc.wait()
-                self.current_process = None
+                try:
+                    if not completed or proc.poll() is None:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    proc.wait(timeout=max(0, deadline - time.monotonic()))
+                finally:
+                    try:
+                        for stream in (proc.stdin, proc.stdout):
+                            if stream is not None:
+                                try:
+                                    stream.close()
+                                except BrokenPipeError:
+                                    pass
+                    finally:
+                        with self._execution_lock:
+                            if self.current_process is proc and proc.poll() is not None:
+                                self.current_process = None
 
     def hosted_ci(self, policy, cwd, target, branch, transcript, timeout):
         watchdog = AppServerCodex._trusted_executable("timeout", str(cwd))

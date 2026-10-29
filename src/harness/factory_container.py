@@ -83,21 +83,23 @@ def check_stopped(cancel, deadline):
         raise ExecutionStopped("TIMEOUT")
 
 
-def prepare_dependencies(runtime, argv, cwd, log, cancel, deadline):
+def prepare_client(runtime, argv, cwd, log, cancel, deadline, *, env=ENV):
     """A preparation client belongs to the same execution as validation."""
     with runtime._execution_lock:
         check_stopped(cancel, deadline)
         if runtime.container_cancel is not cancel:
             raise ExecutionStopped("CANCELLED")
-        proc = subprocess.Popen(argv, cwd=cwd, env=ENV, stdout=subprocess.PIPE,
+        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, start_new_session=True)
         runtime.current_process = proc
     output = RedactedOutput(log)
+    completed = False
     try:
         consume_output(proc, output, cancel, deadline)
+        completed = True
     finally:
         try:
-            if proc.poll() is None:
+            if not completed or proc.poll() is None:
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except ProcessLookupError:
@@ -275,10 +277,6 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
         raise RuntimeError("container execution cancelled before launch")
     with tempfile.TemporaryDirectory(prefix="cmh-validation-", dir=transcript.parent) as temporary:
         workspace = Path(temporary) / "source"
-        git(cwd, "clone", "--no-local", "--no-hardlinks", "--no-checkout", "--", str(cwd), str(workspace))
-        git(workspace, "remote", "remove", "origin")
-        git(workspace, "checkout", "--detach", target["head"])
-        git(workspace, "update-ref", "refs/remotes/origin/main", target["base"])
         service, proc, output = None, None, None
         outcome = "EXITED"
         result.update(container_name=name, source_before=before, cleanup_confirmed=False, exit_code=None)
@@ -299,13 +297,27 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
             try:
                 dependency_name = name + "-dependencies"
                 try:
+                    # Only this preparation path uses the cancellable client;
+                    # keep the same Git config/environment protections as git().
+                    git_env = {**ENV, "GIT_OPTIONAL_LOCKS": "0", "GIT_NO_LAZY_FETCH": "1",
+                               "GIT_LITERAL_PATHSPECS": "1"}
+                    for repo, args in (
+                        (cwd, ["clone", "--no-local", "--no-hardlinks", "--no-checkout", "--", str(cwd), str(workspace)]),
+                        (workspace, ["remote", "remove", "origin"]),
+                        (workspace, ["checkout", "--detach", target["head"]]),
+                        (workspace, ["update-ref", "refs/remotes/origin/main", target["base"]]),
+                    ):
+                        argv = ["git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
+                                "-c", "core.quotePath=false", "-c", "core.fsmonitor=false", "-C", str(repo), *args]
+                        if prepare_client(runtime, argv, temporary, log, cancel, deadline, env=git_env):
+                            raise RuntimeError("validation source preparation failed")
                     labels = [v for k, value in resources[1]["labels"].items() for v in ("--label", k + "=" + value)]
                     create = ["/usr/bin/docker", "create", "--pull=never", "--name", dependency_name, *labels,
                               "--network=none", "--entrypoint=/usr/bin/true", image]
-                    if prepare_dependencies(runtime, create, temporary, log, cancel,
+                    if prepare_client(runtime, create, temporary, log, cancel,
                                             min(deadline, time.monotonic() + 15)):
                         raise RuntimeError("dependency copy container could not start")
-                    copied = prepare_dependencies(runtime,
+                    copied = prepare_client(runtime,
                         ["/usr/bin/docker", "cp", dependency_name + ":/app/node_modules", str(workspace / "node_modules")],
                         temporary, log, cancel, min(deadline, time.monotonic() + 60))
                     result["image_node_dependencies_copied"] = copied == 0
@@ -379,6 +391,8 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                 if cancel.is_set():
                     outcome = "CANCELLED"
         try:
+            if "snapshot_before" not in result:
+                raise ValueError("source preparation did not finish; no snapshot to compare")
             after = binding(spec, cwd, target)
             snapshot_after = source_fingerprint(workspace, target["head"])
             unchanged = (before == after and result.get("snapshot_before") == snapshot_after

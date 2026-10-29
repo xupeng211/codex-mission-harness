@@ -102,7 +102,13 @@ class ControllerGatesTests(unittest.TestCase):
         self.assertIn("PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin", argv)
         self.assertIn(f"type=bind,src={self.cwd / '.git'},dst=/app/.git,readonly", argv)
         self.assertNotIn("docker.sock", str(argv))
-        self.assertNotIn(str(Path.home()), str(argv))
+        mounts = [dict(part.split("=", 1) if "=" in part else (part, "") for part in argv[i + 1].split(","))
+                  for i, value in enumerate(argv) if value == "--mount"]
+        for mount in mounts:
+            self.assertEqual(mount["type"], "bind")
+            self.assertNotEqual(Path(mount["src"]).resolve(), Path.home().resolve())
+        self.assertEqual({(Path(m["src"]).resolve(), m["dst"]) for m in mounts},
+                         {(self.cwd.resolve(), "/app"), ((self.cwd / ".git").resolve(), "/app/.git")})
         self.assertNotIn("--privileged", argv)
         with self.assertRaises(ValueError): argv_for(CONTAINER, self.cwd, "x", "shell")
 

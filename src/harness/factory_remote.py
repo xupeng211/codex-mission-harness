@@ -60,9 +60,11 @@ def render_body(policy, spec, target, reviews, validations):
 
 
 class Remote:
-    def __init__(self, cwd, transcript, timeout, adapter=None):
+    def __init__(self, cwd, transcript, timeout, adapter=None, *, deadline=None):
         self.cwd, self.transcript = str(cwd), Path(transcript)
         self.deadline = time.monotonic() + timeout
+        if deadline is not None:
+            self.deadline = min(self.deadline, deadline)
         self.adapter = adapter or FootballPredictionAdapter()
         self.env = self.adapter._trusted_subprocess_environment(env={"LANG": "C.UTF-8"})
         self.env["GIT_SSH_COMMAND"] = "/usr/bin/ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15"
@@ -126,6 +128,12 @@ class Remote:
                 "body_sha256": hashlib.sha256(body.encode()).hexdigest(), "fixture": False, "MERGE_PERFORMED": False}
 
     def publish(self, policy, spec, target, body, previous_head=None):
+        objective = spec.get("objective")
+        title = ""
+        if isinstance(objective, str):
+            title = next((line.strip() for line in objective.splitlines() if line.strip()), "")[:200]
+        if not title:
+            raise ValueError("publication requires a nonempty PR title")
         branch, marker = identity(policy, spec, target)
         self.main_head(policy, target)
         pulls = self.pulls(policy, branch)
@@ -149,7 +157,7 @@ class Remote:
             self.command(["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "credential.helper=",
                           "-c", "credential.helper=!/usr/bin/gh auth git-credential", "push", "--", destination,
                           target["head"] + ":refs/heads/" + branch], cwd=temporary)
-        payload = {"title": spec["objective"].splitlines()[0][:200], "body": body}
+        payload = {"title": title, "body": body}
         if pulls:
             self.api(f"repos/{policy['repository']}/pulls/{pulls[0]['number']}", "PATCH", payload)
         else:
@@ -164,13 +172,15 @@ class Remote:
             result = {**publication, "status": gate.status, "reason": gate.evidence, "ci_data": gate.data}
             if gate.status != "PENDING" or not wait:
                 return result
-            if time.monotonic() >= self.deadline:
-                return {**result, "status": "TIMEOUT", "reason": "exact PR checks missing or unfinished at deadline"}
             time.sleep(min(2, max(0, self.deadline - time.monotonic())))
+            if time.monotonic() >= self.deadline:
+                # The last observation was PENDING. Do not start another remote
+                # observation after the deadline and lose this confirmed wait.
+                return {**result, "status": "TIMEOUT", "reason": "exact PR checks missing or unfinished at deadline"}
 
 
-def run(action, policy, spec, cwd, target, body, transcript, timeout, reviews=None, previous_head=None):
-    remote = Remote(cwd, transcript, timeout)
+def run(action, policy, spec, cwd, target, body, transcript, timeout, reviews=None, previous_head=None, deadline=None):
+    remote = Remote(cwd, transcript, timeout, deadline=deadline)
     # No project executable is run before canonical policy/body admission.
     contract = FootballPredictionContract(remote.adapter)
     verify_target(spec, Path(cwd), target)

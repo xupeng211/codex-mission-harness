@@ -112,8 +112,9 @@ COMPLETE 必须通过原操作证据与 lifecycle 摘要、任务和目标绑定
 每次 Factory 执行有独立取消事件和不复用的身份；watcher 必须携带该身份，迟到的旧
 取消或结束回调不能影响新任务。相同 LocalRuntime 的重叠执行被拒绝，直接 Controller
 容器调用也建立任务身份；取消直接调用时须传入该次 `container_cancel` 事件。
-依赖 create/cp 客户端同样登记到该执行身份，派发前检查取消和剩余 deadline，
+源码 clone/remote-remove/checkout/update-ref 和依赖 create/cp 客户端同样登记到该执行身份，派发前检查取消和剩余 deadline，
 准备期间可取消且不重新获得原 timeout；停止后仍执行有界、核对归属的 finally 清理。
+源码准备中止时不再派发验证，未建立完整快照不声称源码完整性已确认。
 删除只派发一次；Docker 自动删除与取消重叠时，在两秒确认窗口内查询准确资源名，
 只有肯定的不存在证据才能确认清理，原 rm 退出码仍保留。查询失败或未消失仍为未确认。
 
@@ -126,6 +127,8 @@ COMPLETE 必须通过原操作证据与 lifecycle 摘要、任务和目标绑定
 候选 hooks/config，不 force push。只有已证明的上一候选 publication 可更新同一
 PR，其他 HEAD、closed PR、fork、不同 base 或模糊发现均拒绝。正文由 immutable
 Controller template 与已验证 receipt 渲染，准确 HEAD/body/scope 均需绑定。
+PR 标题取任务目标中首个非空行并去除首尾空白，保持 200 字符上限；标题无效时在任何
+远端写入前拒绝，原任务目标文本保持不变。
 
 发布使用既有非付费 operation/evidence。创建/更新只尝试一次；响应丢失或崩溃后，
 恢复只查询 branch 和 PR。仅当 repo/base/head/body/marker 全匹配时，追加只读
@@ -136,6 +139,10 @@ reconciliation operation 和 event，原 RUNNING/UNKNOWN 行保持不变。无�
 CI 复用 `adapter.ci` 和 trusted-base `pr_ready_check`，查询 active ruleset 对该
 真实 PR 的 required checks，严格比较准确 base/head。missing/queued/in_progress
 等待到既有 timeout；失败或 skipped 不能 PASS。push workflow 不能替代 PR checks。
+remote worker 与父进程共用绝对单调截止时间；在原总时限内预留至多一秒（短时限为
+其四分之一）供结果返回和回收。正常退出的完整 worker 结果才能确认等待 TIMEOUT；
+取消、异常退出或父层强制中断分别保留其错误类型，operation 仍按既有规则记 UNKNOWN，
+不把残缺输出补成正常结果，也不重新获得完整 timeout。
 失败 CI 进入既有 rework → 新 checkpoint → 新 tests/reviews → PR update → 新 CI。
 
 最终 `verify` 把实际 PR number/repo/base、两份 codex/deepseek receipt 与当前

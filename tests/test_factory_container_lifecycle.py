@@ -10,7 +10,6 @@ import time
 import unittest
 from unittest.mock import patch
 
-from harness.factory import git
 from harness.factory_container import remove_owned
 from harness.factory_runtime import LocalRuntime
 import test_factory_controller_gates as fixtures
@@ -26,15 +25,6 @@ class DockerDouble:
         self.offset, self.cleanup_blocked = 0, False
         self.real_run, self.real_popen = subprocess.run, subprocess.Popen
         self.real_output, self.clock = subprocess.check_output, time.monotonic
-
-    def cloned(self, cwd, *args):
-        result = git(cwd, *args)
-        if args[0] == "clone":
-            if self.mode == "clone_cancel":
-                self.runtime.container_cancel.set()
-            if self.mode == "clone_deadline":
-                self.offset = 10
-        return result
 
     def dispatch(self, argv, **kwargs):
         phase = argv[1]
@@ -61,7 +51,17 @@ class DockerDouble:
 
     def popen(self, argv, *args, **kwargs):
         if argv[0] != "/usr/bin/docker":
-            return self.real_popen(argv, *args, **kwargs)
+            proc = self.real_popen(argv, *args, **kwargs)
+            if "clone" in argv and (self.mode == "clone_cancel" or self.mode == "clone_deadline"):
+                poll = proc.poll
+                def after_clone():
+                    result = poll()
+                    if result == 0:
+                        if self.mode == "clone_cancel": self.runtime.container_cancel.set()
+                        if self.mode == "clone_deadline": self.offset = 10
+                    return result
+                proc.poll = after_clone
+            return proc
         return self.dispatch(argv, **kwargs)
 
     def command(self, argv, *args, **kwargs):
@@ -103,7 +103,6 @@ class DockerDouble:
         stack = ExitStack()
         for name, value in (("harness.factory_project.FootballPredictionContract.policy", lambda *a: {}),
                             ("harness.factory_container.inspect_image", lambda *a: IMAGE),
-                            ("harness.factory.git", self.cloned),
                             ("harness.factory_container.subprocess.Popen", self.popen),
                             ("harness.factory_container.subprocess.run", self.command),
                             ("harness.factory_container.subprocess.check_output", self.output),
