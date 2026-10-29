@@ -4570,8 +4570,17 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         self.assertEqual(result.data["reason"], "exact gates")
         self.assertEqual(call.call_count, 2)
         self.assertEqual(call.call_args_list[0].args[0][0], sys.executable)
-        self.assertEqual(call.call_args_list[0].kwargs["cwd"], str(trusted))
-        self.assertNotIn("make", call.call_args_list[0].args[0])
+        for invocation in call.call_args_list:
+            argv = invocation.args[0]
+            self.assertEqual(invocation.kwargs["cwd"], str(candidate))
+            self.assertEqual(argv[1:4], ["-I", "-B", "-c"])
+            self.assertEqual(argv[5:7], [str(trusted), str(candidate)])
+            self.assertIn("sys.path.insert(0, sys.argv[1])", argv[4])
+            self.assertNotIn("make", argv)
+        self.assertEqual(call.call_args_list[0].args[0][-2:], ["a" * 40, "b" * 40])
+        final_argv = call.call_args_list[1].args[0]
+        self.assertEqual(final_argv[final_argv.index("--base-sha") + 1], "a" * 40)
+        self.assertEqual(final_argv[final_argv.index("--head-sha") + 1], "b" * 40)
         self.assertFalse(marker.exists())
 
     def test_owner_approval_precedes_target_merge_readiness_command(self):
