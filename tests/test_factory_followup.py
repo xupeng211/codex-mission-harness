@@ -68,6 +68,8 @@ class CredentialPersistenceTests(unittest.TestCase):
         observer.start()
         def launch(argv, *args, **kw):
             if argv[0] != "/usr/bin/docker": return real_popen(argv, *args, **kw)
+            if argv[1] in {"create", "cp"}:
+                return real_popen(["/usr/bin/true"], *args, **kw)
             return real_popen([sys.executable, "-c", code], cwd=kw["cwd"], env=kw["env"],
                               stdout=kw["stdout"], stderr=kw["stderr"], start_new_session=True)
         def command(argv, *args, **kw):

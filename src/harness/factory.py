@@ -1124,11 +1124,27 @@ class Factory:
             return cleanups
         spec = json.loads(self.row(mission)["spec"])
         for pending in self.db.execute("SELECT * FROM operations WHERE mission=? AND paid=0 "
-                                       "AND stage IN ('checks','ci') AND status IN ('RUNNING','UNKNOWN')",
+                                       "AND stage IN ('checks','ci') AND status IN ('RUNNING','UNKNOWN','COMPLETE')",
                                        (mission,)).fetchall():
             try:
                 payload = json.loads(pending["input"])
                 transcript = self.root / "evidence" / mission / (pending["id"] + ".raw")
+                if pending["status"] == "COMPLETE":
+                    # COMPLETE means the check returned, not that all its
+                    # resources disappeared. Trust only its immutable proof.
+                    self.verify_evidence(pending)
+                    result = json.loads(pending["result"])
+                    proof = json.loads(Path(pending["evidence"]).read_text())
+                    lifecycle = str(transcript.with_suffix(".container.json"))
+                    if (proof != {"operation": pending["id"], "identity": json.loads(pending["identity"]),
+                                  "input": payload, "result": result}
+                            or result.get("target") != payload["target"] or result.get("mission_id") != mission
+                            or result.get("lifecycle_record") != lifecycle
+                            or not any(raw["path"] == lifecycle for raw in result.get("raw_evidence", []))):
+                        raise ValueError("completed container cleanup proof is incomplete or mismatched")
+                    if all(result.get(key) is True for key in ("cleanup_confirmed", "dependencies_cleanup_confirmed",
+                                                              "temporary_directory_cleanup_confirmed")):
+                        continue
                 cleanup = self.runtime.recover_container(self.config["project_container"], spec, payload["target"],
                                                          payload["command"], transcript)
             except Exception as error:

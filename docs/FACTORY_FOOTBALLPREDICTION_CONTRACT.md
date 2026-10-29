@@ -103,12 +103,17 @@ RUNNING/UNKNOWN 验证改为通过，也不能自动重跑测试。退出码 137
 这不识别任意未知秘密。Controller 被杀时可能丢失尚未写出的短尾部，但不依赖 finally
 重写原日志来保护密码。任务凭据临时文件仍受私有目录/0600 和精确恢复清理保护。
 
-取消后 resume 只允许在既有 RUNNING/UNKNOWN 的非付费 checks/ci 记录上执行精确
+取消后 resume 只允许在既有 RUNNING/UNKNOWN，以及清理尚未确认的 COMPLETE
+非付费 checks/ci 记录上执行精确
 ownership 核验与清理，不准备候选、不重新验证、不查询发布状态或调用模型。
-清理失败明确记为未确认；原 operation、UNKNOWN、usage 和 reservation 保持原样。
+COMPLETE 必须通过原操作证据与 lifecycle 摘要、任务和目标绑定核对；已确认清理的
+记录跳过恢复。清理失败明确记为未确认；原 operation、COMPLETE/UNKNOWN、usage
+和 reservation 保持原样，仅追加清理证据。
 每次 Factory 执行有独立取消事件和不复用的身份；watcher 必须携带该身份，迟到的旧
 取消或结束回调不能影响新任务。相同 LocalRuntime 的重叠执行被拒绝，直接 Controller
 容器调用也建立任务身份；取消直接调用时须传入该次 `container_cancel` 事件。
+依赖 create/cp 客户端同样登记到该执行身份，派发前检查取消和剩余 deadline，
+准备期间可取消且不重新获得原 timeout；停止后仍执行有界、核对归属的 finally 清理。
 删除只派发一次；Docker 自动删除与取消重叠时，在两秒确认窗口内查询准确资源名，
 只有肯定的不存在证据才能确认清理，原 rm 退出码仍保留。查询失败或未消失仍为未确认。
 

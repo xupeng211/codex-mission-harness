@@ -76,6 +76,44 @@ def consume_output(proc, output, cancel, deadline):
             return
 
 
+def check_stopped(cancel, deadline):
+    if cancel.is_set():
+        raise ExecutionStopped("CANCELLED")
+    if time.monotonic() >= deadline:
+        raise ExecutionStopped("TIMEOUT")
+
+
+def prepare_dependencies(runtime, argv, cwd, log, cancel, deadline):
+    """A preparation client belongs to the same execution as validation."""
+    with runtime._execution_lock:
+        check_stopped(cancel, deadline)
+        if runtime.container_cancel is not cancel:
+            raise ExecutionStopped("CANCELLED")
+        proc = subprocess.Popen(argv, cwd=cwd, env=ENV, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, start_new_session=True)
+        runtime.current_process = proc
+    output = RedactedOutput(log)
+    try:
+        consume_output(proc, output, cancel, deadline)
+    finally:
+        try:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            proc.wait(timeout=5)
+        finally:
+            try:
+                proc.stdout.close()
+                output.finish()
+            finally:
+                with runtime._execution_lock:
+                    if runtime.current_process is proc:
+                        runtime.current_process = None
+    return proc.returncode
+
+
 def validate_policy(policy):
     if (not isinstance(policy, dict) or set(policy) - {"image_id", "profiles", "postgres_image_id"}
             or not {"image_id", "profiles"} <= set(policy)
@@ -232,7 +270,8 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
     resources = resources_for(name, spec, target, needs_postgres)
     started = time.monotonic()
     deadline = started + timeout
-    if runtime.container_cancel.is_set():
+    cancel = runtime.container_cancel
+    if cancel.is_set():
         raise RuntimeError("container execution cancelled before launch")
     with tempfile.TemporaryDirectory(prefix="cmh-validation-", dir=transcript.parent) as temporary:
         workspace = Path(temporary) / "source"
@@ -261,18 +300,21 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                 dependency_name = name + "-dependencies"
                 try:
                     labels = [v for k, value in resources[1]["labels"].items() for v in ("--label", k + "=" + value)]
-                    subprocess.run(["/usr/bin/docker", "create", "--pull=never", "--name", dependency_name, *labels,
-                                    "--network=none", "--entrypoint=/usr/bin/true", image], env=ENV, check=True,
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
-                    copied = subprocess.run(["/usr/bin/docker", "cp", dependency_name + ":/app/node_modules",
-                                             str(workspace / "node_modules")], env=ENV, stdout=subprocess.PIPE,
-                                            stderr=subprocess.PIPE, timeout=max(0.1, min(60, timeout)))
-                    result["image_node_dependencies_copied"] = copied.returncode == 0
+                    create = ["/usr/bin/docker", "create", "--pull=never", "--name", dependency_name, *labels,
+                              "--network=none", "--entrypoint=/usr/bin/true", image]
+                    if prepare_dependencies(runtime, create, temporary, log, cancel,
+                                            min(deadline, time.monotonic() + 15)):
+                        raise RuntimeError("dependency copy container could not start")
+                    copied = prepare_dependencies(runtime,
+                        ["/usr/bin/docker", "cp", dependency_name + ":/app/node_modules", str(workspace / "node_modules")],
+                        temporary, log, cancel, min(deadline, time.monotonic() + 60))
+                    result["image_node_dependencies_copied"] = copied == 0
                 finally:
                     cleaned, code = remove_owned(dependency_name, name, resources[1]["labels"])
                     result.update(dependencies_cleanup_confirmed=cleaned, dependencies_cleanup_exit_code=code)
                     if not cleaned:
                         raise RuntimeError("dependency copy container cleanup could not be confirmed")
+                check_stopped(cancel, deadline)
                 snapshot = source_fingerprint(workspace, target["head"])
                 result["snapshot_before"] = snapshot
                 lifetime = max(1, math.ceil(deadline - time.monotonic()))
@@ -285,25 +327,26 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                 argv[index:index] = [v for k, value in resources[0]["labels"].items() for v in ("--label", k + "=" + value)]
                 if needs_postgres:
                     service = ProjectPostgres(policy["postgres_image_id"], name + "-postgres", Path(temporary),
-                                              target, spec["mission_id"], runtime.container_cancel, deadline, ENV, log)
+                                              target, spec["mission_id"], cancel, deadline, ENV, log)
                     result["services"]["postgres"] = service.evidence
                     service.start()
                     service.check()
                     argv = service.validation_argv(argv)
                     result["network"] = "none_shared_loopback"
-                if runtime.container_cancel.is_set():
-                    raise ExecutionStopped("CANCELLED")
-                if time.monotonic() >= deadline:
-                    raise ExecutionStopped("TIMEOUT")
+                check_stopped(cancel, deadline)
                 lifetime = max(1, math.ceil(deadline - time.monotonic()))
                 argv[argv.index("--kill-after=5") + 1] = str(lifetime)
                 result["lifetime_limit_seconds"] = lifetime
                 result["argv"] = argv
                 output = RedactedOutput(log, service.password.encode() if service else None)
-                proc = subprocess.Popen(argv, cwd=temporary, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                        start_new_session=True)
-                runtime.current_process = proc
-                consume_output(proc, output, runtime.container_cancel, deadline)
+                with runtime._execution_lock:
+                    check_stopped(cancel, deadline)
+                    if runtime.container_cancel is not cancel:
+                        raise ExecutionStopped("CANCELLED")
+                    proc = subprocess.Popen(argv, cwd=temporary, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                            start_new_session=True)
+                    runtime.current_process = proc
+                consume_output(proc, output, cancel, deadline)
             except ExecutionStopped as error:
                 outcome = error.outcome
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
@@ -324,14 +367,16 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                         if output is not None:
                             output.finish()
                     finally:  # A broken log sink must not bypass resource cleanup.
-                        runtime.current_process = None
+                        with runtime._execution_lock:
+                            if runtime.current_process is proc:
+                                runtime.current_process = None
                         cleaned, code = remove_owned(name, name, resources[0]["labels"])
                         result.update(cleanup_confirmed=cleaned, cleanup_exit_code=code)
                         if service is not None:
                             service.close()
                             result["cleanup_confirmed"] &= service.evidence["cleanup_confirmed"]
                             result["ephemeral_password_redacted"] = True
-                if runtime.container_cancel.is_set():
+                if cancel.is_set():
                     outcome = "CANCELLED"
         try:
             after = binding(spec, cwd, target)

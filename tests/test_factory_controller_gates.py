@@ -137,6 +137,9 @@ class ControllerGatesTests(unittest.TestCase):
                 return s.returncode
         def popen(argv, *args, **kwargs):
             if argv[0] != "/usr/bin/docker": return real_popen(argv, *args, **kwargs)
+            if argv[1] in {"create", "cp"}:
+                command(argv, *args, **kwargs)
+                return real_popen(["/usr/bin/true"], **kwargs)
             calls.append(argv)
             if mode == "timeout": clock[0] = 10.0
             name = argv[argv.index("--name") + 1]
