@@ -510,6 +510,7 @@ class LocalRuntime:
         import threading
         self.resource_policy = {}
         self.current_process = None
+        self._remote_worker = None
         self.container_cancel = threading.Event()
         self._execution_lock = threading.RLock()
         self._active_execution = self._active_mission = None
@@ -529,8 +530,13 @@ class LocalRuntime:
     def end_execution(self, execution):
         with self._execution_lock:
             if execution is self._active_execution:
+                # An unconfirmed remote group still owns this execution. Even
+                # Factory.run's outer finally must not admit a new execution.
+                if self._remote_worker is not None:
+                    return False
                 self._active_execution = self._active_mission = None
                 self._execution_thread = None
+                return True
 
     def cancel(self, execution=None):
         with self._execution_lock:
@@ -541,7 +547,15 @@ class LocalRuntime:
                 return False  # A delayed callback cannot affect a later mission/run.
             self.container_cancel.set()
             proc = self.current_process
-            if proc is not None and proc.poll() is None:
+            if self._remote_worker is not None:
+                try:
+                    self._signal_remote_worker(self._remote_worker, signal.SIGTERM)
+                except Exception as error:
+                    # The event still cancels work; the owning call performs
+                    # bounded cleanup and records any failure. Never reap the
+                    # group leader here via Popen.poll().
+                    self._remote_worker["cancel_error"] = f"{type(error).__name__}: {error}"
+            elif proc is not None and proc.poll() is None:
                 try:
                     os.killpg(proc.pid, signal.SIGTERM)
                 except ProcessLookupError:
@@ -752,12 +766,99 @@ class LocalRuntime:
                 execution = self.begin_execution(spec["mission_id"])
             elif self._active_mission != spec["mission_id"] or self._execution_thread != threading.get_ident():
                 raise RuntimeError("project remote belongs to a different active execution")
+            if self._remote_worker is not None:
+                raise RuntimeFailure("unconfirmed remote worker cleanup blocks another dispatch")
         try:
             return self._project_remote(action, policy, spec, cwd, target, body, transcript, timeout,
                                         reviews=reviews, previous_head=previous_head)
         finally:
             if standalone:
                 self.end_execution(execution)
+
+    @staticmethod
+    def _remote_process_identity(pid):
+        """Linux metadata only; no process environment or command contents."""
+        path = Path(f"/proc/{pid}")
+        fields = (path / "stat").read_text().rsplit(") ", 1)[1].split()
+        return {"pid": pid, "starttime": fields[19], "ppid": int(fields[1]),
+                "pgid": int(fields[2]), "sid": int(fields[3]), "uid": path.stat().st_uid,
+                "state": fields[0]}
+
+    def _remote_leader(self, worker):
+        # All callers hold _execution_lock. A direct child observed with
+        # WNOWAIT remains unreaped: the kernel cannot reuse its PID/PGID. No
+        # communicate/poll/wait is allowed until group shutdown is confirmed.
+        proc, expected = worker["process"], worker["identity"]
+        if (self._remote_worker is not worker or self.current_process is not proc
+                or self._active_execution is not worker["execution"] or proc.returncode is not None):
+            raise RuntimeFailure("remote worker ownership is no longer current")
+        exited = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        actual = self._remote_process_identity(proc.pid)
+        if (expected is None or any(actual[k] != expected[k] for k in expected if k != "state")
+                or actual["ppid"] != os.getpid() or actual["uid"] != os.geteuid()
+                or actual["pgid"] != proc.pid or actual["sid"] != proc.pid):
+            raise RuntimeFailure("remote worker identity/owned session cannot be confirmed")
+        return exited
+
+    def _remote_group(self, worker):
+        self._remote_leader(worker)
+        leader = worker["identity"]
+        members = []
+        for name in os.listdir("/proc"):
+            if not name.isdecimal():
+                continue
+            try:
+                member = self._remote_process_identity(int(name))
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            if member["pgid"] == leader["pgid"]:
+                if member["sid"] != leader["sid"] or member["uid"] != leader["uid"]:
+                    raise RuntimeFailure("remote group ownership cannot be confirmed")
+                members.append(member)
+        self._remote_leader(worker)
+        return members
+
+    def _signal_remote_worker(self, worker, sig):
+        with self._execution_lock:
+            self._remote_group(worker)
+            # Recheck the unreaped direct-child anchor immediately before
+            # signalling. Never signal this PGID after reaping the leader.
+            self._remote_leader(worker)
+            os.killpg(worker["process"].pid, sig)
+
+    def _finish_remote_worker(self, worker, deadline):
+        record = {"identity": worker["identity"], "mission": worker["mission"], "confirmed": False, "leader_reaped": False,
+                  "members_before": [], "pending_descendant_reap": [], "errors": []}
+        if worker.get("cancel_error"):
+            record["errors"].append(worker["cancel_error"])
+        try:
+            with self._execution_lock:
+                record["members_before"] = self._remote_group(worker)
+            if any(p["state"] not in {"Z", "X"} for p in record["members_before"]):
+                self._signal_remote_worker(worker, signal.SIGKILL)
+                record["signal"] = "SIGKILL"
+            while True:
+                with self._execution_lock:
+                    members = self._remote_group(worker)
+                    if not any(p["state"] not in {"Z", "X"} for p in members):
+                        record["pending_descendant_reap"] = [p for p in members if p["pid"] != worker["process"].pid]
+                        # The leader is known exited; wait(0) does not create a
+                        # new work/cleanup budget. Descendants may await their
+                        # own parent/init reaper; they are no longer running.
+                        worker["process"].wait(timeout=0)
+                        record.update(confirmed=True, leader_reaped=True)
+                        self.current_process = self._remote_worker = None
+                        break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("remote group shutdown unconfirmed within original deadline")
+                time.sleep(min(0.01, remaining))
+        except Exception as error:
+            record["errors"].append(f"{type(error).__name__}: {error}")
+            # Keep both the unreaped anchor and execution identity when we
+            # cannot safely establish group shutdown. No speculative kill,
+            # no new execution, and no claim that cleanup succeeded.
+        return record
 
     def _project_remote(self, action, policy, spec, cwd, target, body, transcript, timeout, *, reviews=None, previous_head=None):
         # Trusted Controller worker; development agents never receive this env.
@@ -773,58 +874,85 @@ class LocalRuntime:
         env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
         stderr = transcript.with_suffix(".stderr")
         argv = [sys.executable, "-m", "harness.factory_remote"]
-        with stderr.open("xb") as errors:
+        # Regular private capture files let us observe worker exit WITHOUT
+        # communicate() reaping the only kernel ownership anchor. Raw stdout
+        # also survives abnormal/partial worker responses for UNKNOWN evidence.
+        with stderr.open("xb") as errors, transcript.with_suffix(".stdout").open("xb+") as output, \
+                tempfile.TemporaryFile(dir=transcript.parent) as request:
             os.fchmod(errors.fileno(), 0o600)
+            os.fchmod(output.fileno(), 0o600)
+            request.write(json.dumps({"action": action, "policy": policy, "spec": spec,
+                "cwd": str(cwd), "target": target, "body": body, "transcript": str(transcript),
+                "timeout": timeout, "deadline": worker_deadline, "reviews": reviews, "previous_head": previous_head}).encode())
+            request.seek(0)
             with self._execution_lock:
                 if cancel.is_set() or self.container_cancel is not cancel:
                     raise ExecutionStopped("CANCELLED")
                 if time.monotonic() >= worker_deadline:
                     raise subprocess.TimeoutExpired(argv, timeout)
-                proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors,
+                proc = subprocess.Popen(argv, stdin=request, stdout=output, stderr=errors,
                     text=True, cwd=transcript.parent, env=env, start_new_session=True)
                 self.current_process = proc
-            completed = False
+                worker = {"process": proc, "execution": self._active_execution,
+                          "mission": spec["mission_id"], "identity": None}
+                self._remote_worker = worker
+            original_error = None
             try:
-                message = json.dumps({"action": action, "policy": policy, "spec": spec,
-                    "cwd": str(cwd), "target": target, "body": body, "transcript": str(transcript),
-                    "timeout": timeout, "deadline": worker_deadline, "reviews": reviews, "previous_head": previous_head})
+                worker["identity"] = self._remote_process_identity(proc.pid)
                 while True:
                     if cancel.is_set() or self.container_cancel is not cancel:
                         raise ExecutionStopped("CANCELLED")
                     remaining = response_deadline - time.monotonic()
                     if remaining <= 0:
                         raise subprocess.TimeoutExpired(argv, timeout)
-                    try:
-                        output, _ = proc.communicate(message, timeout=min(0.05, remaining))
-                        completed = True
+                    with self._execution_lock:
+                        exited = self._remote_leader(worker)
+                    if exited is not None:
                         break
-                    except subprocess.TimeoutExpired:
-                        message = None  # communicate retains the unsent input/output.
+                    cancel.wait(min(0.05, remaining))
                 if cancel.is_set():
                     raise ExecutionStopped("CANCELLED")
-                if proc.returncode:
+                if exited.si_code != os.CLD_EXITED or exited.si_status:
                     raise RuntimeFailure("project PR/CI worker failed; outcome retained as UNKNOWN, no replay")
-                return json.loads(output)
+            except BaseException as error:
+                original_error = error
+                raise
             finally:
                 try:
-                    if not completed or proc.poll() is None:
-                        try:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                    proc.wait(timeout=max(0, deadline - time.monotonic()))
-                finally:
-                    try:
-                        for stream in (proc.stdin, proc.stdout):
-                            if stream is not None:
-                                try:
-                                    stream.close()
-                                except BrokenPipeError:
-                                    pass
-                    finally:
-                        with self._execution_lock:
-                            if self.current_process is proc and proc.poll() is not None:
-                                self.current_process = None
+                    cleanup = self._finish_remote_worker(worker, deadline)
+                except Exception as error:
+                    # Preserve the original execution exception even if the
+                    # cleanup implementation itself unexpectedly fails.
+                    cleanup = {"identity": worker["identity"], "mission": worker["mission"],
+                        "confirmed": False, "leader_reaped": False,
+                        "errors": [f"{type(error).__name__}: {error}"]}
+                cleanup["evidence_written"] = False
+                try:
+                    FootballPredictionAdapter._write_private_file(transcript.with_suffix(".cleanup.json"),
+                        json.dumps({k: v for k, v in cleanup.items() if k != "evidence_written"}), exclusive=True)
+                    cleanup["evidence_written"] = True
+                except Exception as error:
+                    detail = f"cleanup evidence {type(error).__name__}: {error}"
+                    if error.__cause__ is not None:
+                        detail += f"; caused by {type(error.__cause__).__name__}: {error.__cause__}"
+                    cleanup["errors"].append(detail)
+                if original_error is not None:
+                    original_error.remote_cleanup = cleanup
+                    if not cleanup["confirmed"] or not cleanup["evidence_written"]:
+                        original_error.add_note("remote cleanup/evidence unconfirmed; execution outcome remains UNKNOWN")
+                elif not cleanup["confirmed"] or not cleanup["evidence_written"]:
+                    error = RuntimeFailure("remote cleanup/evidence unconfirmed; outcome retained as UNKNOWN, no replay")
+                    error.remote_cleanup = cleanup
+                    raise error
+            output.seek(0)
+            try:
+                if cancel.is_set() or self.container_cancel is not cancel:
+                    raise ExecutionStopped("CANCELLED")
+                result = json.loads(output.read().decode("utf-8"))
+            except Exception as error:
+                error.remote_cleanup = cleanup
+                raise
+            return {**result, "remote_cleanup": cleanup}
 
     def hosted_ci(self, policy, cwd, target, branch, transcript, timeout):
         watchdog = AppServerCodex._trusted_executable("timeout", str(cwd))

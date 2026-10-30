@@ -1,5 +1,6 @@
 """离线回归：真实本地子进程、合成 Git/CI/发布替身，不运行 Docker 或远端。"""
 from contextlib import ExitStack
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -260,7 +261,16 @@ class RemoteWorkerTests(unittest.TestCase):
             self.assertEqual(blocked.exception.status, "UNKNOWN")
             row = fx.f.db.execute("SELECT status,result FROM operations WHERE key=?", (mode,)).fetchone()
             self.assertEqual(row["status"], "UNKNOWN")
-            self.assertNotIn("status", json.loads(row["result"]))
+            saved = json.loads(row["result"])
+            self.assertNotIn("status", saved)
+            self.assertTrue(saved["remote_cleanup"]["confirmed"])
+            self.assertTrue(saved["remote_cleanup"]["evidence_written"])
+            raw = {Path(v["path"]): v["sha256"] for v in saved["raw_evidence"]}
+            self.assertTrue(any(p.name.endswith(".cleanup.json") for p in raw))
+            stdout = next(p for p in raw if p.suffix == ".stdout")
+            self.assertEqual(stdout.read_bytes(), b'{"status": "TIMEOUT"}\n' if mode == "partial" else b'')
+            for path, digest in raw.items():
+                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
             self.assert_reaped()
 
     def test_cancelled_and_ended_unrelated_task_does_not_block_a_new_observation(self):

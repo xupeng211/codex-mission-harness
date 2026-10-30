@@ -186,6 +186,16 @@ remote worker 与父进程共用绝对单调截止时间；在原总时限内预
 其四分之一）供结果返回和回收。正常退出的完整 worker 结果才能确认等待 TIMEOUT；
 取消、异常退出或父层强制中断分别保留其错误类型，operation 仍按既有规则记 UNKNOWN，
 不把残缺输出补成正常结果，也不重新获得完整 timeout。
+父层以 Linux `waitid(WNOWAIT)` 观察远端 worker 退出，在同组普通后代结束前
+保留尚未回收的直接子 worker，作为防 PID/PGID 复用的内核锚点。每次组信号均
+核对当前执行令牌、PID/starttime、父子关系、UID 及 PGID/SID；主 worker 已退出
+也不能跳过组收尾。stdin 使用私有临时文件，stdout/stderr 原字节另存并绑定到
+operation，避免 `communicate/poll` 提前回收锚点。收尾仍只使用原截止前的剩余时间。
+`.cleanup.json` 区分组内进程已停止、leader 已回收、等待其父/init 回收的后代
+zombie，以及诊断写入失败。无法确认归属或组停止时保留执行身份并阻止再次派发，
+等待人工处理，不使用过期 PGID 猜测清理；原执行错误和 UNKNOWN 保留。
+清理成功但诊断写入失败也如实记录并保留 UNKNOWN。产品不启用 subreaper，
+不承诺收回主动 setsid 逃逸进程或任意 daemon；离线测试 subreaper 仅用于回收测试孤儿。
 失败 CI 进入既有 rework → 新 checkpoint → 新 tests/reviews → PR update → 新 CI。
 
 最终 `verify` 把实际 PR number/repo/base、两份 codex/deepseek receipt 与当前

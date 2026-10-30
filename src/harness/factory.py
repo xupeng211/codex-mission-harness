@@ -576,8 +576,11 @@ class Factory:
                               "usage_complete": getattr(exc, "usage_complete", False)}, "UNKNOWN"
             if getattr(exc, "usage_telemetry", None) is not None:
                 result["usage_telemetry"] = exc.usage_telemetry
+            if getattr(exc, "remote_cleanup", None) is not None:
+                result["remote_cleanup"] = exc.remote_cleanup
         raw_paths = [p for p in (transcript, transcript.with_suffix(".stderr"), transcript.with_suffix(".proxy.jsonl"),
-                                transcript.with_suffix(".container.json")) if p.is_file()]
+                                transcript.with_suffix(".container.json"), transcript.with_suffix(".stdout"),
+                                transcript.with_suffix(".cleanup.json")) if p.is_file()]
         result["raw_evidence"] = [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in raw_paths]
         data = encoded({"operation": operation_id, "identity": identity, "input": payload, "result": result}).encode()
         with evidence.open("xb") as stream:
