@@ -12,7 +12,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from harness.factory import FactoryBlocked, validate_config, validate_mission
+from harness.factory import READY, FactoryBlocked, validate_config, validate_mission
 from harness.factory_fixture import fixture_config
 from harness.factory_runtime import LocalRuntime, RuntimeFailure
 from harness.factory_test_service import ExecutionStopped
@@ -103,6 +103,15 @@ if mode == 'ignore_cancel':
  Path(data['cwd'],'worker.ready').write_text('synthetic client ready')
  time.sleep(30)
 if mode == 'exit': sys.exit(7)
+if mode == 'invalid':
+ print('not a JSON observation',flush=True)
+ sys.exit(0)
+if mode == 'delayed_pass':
+ from pathlib import Path
+ Path(data['cwd'],'worker.ready').write_text('offline observation waiting')
+ end=time.monotonic()+5
+ while not Path(data['cwd'],'worker.release').exists() and time.monotonic()<end: time.sleep(0.005)
+ if not Path(data['cwd'],'worker.release').exists(): sys.exit(8)
 if mode == 'partial':
  print(json.dumps({'status':'TIMEOUT'}),flush=True)
 if mode in {'hang','partial'}: time.sleep(30)
@@ -111,7 +120,7 @@ class Pending(OriginalRemote):
  def __init__(self,*args,**kwargs):
   super().__init__(*args,adapter=SimpleNamespace(
    _trusted_subprocess_environment=lambda **kw:{},
-   ci=lambda *a,**kw:GateResult('PASS' if mode == 'pass' else 'PENDING','offline queued CI')),**kwargs)
+   ci=lambda *a,**kw:GateResult('PASS' if mode in {'pass','delayed_pass'} else 'FAIL' if mode == 'fail' else 'PENDING','offline queued CI')),**kwargs)
  def observe(self,policy,spec,target,body):
   if time.monotonic() >= self.deadline: raise TimeoutError('no observation after worker deadline')
   return {'status':'PASS','target':target,'pr_number':7,'pr_repo':'fixture/only','pr_base_sha':target['base']}
@@ -155,8 +164,8 @@ class RemoteWorkerTests(unittest.TestCase):
                                   return_value={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}))
         return stack
 
-    def invoke(self, transcript=None):
-        return self.runtime.project_remote("ci", {}, {}, self.root, {"head": "a" * 40, "base": "b" * 40},
+    def invoke(self, transcript=None, *, mission="feature"):
+        return self.runtime.project_remote("ci", {}, {"mission_id": mission}, self.root, {"head": "a" * 40, "base": "b" * 40},
             "", transcript or self.root / "ci.raw", self.timeout)
 
     def assert_reaped(self):
@@ -217,7 +226,7 @@ class RemoteWorkerTests(unittest.TestCase):
         with self.hooks("ignore_cancel"):
             watcher.start()
             try:
-                try: self.invoke()
+                try: self.invoke(mission="current")
                 except Exception as exc: caught = exc
             finally:
                 watcher.join(3)
@@ -233,9 +242,11 @@ class RemoteWorkerTests(unittest.TestCase):
         self.assertTrue(self.runtime.cancel(current))
         try:
             with self.hooks("hang"), self.assertRaises(ExecutionStopped) as stopped:
-                self.invoke()
+                self.invoke(mission="cancelled")
             self.assertEqual(stopped.exception.outcome, "CANCELLED")
             self.assertFalse(self.clients)
+            self.assertIs(self.runtime._active_execution, current)
+            self.assertTrue(current.is_set())
         finally:
             self.runtime.end_execution(current)
 
@@ -251,6 +262,178 @@ class RemoteWorkerTests(unittest.TestCase):
             self.assertEqual(row["status"], "UNKNOWN")
             self.assertNotIn("status", json.loads(row["result"]))
             self.assert_reaped()
+
+    def test_cancelled_and_ended_unrelated_task_does_not_block_a_new_observation(self):
+        previous = self.runtime.begin_execution("unrelated")
+        self.assertTrue(self.runtime.cancel(previous))
+        self.runtime.end_execution(previous)
+        with self.hooks("pass"): result = self.invoke()
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(len(self.clients), 1, "必须启动并完成新观察，不能返回缓存")
+        self.assertTrue(previous.is_set())
+        self.assertIsNot(self.runtime.container_cancel, previous)
+        self.assertIsNone(self.runtime._active_execution)
+        self.assertIsNone(self.runtime._active_mission)
+        self.assertIsNone(self.runtime._execution_thread)
+        self.assert_reaped()
+
+    def test_standalone_query_releases_its_identity_on_result_or_exception(self):
+        for mode, error in (("pass", None), ("exit", RuntimeFailure), ("invalid", json.JSONDecodeError)):
+            with self.subTest(mode=mode), self.hooks(mode):
+                if error is None: self.assertEqual(self.invoke(self.root / (mode + ".raw"))["status"], "PASS")
+                else:
+                    with self.assertRaises(error): self.invoke(self.root / (mode + ".raw"))
+            self.assertIsNone(self.runtime._active_execution)
+            self.assertIsNone(self.runtime._active_mission)
+            self.assertIsNone(self.runtime._execution_thread)
+            self.assert_reaped()
+
+    def test_standalone_launch_error_releases_its_identity(self):
+        with self.hooks("pass"), patch("harness.factory_runtime.subprocess.Popen", side_effect=OSError("offline launch failed")):
+            with self.assertRaises(OSError): self.invoke()
+        self.assertFalse(self.clients)
+        self.assertIsNone(self.runtime._active_execution)
+        self.assertIsNone(self.runtime._active_mission)
+        self.assertIsNone(self.runtime._execution_thread)
+        self.assertIsNone(self.runtime.current_process)
+
+    def test_failed_observation_is_not_changed_into_pass(self):
+        with self.hooks("fail"): result = self.invoke()
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIsNone(self.runtime._active_execution)
+        self.assert_reaped()
+
+    def test_successful_active_call_keeps_its_owners_identity(self):
+        current = self.runtime.begin_execution("feature")
+        try:
+            with self.hooks("pass"): result = self.invoke()
+            self.assertEqual(result["status"], "PASS")
+            self.assertIs(self.runtime._active_execution, current)
+            self.assertIs(self.runtime.container_cancel, current)
+            self.assertFalse(current.is_set())
+            self.assert_reaped()
+        finally:
+            self.runtime.end_execution(current)
+
+    def test_late_old_cancel_and_end_cannot_stop_a_standalone_observation(self):
+        old = self.runtime.begin_execution("old")
+        self.assertTrue(self.runtime.cancel(old))
+        self.runtime.end_execution(old)
+        self.timeout = 3
+        results, errors = [], []
+        def observe():
+            try: results.append(self.invoke())
+            except BaseException as error: errors.append(error)
+        worker = threading.Thread(target=observe)
+        with self.hooks("delayed_pass"):
+            worker.start()
+            try:
+                end = time.monotonic() + 2
+                while time.monotonic() < end and not (self.root / "worker.ready").exists(): time.sleep(0.005)
+                self.assertTrue((self.root / "worker.ready").exists(), errors)
+                current = self.runtime._active_execution
+                self.assertIsNotNone(current)
+                self.assertIsNot(current, old)
+                self.assertFalse(self.runtime.cancel(old))
+                self.runtime.end_execution(old)
+                self.assertIs(self.runtime._active_execution, current)
+                self.assertFalse(current.is_set())
+                self.assertIsNone(self.clients[0].poll())
+                (self.root / "worker.release").touch()
+                worker.join(2)
+                self.assertFalse(worker.is_alive())
+            finally:
+                self.cleanup_clients()
+                worker.join(3)
+        self.assertFalse(errors, errors)
+        self.assertEqual(results[0]["status"], "PASS")
+        self.assertIsNone(self.runtime._active_execution)
+        self.assert_reaped()
+
+    def test_other_active_mission_identity_and_cancellation_cannot_be_stolen(self):
+        current = self.runtime.begin_execution("other")
+        self.assertTrue(self.runtime.cancel(current))
+        try:
+            with self.hooks("pass"), self.assertRaisesRegex(RuntimeError, "different active execution"):
+                self.invoke()
+            self.assertFalse(self.clients)
+            self.assertIs(self.runtime._active_execution, current)
+            self.assertEqual(self.runtime._active_mission, "other")
+            self.assertIs(self.runtime.container_cancel, current)
+            self.assertTrue(current.is_set())
+        finally:
+            self.runtime.end_execution(current)
+
+    def test_same_mission_on_another_thread_cannot_borrow_active_identity(self):
+        current = self.runtime.begin_execution("feature")
+        errors = []
+        def observe():
+            try: self.invoke()
+            except BaseException as error: errors.append(error)
+        worker = threading.Thread(target=observe)
+        try:
+            with self.hooks("pass"):
+                worker.start()
+                worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], RuntimeError)
+            self.assertIn("different active execution", str(errors[0]))
+            self.assertFalse(self.clients)
+            self.assertIs(self.runtime._active_execution, current)
+            self.assertFalse(current.is_set())
+        finally:
+            self.cleanup_clients()
+            worker.join(3)
+            self.runtime.end_execution(current)
+
+
+class ReportExecutionIsolationTests(unittest.TestCase):
+    def test_report_observes_again_after_an_unrelated_cancelled_execution(self):
+        # Factory, operation evidence and worker controller are real. Development,
+        # reviews, container and GitHub authority remain explicit offline doubles.
+        class Runtime(fixtures.LiveProtocolDouble, LocalRuntime):
+            def __init__(self):
+                fixtures.LiveProtocolDouble.__init__(self)
+                LocalRuntime.__init__(self)
+                self.real_controller = False
+
+            def project_remote(self, *args, **kwargs):
+                method = LocalRuntime.project_remote if self.real_controller else fixtures.LiveProtocolDouble.project_remote
+                return method(self, *args, **kwargs)
+
+        fx = fixtures.FactoryLiveProtocolTests()
+        fx.setUp()
+        self.addCleanup(fx.doCleanups)
+        runtime = Runtime()
+        fx.f.runtime = runtime
+        ready = fx.f.run("feature")
+        self.assertEqual(ready["DELIVERY_STATUS"], READY)
+        observation = ready["CURRENT_REMOTE_VERIFICATION"]
+        runtime.real_controller = True
+        original_popen, starts = subprocess.Popen, []
+
+        def local_observation(argv, *args, **kwargs):
+            if argv != [sys.executable, "-m", "harness.factory_remote"]:
+                return original_popen(argv, *args, **kwargs)
+            starts.append(runtime._active_execution)
+            code = "import json,sys; json.load(sys.stdin); print(" + repr(json.dumps(observation)) + ")"
+            return original_popen([sys.executable, "-I", "-B", "-c", code], *args, **kwargs)
+
+        with patch("harness.factory_runtime.subprocess.Popen", side_effect=local_observation):
+            self.assertEqual(fx.f.report("feature")["DELIVERY_STATUS"], READY)
+            old = runtime.begin_execution("unrelated")
+            self.assertTrue(runtime.cancel(old))
+            runtime.end_execution(old)
+            report = fx.f.report("feature")
+        self.assertEqual(report["DELIVERY_STATUS"], READY, report)
+        self.assertEqual(len(starts), 2)
+        self.assertTrue(all(token is not None and token is not old for token in starts))
+        self.assertIsNot(starts[0], starts[1])
+        self.assertTrue(old.is_set())
+        self.assertFalse(fx.f.cancel_requested("feature"))
+        self.assertIsNone(runtime._active_execution)
+        self.assertIsNone(runtime.current_process)
 
 
 class PublicationTitleTests(unittest.TestCase):

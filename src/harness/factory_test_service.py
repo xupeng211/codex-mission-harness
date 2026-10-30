@@ -35,7 +35,8 @@ class ProjectPostgres:
         self.evidence = {"image_id": image, "container_name": name, "mission_id": mission,
                          "target": target, "storage": "tmpfs_only", "host_ports": [],
                          "network": "none_shared_loopback", "ready": False,
-                         "cleanup_confirmed": False, "persistent_volumes_created": []}
+                         "cleanup_confirmed": False, "diagnostics_complete": True,
+                         "persistent_volumes_created": []}
         self.labels = {"cmh.qa.owner": self.owner, "cmh.qa.mission": mission,
                        "cmh.qa.head": target["head"], "cmh.qa.scope": target["mission_scope_sha256"]}
 
@@ -45,11 +46,23 @@ class ProjectPostgres:
         if time.monotonic() >= self.deadline:
             raise ExecutionStopped("TIMEOUT")
 
-    def record(self, value):
+    def record(self, value, *, best_effort=False):
         # Only this newly generated test password is handled here; no personal
         # or production credentials are read. Never emit it, even on failure.
-        self.log.write((json.dumps(value, ensure_ascii=False).replace(self.password, "[TEST_PASSWORD_REDACTED]") + "\n").encode())
-        self.log.flush()
+        raw = (json.dumps(value, ensure_ascii=False).replace(self.password, "[TEST_PASSWORD_REDACTED]") + "\n").encode()
+        try:
+            self.log.write(raw)
+            self.log.flush()
+        except (OSError, ValueError) as error:
+            # Retain result/error metadata without writing to the broken sink
+            # again, or retaining output/exception text that may contain secrets.
+            self.evidence["diagnostics_complete"] = False
+            self.evidence.setdefault("diagnostic_errors", []).append({
+                "service_command": value["service_command"][0], "exit_code": value["exit_code"],
+                "command_error_type": value.get("error_type"), "error_type": type(error).__name__,
+                "errno": getattr(error, "errno", None)})
+            if not best_effort:
+                raise
 
     def command(self, args, *, cleanup=False, password=False):
         if not cleanup:
@@ -66,11 +79,11 @@ class ProjectPostgres:
                 result = subprocess.run(["/usr/bin/docker", *args], env=env,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=limit)
         except (OSError, subprocess.SubprocessError) as error:
-            self.record({"service_command": args, "exit_code": None, "error_type": type(error).__name__})
+            self.record({"service_command": args, "exit_code": None, "error_type": type(error).__name__}, best_effort=True)
             raise
         self.record({"service_command": args, "exit_code": result.returncode,
                      "stdout": result.stdout.decode(errors="replace"),
-                     "stderr": result.stderr.decode(errors="replace")})
+                     "stderr": result.stderr.decode(errors="replace")}, best_effort=cleanup)
         return result
 
     def start(self):
@@ -151,6 +164,10 @@ class ProjectPostgres:
         return argv
 
     def close(self):
+        self.evidence["cleanup_confirmed"] = False
+        self.evidence["cleanup_exit_code"] = None
+        self.evidence["cleanup_ownership_confirmed"] = False
+        self.evidence["cleanup_absence_confirmed"] = False
         if not self.attempted:
             self.evidence["cleanup_confirmed"] = True
             return
@@ -160,14 +177,23 @@ class ProjectPostgres:
                 actual = json.loads(labels.stdout)
                 if not isinstance(actual, dict) or any(actual.get(k) != v for k, v in self.labels.items()):
                     raise RuntimeError("refusing to delete a container without this task's ownership labels")
+                self.evidence["cleanup_ownership_confirmed"] = True
                 try:
-                    self.command(["logs", "--tail", "200", self.name], cleanup=True)
+                    logs = self.command(["logs", "--tail", "200", self.name], cleanup=True)
+                    self.evidence["logs_exit_code"] = logs.returncode
+                    if logs.returncode:
+                        self.evidence["diagnostics_complete"] = False
                 except (OSError, subprocess.SubprocessError) as error:
                     self.evidence["logs_error_type"] = type(error).__name__
-                self.command(["rm", "--force", "--volumes", self.name], cleanup=True)
+                    self.evidence["diagnostics_complete"] = False
+                removed = self.command(["rm", "--force", "--volumes", self.name], cleanup=True)
+                self.evidence["cleanup_exit_code"] = removed.returncode
+                if removed.returncode:
+                    raise RuntimeError("test service removal failed; cleanup remains unconfirmed")
             absence = self.command(["ps", "-a", "--filter", "name=^/" + self.name + "$",
                                     "--format", "{{.Names}}"], cleanup=True)
-            self.evidence["cleanup_confirmed"] = absence.returncode == 0 and not absence.stdout.strip()
+            self.evidence["cleanup_absence_confirmed"] = absence.returncode == 0 and not absence.stdout.strip()
+            self.evidence["cleanup_confirmed"] = self.evidence["cleanup_absence_confirmed"]
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             self.evidence["cleanup_error_type"] = type(error).__name__
         finally:

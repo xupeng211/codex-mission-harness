@@ -431,6 +431,59 @@ class ServiceDouble(InspectionDouble):
 
 
 class ServiceClientBoundaryTests(unittest.TestCase):
+    def test_cleanup_diagnostic_loss_cleans_owned_service_but_cannot_pass_the_gate(self):
+        from test_factory_test_service import BrokenDiagnosticLog
+        from harness.factory_test_service import ProjectPostgres
+        fx = gates.ControllerGatesTests()
+        fx.setUp()
+        self.addCleanup(fx.doCleanups)
+        runtime = LocalRuntime()
+        double = ServiceDouble(fx, runtime)
+        self.addCleanup(double.close)
+        original_close = ProjectPostgres.close
+
+        def close_with_failed_sink(service):
+            # Only cleanup diagnostics lose their sink; actual command outcomes
+            # and the final source check remain available to the Controller.
+            service.log = BrokenDiagnosticLog()
+            original_close(service)
+
+        with double.hooks(), patch.object(ProjectPostgres, "close", close_with_failed_sink):
+            result = runtime.container_gate(gates.CONTAINER, fx.spec, fx.cwd, fx.target,
+                ["make", "verify-pr"], fx.root / "service-log-fault.raw", 5)
+        self.assertFalse(double.resources)
+        self.assertTrue(result["cleanup_confirmed"])
+        self.assertTrue(result["services"]["postgres"]["cleanup_confirmed"])
+        self.assertFalse(result["services"]["postgres"]["diagnostics_complete"])
+        self.assertEqual(result["exit_code"], 0)
+        self.assertTrue(result["source_unchanged"])
+        self.assertEqual(result["status"], "BLOCKED_ENVIRONMENT", result)
+        self.assertTrue(all(p.poll() is not None for p in double.clients))
+        self.assertIsNone(runtime.current_process)
+
+    def test_service_log_command_failure_is_recorded_and_cannot_pass_the_gate(self):
+        fx = gates.ControllerGatesTests()
+        fx.setUp()
+        self.addCleanup(fx.doCleanups)
+        runtime = LocalRuntime()
+        double = ServiceDouble(fx, runtime)
+        self.addCleanup(double.close)
+        original_command = double.command
+        def command(argv, *args, **kwargs):
+            if argv[:2] == ["/usr/bin/docker", "logs"]:
+                return subprocess.CompletedProcess(argv, 7, b"", b"synthetic log command failure")
+            return original_command(argv, *args, **kwargs)
+        double.command = command
+        with double.hooks():
+            result = runtime.container_gate(gates.CONTAINER, fx.spec, fx.cwd, fx.target,
+                ["make", "verify-pr"], fx.root / "service-log-command-fault.raw", 5)
+        self.assertFalse(double.resources)
+        self.assertTrue(result["cleanup_confirmed"])
+        service = result["services"]["postgres"]
+        self.assertEqual(service["logs_exit_code"], 7)
+        self.assertFalse(service["diagnostics_complete"])
+        self.assertEqual(result["status"], "BLOCKED_ENVIRONMENT", result)
+
     def test_service_metadata_diagnostics_preserve_stdout_json(self):
         fx = gates.ControllerGatesTests()
         fx.setUp()

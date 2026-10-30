@@ -745,6 +745,21 @@ class LocalRuntime:
         return result
 
     def project_remote(self, action, policy, spec, cwd, target, body, transcript, timeout, *, reviews=None, previous_head=None):
+        import threading
+        with self._execution_lock:
+            standalone = self._active_execution is None
+            if standalone:
+                execution = self.begin_execution(spec["mission_id"])
+            elif self._active_mission != spec["mission_id"] or self._execution_thread != threading.get_ident():
+                raise RuntimeError("project remote belongs to a different active execution")
+        try:
+            return self._project_remote(action, policy, spec, cwd, target, body, transcript, timeout,
+                                        reviews=reviews, previous_head=previous_head)
+        finally:
+            if standalone:
+                self.end_execution(execution)
+
+    def _project_remote(self, action, policy, spec, cwd, target, body, transcript, timeout, *, reviews=None, previous_head=None):
         # Trusted Controller worker; development agents never receive this env.
         from .adapters import FootballPredictionAdapter
         from .factory_test_service import ExecutionStopped

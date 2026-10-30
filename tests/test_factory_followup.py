@@ -46,7 +46,7 @@ class CredentialPersistenceTests(unittest.TestCase):
         class Service:
             def __init__(s, *args, **kwargs):
                 s.password = secret
-                s.evidence = {"cleanup_confirmed": False}
+                s.evidence = {"cleanup_confirmed": False, "diagnostics_complete": True}
             def start(s): pass
             def check(s): pass
             def validation_argv(s, argv): return argv

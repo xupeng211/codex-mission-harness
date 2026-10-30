@@ -120,6 +120,13 @@ RUNNING/UNKNOWN 验证改为通过，也不能自动重跑测试。退出码 137
 这不识别任意未知秘密。Controller 被杀时可能丢失尚未写出的短尾部，但不依赖 finally
 重写原日志来保护密码。任务凭据临时文件仍受私有目录/0600 和精确恢复清理保护。
 
+PostgreSQL 清理区分命令结果与诊断写入结果。日志 write/flush 的 OSError 或关闭流
+错误只追加无输出、无异常正文的错误类型/errno/命令结果摘要，不吞掉真实命令错误；
+inspect 已成功时仍按本任务全部 ownership 标签核验，再执行一次有界移除及准确名称
+的不存在确认。inspect 失败、输出损坏或身份不符时不删除；rm 非零或响应未知保持
+清理未确认。重复 close 重新取得证据，不沿用旧成功。诊断丢失或服务 logs 命令失败
+单独标为 diagnostics_complete=false，即使资源确已清理也不能得到容器检查 PASS。
+
 取消后 resume 只允许在既有 RUNNING/UNKNOWN，以及清理尚未确认的 COMPLETE
 非付费 checks/ci 记录上执行精确
 ownership 核验与清理，不准备候选、不重新验证、不查询发布状态或调用模型。
@@ -129,6 +136,9 @@ COMPLETE 必须通过原操作证据与 lifecycle 摘要、任务和目标绑定
 每次 Factory 执行有独立取消事件和不复用的身份；watcher 必须携带该身份，迟到的旧
 取消或结束回调不能影响新任务。相同 LocalRuntime 的重叠执行被拒绝，直接 Controller
 容器调用也建立任务身份；取消直接调用时须传入该次 `container_cancel` 事件。
+独立 project_remote 状态观察同样建立新身份，并在正常或异常结束时释放；活动执行
+只允许相同 mission 与所属线程借用其身份，并继续服从其取消。其他活动任务的查询
+被拒绝，不覆盖身份或清除取消；旧任务已置位的事件和迟到回调对新观察没有权限。
 源码 clone/remote-remove/checkout/update-ref 和依赖 create/cp 客户端同样登记到该执行身份，派发前检查取消和剩余 deadline，
 准备期间可取消且不重新获得原 timeout；停止后仍执行有界、核对归属的 finally 清理。
 源码准备中止时不再派发验证，未建立完整快照不声称源码完整性已确认。

@@ -288,7 +288,7 @@ class LifetimeAndAuthTests(unittest.TestCase):
                 def wait(worker, **kwargs): return 0
             def launch(argv, **kwargs): outer.append(kwargs["env"]); return Worker()
             with patch.dict(os.environ, host, clear=True), patch("harness.factory_runtime.subprocess.Popen", side_effect=launch):
-                LocalRuntime().project_remote("ci", {}, {}, root, {}, "fixture body", transcript, 5)
+                LocalRuntime().project_remote("ci", {}, {"mission_id": "fixture"}, root, {}, "fixture body", transcript, 5)
                 # Same constructor is used for both development and review App Servers.
                 agent = AppServerCodex._app_server_environment("/usr/bin/python3", codex_home=str(root / "auth"))
             self.assertEqual(len(outer), 1); self.assertEqual(len(inner), 1)

@@ -509,7 +509,8 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
         result.update(outcome=outcome, source_after=after, snapshot_after=snapshot_after,
                       source_unchanged=unchanged)
         result["status"] = (outcome if outcome != "EXITED" else "SOURCE_CHANGED" if not unchanged else
-                            "BLOCKED_ENVIRONMENT" if not result["cleanup_confirmed"] else
+                            "BLOCKED_ENVIRONMENT" if not result["cleanup_confirmed"] or
+                                (service is not None and not service.evidence["diagnostics_complete"]) else
                             "PASS" if result["exit_code"] == 0 else "FAIL")
     result["temporary_directory_cleanup_confirmed"] = not Path(temporary).exists()
     if not result["temporary_directory_cleanup_confirmed"] and result["status"] == "PASS":
