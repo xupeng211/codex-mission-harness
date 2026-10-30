@@ -63,6 +63,16 @@ changed-line 输入绑定完整批准 BASE。依赖隐式 cwd 的 Git 也在候�
 规则不变，涉及它们须另行明确授权任务。验证前重建准确 base/head/tree、完整 diff、文件集合、scope
 和 policy；还直接校验实际 tracked 源码字节/mode，不能仅依赖 Git stat cache。
 
+Ruff 权威保护按批准的完整 BASE→HEAD Git 对象比较，覆盖任意层级的
+`ruff.toml`、`.ruff.toml`，以及 `pyproject.toml` 中的 `[tool.ruff]`。
+新增、修改、删除、重命名和类型变化不能借普通业务 scope 授权改变 QA 标准；
+同路径同类型且 Ruff 表不变的嵌套 pyproject 业务元数据编辑仍可继续，根配置的原保护不变。
+从两个端点的配置逐条追踪直接 `extend` 关系，依赖文件即使不是 TOML 后缀也受保护。
+只解析仓库内普通 Git blob，不执行候选代码、不跟随符号链接或读取仓库外文件；
+缺失、损坏、循环、越界或需环境/用户目录展开的依赖无法核实，明确拒绝并要求
+单独的 policy mission。当前项目桥未实现这种独立 QA 变更授权入口，不能凭候选标记或
+布尔字段放行，也不修改原项目 Ruff 配置发现或检查命令。
+
 固定本地 image ID，`--pull=never`，不 build、不下载、不访问现有业务容器。
 Controller 克隆一次性验证副本并设置批准 base 的 origin/main ref；只把副本挂入
 容器，`.git` 只读。既有镜像 node_modules 经 Docker copy-out 进入临时副本，避免

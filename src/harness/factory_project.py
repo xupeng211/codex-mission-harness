@@ -9,8 +9,10 @@ import hashlib
 import fnmatch
 import json
 import os
+import posixpath
 import re
 import subprocess
+import tomllib
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -199,6 +201,97 @@ def tracked_source_digest(cwd, head, *, require_committed=False):
     return result.hexdigest()
 
 
+def protect_ruff_authority(spec, cwd):
+    """只读完整 BASE/HEAD Git 对象；候选路径授权不授予 QA 变更权限。"""
+    from .factory import git
+
+    def refuse(reason):
+        raise ValueError("Ruff QA authority " + reason + "; separate policy mission required")
+
+    revisions = (spec["base"], git(cwd, "rev-parse", "HEAD"))
+    if any(not re.fullmatch(r"[0-9a-f]{40}", revision) for revision in revisions):
+        refuse("requires exact BASE/HEAD")
+    trees = {}
+    for revision in revisions:
+        entries = {}
+        for entry in filter(None, git(cwd, "ls-tree", "-r", "-z", revision).split("\0")):
+            metadata, path = entry.split("\t", 1)
+            entries[path] = tuple(metadata.split())
+        trees[revision] = entries
+    before, after = (trees[revision] for revision in revisions)
+    changed = {path for path in before.keys() | after.keys() if before.get(path) != after.get(path)}
+    names = {"ruff.toml", ".ruff.toml"}
+    if any(Path(path).name in names for path in changed):
+        refuse("configuration changed")
+    cache = {}
+
+    def settings(revision, path):
+        key = (revision, path)
+        if key not in cache:
+            entry = trees[revision].get(path)
+            if entry is None:
+                return None
+            mode, kind, blob = entry
+            if kind != "blob" or mode not in {"100644", "100755"}:
+                refuse("cannot inspect non-regular configuration " + path)
+            try:
+                document = tomllib.loads(git(cwd, "show", blob))
+            except (tomllib.TOMLDecodeError, UnicodeError):
+                refuse("cannot parse configuration " + path)
+            if Path(path).name == "pyproject.toml":
+                tool = document.get("tool", {})
+                document = tool.get("ruff") if isinstance(tool, dict) else None
+                if document is not None and not isinstance(document, dict):
+                    refuse("has an invalid tool.ruff table in " + path)
+            cache[key] = document
+        return cache[key]
+
+    def frozen_settings(revision, path):
+        try:
+            return json.dumps(settings(revision, path), sort_keys=True, allow_nan=False)
+        except (TypeError, ValueError):
+            refuse("cannot compare tool.ruff settings in " + path)
+
+    for revision in revisions:
+        # 不执行配置；pyproject 的其他业务元数据不自动成为 QA 权威。
+        roots = [path for path in trees[revision]
+                 if Path(path).name in names | {"pyproject.toml"}
+                 and settings(revision, path) is not None]
+        pending = [(path, ()) for path in roots]
+        visited = set()
+        while pending:
+            path, ancestors = pending.pop()
+            if path in ancestors:
+                refuse("extend cycle at " + path)
+            if path in visited:
+                continue
+            visited.add(path)
+            config = settings(revision, path)
+            if config is None:
+                refuse("extend target has no Ruff configuration: " + path)
+            if path in changed:
+                # 同路径、同类型且 Ruff 表不变的 pyproject 元数据编辑仍可继续。
+                metadata_only = (Path(path).name == "pyproject.toml"
+                    and before.get(path) is not None and after.get(path) is not None
+                    and before[path][:2] == after[path][:2]
+                    and frozen_settings(revisions[0], path) == frozen_settings(revisions[1], path))
+                if not metadata_only:
+                    refuse("configuration or extend dependency changed: " + path)
+            if "extend" not in config:
+                continue
+            extended = config["extend"]
+            if (not isinstance(extended, str) or not extended or "\\" in extended
+                    or "$" in extended or "~" in extended or ":" in extended
+                    or extended.startswith("/")):
+                refuse("cannot safely resolve extend in " + path)
+            dependency = posixpath.normpath(posixpath.join(posixpath.dirname(path), extended))
+            if dependency == ".." or dependency.startswith("../"):
+                refuse("extend leaves repository: " + path)
+            if dependency not in trees[revision]:
+                refuse("extend target is missing: " + path)
+            pending.append((dependency, (*ancestors, path)))
+
+
 class FootballPredictionContract:
     """Reuse trusted-base execution and original project receipt validators."""
 
@@ -213,6 +306,7 @@ class FootballPredictionContract:
                     or path.startswith(("scripts/devops/", "scripts/ops/helpers/", "schemas/agentic/", ".github/",
                                         "scripts/test/", ".githooks/", ".devcontainer/", "config/"))):
                 raise ValueError("candidate changed protected canonical authority; separate policy mission required")
+        protect_ruff_authority(spec, cwd)
         trusted = self.adapter._trusted_base_checkout(str(cwd), spec["base"])
         # These modules are byte-verified base policy, never candidate code.
         query = """
