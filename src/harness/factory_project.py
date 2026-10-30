@@ -313,7 +313,7 @@ print(json.dumps({'canonical_diff_sha256':hashlib.sha256(diff).hexdigest(), 'can
         self.adapter._private_dir(evidence, private_root=evidence)
         path = evidence / (sha256(body.encode()) + ".md")
         if path.exists():
-            if path.is_symlink() or path.read_text() != body:
+            if path.is_symlink() or path.read_bytes() != body.encode("utf-8"):
                 raise ValueError("publication body evidence changed")
         else:
             self.adapter._write_private_file(path, body)

@@ -168,6 +168,8 @@ Factory.prepare、本地报告和发布使用同一分支推导；发布/观察�
 候选 hooks/config，不 force push。只有已证明的上一候选 publication 可更新同一
 PR，其他 HEAD、closed PR、fork、不同 base 或模糊发现均拒绝。正文由 immutable
 Controller template 与已验证 receipt 渲染，准确 HEAD/body/scope 均需绑定。
+正文缓存重复检查按原始 UTF-8 字节与批准正文比较，保留 CRLF；即使只改变换行字节，
+也按证据变化拒绝，不规范化或改写已保存正文及其 SHA256 路径。
 PR 标题取任务目标中首个非空行并去除首尾空白，保持 200 字符上限；标题无效时在任何
 远端写入前拒绝，原任务目标文本保持不变。
 
