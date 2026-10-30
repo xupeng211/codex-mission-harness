@@ -10,6 +10,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -269,28 +270,38 @@ class LifetimeAndAuthTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root); transcript = root / "remote.raw"
             credentials = {"GH_TOKEN": "synthetic-gh-only", "GITHUB_TOKEN": "synthetic-github-only", "GH_ENTERPRISE_TOKEN": "synthetic-enterprise-only"}
-            host = {**credentials, "HOME": str(root), "RANDOM_PRIVATE_SECRET": "must-not-pass",
+            host = {**credentials, "HOME": str(Path.home()), "RANDOM_PRIVATE_SECRET": "must-not-pass",
                     "PYTHONPATH": "/untrusted", "LD_PRELOAD": "/untrusted/loader.so", "GIT_CONFIG_COUNT": "1"}
             outer, inner, messages = [], [], []
-            def tool(argv, **kwargs):
-                inner.append(kwargs["env"])
-                return subprocess.CompletedProcess(argv, 0, "{}", "")
-            class Worker:
-                returncode = 0
-                stdin = stdout = None
-                def communicate(worker, message, **kwargs):
-                    messages.append(message)
-                    with patch.dict(os.environ, outer[-1], clear=True), patch("harness.factory_remote.subprocess.run", side_effect=tool):
-                        remote = Remote(root, transcript, 5)
-                        remote.command(["/usr/bin/gh", "api", "repos/fixture/only-read"])
-                    return json.dumps({"status": "PASS", "fixture": "offline-double"}), None
-                def poll(worker): return 0
-                def wait(worker, **kwargs): return 0
-            def launch(argv, **kwargs): outer.append(kwargs["env"]); return Worker()
+            # Exercise the actual PID/session/exit contract. Only external gh
+            # I/O is synthetic; these credentials are explicit test sentinels.
+            worker = r'''
+import json,subprocess,sys
+from pathlib import Path
+from unittest.mock import patch
+from harness.factory_remote import Remote
+data=json.load(sys.stdin)
+root=Path(data['cwd'])
+(root/'request.json').write_text(json.dumps(data))
+def tool(argv,**kwargs):
+ (root/'inner-environment.json').write_text(json.dumps(kwargs['env']))
+ return subprocess.CompletedProcess(argv,0,'{}','')
+with patch('harness.factory_remote.subprocess.run',side_effect=tool):
+ Remote(root,data['transcript'],data['timeout'],deadline=data['deadline']).command(
+  ['/usr/bin/gh','api','repos/fixture/only-read'])
+print(json.dumps({'status':'PASS','fixture':'offline-double'}))
+'''
+            real_popen = subprocess.Popen
+            def launch(argv, **kwargs):
+                self.assertEqual(argv, [sys.executable, "-m", "harness.factory_remote"])
+                outer.append(kwargs["env"])
+                return real_popen([sys.executable, "-B", "-c", worker], **kwargs)
             with patch.dict(os.environ, host, clear=True), patch("harness.factory_runtime.subprocess.Popen", side_effect=launch):
                 LocalRuntime().project_remote("ci", {}, {"mission_id": "fixture"}, root, {}, "fixture body", transcript, 5)
                 # Same constructor is used for both development and review App Servers.
                 agent = AppServerCodex._app_server_environment("/usr/bin/python3", codex_home=str(root / "auth"))
+            inner.append(json.loads((root / "inner-environment.json").read_text()))
+            messages.append((root / "request.json").read_text())
             self.assertEqual(len(outer), 1); self.assertEqual(len(inner), 1)
             for environment in (*outer, *inner):
                 for key, value in credentials.items(): self.assertEqual(environment[key], value)
@@ -299,7 +310,9 @@ class LifetimeAndAuthTests(unittest.TestCase):
             self.assertNotIn("PYTHONPATH", inner[0])
             self.assertNotEqual(outer[0]["PYTHONPATH"], "/untrusted")
             for key in credentials: self.assertNotIn(key, agent)
-            saved = transcript.read_text() + transcript.with_suffix(".stderr").read_text() + str(messages)
+            saved = (transcript.read_text() + transcript.with_suffix(".stderr").read_text()
+                     + transcript.with_suffix(".stdout").read_text()
+                     + transcript.with_suffix(".cleanup.json").read_text() + str(messages))
             for value in credentials.values(): self.assertNotIn(value, saved)
 
 
