@@ -59,26 +59,29 @@ class RedactedOutput:
         self.stream.flush()
 
 
-def consume_output(proc, output, cancel, deadline, *, stderr_output=None):
+def consume_output(proc, output, cancel, deadline, *, stderr_output=None, exited=None):
     """Controller-owned pipes; the child never receives a log file fd."""
     streams = {proc.stdout: output}
     if stderr_output is not None and getattr(proc, "stderr", None) is not None:
         streams[proc.stderr] = stderr_output
     while True:
+        delay = min(0.05, max(0, deadline - time.monotonic())) if exited is not None else 0.05
         if streams:
-            for stream in select.select(list(streams), [], [], 0.05)[0]:
+            for stream in select.select(list(streams), [], [], delay)[0]:
                 data = os.read(stream.fileno(), 65536)
                 if data:
                     streams[stream].write(data)
                 else:
                     del streams[stream]
         else:
-            cancel.wait(0.05)
+            cancel.wait(delay)
         if cancel.is_set():
             raise ExecutionStopped("CANCELLED")
         if time.monotonic() >= deadline:
             raise ExecutionStopped("TIMEOUT")
-        if not streams and proc.poll() is not None:
+        # Preparation keeps its direct-child ownership anchor unreaped until
+        # the whole group is stopped. Other existing callers retain poll().
+        if not streams and (exited() if exited is not None else proc.poll() is not None):
             return
 
 
@@ -91,46 +94,85 @@ def check_stopped(cancel, deadline):
 
 def prepare_client(runtime, argv, cwd, log, cancel, deadline, *, env=ENV, stderr_log=None):
     """A preparation client belongs to the same execution as validation."""
+    from .factory_runtime import RuntimeFailure
     with runtime._execution_lock:
         check_stopped(cancel, deadline)
         if runtime.container_cancel is not cancel:
             raise ExecutionStopped("CANCELLED")
+        if runtime.current_process is not None or runtime._preparation_client is not None:
+            raise RuntimeFailure("another client still owns this execution")
         proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE if stderr_log is not None else subprocess.STDOUT,
                                 start_new_session=True)
         runtime.current_process = proc
+        client = {"process": proc, "execution": runtime._active_execution,
+                  "mission": runtime._active_mission, "identity": None}
+        runtime._preparation_client = client
     output = RedactedOutput(log)
     error_output = RedactedOutput(stderr_log) if stderr_log is not None else None
-    completed = False
+    original_error = None
     try:
-        consume_output(proc, output, cancel, deadline, stderr_output=error_output)
-        completed = True
+        client["identity"] = runtime._client_process_identity(proc.pid)
+        def exited():
+            with runtime._execution_lock:
+                status = runtime._owned_client_leader(client)
+                if status is not None:
+                    client["exit_code"] = status.si_status if status.si_code == os.CLD_EXITED else -status.si_status
+                return status is not None
+        # Work and shutdown share the caller's remaining total/stage budget.
+        # A small reserve allows SIGKILL and observation without a fresh grace.
+        work_deadline = deadline - min(0.1, max(0, deadline - time.monotonic()) / 4)
+        consume_output(proc, output, cancel, work_deadline, stderr_output=error_output, exited=exited)
+    except BaseException as error:
+        original_error = error
+        raise
     finally:
         try:
-            if not completed or proc.poll() is None:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            proc.wait(timeout=5)
-        finally:
+            cleanup = runtime._finish_owned_client(client, deadline)
+        except Exception as error:
+            cleanup = {"identity": client["identity"], "mission": client["mission"],
+                       "confirmed": False, "leader_reaped": False,
+                       "errors": [f"{type(error).__name__}: {error}"]}
+        cleanup["exit_code"] = proc.returncode if proc.returncode is not None else client.get("exit_code")
+        cleanup["diagnostics_complete"] = original_error is None
+        # Diagnostic failure must neither bypass group shutdown nor replace
+        # the original command/cancellation error. Try each sink independently.
+        for stream in (proc.stdout, getattr(proc, "stderr", None), output, error_output):
+            if stream is None:
+                continue
             try:
-                proc.stdout.close()
-                if getattr(proc, "stderr", None) is not None:
-                    proc.stderr.close()
-                output.finish()
-                if error_output is not None:
-                    error_output.finish()
-            finally:
-                with runtime._execution_lock:
-                    if runtime.current_process is proc:
-                        runtime.current_process = None
+                stream.finish() if isinstance(stream, RedactedOutput) else stream.close()
+            except Exception as error:
+                cleanup["diagnostics_complete"] = False
+                # A sink exception may quote sensitive output. Keep only its
+                # type/errno, as in the existing service diagnostic contract.
+                cleanup["errors"].append(f"diagnostic {type(error).__name__} errno={getattr(error, 'errno', None)}")
+        runtime._preparation_cleanups.append(cleanup)
+        if original_error is not None:
+            original_error.preparation_cleanup = cleanup
+            if not cleanup["confirmed"] or not cleanup["diagnostics_complete"]:
+                original_error.add_note("preparation cleanup/diagnostics unconfirmed; original error retained")
+        elif not cleanup["confirmed"] or not cleanup["diagnostics_complete"]:
+            error = RuntimeFailure("preparation client cleanup/diagnostics unconfirmed")
+            error.preparation_cleanup = cleanup
+            raise error
+    try:
+        check_stopped(cancel, deadline)
+    except ExecutionStopped as error:
+        error.preparation_cleanup = cleanup
+        raise
     return proc.returncode
 
 
 def captured_client(runtime, argv, cwd, cancel, deadline, *, env=ENV):
     output, error = io.BytesIO(), io.BytesIO()
-    code = prepare_client(runtime, argv, cwd, output, cancel, deadline, env=env, stderr_log=error)
+    try:
+        code = prepare_client(runtime, argv, cwd, output, cancel, deadline, env=env, stderr_log=error)
+    except BaseException as failure:
+        # Keep already captured, separate output on failure too. These bytes
+        # are not placed in cleanup metadata or interpolated into diagnostics.
+        failure.stdout, failure.stderr = output.getvalue(), error.getvalue()
+        raise
     return subprocess.CompletedProcess(argv, code, output.getvalue(), error.getvalue())
 
 
@@ -336,6 +378,7 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
     started = time.monotonic()
     deadline = started + timeout
     cancel = runtime.container_cancel
+    preparation_start = len(runtime._preparation_cleanups)
     profile = PROFILES.get(tuple(command))
     if profile is None or profile not in validate_policy(policy)["profiles"]:
         raise ValueError("Controller container executor only accepts approved canonical profiles")
@@ -500,8 +543,15 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                         unchanged = before == after and snapshot == snapshot_after and not final["snapshot_dirty"]
                     except ExecutionStopped as error:
                         outcome = error.outcome
-                    except (OSError, ValueError, subprocess.SubprocessError):
+                    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
                         pass  # Unverifiable source can never produce PASS.
+                result["preparation_clients"] = runtime._preparation_cleanups[preparation_start:]
+                result["preparation_cleanup_confirmed"] = all(c["confirmed"] for c in result["preparation_clients"])
+                result["preparation_diagnostics_complete"] = all(c["diagnostics_complete"] for c in result["preparation_clients"])
+                result["cleanup_confirmed"] &= result["preparation_cleanup_confirmed"]
+                if outcome == "EXITED" and (not result["preparation_cleanup_confirmed"]
+                                           or not result["preparation_diagnostics_complete"]):
+                    outcome = "BLOCKED_ENVIRONMENT"
                 if cancel.is_set():
                     outcome = "CANCELLED"
         # 137 can also be OOM or an unrelated SIGKILL; do not invent a

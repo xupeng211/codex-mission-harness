@@ -141,6 +141,16 @@ COMPLETE 必须通过原操作证据与 lifecycle 摘要、任务和目标绑定
 被拒绝，不覆盖身份或清除取消；旧任务已置位的事件和迟到回调对新观察没有权限。
 源码 clone/remote-remove/checkout/update-ref 和依赖 create/cp 客户端同样登记到该执行身份，派发前检查取消和剩余 deadline，
 准备期间可取消且不重新获得原 timeout；停止后仍执行有界、核对归属的 finally 清理。
+该公共准备入口以 Linux `waitid(WNOWAIT)` 观察退出，禁止输出消费和取消回调提前
+`poll/communicate` 回收 leader。它与远端 worker 仅共用直接的归属核验和组收尾逻辑：
+核对本次执行令牌、PID/starttime、直接父进程、UID、PGID/SID，在未回收子进程的
+内核身份锚点仍有效时停止普通同组后代，然后回收 leader。无活进程时不发送组信号。
+工作在原总时限及阶段上限内预留 0.1 秒与剩余时间四分之一的较小者供收尾，不增加
+新的等待预算。`preparation_clients` 分别记录退出码、组停止、leader 回收、待父/init
+回收的 zombie 与诊断状态；stdout/stderr 保持各自原输出语义。归属或组停止无法确认
+时保留执行身份、阻止新派发，容器门禁不得宣称清理完成或 PASS。日志失败仍先尝试
+安全收尾，保留原执行异常及可获得的退出码/输出；诊断缺失同样不能 PASS。产品不启用
+subreaper，不保证主动 setsid 逃逸进程或任意 daemon 的回收。
 源码准备中止时不再派发验证，未建立完整快照不声称源码完整性已确认。
 gate 从首次镜像检查之前开始计时，镜像检查、原有源码/策略核验、源码准备、
 依赖准备、PG 启动/隔离检查/健康检查、验证及结束源码核验共用一次绝对 deadline

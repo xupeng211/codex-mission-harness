@@ -53,14 +53,16 @@ class DockerDouble:
         if argv[0] != "/usr/bin/docker":
             proc = self.real_popen(argv, *args, **kwargs)
             if "clone" in argv and (self.mode == "clone_cancel" or self.mode == "clone_deadline"):
-                poll = proc.poll
-                def after_clone():
-                    result = poll()
+                wait = proc.wait
+                def after_clone(*args, **kwargs):
+                    result = wait(*args, **kwargs)
                     if result == 0:
                         if self.mode == "clone_cancel": self.runtime.container_cancel.set()
                         if self.mode == "clone_deadline": self.offset = 10
                     return result
-                proc.poll = after_clone
+                # The product intentionally never polls/reaps preparation
+                # leaders before group shutdown. Inject at its final wait.
+                proc.wait = after_clone
             return proc
         return self.dispatch(argv, **kwargs)
 

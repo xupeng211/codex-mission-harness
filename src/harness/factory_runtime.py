@@ -511,6 +511,8 @@ class LocalRuntime:
         self.resource_policy = {}
         self.current_process = None
         self._remote_worker = None
+        self._preparation_client = None
+        self._preparation_cleanups = []
         self.container_cancel = threading.Event()
         self._execution_lock = threading.RLock()
         self._active_execution = self._active_mission = None
@@ -523,6 +525,7 @@ class LocalRuntime:
                 raise RuntimeError("runtime already belongs to an active execution")
             # A new identity, not clearing an old task's cancellation latch.
             self.container_cancel = threading.Event()
+            self._preparation_cleanups = []
             self._active_execution, self._active_mission = self.container_cancel, mission
             self._execution_thread = threading.get_ident()
             return self._active_execution
@@ -530,9 +533,9 @@ class LocalRuntime:
     def end_execution(self, execution):
         with self._execution_lock:
             if execution is self._active_execution:
-                # An unconfirmed remote group still owns this execution. Even
+                # An unconfirmed owned group still owns this execution. Even
                 # Factory.run's outer finally must not admit a new execution.
-                if self._remote_worker is not None:
+                if self._remote_worker is not None or self._preparation_client is not None:
                     return False
                 self._active_execution = self._active_mission = None
                 self._execution_thread = None
@@ -547,14 +550,15 @@ class LocalRuntime:
                 return False  # A delayed callback cannot affect a later mission/run.
             self.container_cancel.set()
             proc = self.current_process
-            if self._remote_worker is not None:
+            client = self._remote_worker if self._remote_worker is not None else self._preparation_client
+            if client is not None:
                 try:
-                    self._signal_remote_worker(self._remote_worker, signal.SIGTERM)
+                    self._signal_owned_client(client, signal.SIGTERM)
                 except Exception as error:
                     # The event still cancels work; the owning call performs
                     # bounded cleanup and records any failure. Never reap the
                     # group leader here via Popen.poll().
-                    self._remote_worker["cancel_error"] = f"{type(error).__name__}: {error}"
+                    client["cancel_error"] = f"{type(error).__name__}: {error}"
             elif proc is not None and proc.poll() is None:
                 try:
                     os.killpg(proc.pid, signal.SIGTERM)
@@ -688,6 +692,8 @@ class LocalRuntime:
                 execution = self.begin_execution(spec["mission_id"])
             elif self._active_mission != spec["mission_id"] or self._execution_thread != threading.get_ident():
                 raise RuntimeError("container gate belongs to a different active execution")
+            if self._remote_worker is not None or self._preparation_client is not None:
+                raise RuntimeFailure("unconfirmed client cleanup blocks another container gate")
         try:
             return run(self, policy, spec, cwd, target, command, transcript, timeout)
         finally:
@@ -766,8 +772,8 @@ class LocalRuntime:
                 execution = self.begin_execution(spec["mission_id"])
             elif self._active_mission != spec["mission_id"] or self._execution_thread != threading.get_ident():
                 raise RuntimeError("project remote belongs to a different active execution")
-            if self._remote_worker is not None:
-                raise RuntimeFailure("unconfirmed remote worker cleanup blocks another dispatch")
+            if self._remote_worker is not None or self._preparation_client is not None:
+                raise RuntimeFailure("unconfirmed client cleanup blocks another dispatch")
         try:
             return self._project_remote(action, policy, spec, cwd, target, body, transcript, timeout,
                                         reviews=reviews, previous_head=previous_head)
@@ -776,7 +782,7 @@ class LocalRuntime:
                 self.end_execution(execution)
 
     @staticmethod
-    def _remote_process_identity(pid):
+    def _client_process_identity(pid):
         """Linux metadata only; no process environment or command contents."""
         path = Path(f"/proc/{pid}")
         fields = (path / "stat").read_text().rsplit(") ", 1)[1].split()
@@ -784,62 +790,67 @@ class LocalRuntime:
                 "pgid": int(fields[2]), "sid": int(fields[3]), "uid": path.stat().st_uid,
                 "state": fields[0]}
 
-    def _remote_leader(self, worker):
+    def _owned_client_leader(self, worker):
         # All callers hold _execution_lock. A direct child observed with
         # WNOWAIT remains unreaped: the kernel cannot reuse its PID/PGID. No
         # communicate/poll/wait is allowed until group shutdown is confirmed.
         proc, expected = worker["process"], worker["identity"]
-        if (self._remote_worker is not worker or self.current_process is not proc
+        if ((self._remote_worker is not worker and self._preparation_client is not worker)
+                or self.current_process is not proc
                 or self._active_execution is not worker["execution"] or proc.returncode is not None):
-            raise RuntimeFailure("remote worker ownership is no longer current")
+            raise RuntimeFailure("controlled client ownership is no longer current")
         exited = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-        actual = self._remote_process_identity(proc.pid)
+        actual = self._client_process_identity(proc.pid)
         if (expected is None or any(actual[k] != expected[k] for k in expected if k != "state")
                 or actual["ppid"] != os.getpid() or actual["uid"] != os.geteuid()
                 or actual["pgid"] != proc.pid or actual["sid"] != proc.pid):
-            raise RuntimeFailure("remote worker identity/owned session cannot be confirmed")
+            raise RuntimeFailure("controlled client identity/owned session cannot be confirmed")
         return exited
 
-    def _remote_group(self, worker):
-        self._remote_leader(worker)
+    def _owned_client_group(self, worker):
+        self._owned_client_leader(worker)
         leader = worker["identity"]
         members = []
         for name in os.listdir("/proc"):
             if not name.isdecimal():
                 continue
             try:
-                member = self._remote_process_identity(int(name))
+                member = self._client_process_identity(int(name))
             except (FileNotFoundError, ProcessLookupError):
                 continue
             if member["pgid"] == leader["pgid"]:
                 if member["sid"] != leader["sid"] or member["uid"] != leader["uid"]:
-                    raise RuntimeFailure("remote group ownership cannot be confirmed")
+                    raise RuntimeFailure("controlled group ownership cannot be confirmed")
                 members.append(member)
-        self._remote_leader(worker)
+        self._owned_client_leader(worker)
         return members
 
-    def _signal_remote_worker(self, worker, sig):
+    def _signal_owned_client(self, worker, sig):
         with self._execution_lock:
-            self._remote_group(worker)
+            self._owned_client_group(worker)
             # Recheck the unreaped direct-child anchor immediately before
             # signalling. Never signal this PGID after reaping the leader.
-            self._remote_leader(worker)
+            self._owned_client_leader(worker)
             os.killpg(worker["process"].pid, sig)
 
     def _finish_remote_worker(self, worker, deadline):
+        return self._finish_owned_client(worker, deadline)
+
+    def _finish_owned_client(self, worker, deadline):
+        """Shared only by the remote worker and this gate's preparation clients."""
         record = {"identity": worker["identity"], "mission": worker["mission"], "confirmed": False, "leader_reaped": False,
                   "members_before": [], "pending_descendant_reap": [], "errors": []}
         if worker.get("cancel_error"):
             record["errors"].append(worker["cancel_error"])
         try:
             with self._execution_lock:
-                record["members_before"] = self._remote_group(worker)
+                record["members_before"] = self._owned_client_group(worker)
             if any(p["state"] not in {"Z", "X"} for p in record["members_before"]):
-                self._signal_remote_worker(worker, signal.SIGKILL)
+                self._signal_owned_client(worker, signal.SIGKILL)
                 record["signal"] = "SIGKILL"
             while True:
                 with self._execution_lock:
-                    members = self._remote_group(worker)
+                    members = self._owned_client_group(worker)
                     if not any(p["state"] not in {"Z", "X"} for p in members):
                         record["pending_descendant_reap"] = [p for p in members if p["pid"] != worker["process"].pid]
                         # The leader is known exited; wait(0) does not create a
@@ -847,11 +858,15 @@ class LocalRuntime:
                         # own parent/init reaper; they are no longer running.
                         worker["process"].wait(timeout=0)
                         record.update(confirmed=True, leader_reaped=True)
-                        self.current_process = self._remote_worker = None
+                        self.current_process = None
+                        if self._remote_worker is worker:
+                            self._remote_worker = None
+                        if self._preparation_client is worker:
+                            self._preparation_client = None
                         break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError("remote group shutdown unconfirmed within original deadline")
+                    raise TimeoutError("controlled group shutdown unconfirmed within original deadline")
                 time.sleep(min(0.01, remaining))
         except Exception as error:
             record["errors"].append(f"{type(error).__name__}: {error}")
@@ -898,7 +913,7 @@ class LocalRuntime:
                 self._remote_worker = worker
             original_error = None
             try:
-                worker["identity"] = self._remote_process_identity(proc.pid)
+                worker["identity"] = self._client_process_identity(proc.pid)
                 while True:
                     if cancel.is_set() or self.container_cancel is not cancel:
                         raise ExecutionStopped("CANCELLED")
@@ -906,7 +921,7 @@ class LocalRuntime:
                     if remaining <= 0:
                         raise subprocess.TimeoutExpired(argv, timeout)
                     with self._execution_lock:
-                        exited = self._remote_leader(worker)
+                        exited = self._owned_client_leader(worker)
                     if exited is not None:
                         break
                     cancel.wait(min(0.05, remaining))
