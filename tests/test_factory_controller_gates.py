@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -145,22 +146,10 @@ class ControllerGatesTests(unittest.TestCase):
     def execute_container_double(self, mode, *, timeout=5, profile="targeted"):
         runtime = LocalRuntime()
         real_output, real_run, real_popen = subprocess.check_output, subprocess.run, subprocess.Popen
-        stopped, calls, containers = [False], [], {}
+        calls, containers, clients = [], {}, []
+        from test_factory_preparation_cleanup import identity, same
         # Each operation has a distinct immutable transcript/lifecycle record.
         transcript = self.root / ("container-" + mode + ".log")
-        clock = [0.0]
-        class Process:
-            pid = 99999999
-            returncode = None
-            def poll(s):
-                if mode not in {"timeout", "cancel"} or stopped[0]:
-                    s.returncode = -9 if stopped[0] else 0
-                    if not stopped[0]:
-                        containers.pop(s.name, None)  # Docker --rm on normal exit.
-                return s.returncode
-            def wait(s, **kwargs):
-                s.returncode = -9 if stopped[0] else 0
-                return s.returncode
         def popen(argv, *args, **kwargs):
             if argv[0] != "/usr/bin/docker": return real_popen(argv, *args, **kwargs)
             if argv[1] in {"image", "create", "cp", "inspect", "exec"} or "--detach" in argv:
@@ -169,18 +158,17 @@ class ControllerGatesTests(unittest.TestCase):
                 return real_popen([sys.executable, "-B", "-c",
                     f"import sys; sys.stdout.buffer.write({result.stdout!r}); sys.exit({result.returncode})"], **kwargs)
             calls.append(argv)
-            if mode == "timeout": clock[0] = 10.0
             name = argv[argv.index("--name") + 1]
             containers[name] = dict(x.split("=", 1) for i, x in enumerate(argv) if i and argv[i - 1] == "--label")
             workspace = Path(next(x.split(",dst=")[0].split("src=")[1] for x in argv if x.startswith("type=bind,") and "dst=/app" in x))
             if mode == "mutate": (workspace / "score.py").write_text("unexpected mutation\n")
             if mode == "mutate_candidate": (self.cwd / "score.py").write_text("unexpected host mutation\n")
             if mode == "cancel": runtime.container_cancel.set()
-            process = Process()
-            process.name = name
-            read, write = os.pipe()
-            os.close(write)
-            process.stdout = os.fdopen(read, "rb")
+            # Ownership cannot be exercised by a fabricated/reaped PID. Keep
+            # Docker I/O synthetic, but run the validation client locally.
+            process = real_popen([sys.executable, "-I", "-B", "-c", "import time;time.sleep(30)"]
+                                 if mode in {"timeout", "cancel"} else ["/usr/bin/true"], *args, **kwargs)
+            clients.append((process, identity(process.pid)))
             return process
         def output(argv, *args, **kwargs):
             if argv[0] == "/usr/bin/docker":
@@ -215,15 +203,33 @@ class ControllerGatesTests(unittest.TestCase):
                     containers.pop(argv[-1], None)
                 return subprocess.CompletedProcess(argv, 0, b"", b"")
             return real_run(argv, *args, **kwargs)
-        with patch("harness.factory_project.FootballPredictionContract.policy", return_value={}), \
-                patch("harness.factory_container.source_check", side_effect=local_source_check), \
-                patch("harness.factory_container.subprocess.Popen", side_effect=popen), \
-                patch("harness.factory_container.subprocess.check_output", side_effect=output), \
-                patch("harness.factory_container.subprocess.run", side_effect=command), \
-                patch("harness.factory_container.time.monotonic", side_effect=lambda: clock[0]), \
-                patch("harness.factory_container.os.killpg", side_effect=lambda *a: stopped.__setitem__(0, True)):
-            result = container_run(runtime, CONTAINER, self.spec, self.cwd, self.target, ["make", "verify-" + profile],
-                                   transcript, timeout)
+        fallback_kills = []
+        def watchdog(*_):
+            raise TimeoutError("independent container-double deadline")
+        previous_alarm = signal.signal(signal.SIGALRM, watchdog)
+        signal.alarm(15)
+        try:
+            with patch("harness.factory_project.FootballPredictionContract.policy", return_value={}), \
+                    patch("harness.factory_container.source_check", side_effect=local_source_check), \
+                    patch("harness.factory_container.subprocess.Popen", side_effect=popen), \
+                    patch("harness.factory_container.subprocess.check_output", side_effect=output), \
+                    patch("harness.factory_container.subprocess.run", side_effect=command):
+                result = container_run(runtime, CONTAINER, self.spec, self.cwd, self.target, ["make", "verify-" + profile],
+                                       transcript, timeout)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous_alarm)
+            for client, expected in clients:
+                actual = same(expected)
+                if actual and actual["state"] not in {"Z", "X"}:
+                    self.assertEqual(actual["ppid"], os.getpid())
+                    self.assertEqual(actual["pgid"], actual["sid"])
+                    self.assertEqual(actual["pgid"], client.pid)
+                    fallback_kills.append(client.pid)
+                    os.kill(client.pid, signal.SIGKILL)
+                client.wait(timeout=2)
+                client.stdout.close()
+        self.assertFalse(fallback_kills, "the product must stop its own validation client")
         self.assertTrue(any("rm" in call for call in calls))
         self.assertIsNone(runtime.current_process)
         return result

@@ -511,6 +511,8 @@ class LocalRuntime:
         self.resource_policy = {}
         self.current_process = None
         self._remote_worker = None
+        # The gate's sequential owned-client slot covers preparation and the
+        # main validation client; retain the existing slot name for callers.
         self._preparation_client = None
         self._preparation_cleanups = []
         self.container_cancel = threading.Event()
@@ -837,7 +839,7 @@ class LocalRuntime:
         return self._finish_owned_client(worker, deadline)
 
     def _finish_owned_client(self, worker, deadline):
-        """Shared only by the remote worker and this gate's preparation clients."""
+        """Shared by the remote worker and this gate's sequential clients."""
         record = {"identity": worker["identity"], "mission": worker["mission"], "confirmed": False, "leader_reaped": False,
                   "members_before": [], "pending_descendant_reap": [], "errors": []}
         if worker.get("cancel_error"):

@@ -8,7 +8,6 @@ import math
 import re
 import select
 import shutil
-import signal
 import stat
 import subprocess
 import sys
@@ -79,7 +78,7 @@ def consume_output(proc, output, cancel, deadline, *, stderr_output=None, exited
             raise ExecutionStopped("CANCELLED")
         if time.monotonic() >= deadline:
             raise ExecutionStopped("TIMEOUT")
-        # Preparation keeps its direct-child ownership anchor unreaped until
+        # Gate clients keep their direct-child ownership anchor unreaped until
         # the whole group is stopped. Other existing callers retain poll().
         if not streams and (exited() if exited is not None else proc.poll() is not None):
             return
@@ -92,8 +91,9 @@ def check_stopped(cancel, deadline):
         raise ExecutionStopped("TIMEOUT")
 
 
-def prepare_client(runtime, argv, cwd, log, cancel, deadline, *, env=ENV, stderr_log=None):
-    """A preparation client belongs to the same execution as validation."""
+def _gate_client(runtime, argv, cwd, log, cancel, deadline, *, cleanups, env=ENV,
+                 stderr_log=None, password=None):
+    """One sequential gate client, including main validation, owns its group."""
     from .factory_runtime import RuntimeFailure
     with runtime._execution_lock:
         check_stopped(cancel, deadline)
@@ -108,8 +108,8 @@ def prepare_client(runtime, argv, cwd, log, cancel, deadline, *, env=ENV, stderr
         client = {"process": proc, "execution": runtime._active_execution,
                   "mission": runtime._active_mission, "identity": None}
         runtime._preparation_client = client
-    output = RedactedOutput(log)
-    error_output = RedactedOutput(stderr_log) if stderr_log is not None else None
+    output = RedactedOutput(log, password)
+    error_output = RedactedOutput(stderr_log, password) if stderr_log is not None else None
     original_error = None
     try:
         client["identity"] = runtime._client_process_identity(proc.pid)
@@ -147,21 +147,32 @@ def prepare_client(runtime, argv, cwd, log, cancel, deadline, *, env=ENV, stderr
                 # A sink exception may quote sensitive output. Keep only its
                 # type/errno, as in the existing service diagnostic contract.
                 cleanup["errors"].append(f"diagnostic {type(error).__name__} errno={getattr(error, 'errno', None)}")
-        runtime._preparation_cleanups.append(cleanup)
+        cleanups.append(cleanup)
         if original_error is not None:
-            original_error.preparation_cleanup = cleanup
+            original_error.client_cleanup = cleanup
             if not cleanup["confirmed"] or not cleanup["diagnostics_complete"]:
-                original_error.add_note("preparation cleanup/diagnostics unconfirmed; original error retained")
+                original_error.add_note("client cleanup/diagnostics unconfirmed; original error retained")
         elif not cleanup["confirmed"] or not cleanup["diagnostics_complete"]:
-            error = RuntimeFailure("preparation client cleanup/diagnostics unconfirmed")
-            error.preparation_cleanup = cleanup
+            error = RuntimeFailure("controlled client cleanup/diagnostics unconfirmed")
+            error.client_cleanup = cleanup
             raise error
     try:
         check_stopped(cancel, deadline)
     except ExecutionStopped as error:
-        error.preparation_cleanup = cleanup
+        error.client_cleanup = cleanup
         raise
     return proc.returncode
+
+
+def prepare_client(runtime, argv, cwd, log, cancel, deadline, *, env=ENV, stderr_log=None):
+    """A preparation client belongs to the same execution as validation."""
+    try:
+        return _gate_client(runtime, argv, cwd, log, cancel, deadline,
+                            cleanups=runtime._preparation_cleanups, env=env, stderr_log=stderr_log)
+    except BaseException as error:
+        if hasattr(error, "client_cleanup"):
+            error.preparation_cleanup = error.client_cleanup
+        raise
 
 
 def captured_client(runtime, argv, cwd, cancel, deadline, *, env=ENV):
@@ -392,7 +403,8 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
     resources = resources_for(name, spec, target, needs_postgres)
     with tempfile.TemporaryDirectory(prefix="cmh-validation-", dir=transcript.parent) as temporary:
         workspace = Path(temporary) / "source"
-        service, proc, output = None, None, None
+        service = None
+        validation_cleanups = []
         before = after = snapshot_after = "NOT_VERIFIABLE"
         unchanged, validation_attempted = False, False
         outcome = "EXITED"
@@ -491,16 +503,9 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                 argv[argv.index("--kill-after=5") + 1] = str(lifetime)
                 result["lifetime_limit_seconds"] = lifetime
                 result["argv"] = argv
-                output = RedactedOutput(log, service.password.encode() if service else None)
-                with runtime._execution_lock:
-                    check_stopped(cancel, deadline)
-                    if runtime.container_cancel is not cancel:
-                        raise ExecutionStopped("CANCELLED")
-                    validation_attempted = True
-                    proc = subprocess.Popen(argv, cwd=temporary, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                            start_new_session=True)
-                    runtime.current_process = proc
-                consume_output(proc, output, cancel, deadline)
+                validation_attempted = True
+                result["exit_code"] = _gate_client(runtime, argv, temporary, log, cancel, deadline,
+                    cleanups=validation_cleanups, password=service.password.encode() if service else None)
             except ExecutionStopped as error:
                 outcome = error.outcome
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
@@ -508,29 +513,21 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                 result["error_type"] = type(error).__name__
                 log.write(("Controller execution failed: " + type(error).__name__ + "\n").encode())
             finally:
-                try:
-                    if proc is not None:
-                        if proc.poll() is None:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        proc.wait(timeout=5)
-                        result["exit_code"] = proc.returncode
-                finally:
-                    try:
-                        if proc is not None and proc.stdout is not None:
-                            proc.stdout.close()
-                        if output is not None:
-                            output.finish()
-                    finally:  # A broken log sink must not bypass resource cleanup.
-                        with runtime._execution_lock:
-                            if runtime.current_process is proc:
-                                runtime.current_process = None
-                        cleaned, code = (remove_owned(name, name, resources[0]["labels"])
-                                         if validation_attempted else (True, None))
-                        result.update(cleanup_confirmed=cleaned, cleanup_exit_code=code)
-                        if service is not None:
-                            service.close()
-                            result["cleanup_confirmed"] &= service.evidence["cleanup_confirmed"]
-                            result["ephemeral_password_redacted"] = True
+                # _gate_client already stopped the owned group before reaping
+                # its leader. On uncertainty its slot/identity remain held;
+                # neither this finally nor cancel may poll/reap that anchor.
+                validation_cleanup = validation_cleanups[-1] if validation_cleanups else None
+                result["validation_client_cleanup"] = validation_cleanup
+                if validation_cleanup is not None:
+                    result["exit_code"] = validation_cleanup["exit_code"]
+                client_cleaned = not validation_attempted or bool(validation_cleanup and validation_cleanup["confirmed"])
+                cleaned, code = (remove_owned(name, name, resources[0]["labels"])
+                                 if validation_attempted else (True, None))
+                result.update(cleanup_confirmed=cleaned and client_cleaned, cleanup_exit_code=code)
+                if service is not None:
+                    service.close()
+                    result["cleanup_confirmed"] &= service.evidence["cleanup_confirmed"]
+                    result["ephemeral_password_redacted"] = True
                 if outcome == "EXITED" and result["exit_code"] == 124:
                     outcome = "TIMEOUT"
                 if outcome == "EXITED":
