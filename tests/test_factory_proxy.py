@@ -333,6 +333,7 @@ class ProxyContracts(unittest.TestCase):
         server = FactoryAppServer.__new__(FactoryAppServer)
         server.usage, server.events, server.runtime_identity = None, [], {}
         server._proxy_relay, server._policy_cwd = relay, str(self.root)
+        server._reuse_session, server.token_limit = True, 1000
         server.MODEL, server.REASONING_EFFORT = "fixture-model", None
         turn = [0]
         def request(method, params):
@@ -341,9 +342,11 @@ class ProxyContracts(unittest.TestCase):
             return {"turn": {"id": str(turn[0])}}
         def completed(thread_id, turn_id, require_success):
             self.post(relay)
-            server.events.append({"method": "thread/tokenUsage/updated", "params": {
+            event = {"method": "thread/tokenUsage/updated", "params": {
                 "threadId": thread_id, "turnId": turn_id, "tokenUsage": {"total": {
-                    "inputTokens": 100*turn[0], "outputTokens": 10*turn[0], "totalTokens": 110*turn[0]}}}})
+                    "inputTokens": 100*turn[0], "outputTokens": 10*turn[0], "totalTokens": 110*turn[0]}}}}
+            server.events.append(event)
+            server._observe_execution_event(event)
             return {"status": "completed", "items": [{"id": "result", "type": "agentMessage",
                     "text": '{"summary":"fixture","known_risks":[]}'}]}
         with patch.object(server, "start_or_resume", return_value="fixture-thread"), patch.object(server, "_request", side_effect=request), patch.object(server, "_policy_params", return_value={}), patch.object(server, "_turn_completed", side_effect=completed):
