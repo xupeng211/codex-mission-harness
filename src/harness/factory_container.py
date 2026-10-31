@@ -435,9 +435,9 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                 def client(argv, *, env=ENV, timeout):
                     return captured_client(runtime, argv, temporary, cancel,
                                            min(deadline, time.monotonic() + timeout), env=env)
-                image = inspect_image(policy, client=client)
                 before = source_check(runtime, request, "candidate", log, cancel, deadline)["source"]
                 result["source_before"] = before
+                image = inspect_image(policy, client=client)
                 dependency_name = name + "-dependencies"
                 try:
                     # Only this preparation path uses the cancellable client;

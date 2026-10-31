@@ -59,7 +59,7 @@ changed-line 输入绑定完整批准 BASE。依赖隐式 cwd 的 Git 也在候�
 `factory_container.py` 只由 Controller 调用；只接受上述 canonical make profile，
 实际在容器执行 `python3 scripts/devops/validation_profiles.py <profile>`。候选不能
 修改 Makefile、scripts/devops、scripts/ops/helpers、workflow、schemas/agentic 或
-原 review authority；package/lockfile、QA 配置、config、测试调度器和容器定义也须保持 base
+原 review authority；package 执行字段/lockfile、QA 配置、config、测试调度器和容器定义也须保持 base
 规则不变，涉及它们须另行明确授权任务。验证前重建准确 base/head/tree、完整 diff、文件集合、scope
 和 policy；还直接校验实际 tracked 源码字节/mode，不能仅依赖 Git stat cache。
 
@@ -72,6 +72,23 @@ Ruff 权威保护按批准的完整 BASE→HEAD Git 对象比较，覆盖任意�
 缺失、损坏、循环、越界或需环境/用户目录展开的依赖无法核实，明确拒绝并要求
 单独的 policy mission。当前项目桥未实现这种独立 QA 变更授权入口，不能凭候选标记或
 布尔字段放行，也不修改原项目 Ruff 配置发现或检查命令。
+
+ESLint 权威按同样的完整 Git 端点比较，固定原版本为 8.57.1。
+各层 `.eslintrc.js/.cjs/.yaml/.yml/.json`、无后缀 `.eslintrc` 和
+`package.json.eslintConfig` 的新增、修改、删除、重命名或类型/mode 变化均受保护。
+原 lint 的 cwd 是仓库根；根 `.eslintignore`、根 package 的 `eslintIgnore` 及
+会自动切换 flat 模式的根 `eslint.config.js/.mjs/.cjs` 也受保护。
+嵌套 `.eslintignore`、嵌套 flat 文件不会由该固定命令选择。
+JSON 配置的本地 `extends`（含 overrides）依赖同样冻结；只接受可在 Git 树内
+精确确认的普通 blob，不猜测 Node 后缀/目录回退。固定合同的 recommended/jsdoc
+依赖由原 lockfile 保护；动态配置、非 JSON YAML、自定义 parser/plugin 或无法
+核实的依赖明确阻断，不执行候选配置。此桥没有建设通用 ESLint loader。
+混合 package 文件保留无关元数据编辑：嵌套比较 ESLint 字段；根仅豁免已知展示
+字段（如 description、author、license），scripts、依赖、type 和未知根字段仍冻结。
+根 lockfile、`.npmrc` 和优先于 package-lock 的 `npm-shrinkwrap.json` 也按完整端点冻结；
+固定基线没有后两者，不允许普通候选改变 npm 的执行环境或依赖选择。
+发布正文预检入口重复核对 target/policy；容器 source_check 在镜像检查前运行。
+这些是本地准入保证，不代表真实容器、独立审核或交付已通过。
 
 pytest 权威以固定项目依赖 `pytest==9.0.2` 的配置发现为依据，按完整 BASE→HEAD
 保护任意层级的 `pytest.toml`、`.pytest.toml`、`pytest.ini`、`.pytest.ini`（空文件也能

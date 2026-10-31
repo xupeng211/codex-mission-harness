@@ -339,11 +339,15 @@ class ControllerGatesTests(unittest.TestCase):
             with self.assertRaises(ValueError): validate_review_limits(limits)
 
     def test_candidate_cannot_change_its_validation_rules_or_dependency_authority(self):
+        (self.cwd / "package.json").write_text('{"scripts":{"lint":"true"}}\n')
+        git(self.cwd, "add", "package.json")
+        git(self.cwd, "-c", "user.name=Fixture", "-c", "user.email=f@localhost",
+            "commit", "-qm", "Unauthorized lint command")
         for path in ("pytest.ini", "package.json", ".eslintrc.json", "scripts/test/run_test_suite.js",
                      "config/model_feature_contracts.json", "tests/conftest.py", ".devcontainer/Dockerfile"):
-            with self.subTest(path=path), patch("harness.factory_project.subprocess.run") as run, self.assertRaises(ValueError):
+            with self.subTest(path=path), patch.object(FootballPredictionAdapter, "_trusted_base_checkout") as checkout, self.assertRaises(ValueError):
                 FootballPredictionContract().policy(self.spec, self.cwd, [path])
-            run.assert_not_called()
+            checkout.assert_not_called()
 
     def test_original_adapter_rejects_missing_failed_skipped_and_wrong_head_required_checks(self):
         adapter = FootballPredictionAdapter()

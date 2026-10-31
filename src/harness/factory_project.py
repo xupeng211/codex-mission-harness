@@ -26,7 +26,7 @@ OFFLINE_PASS = "OFFLINE_CONTRACT_PASS"
 LANES = {"reviewer": "codex", "second_reviewer": "deepseek"}
 BACKENDS = {"codex": "codex-cli", "deepseek": "claude-code-deepseek"}
 VALIDATION_AUTHORITY_PATHS = frozenset({
-    "package.json", "package-lock.json", "pyproject.toml", "pytest.ini", "ruff.toml", ".ruff.toml",
+    "package-lock.json", "pyproject.toml", "pytest.ini", "ruff.toml", ".ruff.toml",
     "mypy.ini", ".mypy.ini", ".eslintrc.json", ".eslintrc", ".eslintrc.js", ".eslintrc.cjs",
     "eslint.config.js", "eslint.config.mjs", ".coveragerc", "setup.cfg", "tox.ini",
 })
@@ -406,6 +406,148 @@ def protect_pytest_authority(spec, cwd):
             refuse("pyproject fallback rootdir changed")
 
 
+def protect_eslint_authority(spec, cwd):
+    """冻结原 ESLint 8.57.1 的配置来源；不执行候选配置或 Node resolver。"""
+    from .factory import git
+
+    def refuse(reason):
+        raise ValueError("ESLint QA authority " + reason + "; separate policy mission required")
+
+    revisions = (spec["base"], git(cwd, "rev-parse", "HEAD"))
+    if any(not re.fullmatch(r"[0-9a-f]{40}", revision) for revision in revisions):
+        refuse("requires exact BASE/HEAD")
+    trees = {}
+    for revision in revisions:
+        trees[revision] = {}
+        for entry in filter(None, git(cwd, "ls-tree", "-r", "-z", revision).split("\0")):
+            metadata, path = entry.split("\t", 1)
+            trees[revision][path] = tuple(metadata.split())
+    before, after = (trees[revision] for revision in revisions)
+    changed = {p for p in before.keys() | after.keys() if before.get(p) != after.get(p)}
+    legacy = {".eslintrc.js", ".eslintrc.cjs", ".eslintrc.yaml", ".eslintrc.yml",
+              ".eslintrc.json", ".eslintrc"}
+    # 原命令 cwd 固定为仓库根：ignore 只在 cwd 读取；flat 从 cwd 向上发现，
+    # 不从被 lint 的源文件目录发现。8.57.1 的三种 flat 后缀均会自动切换模式。
+    flat = {"eslint.config.js", "eslint.config.mjs", "eslint.config.cjs"}
+    root_only = flat | {".eslintignore", "package-lock.json", "npm-shrinkwrap.json", ".npmrc"}
+    if any(Path(p).name in legacy or p in root_only for p in changed):
+        refuse("configuration/selection or file type/mode changed")
+    cache = {}
+
+    def document(revision, path):
+        key = (revision, path)
+        if key in cache:
+            return cache[key]
+        entry = trees[revision].get(path)
+        if entry is None:
+            return None
+        if entry[0] not in {"100644", "100755"} or entry[1] != "blob":
+            refuse("cannot inspect non-regular configuration " + path)
+
+        def unique(pairs):
+            result = {}
+            for name, value in pairs:
+                if name in result:
+                    refuse("ambiguous duplicate key in " + path)
+                result[name] = value
+            return result
+
+        try:
+            value = json.loads(git(cwd, "show", entry[2]), object_pairs_hook=unique,
+                               parse_constant=lambda value: refuse("invalid JSON constant in " + path))
+        except (json.JSONDecodeError, UnicodeError):
+            refuse("cannot statically confirm configuration " + path)
+        if not isinstance(value, dict):
+            refuse("configuration must be an object: " + path)
+        cache[key] = value
+        return value
+
+    # package.json 是混合文件。根 scripts/依赖等原有权威仍冻结，仅排除已知
+    # 不参与原 QA 执行的展示元数据；未知根字段仍冻结。嵌套只比较 eslintConfig。
+    metadata = {"description", "keywords", "author", "contributors", "license", "homepage",
+                "repository", "bugs", "funding"}
+    packages = {p for p in before.keys() | after.keys() if Path(p).name == "package.json"}
+    for path in packages:
+        values = [document(rev, path) for rev in revisions]
+        configs = [value.get("eslintConfig") if value is not None else None for value in values]
+        if any(value is not None and not isinstance(value, dict) for value in configs):
+            refuse("cannot confirm eslintConfig in " + path)
+        if (json.dumps(configs[0], sort_keys=True) != json.dumps(configs[1], sort_keys=True)
+                or any(value is not None for value in configs)
+                and before.get(path, ())[:2] != after.get(path, ())[:2]):
+            refuse("package eslintConfig or file type/mode changed: " + path)
+        if path == "package.json" and path in changed:
+            authority = [{k: v for k, v in value.items() if k not in metadata}
+                         if value is not None else None for value in values]
+            if (any(value is None for value in values) or before[path][:2] != after[path][:2]
+                    or json.dumps(authority[0], sort_keys=True) != json.dumps(authority[1], sort_keys=True)):
+                refuse("root package execution/configuration authority changed")
+
+    # 固定合同是 JSON + eslint:recommended + 已锁定 jsdoc 插件。额外的本地
+    # extends（含 overrides）按精确路径追踪；不猜测 Node 的后缀/目录/包回退。
+    # 动态 JS、非 JSON YAML、自定义 parser/plugin/共享包无法安全确认，阻断，
+    # 不建设另一套 ESLint loader，也不让候选执行代码来证明自己安全。
+    def dependencies(config, path):
+        if not isinstance(config, dict):
+            refuse("cannot confirm configuration object in " + path)
+        plugins = config.get("plugins", [])
+        if (config.get("parser") or not isinstance(plugins, list)
+                or any(p != "jsdoc" for p in plugins)):
+            refuse("cannot confirm parser/plugin sources in " + path)
+        extends = config.get("extends", [])
+        extends = [extends] if isinstance(extends, str) else extends
+        if not isinstance(extends, list):
+            refuse("cannot confirm extends in " + path)
+        for name in extends:
+            if not isinstance(name, str):
+                refuse("cannot confirm extends in " + path)
+            if name in {"eslint:recommended", "plugin:jsdoc/recommended"}:
+                continue
+            if (not name.startswith(("./", "../"))
+                    or any(c in name for c in ("\\", "$", "~", ":"))):
+                refuse("cannot safely resolve extends in " + path)
+            dependency = posixpath.normpath(posixpath.join(posixpath.dirname(path), name))
+            if dependency == ".." or dependency.startswith("../"):
+                refuse("extends leaves repository: " + path)
+            yield dependency
+        overrides = config.get("overrides", [])
+        if not isinstance(overrides, list):
+            refuse("cannot confirm overrides in " + path)
+        for override in overrides:
+            yield from dependencies(override, path)
+
+    for revision in revisions:
+        roots = [(p, (), False) for p in trees[revision] if Path(p).name in legacy]
+        roots += [(p, (), True) for p in packages if p in trees[revision]
+                  and document(revision, p).get("eslintConfig") is not None]
+        if any(p in trees[revision] for p in flat):
+            refuse("cannot statically confirm flat configuration sources")
+        if any(p in trees[revision] for p in {".npmrc", "npm-shrinkwrap.json"}):
+            refuse("cannot confirm npm execution/dependency override sources")
+        for path in root_only - flat:
+            entry = trees[revision].get(path)
+            if entry is not None and (entry[0] not in {"100644", "100755"} or entry[1] != "blob"):
+                refuse("cannot inspect non-regular configuration " + path)
+        pending, visited = roots, set()
+        while pending:
+            path, ancestors, package_config = pending.pop()
+            if path in ancestors:
+                refuse("extends cycle at " + path)
+            if (path, package_config) in visited:
+                continue
+            visited.add((path, package_config))
+            if path in changed and not package_config:
+                refuse("extends dependency changed: " + path)
+            if path.endswith((".js", ".cjs")):
+                refuse("cannot statically confirm executable configuration " + path)
+            config = document(revision, path)
+            if config is None:
+                refuse("extends target is missing: " + path)
+            if package_config:
+                config = config["eslintConfig"]
+            pending.extend((p, (*ancestors, path), False) for p in dependencies(config, path))
+
+
 class FootballPredictionContract:
     """Reuse trusted-base execution and original project receipt validators."""
 
@@ -422,6 +564,7 @@ class FootballPredictionContract:
                 raise ValueError("candidate changed protected canonical authority; separate policy mission required")
         protect_ruff_authority(spec, cwd)
         protect_pytest_authority(spec, cwd)
+        protect_eslint_authority(spec, cwd)
         trusted = self.adapter._trusted_base_checkout(str(cwd), spec["base"])
         # These modules are byte-verified base policy, never candidate code.
         query = """
@@ -516,6 +659,7 @@ print(json.dumps({'canonical_diff_sha256':hashlib.sha256(diff).hexdigest(), 'can
                 "provider_internal_requests": "UNKNOWN", "physical_cost_cap": "UNKNOWN"}
 
     def validate_pr_body(self, spec, cwd, target, body):
+        verify_target(spec, cwd, target)
         trusted = self.adapter._trusted_base_checkout(str(cwd), target["base"])
         # Same canonical preflight as merge_ready, before any remote mutation.
         evidence = cwd.parent / ".cmh-publication"
