@@ -43,6 +43,20 @@ base、head 均使用完整 40 字符 SHA。用户源工作区和安装入口不
 }
 ```
 
+上例不会证明 STRICT 已验证。原 `AGENTS.md` 和 `docs/AGENT_WORKFLOW.md` 要求
+STRICT 在 PR 前实际通过 `make verify-strict`；Controller 必须在既有 `checks`
+或 `ci` 中配置该命令，并授权 strict profile 及固定 dev/PostgreSQL 镜像。
+缺少配置或成功执行证据时，Factory 在审核派发/发布之前阻断，不自动增加命令、
+费用或降低 profile。NORMAL 与其他 workflow 的既有合同处理不变。
+
+strict 结果以既有 operation 保存，绑定 immutable 任务、完整 BASE/HEAD/tree/diff/
+scope/policy、容器策略/镜像、timeout 策略和 Controller 执行器源码版本。
+仅允许当前完整执行记录的 PASS/exit 0；targeted、PR、未运行的配置、旧格式证据、
+失败/超时/取消/UNKNOWN 与 fixture 不能替代它。发布、只读恢复、最终 gate 和
+READY 报告重新核对记录及原始证据；源码/合同/执行条件变化使旧结果失效。
+同一任务和版本的有效 strict 可以跨 checks/ci、round 和重启复用，无需逐阶段重跑；
+恢复不把原 UNKNOWN 改写为成功。本规则不修改项目分类器、profile 实现或检查矩阵。
+
 mission v2 另需 `pr_body_template`：Controller 审定的项目现有 PR 模板正文，包含
 Summary、Scope、Documentation Impact、Tests、Risk、Rollback 和适用的 Strict
 Review Evidence。只支持 `{{candidate_head}}`、`{{review_timestamp}}` 两个占位符，

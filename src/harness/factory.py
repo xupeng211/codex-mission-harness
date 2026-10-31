@@ -830,6 +830,7 @@ class Factory:
     def project_remote_read(self, action, spec, cwd, target, body, reviews=None, expected_pr=None):
         if action not in {"reconcile", "ci", "verify"}:
             raise FactoryBlocked("UNKNOWN", "only canonical read-only observation kinds are supported")
+        self.require_project_validation(spec, cwd, target)
         payload = {"target": target, "policy": self.config["project_delivery"], "body": body,
                    "action": action, "reviews": reviews or [], "expected_pr": None}
         # A first discovery may establish a PR, but cannot retroactively prove
@@ -890,6 +891,9 @@ class Factory:
             raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "Controller project PR publication policy missing")
         if self.target(spec, cwd) != target:
             raise FactoryBlocked("UNKNOWN", "candidate changed before PR publication")
+        required = self.require_project_validation(spec, cwd, target)
+        required_keys = {item["evidence_key"] for item in required}
+        validations = [item for item in validations if item.get("evidence_key") not in required_keys] + required
         body = render_body(policy, spec, target, reviews, validations)
         payload = {"target": target, "policy": policy, "body": body}
         key = digest({"project_publish": payload})
@@ -916,6 +920,7 @@ class Factory:
         return {"publication": publication, "ci": ci, "body": body}
 
     def project_final_gate(self, spec, cwd, target, reviews, remote=None):
+        self.require_project_validation(spec, cwd, target)
         if {r["lane"] for r in reviews} != set(LANES) or any(r["status"] != "PASS" for r in reviews):
             raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "both validated canonical receipts are required")
         if not self.config["simulation"]:
@@ -935,11 +940,89 @@ class Factory:
             raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", result.get("reason", "project final validator rejected candidate"))
         return {**result, "evidence_key": key}
 
+    def project_validation_binding(self, spec, cwd, target):
+        """Bind new strict executions to this task, source, contract and executor.
+
+        The full target is reconstructed by the existing trusted-base policy
+        path, never from a caller's profile declaration or reduced path list.
+        No old gate/fixture result is upgraded to this execution format.
+        """
+        if self.target(spec, cwd) != target:
+            raise FactoryBlocked("UNKNOWN", "validation candidate/task/policy changed")
+        from .factory_project import tracked_source_digest
+        try:
+            source = tracked_source_digest(cwd, target["head"], require_committed=True)
+        except (OSError, ValueError) as exc:
+            raise FactoryBlocked("UNKNOWN", "validation source bytes/mode changed: " + str(exc)) from exc
+        policy = self.config.get("project_container")
+        if policy is None or "strict" not in policy["profiles"] or not policy.get("postgres_image_id"):
+            raise FactoryBlocked("BLOCKED_VALIDATION", "make verify-strict requires Controller authorization and pinned dev/PostgreSQL images; no profile added or downgraded")
+        implementations = ("factory.py", "factory_container.py", "factory_test_service.py",
+                           "factory_runtime.py", "factory_project.py", "adapters.py")
+        return {"version": "factory-strict-execution/v1", "mission_id": spec["mission_id"],
+                "spec_sha256": digest(spec), "target": target, "profile": "strict", "source_sha256": source,
+                "container_policy": policy, "simulation": self.config["simulation"],
+                "timeout_seconds": self.config["timeout_seconds"],
+                "executor_sha256": digest({name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+                                           for name in implementations})}
+
+    def check_project_strict_result(self, spec, target, result):
+        if (result.get("status") != "PASS" or type(result.get("exit_code")) is not int or result["exit_code"] != 0
+                or result.get("profile") != "strict" or result.get("fixture") is not False
+                or result.get("target") != target or result.get("mission_id") != spec["mission_id"]
+                or result.get("scope_sha256") != target["mission_scope_sha256"]
+                or result.get("container_policy") != self.config["project_container"]
+                or result.get("image_id") != self.config["project_container"]["image_id"]):
+            raise FactoryBlocked("BLOCKED_VALIDATION", "current make verify-strict has no bound successful container execution")
+
+    def require_project_validation(self, spec, cwd, target):
+        """Consume actual strict success before publication, recovery and READY.
+
+        STRICT's pre-PR requirement comes from the fixed original contract.
+        NORMAL and CRITICAL retain their existing paths; simulation never
+        establishes live success. Configuration only permits execution.
+        """
+        if not self.project or self.config["simulation"]:
+            return []
+        current = self.target(spec, cwd)
+        if current != target:
+            raise FactoryBlocked("UNKNOWN", "validation candidate/task/policy changed")
+        workflow = current["project_policy"].get("workflow_class")
+        if workflow not in {"NORMAL", "STRICT", "CRITICAL"}:
+            raise FactoryBlocked("BLOCKED_VALIDATION", "original workflow classification unavailable")
+        if workflow != "STRICT":
+            return []
+        binding = self.project_validation_binding(spec, cwd, target)
+        payload = {"command": ["make", "verify-strict"], "target": target, "validation_binding": binding}
+        key = digest({"canonical_validation": binding})
+        op = self.db.execute("SELECT * FROM operations WHERE mission=? AND key=?", (spec["mission_id"], key)).fetchone()
+        if (op is None or op["status"] != "COMPLETE" or op["stage"] not in {"checks", "ci"}
+                or op["lane"] != "local" or op["paid"] or op["ended"] is None
+                or json.loads(op["input"]) != payload
+                or json.loads(op["identity"]) != {"target": target, "validation_binding": binding}):
+            raise FactoryBlocked("BLOCKED_VALIDATION", "STRICT requires an actually successful current make verify-strict before PR; configured targeted/PR or unexecuted strict cannot substitute; no extra dispatch authorized")
+        self.verify_evidence(op)
+        result = json.loads(op["result"])
+        if json.loads(Path(op["evidence"]).read_text()) != {
+                "operation": op["id"], "identity": json.loads(op["identity"]), "input": payload, "result": result}:
+            raise FactoryBlocked("UNKNOWN", "strict operation envelope/binding changed")
+        self.check_project_strict_result(spec, target, result)
+        return [{**result, "evidence_key": key}]
+
     def gates(self, spec, cwd, target, kind, round_):
         results = []
         for index, command in enumerate(self.config[kind]):
             payload = {"command": command, "target": target, "round": round_}
             key = digest({"kind": kind, "index": index, **payload})
+            identity = {"target": target}
+            strict = self.project and not self.config["simulation"] and command == ["make", "verify-strict"]
+            if strict:
+                binding = self.project_validation_binding(spec, cwd, target)
+                payload = {"command": command, "target": target, "validation_binding": binding}
+                identity = {"target": target, "validation_binding": binding}
+                # Same valid strict execution can satisfy checks/ci and resume;
+                # a new round alone does not require another expensive run.
+                key = digest({"canonical_validation": binding})
             def invoke(transcript):
                 if self.project and not self.config["simulation"]:
                     if "project_container" not in self.config:
@@ -947,7 +1030,7 @@ class Factory:
                     return self.runtime.container_gate(self.config["project_container"], spec, cwd, target, command,
                                                        transcript, self.operation_timeout(spec["mission_id"]))
                 return self.runtime.gate(command, cwd, target, transcript, self.operation_timeout(spec["mission_id"]))
-            result = self.operation(spec["mission_id"], key, kind, "local", {"target": target}, payload, False, invoke)
+            result = self.operation(spec["mission_id"], key, kind, "local", identity, payload, False, invoke)
             if self.project and not self.config["simulation"]:
                 if (result.get("target") != target or result.get("fixture") is not False
                         or result.get("image_id") != self.config["project_container"]["image_id"]):
@@ -958,6 +1041,8 @@ class Factory:
                 raise FactoryBlocked("UNKNOWN", "test/CI command lacks a proven exit status")
             if self.target(spec, cwd) != target:
                 raise FactoryBlocked("UNKNOWN", "test/CI changed the reviewed target")
+            if strict and result["status"] == "PASS":
+                self.check_project_strict_result(spec, target, result)
             results.append({**result, "evidence_key": key})
         if kind == "ci" and "hosted_ci" in self.config:
             policy = self.config["hosted_ci"]
@@ -1007,6 +1092,9 @@ class Factory:
                 spec, cwd = json.loads(row["spec"]), Path(row["candidate"])
                 if self.target(spec, cwd) != delivery.get("target"):
                     raise FactoryBlocked("UNKNOWN", "delivery HEAD/tree/scope changed after verification")
+                for validation in self.require_project_validation(spec, cwd, delivery["target"]):
+                    if validation["evidence_key"] not in delivery["evidence_keys"]:
+                        raise FactoryBlocked("UNKNOWN", "required strict operation absent from delivery evidence")
                 if not delivery.get("target", {}).get("files") or not isinstance(delivery.get("implemented"), str) or not delivery["implemented"].strip():
                     raise FactoryBlocked("UNKNOWN", "delivery implementation/change evidence is missing")
                 expected_lanes = {"reviewer", "second_reviewer"} if self.config["independent_review_required"] else {"reviewer"}
@@ -1228,7 +1316,7 @@ class Factory:
                 # First-paid operation rechecks preflight and appends a fresh
                 # event. Preserve spec, policy, round, submission time and usage.
                 self.state(mission, "PLAN")
-            elif row["status"] in ("UNKNOWN", "BLOCKED_BUDGET", "BLOCKED_SCOPE", "BLOCKED_LIMIT"):
+            elif row["status"] in ("UNKNOWN", "BLOCKED_BUDGET", "BLOCKED_SCOPE", "BLOCKED_LIMIT", "BLOCKED_VALIDATION"):
                 return self.report(mission)
             planning_payload = {"objective": spec["objective"], "acceptance": spec["acceptance"], "constraints": spec["constraints"],
                                 "scope": spec["scope"], "instruction": "Act as technical lead. Understand the repository, plan a minimal complete solution and acceptance tests. Decide ordinary engineering questions yourself. Only unresolved major product ambiguity, safety, independence, budget or irreversible changes belong in decisions_required. Do not edit files. Return plan, bounded tasks, acceptance and decisions_required."}
@@ -1279,6 +1367,7 @@ class Factory:
                 feedback = [{"department": kind, "result": result} for kind, results in (("test", tests), ("ci", ci)) for result in results if result["status"] != "PASS"]
                 reviews = []
                 if not feedback:
+                    self.require_project_validation(spec, cwd, target)
                     self.state(mission, "REVIEW")
                     lanes = ["reviewer", "second_reviewer"] if self.config["independent_review_required"] else ["reviewer"]
                     # Do not send the first lane's findings/results to the second.

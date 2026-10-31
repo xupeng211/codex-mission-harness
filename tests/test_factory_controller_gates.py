@@ -395,7 +395,9 @@ class LiveProtocolDouble(project_fixtures.ProjectRuntime):
     def container_gate(self, policy, spec, cwd, target, command, transcript, timeout):
         transcript.write_text("OFFLINE container double; no Docker execution")
         return {"status": "PASS", "exit_code": 0, "target": target, "fixture": False,
-                "profile": command[-1][7:], "image_id": IMAGE, "OFFLINE_DOUBLE": True}
+                "profile": command[-1][7:], "image_id": IMAGE, "OFFLINE_DOUBLE": True,
+                "mission_id": spec["mission_id"], "scope_sha256": target["mission_scope_sha256"],
+                "container_policy": policy}
 
     def project_remote(self, action, policy, spec, cwd, target, body, transcript, timeout, **kwargs):
         transcript.write_text("OFFLINE remote double; no GitHub writes")
@@ -416,7 +418,7 @@ class FactoryLiveProtocolTests(unittest.TestCase):
         self.runtime = LiveProtocolDouble()
         self.config = {**self.fx.config, "simulation": False, "project_container": CONTAINER,
                        "project_delivery": DELIVERY, "project_review_limits": LIMITS,
-                       "checks": [["make", "verify-targeted"]], "ci": [["make", "verify-pr"]]}
+                       "checks": [["make", "verify-targeted"]], "ci": [["make", "verify-strict"]]}
         self.f = Factory(self.fx.root / "live-protocol-double-state", self.config, self.runtime)
         self.addCleanup(self.f.close)
         self.spec = {**self.fx.spec, "pr_body_template": "OFFLINE PR body {{candidate_head}} {{review_timestamp}}"}
