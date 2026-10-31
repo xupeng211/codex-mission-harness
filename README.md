@@ -168,3 +168,14 @@ Reviewer V2 的 chunk/group/synthesis 和旧 qualification 路径已 deprecated�
 [架构说明](docs/FACTORY_ARCHITECTURE.md) · [历史迁移验证](docs/FACTORY_VALIDATION.md)
 
 维护者的本地验证：`make verify`。真实验收脚本 `scripts/factory_acceptance.py` 必须显式提供新输出目录和配置，CI/unit tests 不会发起付费模型调用。
+
+完整 `make verify` / `make test` 必须能读取 FootballPrediction 的完整固定合同源码：
+HEAD `a65464d1e5de498a072ed9a8fdf69ce46bcc04c5`，tree
+`e8b62991f586b8e1127653db36e5437f262007c1`。用
+`FOOTBALLPREDICTION_CONTRACT_REPO` 指向该干净 checkout；未设置时仅查找同级
+`FootballPrediction`。验证先检查完整源码字节和 mode，缺失、版本不符或不完整时以
+`BLOCKED_CONTRACT_SOURCE` 阻断，不把必需的合同覆盖记为 skip 或完整通过。
+本地入口不会自行下载源码。CI 只读获取上述固定 Git 对象并校验，目前该仓库为公开仓库，
+不需要新增私有仓库 token；若访问条件变化，应报告前置阻断，不自动扩大权限或改用最新版本。
+这些测试执行原合同的离线规则并明确替换外部 I/O，不运行项目真实严格门禁或业务任务。
+Native Codex / 平台条件限定的可选测试仍单独报告 skip，不能替代必需的合同测试。

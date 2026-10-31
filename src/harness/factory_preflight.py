@@ -337,9 +337,27 @@ def inspect_prepaid(spec, config):
             except (OSError, ValueError, subprocess.SubprocessError):
                 add("UNVERIFIED", "project_contract", "canonical baseline source cannot be inspected", path=path)
         add("UNVERIFIED", "independent_context", "canonical reviewer reads exact diff and relevant source; full-repository prompt capacity is not the contract")
-        add("UNVERIFIED", "project_final_gate", "canonical receipts and current exact PR/CI must pass before live readiness")
-        if not config["simulation"]:
-            add("HARD_BLOCKER", "first_paid_execution", "canonical DeepSeek outer operation may execute up to 64 backend calls; physical cost ceiling is unproven and first live paid execution remains blocked")
+        if "trusted_validation" in config or "project_pr_ci" in config:
+            add("UNVERIFIED", "project_final_gate", "canonical receipts and current exact PR/CI must pass before live readiness")
+            if not config["simulation"]:
+                add("HARD_BLOCKER", "first_paid_execution", "canonical DeepSeek outer operation may execute up to 64 backend calls; physical cost ceiling is unproven and first live paid execution remains blocked")
+        else:
+            if not config.get("project_delivery"):
+                add("HARD_BLOCKER" if not config["simulation"] else "UNVERIFIED", "project_final_gate", "Controller exact PR/CI publication policy is missing")
+            else:
+                add("UNVERIFIED", "project_final_gate", "Controller PR/CI bridge configured; remote permissions, PR checks and final gate remain unverified")
+            if not config["simulation"]:
+                if not config.get("project_review_limits"):
+                    add("HARD_BLOCKER", "first_paid_execution", "canonical DeepSeek outer operation may execute up to 64 backend calls; physical cost ceiling is unproven and first live paid execution remains blocked")
+                if not config.get("project_container"):
+                    add("HARD_BLOCKER", "project_container", "Controller container executor policy missing; host fallback is forbidden")
+                from .factory_project import validate_review_limits
+                try:
+                    validate_review_limits(config.get("project_review_limits"))
+                    if not spec.get("pr_body_template"):
+                        raise ValueError("Controller PR body template is missing")
+                except ValueError as exc:
+                    add("HARD_BLOCKER", "review_authorization", str(exc))
     elif config["independent_review_required"] and not local_mode:
         try:
             capacity = text_capacity(repo, commit, config["max_context_bytes"])
@@ -371,6 +389,22 @@ def inspect_prepaid(spec, config):
     for kind in ("checks", "ci"):
         for index, command in enumerate(config[kind]):
             check = f"{kind}[{index}]"
+            if config.get("project_contract") == "footballprediction" and config.get("project_container"):
+                from .factory_container import PROFILES, inspect_image
+                profile = PROFILES.get(tuple(command))
+                if profile not in config["project_container"]["profiles"]:
+                    add("HARD_BLOCKER", check, "command is not an authorized Controller container profile")
+                else:
+                    try:
+                        if committed_text(repo, commit, "scripts/devops/validation_profiles.py") is None:
+                            raise ValueError("canonical profile dispatcher is missing at approved base")
+                        if profile in {"pr", "strict"} and not config["project_container"].get("postgres_image_id"):
+                            raise ValueError("canonical profile requires an isolated pinned PostgreSQL image")
+                        image = inspect_image(config["project_container"])
+                        add("WARNING", check, "Controller offline container executor available; candidate behavior remains unverified", image_id=image, profile=profile)
+                    except (OSError, ValueError, subprocess.SubprocessError):
+                        add("HARD_BLOCKER", check, "pinned local dev/test-service images, policy or Docker daemon unavailable; no pull/build/host fallback")
+                continue
             name = Path(command[0]).name
             if not shutil.which(command[0], path=SAFE_PATH) and not command[0].startswith("./"):
                 add("HARD_BLOCKER", check, "configured executable is absent from gate runtime PATH")

@@ -399,6 +399,9 @@ class LocalCandidateTests(unittest.TestCase):
         server = FactoryAppServer.__new__(FactoryAppServer)
         server.events, server.token_limit, server.runtime_identity = [], 36000, {}
         server._active_thread_id, server._active_turn_id = "t", "repair"
+        server._reuse_session = True
+        server._bind_usage_thread("t")
+        server._bind_usage_turn("repair")
         server._end_time, server.seq = time.monotonic() + 30, 0
         server.proc = SimpleNamespace(stdin=io.StringIO())
         server._turn_usage_baseline = {"total": {"inputTokens": 58000, "outputTokens": 0,
