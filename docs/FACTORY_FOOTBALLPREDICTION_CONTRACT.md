@@ -73,6 +73,18 @@ Ruff 权威保护按批准的完整 BASE→HEAD Git 对象比较，覆盖任意�
 单独的 policy mission。当前项目桥未实现这种独立 QA 变更授权入口，不能凭候选标记或
 布尔字段放行，也不修改原项目 Ruff 配置发现或检查命令。
 
+pytest 权威以固定项目依赖 `pytest==9.0.2` 的配置发现为依据，按完整 BASE→HEAD
+保护任意层级的 `pytest.toml`、`.pytest.toml`、`pytest.ini`、`.pytest.ini`（空文件也能
+被选中），以及 `pyproject.toml` 的 `[tool.pytest]`/`[tool.pytest.ini_options]`、
+`tox.ini` 的 `[pytest]` 和 `setup.cfg` 的 `[tool:pytest]`。配置或模式/类型变更、
+删除和重命名导致的配置回退均须另行 policy mission；原根配置保护不变。
+原计划的 pytest 参数位于 `tests/`，没有有效配置时还核对其目录/共同祖先上的
+无 pytest 表 pyproject 回退 rootdir。未改变选择来源、同路径同类型且 pytest 节不变的
+业务元数据可继续；INI 节采用保守的原节文本比较，TOML 保留值类型比较。
+只读普通 Git blob；符号链接、异常类型、损坏或歧义语法明确拒绝，不执行候选配置、
+不读取仓库外文件。保护不重写原 pytest 命令或发现机制；pytest 版本或原参数范围
+若改变，须重新核实此绑定，不能据本地替身结果宣称真实容器/CI 已验证。
+
 固定本地 image ID，`--pull=never`，不 build、不下载、不访问现有业务容器。
 Controller 克隆一次性验证副本并设置批准 base 的 origin/main ref；只把副本挂入
 容器，`.git` 只读。既有镜像 node_modules 经 Docker copy-out 进入临时副本，避免

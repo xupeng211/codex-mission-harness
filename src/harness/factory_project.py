@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import fnmatch
+import configparser
 import json
 import os
 import posixpath
@@ -292,6 +293,119 @@ def protect_ruff_authority(spec, cwd):
             pending.append((dependency, (*ancestors, path)))
 
 
+def protect_pytest_authority(spec, cwd):
+    """冻结原 pytest 9 配置权威；只读完整 Git 端点，不运行候选配置。"""
+    from .factory import git
+
+    def refuse(reason):
+        raise ValueError("pytest QA authority " + reason + "; separate policy mission required")
+
+    revisions = (spec["base"], git(cwd, "rev-parse", "HEAD"))
+    if any(not re.fullmatch(r"[0-9a-f]{40}", revision) for revision in revisions):
+        refuse("requires exact BASE/HEAD")
+    trees = {}
+    for revision in revisions:
+        entries = {}
+        for entry in filter(None, git(cwd, "ls-tree", "-r", "-z", revision).split("\0")):
+            metadata, path = entry.split("\t", 1)
+            entries[path] = tuple(metadata.split())
+        trees[revision] = entries
+    before, after = (trees[revision] for revision in revisions)
+    changed = {p for p in before.keys() | after.keys() if before.get(p) != after.get(p)}
+    # 这些专用文件即使为空也会被 pytest 9 选中，并可遮蔽低优先级配置。
+    exclusive = {"pytest.toml", ".pytest.toml", "pytest.ini", ".pytest.ini"}
+    if any(Path(p).name in exclusive for p in changed):
+        refuse("configuration changed")
+    names = exclusive | {"pyproject.toml", "tox.ini", "setup.cfg"}
+    cache = {}
+
+    def settings(revision, path):
+        key = (revision, path)
+        if key in cache:
+            return cache[key]
+        entry = trees[revision].get(path)
+        if entry is None:
+            return None, False
+        mode, kind, blob = entry
+        if kind != "blob" or mode not in {"100644", "100755"}:
+            refuse("cannot inspect non-regular configuration " + path)
+        name = Path(path).name
+        if name in exclusive:
+            result = "exclusive configuration", True
+        else:
+            try:
+                text = git(cwd, "show", blob)
+                if name == "pyproject.toml":
+                    tool = tomllib.loads(text).get("tool", {})
+                    if not isinstance(tool, dict):
+                        refuse("invalid tool table in " + path)
+                    config = tool.get("pytest")
+                    if config is not None and not isinstance(config, dict):
+                        refuse("invalid tool.pytest table in " + path)
+                    if config is not None and "ini_options" in config and not isinstance(config["ini_options"], dict):
+                        refuse("invalid tool.pytest.ini_options table in " + path)
+                    result = (json.dumps(config, sort_keys=True, allow_nan=False) if config is not None else None,
+                              config is not None and ("ini_options" in config or bool(config)))
+                else:
+                    parser = configparser.RawConfigParser(default_section="\0", interpolation=None)
+                    parser.optionxform = str
+                    parser.read_string(text)
+                    wanted = "tool:pytest" if name == "setup.cfg" else "pytest"
+                    # iniconfig 的节边界在第0列；保守保留整节原字节，避免用另一个
+                    # INI 解析器的值规范化隐藏测试选项变化。非标准/歧义语法明确拒绝。
+                    section, lines, sections = None, [], set()
+                    for line in text.splitlines(keepends=True):
+                        if line.lstrip().startswith("["):
+                            if not line.startswith("["):
+                                refuse("ambiguous INI section in " + path)
+                            header = line.split("#", 1)[0].split(";", 1)[0].rstrip()
+                            if not header.endswith("]"):
+                                refuse("cannot parse INI section in " + path)
+                            section = header[1:-1]
+                            if not section or section in sections:
+                                refuse("ambiguous INI section in " + path)
+                            sections.add(section)
+                        if section == wanted:
+                            lines.append(line)
+                    if set(parser.sections()) != sections:
+                        refuse("ambiguous INI section in " + path)
+                    if name == "setup.cfg" and "pytest" in sections:
+                        refuse("unsupported setup.cfg [pytest] section in " + path)
+                    result = ("".join(lines) if wanted in sections else None, wanted in sections)
+            except (configparser.Error, tomllib.TOMLDecodeError, UnicodeError, TypeError, ValueError):
+                refuse("cannot safely inspect configuration " + path)
+        cache[key] = result
+        return result
+
+    paths = {p for p in before.keys() | after.keys() if Path(p).name in names}
+    for path in sorted(paths):
+        values = [settings(revision, path)[0] for revision in revisions]
+        if any(value is not None for value in values):
+            identities = [trees[rev][path][:2] if path in trees[rev] else None for rev in revisions]
+            if values[0] != values[1] or identities[0] != identities[1]:
+                refuse("configuration or file type/mode changed: " + path)
+
+    # pytest 9 在没有有效配置时仍可选择无 pytest 表的 pyproject 作为 rootdir。
+    # 原 dispatcher/gatekeeper 的 pytest 参数位于 tests/；覆盖其目录及共同祖先，
+    # 两端使用同一目录集合，普通新增测试本身不会被误当成配置变更。
+    directories = {Path("."), Path("tests"), Path("tests/unit")}
+    for path in before.keys() | after.keys():
+        if path.startswith("tests/") and path.endswith(".py"):
+            directories.update(Path(path).parents)
+    for directory in directories:
+        ancestors = (directory, *directory.parents)
+        fallback = []
+        for revision in revisions:
+            if any(settings(revision, str(parent / name))[1] for parent in ancestors for name in names):
+                fallback.append(None)
+                continue
+            selected = next((str(parent / "pyproject.toml") for parent in ancestors
+                             if str(parent / "pyproject.toml") in trees[revision]), None)
+            fallback.append((selected, trees[revision][selected][:2]) if selected else None)
+        if fallback[0] != fallback[1]:
+            refuse("pyproject fallback rootdir changed")
+
+
 class FootballPredictionContract:
     """Reuse trusted-base execution and original project receipt validators."""
 
@@ -307,6 +421,7 @@ class FootballPredictionContract:
                                         "scripts/test/", ".githooks/", ".devcontainer/", "config/"))):
                 raise ValueError("candidate changed protected canonical authority; separate policy mission required")
         protect_ruff_authority(spec, cwd)
+        protect_pytest_authority(spec, cwd)
         trusted = self.adapter._trusted_base_checkout(str(cwd), spec["base"])
         # These modules are byte-verified base policy, never candidate code.
         query = """
