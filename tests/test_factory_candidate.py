@@ -130,6 +130,115 @@ class LocalCandidateTests(unittest.TestCase):
         self.f.submit(self.spec)
         return self.f.run("feature")
 
+    def configure_project_local_flow(self):
+        # Keep the existing real Python fixture gates, with project scope binding.
+        self.f.close()
+        self.config["project_contract"] = "footballprediction"
+        self.f = Factory(self.root / "project-flow", self.config, self.runtime)
+        self.spec["approved_mission_scope"] = self.approval()
+        self.authorize()
+
+    def test_project_local_candidate_full_flow_and_reopen_keep_one_branch_identity(self):
+        self.configure_project_local_flow()
+        self.f.submit(self.spec)
+        spec, cwd = self.f.prepare("feature")
+        prepared_branch = git(cwd, "branch", "--show-current")
+        qa_branches = []
+        original_gate = self.runtime.gate
+        def gate(command, cwd, *args):
+            qa_branches.append(git(cwd, "branch", "--show-current"))
+            return original_gate(command, cwd, *args)
+        with patch.object(self.runtime, "gate", side_effect=gate):
+            report = self.f.run("feature")
+        self.assertEqual(report["DELIVERY_STATUS"], LOCAL_READY, {
+            "status": report["DELIVERY_STATUS"], "blockers": report["BLOCKERS_REMAINING"],
+            "prepared_branch": prepared_branch, "reported_branch": report["CANDIDATE_BRANCH"],
+            "operations": [r[0] for r in self.f.db.execute("SELECT stage FROM operations")]})
+        self.assertEqual(prepared_branch, "factory/feature")
+        self.assertEqual(report["CANDIDATE_BRANCH"], prepared_branch)
+        self.assertEqual(qa_branches, [prepared_branch, prepared_branch])
+        self.assertEqual([call["payload"]["workspace"]["CURRENT_BRANCH"] for call in self.runtime.calls],
+                         [prepared_branch])
+        evidence = report["LOCAL_CANDIDATE_EVIDENCE"]
+        self.assertEqual(evidence["target"], self.f.target(spec, cwd))
+        self.assertEqual(evidence["target"]["mission_scope_sha256"], self.approval()["sha256"])
+        operations = [dict(r) for r in self.f.db.execute("SELECT * FROM operations ORDER BY started")]
+        self.assertEqual([r["stage"] for r in operations], ["implement", "checks", "ci"])
+        for kind in ("checks", "ci"):
+            self.assertEqual(evidence["validation_results"][kind][0]["exit_code"], 0)
+        self.assertEqual(git(cwd, "remote"), "")
+
+        state_root = self.f.root
+        self.f.close()
+        self.runtime = LocalRuntimeFixture()
+        self.f = Factory(state_root, self.config, self.runtime)
+        with patch.object(self.runtime, "agent", side_effect=AssertionError("execution replay")), \
+             patch.object(self.runtime, "gate", side_effect=AssertionError("QA replay")), \
+             patch.object(self.runtime, "project_review", side_effect=AssertionError("formal review")), \
+             patch.object(self.runtime, "project_final_gate", side_effect=AssertionError("formal gate")):
+            for result in (self.f.report("feature"), self.f.run("feature")):
+                self.assertEqual(result["DELIVERY_STATUS"], LOCAL_READY, result)
+                self.assertEqual(result["CANDIDATE_BRANCH"], prepared_branch)
+                self.assertEqual(result["LOCAL_CANDIDATE_EVIDENCE"], evidence)
+        self.assertEqual(operations, [dict(r) for r in self.f.db.execute(
+            "SELECT * FROM operations ORDER BY started")])
+        self.assertEqual(self.runtime.calls, [])
+
+    def test_project_local_candidate_rejects_branch_remote_and_evidence_drift(self):
+        from harness.factory_candidate import verify
+        self.configure_project_local_flow()
+        self.f.submit(self.spec)
+        spec, cwd = self.f.prepare("feature")
+        for drift in ("branch", "remote"):
+            with self.subTest(before_dispatch=drift):
+                if drift == "branch":
+                    git(cwd, "branch", "-m", "factory/feature-unapproved")
+                else:
+                    git(cwd, "remote", "add", "unexpected", "https://example.invalid/no-request")
+                try:
+                    with self.assertRaises(FactoryBlocked) as stopped:
+                        self.f._single_agent_operation(spec, cwd, {}, "implement", 0, None)
+                    self.assertEqual(stopped.exception.status, "BLOCKED_SCOPE")
+                    self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM operations").fetchone()[0], 0)
+                finally:
+                    if drift == "branch":
+                        git(cwd, "branch", "-m", "factory/feature")
+                    else:
+                        git(cwd, "remote", "remove", "unexpected")
+        self.assertEqual(self.runtime.calls, [])
+        report = self.f.run("feature")
+        self.assertEqual(report["DELIVERY_STATUS"], LOCAL_READY, report)
+        evidence = report["LOCAL_CANDIDATE_EVIDENCE"]
+        for field in ("head", "base", "tree", "mission_scope_sha256"):
+            with self.subTest(evidence_binding=field):
+                changed = copy.deepcopy(evidence)
+                changed["target"][field] = "0" * len(changed["target"][field])
+                with self.assertRaisesRegex(FactoryBlocked, "HEAD/tree/scope/worktree changed"):
+                    verify(self.f, spec, cwd, changed)
+        operations = [dict(r) for r in self.f.db.execute("SELECT * FROM operations ORDER BY started")]
+        calls = len(self.runtime.calls)
+        for drift in ("branch", "remote"):
+            with self.subTest(after_delivery=drift):
+                if drift == "branch":
+                    git(cwd, "branch", "-m", "factory/feature-unapproved")
+                else:
+                    git(cwd, "remote", "add", "unexpected", "https://example.invalid/no-request")
+                try:
+                    for result in (self.f.report("feature"), self.f.run("feature")):
+                        self.assertEqual(result["DELIVERY_STATUS"], "UNKNOWN", result)
+                        self.assertFalse(result["LOCAL_CANDIDATE_READY"])
+                        self.assertIn("local repository isolation identity changed", result["BLOCKERS_REMAINING"])
+                finally:
+                    if drift == "branch":
+                        git(cwd, "branch", "-m", "factory/feature")
+                    else:
+                        git(cwd, "remote", "remove", "unexpected")
+        git(cwd, "-c", "user.name=Fixture", "-c", "user.email=f@localhost", "commit", "--allow-empty", "-qm", "unbound HEAD")
+        self.assertEqual(self.f.run("feature")["DELIVERY_STATUS"], "UNKNOWN")
+        self.assertEqual(calls, len(self.runtime.calls))
+        self.assertEqual(operations, [dict(r) for r in self.f.db.execute(
+            "SELECT * FROM operations ORDER BY started")])
+
     def test_project_local_candidate_submits_materializes_and_binds_approved_scope(self):
         self.configure_project_candidate()
         with patch.object(self.runtime, "project_policy", wraps=self.runtime.project_policy) as policy:

@@ -507,7 +507,10 @@ class Factory:
         row = self.row(mission)
         spec, cwd = json.loads(row["spec"]), Path(row["candidate"])
         from .factory_remote import project_branch
-        branch = project_branch(spec) if self.project else f"factory/{mission}"
+        # Local-only candidates keep the mission branch used by execution and
+        # revalidation; the BASE suffix belongs to project publication.
+        branch = (project_branch(spec) if self.project and not candidate_stage.requested(spec)
+                  else f"factory/{mission}")
         if row["status"] == "CREATED":
             if cwd.exists():
                 raise FactoryBlocked("UNKNOWN", "candidate preparation interrupted; unverified path was not reused")

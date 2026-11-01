@@ -247,8 +247,9 @@ HEAD~1。保留重复预检、原生命周期/归档/证明标记检查与各阶
 只有双 receipt 当前有效且无任何 findings、本地 checks/ci PASS 后，Controller
 才发布。`factory_remote.py` 固定可信 repository/main，以 mission+base 推导专用
 `factory/<mission>-<base12>` 分支，以 scope/repo/base 的 marker 识别所有权。
-Factory.prepare、本地报告和发布使用同一分支推导；发布/观察前核对本地分支。
+项目远端交付的 Factory.prepare、本地报告和发布使用同一分支推导；发布/观察前核对本地分支。
 恢复时同样要求原准确身份，不重命名旧候选或新建替代分支来通过 readiness。
+
 它先核实远端 main 等于批准 base；从新建 Controller Git 元数据取准确提交，禁用
 候选 hooks/config，不 force push。只有已证明的上一候选 publication 可更新同一
 PR，其他 HEAD、closed PR、fork、不同 base 或模糊发现均拒绝。正文由 immutable
@@ -257,6 +258,11 @@ Controller template 与已验证 receipt 渲染，准确 HEAD/body/scope 均需�
 也按证据变化拒绝，不规范化或改写已保存正文及其 SHA256 路径。
 PR 标题取任务目标中首个非空行并去除首尾空白，保持 200 字符上限；标题无效时在任何
 远端写入前拒绝，原任务目标文本保持不变。
+
+显式 `delivery_mode="local_candidate"` 保留既有 `factory/<mission>` 准确分支，
+项目模式和通用模式相同；准备、执行、验收、恢复与报告均使用该身份。
+完整 BASE/HEAD、任务、scope、隔离仓库、无远端和 Owner 授权仍分别严格绑定；
+本地候选终态不授权后续发布，也不接受远端交付的分支名称作为替代。
 
 发布使用既有非付费 operation/evidence。创建/更新只尝试一次；响应丢失或崩溃后，
 恢复只查询 branch 和 PR。仅当 repo/base/head/body/marker 全匹配时，追加只读
