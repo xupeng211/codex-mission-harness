@@ -432,11 +432,13 @@ class TaskTempLifecycleTests(unittest.TestCase):
                     runtime.close_session()
             self.assertIs(runtime._single_server, server)
             self.assertFalse(server._task_temp.path.exists())
+            self.assertIn("no replacement execution", runtime.unconfirmed_appserver())
             with self.assertRaisesRegex(RuntimeError, "active execution"):
                 runtime.begin_execution("another-task")
         finally:
             receipt = runtime.close_session()
         self.assertTrue(receipt["cleanup_confirmed"])
+        self.assertIsNone(runtime.unconfirmed_appserver())
         self.assertEqual(receipt["evidence"]["sha256"], hashlib.sha256(server._task_temp.cleanup_log.read_bytes()).hexdigest())
 
     def test_nonreused_cleanup_failure_retains_exact_resource(self):

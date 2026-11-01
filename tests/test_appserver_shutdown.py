@@ -76,6 +76,7 @@ class AppServerShutdownTests(unittest.TestCase):
         self.payload = self.root / "payload.py"; self.payload.write_text(PAYLOAD)
         self.profile = {"provider": "openai", "model": "fixture-no-inference", "codex_home": str(self.auth)}
         self.owners, self.servers, self.infos, self.observations = [], [], [], []
+        self.control_processes = []
         self.libc = ctypes.CDLL(None, use_errno=True)
         old = ctypes.c_int()
         self.assertEqual(self.libc.prctl(37, ctypes.byref(old), 0, 0, 0), 0)
@@ -158,6 +159,8 @@ class AppServerShutdownTests(unittest.TestCase):
             "import signal,time,pathlib,sys; signal.signal(signal.SIGTERM,lambda *_:pathlib.Path(sys.argv[1]).write_text('signal')); time.sleep(60)",
             str(guard_signal)], start_new_session=True)
         guard_identity = process_identity(guard.pid)
+        control = {"identity": guard_identity, "signals_observed": []}
+        self.control_processes.append(control)
         try:
             for mode in ("serve", "descendant", "detached", "doublefork"):
                 with self.subTest(mode=mode), self.workload(mode) as info:
@@ -183,8 +186,11 @@ class AppServerShutdownTests(unittest.TestCase):
                     server.close()
                     self.assertEqual(server._task_temp.cleanup_log.read_bytes(), receipt)
                     self.assertTrue(self.alive(guard_identity)); self.assertFalse(guard_signal.exists())
+                    control["after_product_cleanup"] = process_identity(guard.pid)
         finally:
             self.kill_exact(guard_identity); guard.wait(timeout=2)
+            control.update(test_teardown_signal="SIGKILL", returncode=guard.returncode,
+                           reaped=True, absent=not Path(f"/proc/{guard.pid}").exists())
 
     def test_legacy_uses_same_child_tree_boundary_even_after_setsid(self):
         with self.workload("detached", legacy=True) as info:
@@ -454,6 +460,7 @@ class AppServerShutdownTests(unittest.TestCase):
                     "cleanup": getattr(server, "_task_temp_cleanup", None)} for server in self.servers],
                 "raw_product_records": raw_records,
                 "own_process_identities": known, "all_owned_processes_stopped": True,
+                "unrelated_control_processes": self.control_processes,
                 "boundary": "real product supervisor/stop/TaskTemp; fixed Python workload, initialize and execute only",
                 "test_teardown": "After UNKNOWN preservation assertions, exact own fixture PIDs/resources reclaimed by test driver; this is not product cleanup success"}, indent=2) + "\n")
         self.fixture.cleanup()

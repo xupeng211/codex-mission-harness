@@ -655,12 +655,10 @@ class LocalRuntime:
         return cleanup
 
     def unconfirmed_appserver(self):
-        server = self._single_server
-        if server is not None and hasattr(server, "_process_stop"):
-            if (server._process_stop.get("confirmed") is not True
-                    or (getattr(server, "_task_temp", None) is not None
-                        and not getattr(server, "_task_temp_cleanup", {}).get("cleanup_confirmed"))):
-                return "AppServer stop or task temporary cleanup remains UNKNOWN; no replacement execution"
+        if self._single_server is not None:
+            # This slot is released only after both shutdown and its complete
+            # cleanup receipt are accepted, including receipt-read failures.
+            return "AppServer still owns this runtime; stop/cleanup is unconfirmed or active; no replacement execution"
         return None
 
     def begin_execution(self, mission):

@@ -463,7 +463,7 @@ class LocalCandidateTests(unittest.TestCase):
         class FakeServer:
             instances = []
             def __init__(self, profile, cwd, transcript, timeout, denied, readonly, reviewer, token_limit,
-                         protected_paths=()):
+                         protected_paths=(), execution_context=None, owner_callback=None):
                 self.transcript = transcript
                 self._transcript_bytes = 0
                 self.proc = object()
@@ -473,7 +473,10 @@ class LocalCandidateTests(unittest.TestCase):
                 self.turn = 0
                 self.token_limit = token_limit
                 self.limits = [token_limit]
+                self.execution_context = execution_context
                 self.__class__.instances.append(self)
+                if owner_callback is not None:
+                    owner_callback(self)
             def _validate_task_temp(self):
                 pass  # This test isolates thread/token reuse, not filesystem policy.
             def execute(self, prompt, schema, thread_id=None, return_thread=False):
@@ -487,6 +490,7 @@ class LocalCandidateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch("harness.factory_runtime.FactoryAppServer", FakeServer):
             root = Path(directory)
             runtime = LocalRuntime()
+            execution = runtime.begin_execution("thread-reuse-fixture")
             runtime.resource_policy = {"max_run_tokens": 36000, "max_first_turn_tokens": 60000,
                                        "max_repair_incremental_tokens": 36000}
             profile = {"provider": "openai", "model": "fixture"}
@@ -503,8 +507,11 @@ class LocalCandidateTests(unittest.TestCase):
             self.assertEqual(FakeServer.instances[0].turn, 2)
             self.assertEqual(FakeServer.instances[0].limits, [60000])
             self.assertEqual(FakeServer.instances[0].token_limit, 36000)
+            self.assertEqual(FakeServer.instances[0].execution_context,
+                             {"mission_id": "thread-reuse-fixture", "runtime_execution": runtime._execution_id})
             runtime.close_session()
             self.assertEqual(FakeServer.instances[0].closed, 1)
+            self.assertTrue(runtime.end_execution(execution))
 
     def test_runtime_observer_applies_repair_cap_to_cumulative_thread_snapshot(self):
         server = FactoryAppServer.__new__(FactoryAppServer)
