@@ -7,17 +7,16 @@ import json
 import math
 import re
 import select
-import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from pathlib import Path
 
 from .sandbox import SAFE_PATH
 from .factory_test_service import ProjectPostgres, ExecutionStopped
+from .task_temp import allocate_directory, remove_directory, _validate_directory, TaskTempError
 
 
 PROFILES = {("make", "verify-" + p): p for p in ("targeted", "pr", "strict")}
@@ -326,15 +325,22 @@ def resources_for(name, spec, target, needs_postgres):
     return resources
 
 
+def temporary_binding(spec, target, name, transcript):
+    from .factory import digest
+    return {"mission_id": spec["mission_id"], "operation_id": Path(transcript).stem,
+            "target_sha256": digest(target), "container_name": name}
+
+
 def recover(policy, spec, target, command, transcript):
     """One-shot cleanup on resume; never retry validation or settle its UNKNOWN."""
     from .factory import digest
     path = Path(transcript).with_suffix(".container.json")
     result = {"target": target, "mission_id": spec["mission_id"], "cleanup_confirmed": False,
-              "operation_replayed": False, "resources": []}
+              "operation_replayed": False, "resources": [], "temporary_directory_cleanup_confirmed": False}
+    temporary_fd = -1
     try:
-        # Old writers embedded the full target. Admit that exact legacy target
-        # plus bounded metadata, not an unlimited record or a changed target.
+        # Bound reads still permit diagnosis of old records, but missing original
+        # allocation identity never authorizes cleanup or an operation replay.
         legacy_limit = len(json.dumps(target, sort_keys=True).encode()) + LIFECYCLE_LIMIT
         info = path.lstat()
         if (not stat.S_ISREG(info.st_mode) or path.is_symlink() or info.st_uid != os.getuid()
@@ -347,11 +353,8 @@ def recover(policy, spec, target, command, transcript):
         record = json.loads(raw)
         if not isinstance(record, dict):
             raise ValueError("invalid container lifecycle record")
-        if "version" not in record:
-            target_matches = record.get("target") == target
-        else:
-            target_matches = (type(record["version"]) is int and record["version"] == 2
-                              and len(raw) <= LIFECYCLE_LIMIT and record.get("target_sha256") == digest(target))
+        target_matches = (type(record.get("version")) is int and record["version"] == 3
+                          and len(raw) <= LIFECYCLE_LIMIT and record.get("target_sha256") == digest(target))
         name = record["container_name"]
         profile = PROFILES.get(tuple(command))
         if (not re.fullmatch(r"cmh-validate-[a-f0-9]{32}", name)
@@ -366,21 +369,32 @@ def recover(policy, spec, target, command, transcript):
         if (temporary.parent != path.parent or not re.fullmatch(r"cmh-validation-[a-z0-9_]{8}", temporary.name)
                 or temporary.is_symlink()):
             raise ValueError("temporary directory escaped operation evidence root")
-        # Check directory ownership before any deletion, including parent cleanup.
-        if temporary.exists():
-            info = temporary.lstat()
-            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
-                raise ValueError("temporary directory ownership mismatch")
+        identity = record["temporary_directory_identity"]
+        if (not isinstance(identity, dict) or identity.get("path") != str(temporary)
+                or identity.get("binding") != temporary_binding(spec, target, name, transcript)
+                or not re.fullmatch(r"[a-f0-9]{32}", str(identity.get("nonce", "")))):
+            raise ValueError("temporary allocation task/operation identity is missing or changed")
+        result["temporary_directory_identity"] = identity
+        temporary_fd = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        _validate_directory(temporary_fd, identity)
         for resource in expected:
             cleaned, code = remove_owned(resource["name"], name, resource["labels"])
             result["resources"].append({"name": resource["name"], "cleanup_confirmed": cleaned, "exit_code": code})
         result["cleanup_confirmed"] = all(r["cleanup_confirmed"] for r in result["resources"])
-        if result["cleanup_confirmed"] and temporary.exists():
-            shutil.rmtree(temporary)
-        result["temporary_directory_cleanup_confirmed"] = not temporary.exists()
+        if result["cleanup_confirmed"]:
+            remove_directory(temporary, identity, held_fd=temporary_fd,
+                             claim_log=Path(transcript).with_suffix(".container.claims.jsonl"))
+            result["temporary_directory_cleanup_confirmed"] = True
         result["cleanup_confirmed"] &= result["temporary_directory_cleanup_confirmed"]
-    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, KeyError, TypeError, TaskTempError, subprocess.SubprocessError) as error:
+        result["cleanup_confirmed"] = False
+        result["temporary_directory_cleanup_confirmed"] = False
+        result["status"] = "UNKNOWN"
         result["error_type"] = type(error).__name__
+        result["error"] = str(error)
+    finally:
+        if temporary_fd != -1:
+            os.close(temporary_fd)
     return result
 
 
@@ -401,7 +415,9 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
               "container_policy": policy, "services": {}}
     name = "cmh-validate-" + uuid.uuid4().hex
     resources = resources_for(name, spec, target, needs_postgres)
-    with tempfile.TemporaryDirectory(prefix="cmh-validation-", dir=transcript.parent) as temporary:
+    temporary, temporary_fd, temporary_identity = allocate_directory(
+        transcript.parent, "cmh-validation-", temporary_binding(spec, target, name, transcript))
+    try:
         workspace = Path(temporary) / "source"
         service = None
         validation_cleanups = []
@@ -413,9 +429,9 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
             os.fchmod(log.fileno(), 0o600)
             # Durable plan precedes the first Docker dispatch. An interrupted
             # Controller can identify only its exact operation's resources.
-            record = {"version": 2, "target_sha256": digest(target), "mission_id": spec["mission_id"], "policy": policy,
+            record = {"version": 3, "target_sha256": digest(target), "mission_id": spec["mission_id"], "policy": policy,
                       "profile": profile, "container_name": name, "resources": resources,
-                      "temporary_directory": temporary}
+                      "temporary_directory": str(temporary), "temporary_directory_identity": temporary_identity}
             raw = json.dumps(record, sort_keys=True).encode()
             if len(raw) > LIFECYCLE_LIMIT:
                 raise ValueError("container lifecycle record exceeds recoverable capacity before dispatch")
@@ -559,8 +575,24 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                             "BLOCKED_ENVIRONMENT" if not result["cleanup_confirmed"] or
                                 (service is not None and not service.evidence["diagnostics_complete"]) else
                             "PASS" if result["exit_code"] == 0 else "FAIL")
-    result["temporary_directory_cleanup_confirmed"] = not Path(temporary).exists()
-    if not result["temporary_directory_cleanup_confirmed"] and result["status"] == "PASS":
-        result["status"] = "BLOCKED_ENVIRONMENT"
+    finally:
+        result["temporary_directory_identity"] = temporary_identity
+        result["temporary_directory_cleanup_confirmed"] = False
+        try:
+            if result.get("cleanup_confirmed") is not True or result.get("dependencies_cleanup_confirmed", True) is not True:
+                # A known failed cleanup remains the original failed outcome,
+                # with its exact scratch retained for cleanup-only recovery.
+                result["temporary_cleanup_error"] = "validation clients/resources not confirmed stopped; retained at " + str(temporary)
+                result["cleanup_confirmed"] = False
+                if result.get("status") == "PASS":
+                    result["status"] = "BLOCKED_ENVIRONMENT"
+            else:
+                remove_directory(temporary, temporary_identity, held_fd=temporary_fd,
+                                 claim_log=transcript.with_suffix(".container.claims.jsonl"))
+                result["temporary_directory_cleanup_confirmed"] = True
+        except TaskTempError as error:
+            result.update(status="UNKNOWN", temporary_cleanup_error=str(error), cleanup_confirmed=False)
+        finally:
+            os.close(temporary_fd)
     result["elapsed_seconds"] = round(time.monotonic() - started, 3)
     return result

@@ -211,6 +211,16 @@ class PreparationTests(unittest.TestCase):
         self.assertIsNone(self.runtime.current_process)
         self.assertIsNone(self.runtime._active_execution)
         self.assertFalse(self.double.resources)
+        record = json.loads(Path(result["lifecycle_record"]).read_text())
+        self.assertEqual(record["version"], 3)
+        self.assertEqual(record["temporary_directory_identity"], result["temporary_directory_identity"])
+        identity = record["temporary_directory_identity"]
+        self.assertEqual(identity["binding"]["mission_id"], self.fx.spec["mission_id"])
+        self.assertEqual(identity["binding"]["operation_id"], "gate")
+        self.assertEqual(identity["path"], record["temporary_directory"])
+        self.assertEqual(identity["mode"], "0o700")
+        self.assertTrue(identity["nonce"])
+        self.assertFalse(Path(identity["path"]).exists())
 
 
 class CompletedCleanupTests(unittest.TestCase):

@@ -466,8 +466,8 @@ class TaskTempLifecycleTests(unittest.TestCase):
         with patch("harness.task_temp.tempfile.mkdtemp", side_effect=remember):
             with self.assertRaisesRegex(self.TaskTempError, "protected root"):
                 self.TaskTemp(str(self.cwd), "cmh_delegated_fixture", (Path("/tmp"),))
-        self.assertEqual(len(created), 1)
-        self.assertFalse(created[0].exists())
+        self.assertTrue(created)
+        self.assertTrue(all(not path.exists() for path in created), "allocation and private cleanup parent must both be removed")
 
     def test_cleanup_failure_is_durable_unknown_and_resume_does_not_dispatch(self):
         from harness.factory import Factory, FactoryBlocked

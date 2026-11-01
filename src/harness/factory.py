@@ -14,6 +14,7 @@ import math
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import time
 import uuid
@@ -1330,8 +1331,81 @@ class Factory:
             results.append({**result, "evidence_key": key, "department": "hosted_ci"})
         return results
 
+    def verify_temporary_cleanup(self, mission):
+        """Read only: every allocation needs its original, bound cleanup proof."""
+        try:
+            candidate = self.row(mission)["candidate"]
+            root = self.root / "evidence" / mission
+            allocations, proofs, native_identities = {}, [], []
+            def read(path, expected_hash):
+                info = path.lstat()
+                if (path.is_symlink() or path.resolve(strict=True) != path or not stat.S_ISREG(info.st_mode)
+                        or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077 or info.st_size > 65536):
+                    raise ValueError("untrusted temporary cleanup evidence")
+                data = path.read_bytes()
+                if hashlib.sha256(data).hexdigest() != expected_hash:
+                    raise ValueError("temporary cleanup evidence hash changed")
+                return data
+            for operation in self.db.execute("SELECT * FROM operations WHERE mission=?", (mission,)):
+                result = json.loads(operation["result"] or "{}")
+                raw = result.get("raw_evidence", [])
+                allocation = root / (operation["id"] + ".temp.json")
+                entries = [v for v in raw if v["path"] == str(allocation)]
+                native = (result.get("runtime_identity") or {}).get("native_runtime", {}).get("temporary_workspace")
+                if native is not None:
+                    native_identities.append(native)
+                if entries or allocation.exists() or allocation.is_symlink():
+                    if len(entries) != 1 or operation["lane"] != "developer":
+                        raise ValueError("temporary allocation lacks original operation binding")
+                    self.verify_evidence(operation)
+                    original = json.loads(Path(operation["evidence"]).read_bytes())
+                    if original != {"operation": operation["id"], "identity": json.loads(operation["identity"]),
+                                    "input": json.loads(operation["input"]), "result": result}:
+                        raise ValueError("temporary allocation differs from immutable operation evidence")
+                    identity = json.loads(read(allocation, entries[0]["sha256"]))
+                    if (not isinstance(identity, dict) or identity.get("worktree") != candidate
+                            or Path(identity["path"]).parent != Path("/tmp")
+                            or identity.get("uid") != os.getuid() or identity.get("mode") != "0o700"
+                            or any(type(identity.get(k)) is not int for k in ("device", "inode"))
+                            or not isinstance(identity.get("permission_profile"), str)):
+                        raise ValueError("temporary allocation candidate/directory identity differs")
+                    allocations[operation["id"]] = (identity, entries[0])
+                    receipt = allocation.with_suffix(".cleanup.jsonl")
+                    proofs.extend((operation["id"], v, None) for v in raw if v["path"] == str(receipt))
+            for event in self.db.execute("SELECT payload FROM events WHERE mission=? AND kind='agent_temporary_cleanup' ORDER BY sequence", (mission,)):
+                payload = json.loads(event[0])
+                if payload.get("cleanup_confirmed") is not True:
+                    raise ValueError("task temporary cleanup is unconfirmed; no replay or resource adoption")
+                source = payload.get("operation_id")
+                if (payload.get("mission_id") != mission or source not in allocations
+                        or payload.get("allocation") != allocations[source][1]
+                        or payload.get("identity") != allocations[source][0]):
+                    raise ValueError("temporary cleanup event task/operation/allocation binding differs")
+                proofs.append((source, payload["evidence"], payload))
+            covered = set()
+            for source, evidence, event in proofs:
+                identity, allocation = allocations[source]
+                receipt = Path(allocation["path"]).with_suffix(".cleanup.jsonl")
+                if evidence["path"] != str(receipt):
+                    raise ValueError("temporary cleanup receipt path binding differs")
+                rows = [json.loads(line) for line in read(receipt, evidence["sha256"]).splitlines()]
+                if not rows or any(v.get("cleanup_confirmed") is not True or v.get("identity") != identity for v in rows):
+                    raise ValueError("temporary cleanup receipt contains unconfirmed or foreign allocation")
+                if event is not None and any(event.get(k) != rows[-1].get(k) for k in ("identity", "cleanup_confirmed", "at")):
+                    raise ValueError("temporary cleanup event differs from original receipt")
+                covered.add(source)
+            if covered != set(allocations) or any(v not in [a[0] for a in allocations.values()] for v in native_identities):
+                raise ValueError("temporary allocation has no confirmed cleanup proof")
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+            raise FactoryBlocked("UNKNOWN", "temporary cleanup evidence invalid: " + str(error)) from error
+
     def report(self, mission):
-        report = self._report(mission)
+        temporary_error = None
+        try:
+            self.verify_temporary_cleanup(mission)
+        except FactoryBlocked as error:
+            temporary_error = error.reason
+        report = self._report(mission, temporary_error)
         if "model_routing" in self.config:
             from .factory_routing import observation
             event = self.db.execute("SELECT payload FROM events WHERE mission=? AND kind='submitted'", (mission,)).fetchone()
@@ -1340,9 +1414,11 @@ class Factory:
             report["MODEL_ROUTING"] = observation(decision, operations)
         return report
 
-    def _report(self, mission):
+    def _report(self, mission, temporary_error=None):
         from .factory_remote import project_branch
         row = self.row(mission)
+        if temporary_error is not None:
+            row = {**dict(row), "status": "UNKNOWN", "reason": temporary_error}
         operations = self.db.execute("SELECT * FROM operations WHERE mission=? ORDER BY started", (mission,)).fetchall()
         events = self.db.execute("SELECT kind,payload FROM events WHERE mission=? ORDER BY sequence", (mission,)).fetchall()
         spec = json.loads(row["spec"])
@@ -1498,8 +1574,9 @@ class Factory:
                 self.runtime.resource_policy = self.config["budget"]
             watcher = threading.Thread(target=watch_cancel, daemon=True)
             watcher.start()
+            cleanup = None
             try:
-                return self._run(mission)
+                result = self._run(mission)
             finally:
                 stopped.set()
                 watcher.join(timeout=1)
@@ -1514,11 +1591,16 @@ class Factory:
                             self.state(mission, "UNKNOWN", str(error))
                             raise FactoryBlocked("UNKNOWN", str(error)) from error
                         if cleanup is not None:
+                            cleanup = {**cleanup, "mission_id": mission,
+                                       "operation_id": Path(cleanup.get("allocation", {}).get("path", "")).name.removesuffix(".temp.json")}
                             self.event(mission, "agent_temporary_cleanup", cleanup)
                             self.db.commit()
                 finally:
                     if execution is not None:
                         self.runtime.end_execution(execution)
+            # Single-session receipts are created only by the finally above.
+            # Do not return the earlier, pre-cleanup delivery assessment.
+            return self.report(mission) if cleanup is not None else result
 
     def recover_interrupted_containers(self, mission):
         """Cleanup only: no candidate preparation, dispatch replay or settlement."""
@@ -1559,9 +1641,7 @@ class Factory:
 
     def _run(self, mission):
         try:
-            cleanup = self.db.execute("SELECT payload FROM events WHERE mission=? AND kind='agent_temporary_cleanup' ORDER BY sequence DESC LIMIT 1", (mission,)).fetchone()
-            if cleanup is not None and json.loads(cleanup[0]).get("cleanup_confirmed") is not True:
-                raise FactoryBlocked("UNKNOWN", "task temporary cleanup is unconfirmed; no replay or resource adoption")
+            self.verify_temporary_cleanup(mission)
             cleanups = self.recover_interrupted_containers(mission)
             if self.cancel_requested(mission):
                 note = ("; cleanup confirmed" if all(c.get("cleanup_confirmed") for c in cleanups)

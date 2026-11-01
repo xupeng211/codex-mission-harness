@@ -639,12 +639,15 @@ class LocalRuntime:
                 path = server._task_temp.cleanup_log
                 try:
                     receipt_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+                    allocation = server._task_temp._record
+                    allocation_hash = hashlib.sha256(allocation.read_bytes()).hexdigest()
                 except OSError as error:
                     # Retain runtime ownership until both deletion and its proof
                     # are confirmed; another task cannot inherit this session.
                     raise TaskTempError("task temporary cleanup receipt is unconfirmed: " + str(path),
                                         server._task_temp.identity) from error
-                cleanup = {**cleanup, "evidence": {"path": str(path), "sha256": receipt_hash}}
+                cleanup = {**cleanup, "evidence": {"path": str(path), "sha256": receipt_hash},
+                           "allocation": {"path": str(allocation), "sha256": allocation_hash}}
             if self.current_process is server.proc:
                 self.current_process = None
         self._single_server = None
