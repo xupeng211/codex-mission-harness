@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from harness.factory import FactoryBlocked, git
-from harness.factory_container import recover, resources_for
+from harness.factory_container import LIFECYCLE_LIMIT, recover, resources_for
 from harness.factory_runtime import LocalRuntime
 import test_factory_controller_gates as fixtures
 from test_factory_container_lifecycle import DockerDouble
@@ -272,13 +272,31 @@ class ContainerContractTests(unittest.TestCase):
 
     def test_compact_format_retains_64k_cap_even_with_large_expected_target(self):
         self.large_candidate()
+        self.double.cleanup_blocked = True
         with self.double.hooks():
-            result = self.gate()
+            result = self.gate("legacy")
         record = json.loads(Path(result["lifecycle_record"]).read_text())
-        record["padding"] = "x" * 70000
-        recovered, remove = self.recover_record(record)
+        temporary = Path(record["temporary_directory"])
+        self.assertTrue(temporary.is_dir())
+        record["padding"] = ""
+        record["padding"] = "x" * (LIFECYCLE_LIMIT - len(json.dumps(record, sort_keys=True).encode()))
+        boundary = json.dumps(record, sort_keys=True).encode()
+        self.assertEqual(len(boundary), LIFECYCLE_LIMIT)
+        # All other bindings and the original allocation remain valid, so an
+        # over-capacity rejection cannot be caused by another invalid field.
+        recovered, remove = self.recover_record(record, raw=boundary + b" ")
+        self.assertEqual(recovered["status"], "UNKNOWN")
         self.assertFalse(recovered["cleanup_confirmed"])
+        self.assertFalse(recovered["operation_replayed"])
         remove.assert_not_called()
+        self.assertTrue(temporary.is_dir())
+        at_limit, remove = self.recover_record(record, raw=boundary)
+        self.assertTrue(at_limit["cleanup_confirmed"], at_limit)
+        self.assertFalse(at_limit["operation_replayed"])
+        self.assertEqual(remove.call_count, 2)
+        self.assertFalse(temporary.exists())
+        evidence("lifecycle-capacity-boundary", {"limit": LIFECYCLE_LIMIT,
+            "at_limit": at_limit, "over_limit": recovered, "record_unchanged": True})
 
     def test_invalid_records_never_remove_any_resources(self):
         with self.double.hooks():
