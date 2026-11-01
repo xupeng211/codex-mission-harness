@@ -687,7 +687,8 @@ class Factory:
                 result["remote_cleanup"] = exc.remote_cleanup
         raw_paths = [p for p in (transcript, transcript.with_suffix(".stderr"), transcript.with_suffix(".proxy.jsonl"),
                                 transcript.with_suffix(".container.json"), transcript.with_suffix(".stdout"),
-                                transcript.with_suffix(".cleanup.json")) if p.is_file()]
+                                transcript.with_suffix(".cleanup.json"), transcript.with_suffix(".temp.json"),
+                                transcript.with_suffix(".temp.cleanup.jsonl")) if p.is_file()]
         result["raw_evidence"] = [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in raw_paths]
         data = encoded({"operation": operation_id, "identity": identity, "input": payload, "result": result}).encode()
         with evidence.open("xb") as stream:
@@ -1502,10 +1503,22 @@ class Factory:
             finally:
                 stopped.set()
                 watcher.join(timeout=1)
-                if hasattr(self.runtime, "close_session"):
-                    self.runtime.close_session()
-                if execution is not None:
-                    self.runtime.end_execution(execution)
+                try:
+                    if hasattr(self.runtime, "close_session"):
+                        from .task_temp import TaskTempError
+                        try:
+                            cleanup = self.runtime.close_session()
+                        except TaskTempError as error:
+                            self.event(mission, "agent_temporary_cleanup", {"cleanup_confirmed": False,
+                                       "identity": error.identity, "error": str(error)})
+                            self.state(mission, "UNKNOWN", str(error))
+                            raise FactoryBlocked("UNKNOWN", str(error)) from error
+                        if cleanup is not None:
+                            self.event(mission, "agent_temporary_cleanup", cleanup)
+                            self.db.commit()
+                finally:
+                    if execution is not None:
+                        self.runtime.end_execution(execution)
 
     def recover_interrupted_containers(self, mission):
         """Cleanup only: no candidate preparation, dispatch replay or settlement."""
@@ -1546,6 +1559,9 @@ class Factory:
 
     def _run(self, mission):
         try:
+            cleanup = self.db.execute("SELECT payload FROM events WHERE mission=? AND kind='agent_temporary_cleanup' ORDER BY sequence DESC LIMIT 1", (mission,)).fetchone()
+            if cleanup is not None and json.loads(cleanup[0]).get("cleanup_confirmed") is not True:
+                raise FactoryBlocked("UNKNOWN", "task temporary cleanup is unconfirmed; no replay or resource adoption")
             cleanups = self.recover_interrupted_containers(mission)
             if self.cancel_requested(mission):
                 note = ("; cleanup confirmed" if all(c.get("cleanup_confirmed") for c in cleanups)

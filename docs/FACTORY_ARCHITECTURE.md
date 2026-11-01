@@ -69,6 +69,8 @@ Known completed results are reused after envelope and raw-file hash verification
 
 Constructor-bound official permissions allow developer source edits and keep Git metadata read-only. Planner/reviewer have a minimal repository/runtime read profile. Original source, controller/evidence storage and authentication are unavailable to delegated tools. Network is disabled; approval requests are denied. Existing trusted launcher/PATH and environment allowlists are reused.
 
+From the Owner's 2026-11-01 boundary decision, writable delegated sessions use only their exact candidate and a Controller-allocated private temporary workspace. Both roles use the minimal repository/runtime profile; neither inherits the built-in `:workspace` host-temp grants. Developer scratch is bound to the canonical worktree and fresh permission profile, outside the candidate and protected roots, and verified before reuse and cleanup. Shared host `/tmp`, other sessions' scratch and candidate-selected paths are not delegated. Read-only roles receive no writable scratch. See [the temporary workspace contract](DELEGATED_TEMPORARY_WORKSPACE.md) for lifecycle, failure and recovery limits. This new rule does not reclassify historical reviews or authorization.
+
 ### Native delegation and usage compatibility
 
 Codex 0.164.0 still recognizes the legacy `features.multi_agent` and

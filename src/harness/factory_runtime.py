@@ -16,6 +16,7 @@ import tempfile
 from pathlib import Path
 
 from .codex import AppServerCodex
+from .task_temp import TaskTemp, TaskTempError
 from .model_registry import read_private_token
 from .sandbox import project_gate_invocation, preflight_project_gate, SAFE_PATH
 from .factory_proxy import validate_transport, ProxyPolicy, ProxyRelay, digest as route_digest
@@ -95,6 +96,7 @@ class FactoryAppServer(AppServerCodex):
         self.transport = validate_transport(profile, reviewer)
         self._proxy_relay = None
         self._proxy_home = None
+        self._task_temp = None
         # Built-in OpenAI ignores configured retry overrides. A fresh official
         # provider entry uses native authentication/endpoint selection while
         # disabling ambiguous request replay and transport fallback.
@@ -146,9 +148,12 @@ class FactoryAppServer(AppServerCodex):
             rules[str(Path(self.transport["policy_file"]).parent)] = "deny"
         # The Git database belongs to the controller, not to coding agents.
         rules[str(cwd / ".git")] = "read"
-        # A read-only lane starts with minimal runtime + the exact repository,
-        # rather than inheriting the built-in profile's broad host read grant.
-        overrides = ([] if read_only else ["-c", f'permissions.{self._permissions_profile}.extends=":workspace"']) + [
+        # Preserve workspace-profile metadata protection without inheriting its
+        # grants to the host's shared /tmp and caller-selected TMPDIR.
+        for name in (".agents", ".codex", ".aws"):
+            rules[str(cwd / name)] = "read"
+        # Both lanes start from the existing minimal repository/runtime boundary.
+        overrides = [
                      "-c", f"default_permissions={json.dumps(self._permissions_profile)}",
                      "-c", f"permissions.{self._permissions_profile}.filesystem=" +
                      "{" + ",".join(f"{json.dumps(k)}={json.dumps(v)}" for k, v in rules.items()) + "}",
@@ -238,10 +243,26 @@ class FactoryAppServer(AppServerCodex):
                 self.close()
                 raise
         try:
+            if not read_only:
+                forbidden = [*denied_roots, Path(home), Path(self._source_home)]
+                if self.transport["type"] == "cli_proxy":
+                    forbidden.append(Path(self.transport["policy_file"]).parent)
+                self._task_temp = TaskTemp(self._policy_cwd, self._permissions_profile, forbidden,
+                                           record=transcript.with_suffix(".temp.json"))
+                rules.update(self._task_temp.permission_rules())
+                # Repeated CLI overrides of the *same* inline table replace it.
+                # Emit one complete table, retaining all protected subpaths.
+                key = f"permissions.{self._permissions_profile}.filesystem="
+                index = next(i for i, item in enumerate(overrides) if item.startswith(key))
+                overrides[index] = key + "{" + ",".join(f"{json.dumps(k)}={json.dumps(v)}" for k, v in rules.items()) + "}"
+                overrides.extend(self._task_temp.environment_overrides())
+                self._native_identity["temporary_workspace"] = self._task_temp.identity
             with transcript.with_suffix(".stderr").open("xb") as stderr:
                 # GNU coreutils supplies a wall-clock watchdog independent of
                 # this controller; unknown dispatch stays charged/unreplayed.
                 environment = self._app_server_environment(str(executable), str(cwd), codex_home=home)
+                if self._task_temp is not None:
+                    environment.update(self._task_temp.environment())
                 if self.transport["type"] == "cli_proxy":
                     # Codex talks only to the local observer. Upstream network
                     # routing belongs to the explicit dedicated proxy config.
@@ -567,21 +588,23 @@ class FactoryAppServer(AppServerCodex):
                 os.killpg(proc.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-        super().close()
-        relay = getattr(self, "_proxy_relay", None)
-        if relay:
-            relay.close()
-            sources = {self.transcript.with_suffix(".stderr")}
-            if hasattr(self, "_session_stderr"):
-                sources.add(self._session_stderr)
-            for error in sources:
-                if error.exists():
-                    error.write_bytes(error.read_bytes().replace(relay.nonce.encode(), b"[REDACTED]"))
-            self._proxy_relay = None
-        home = getattr(self, "_proxy_home", None)
-        if home:
-            home.cleanup()
-            self._proxy_home = None
+        try:
+            super().close()
+        finally:
+            relay = getattr(self, "_proxy_relay", None)
+            if relay:
+                relay.close()
+                sources = {self.transcript.with_suffix(".stderr")}
+                if hasattr(self, "_session_stderr"):
+                    sources.add(self._session_stderr)
+                for error in sources:
+                    if error.exists():
+                        error.write_bytes(error.read_bytes().replace(relay.nonce.encode(), b"[REDACTED]"))
+                self._proxy_relay = None
+            home = getattr(self, "_proxy_home", None)
+            if home:
+                home.cleanup()
+                self._proxy_home = None
 
 
 class LocalRuntime:
@@ -608,17 +631,30 @@ class LocalRuntime:
 
     def close_session(self):
         server = self._single_server
+        cleanup = None
         if server is not None:
             server.close()
+            cleanup = getattr(server, "_task_temp_cleanup", None)
+            if cleanup and server._task_temp.cleanup_log is not None:
+                path = server._task_temp.cleanup_log
+                try:
+                    receipt_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+                except OSError as error:
+                    # Retain runtime ownership until both deletion and its proof
+                    # are confirmed; another task cannot inherit this session.
+                    raise TaskTempError("task temporary cleanup receipt is unconfirmed: " + str(path),
+                                        server._task_temp.identity) from error
+                cleanup = {**cleanup, "evidence": {"path": str(path), "sha256": receipt_hash}}
             if self.current_process is server.proc:
                 self.current_process = None
         self._single_server = None
         self._single_binding = None
+        return cleanup
 
     def begin_execution(self, mission):
         import threading
         with self._execution_lock:
-            if self._active_execution is not None or self.current_process is not None:
+            if self._active_execution is not None or self.current_process is not None or self._single_server is not None:
                 raise RuntimeError("runtime already belongs to an active execution")
             # A new identity, not clearing an old task's cancellation latch.
             self.container_cancel = threading.Event()
@@ -633,7 +669,7 @@ class LocalRuntime:
             if execution is self._active_execution:
                 # An unconfirmed owned group still owns this execution. Even
                 # Factory.run's outer finally must not admit a new execution.
-                if self._remote_worker is not None or self._preparation_client is not None:
+                if self._remote_worker is not None or self._preparation_client is not None or self._single_server is not None:
                     return False
                 self._active_execution = self._active_mission = None
                 self._execution_thread = None
@@ -704,7 +740,7 @@ class LocalRuntime:
             identity["route_identity"] = route
             identity["qualification_identity"] = route_digest(route)
         identity["adapter_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-        dependencies = ["codex.py", "factory_proxy.py", "factory_routing.py"] if profile["provider"] == "openai" else ["factory_http.py", "model_registry.py"]
+        dependencies = ["codex.py", "task_temp.py", "factory_proxy.py", "factory_routing.py"] if profile["provider"] == "openai" else ["factory_http.py", "model_registry.py"]
         identity["transport_hashes"] = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in dependencies}
         return identity
 
@@ -736,6 +772,7 @@ class LocalRuntime:
             if self._single_binding != binding:
                 raise RuntimeFailure("single-agent App Server binding changed; no replay", None, None)
             server = self._single_server
+            server._validate_task_temp()
             server.transcript = transcript
             server._transcript_bytes = 0
             server._response_timeout = timeout
@@ -798,7 +835,13 @@ class LocalRuntime:
                     os.fchmod(errors.fileno(), 0o600)
                     errors.write(chunk)
             if not reuse_session:
-                server.close()
+                try:
+                    server.close()
+                except TaskTempError:
+                    # Keep the exact resource available to Factory's cleanup
+                    # finally; an unconfirmed session cannot pass to a new task.
+                    self._single_server, self._single_binding = server, binding
+                    raise
             self.current_process = None
 
     def second_review(self, profile, cwd, payload, transcript, timeout):

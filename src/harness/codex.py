@@ -16,6 +16,7 @@ from typing import Protocol
 from .policy import SENSITIVE
 from .model_registry import load_registry
 from .model_qualification import require_builder_qualification
+from .task_temp import TaskTemp, TaskTempError
 
 
 @dataclass(frozen=True)
@@ -57,18 +58,22 @@ class AppServerCodex:
         self._permissions_profile = f"cmh_delegated_{uuid.uuid4().hex}"
         codex_home = self._codex_home()
         trusted_executable = self._trusted_executable(executable, self._policy_cwd)
-        app_server_argv = [str(trusted_executable), "-c", f'model="{self.MODEL}"',
-                           "-c", f'model_reasoning_effort="{self.REASONING_EFFORT}"',
-                           "-c", 'default_permissions=":workspace"',
-                           *self._permissions_profile_overrides(codex_home, self._permissions_profile),
-                           "app-server", "--stdio"]
-        self.proc = subprocess.Popen(app_server_argv, stdin=subprocess.PIPE,
-                                     stdout=subprocess.PIPE, text=True, bufsize=1,
-                                     cwd=self._policy_cwd,
-                                     env=self._app_server_environment(
-                                         str(trusted_executable), self._policy_cwd,
-                                         codex_home=codex_home,
-                                     ))
+        self._task_temp = TaskTemp(self._policy_cwd, self._permissions_profile, (codex_home,))
+        try:
+            app_server_argv = [str(trusted_executable), "-c", f'model="{self.MODEL}"',
+                               "-c", f'model_reasoning_effort="{self.REASONING_EFFORT}"',
+                               "-c", f'default_permissions="{self._permissions_profile}"',
+                               *self._permissions_profile_overrides(codex_home, self._permissions_profile, self._task_temp,
+                                                                   trusted_executable),
+                               "app-server", "--stdio"]
+            environment = self._app_server_environment(str(trusted_executable), self._policy_cwd, codex_home=codex_home)
+            environment.update(self._task_temp.environment())
+            self.proc = subprocess.Popen(app_server_argv, stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE, text=True, bufsize=1,
+                                         cwd=self._policy_cwd, env=environment)
+        except BaseException:
+            self.close()
+            raise
         self.seq = 0
         self._pending_messages: list[dict] = []
         self._reader_queue: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -78,7 +83,7 @@ class AppServerCodex:
                 "clientInfo": {"name": "codex-mission-harness", "version": "0.1"},
                 "capabilities": {"experimentalApi": True},
             })
-        except Exception:
+        except BaseException:
             self.close()
             raise
 
@@ -295,7 +300,8 @@ class AppServerCodex:
         return environment
 
     @staticmethod
-    def _permissions_profile_overrides(codex_home: str, profile: str) -> list[str]:
+    def _permissions_profile_overrides(codex_home: str, profile: str, task_temp: TaskTemp,
+                                       executable: Path | None = None) -> list[str]:
         """Define a per-process workspace profile that cannot read Codex auth.
 
         The inline TOML table keeps the absolute path in a value, so paths with
@@ -303,23 +309,30 @@ class AppServerCodex:
         written into the authenticated CODEX_HOME.
         """
         if (not Path(codex_home).is_absolute()
+                or not isinstance(task_temp, TaskTemp)
                 or not profile.startswith("cmh_delegated_")
                 or not profile.replace("_", "").isalnum()):
             raise RuntimeError("Codex delegated permission profile is invalid")
-        filesystem = "{" + json.dumps(codex_home) + ' = "deny"}'
+        task_temp.validate(task_temp.identity["worktree"], profile)
+        worktree = Path(task_temp.identity["worktree"])
+        executable = executable or AppServerCodex._trusted_executable("codex", str(worktree))
+        runtime = executable.parent.parent if executable.name == "codex.js" and (executable.parent.parent / "package.json").is_file() else executable.parent
+        rules = {":root": "deny", ":minimal": "read", str(worktree): "write", str(runtime): "read",
+                 codex_home: "deny", **task_temp.permission_rules()}
+        for name in (".git", ".agents", ".codex", ".aws"):
+            rules[str(worktree / name)] = "read"
+        filesystem = "{" + ",".join(json.dumps(k) + "=" + json.dumps(v) for k, v in rules.items()) + "}"
         return [
-            "-c", f'permissions.{profile}.extends=":workspace"',
             "-c", f"permissions.{profile}.filesystem={filesystem}",
             "-c", f"permissions.{profile}.network.enabled=false",
-        ]
+        ] + task_temp.environment_overrides()
 
     def set_policy(self, forbidden_actions: tuple[str, ...], cwd: str) -> None:
         """Verify constructor-bound mission controls before a turn is started.
 
-        App Server's workspace-write sandbox is restricted to the mission
-        worktree and has no network access whenever the mission carries a
-        deny-list.  Approval requests are deliberately not auto-approved by
-        this adapter, so an attempted forbidden escape fails closed.
+        The sandbox grants writes only to the bound worktree and the allocated
+        session scratch, with protected subpaths retained and network disabled.
+        Approval requests are never auto-approved by this adapter.
         """
         requested = self._effective_policy(forbidden_actions)
         configured = getattr(self, "_configured_forbidden_actions", None)
@@ -365,6 +378,7 @@ class AppServerCodex:
             raise RuntimeError("Codex sandbox policy is not bound to a mission worktree")
         if cwd != root:
             raise RuntimeError("Codex caller cwd differs from the bound mission worktree")
+        self._validate_task_temp()
         return {
             "approvalPolicy": "never",
             "permissions": getattr(self, "_permissions_profile", "cmh_delegated"),
@@ -374,7 +388,7 @@ class AppServerCodex:
         """Express the turn sandbox equivalently in thread start/resume schema."""
         policy = self._policy_params(cwd)
         root = self._policy_cwd
-        return {
+        params = {
             "cwd": root,
             "model": self.MODEL,
             "approvalPolicy": policy["approvalPolicy"],
@@ -391,11 +405,25 @@ class AppServerCodex:
                 },
             },
         }
+        task_temp = getattr(self, "_task_temp", None)
+        if task_temp is not None:
+            params["config"]["shell_environment_policy"]["set"] = {**task_temp.environment(), "PYTHONDONTWRITEBYTECODE": "1"}
+        return params
+
+    def _validate_task_temp(self):
+        task_temp = getattr(self, "_task_temp", None)
+        if task_temp is not None:
+            task_temp.validate(self._policy_cwd, self._permissions_profile)
 
     def _authority_instructions(self, root: str) -> str:
         denied = ", ".join(self._forbidden_actions)
+        task_temp = getattr(self, "_task_temp", None)
+        temporary = (f"Temporary files may use only the assigned {task_temp.path} (TMPDIR/TMP/TEMP); "
+                     "other tasks' or users' temporary files are not delegated. " if task_temp is not None
+                     else "No writable temporary workspace is delegated. ")
         return (
             f"Mission authority boundary: only source editing inside {root} is delegated. "
+            + temporary +
             f"Controller-only forbidden actions are: {denied}. Never perform, request, or "
             "simulate merge or another forbidden/sensitive action. If one is required, stop "
             "and report the boundary; App Server approval requests are always denied."
@@ -469,6 +497,19 @@ class AppServerCodex:
         return message
 
     def close(self) -> None:
+        self._close_process()
+        task_temp = getattr(self, "_task_temp", None)
+        if task_temp is not None:
+            proc = getattr(self, "proc", None)
+            if proc is not None and proc.poll() is None:
+                try:
+                    task_temp._cleanup_event(False, "AppServer process termination unconfirmed")
+                except OSError as error:
+                    raise TaskTempError("AppServer termination and cleanup evidence unconfirmed: " + str(task_temp.path), task_temp.identity) from error
+                raise TaskTempError("task temporary cleanup blocked by live AppServer: " + str(task_temp.path), task_temp.identity)
+            self._task_temp_cleanup = task_temp.close()
+
+    def _close_process(self) -> None:
         """Idempotently release the App Server process and its stdio pipes."""
         if getattr(self, "_closed", False):
             return

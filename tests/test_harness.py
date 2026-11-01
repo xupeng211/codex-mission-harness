@@ -1066,6 +1066,7 @@ class HarnessTest(unittest.TestCase):
         "Codex CLI is not installed",
     )
     def test_codex_profile_denies_known_and_proc_recovered_auth_paths(self):
+        from harness.task_temp import TaskTemp
         executable = shutil.which("codex") or "/usr/lib/chatgpt/resources/codex"
         root = Path(self.tmp.name)
         codex_home = root / "codex.home"
@@ -1075,6 +1076,8 @@ class HarnessTest(unittest.TestCase):
         workspace = root / "sandbox-workspace"
         workspace.mkdir()
         profile = "cmh_delegated_adversarial"
+        task_temp = TaskTemp(str(workspace), profile, (codex_home,))
+        self.addCleanup(task_temp.close)
         script = """import os,sys
 expected=sys.argv[2]
 paths=[sys.argv[1]]
@@ -1107,7 +1110,7 @@ for path in dict.fromkeys(paths):
         pass
 print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         command = [
-            executable, *AppServerCodex._permissions_profile_overrides(str(codex_home), profile),
+            executable, *AppServerCodex._permissions_profile_overrides(str(codex_home), profile, task_temp),
             "-C", str(workspace), "sandbox", "--permission-profile", profile,
             "--", sys.executable, "-I", "-c", script, str(marker), str(codex_home),
             str(workspace),
@@ -1116,6 +1119,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
             "PATH": os.defpath, "HOME": "/nonexistent", "LANG": "C.UTF-8",
             "CODEX_HOME": str(codex_home),
         }
+        env.update(task_temp.environment())
         completed = subprocess.run(command, env=env, text=True, capture_output=True, timeout=30)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn(completed.stdout.strip(), {"BLOCKED:PROC", "BLOCKED:DIRECT_ONLY"})
@@ -1149,12 +1153,16 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         ])
         launch_argv = launch.call_args.args[0]
         self.assertIn('-c', launch_argv)
-        self.assertIn('default_permissions=":workspace"', launch_argv)
-        self.assertIn(f'permissions.{adapter._permissions_profile}.extends=":workspace"', launch_argv)
-        self.assertIn(
-            f'permissions.{adapter._permissions_profile}.filesystem={{"{codex_home}" = "deny"}}',
-            launch_argv,
-        )
+        self.assertIn(f'default_permissions="{adapter._permissions_profile}"', launch_argv)
+        self.assertFalse(any(".extends=" in arg for arg in launch_argv))
+        prefix = f'permissions.{adapter._permissions_profile}.filesystem='
+        table = next(arg[len(prefix):] for arg in launch_argv if arg.startswith(prefix))
+        rules = __import__("tomllib").loads("filesystem=" + table)["filesystem"]
+        self.assertEqual(rules[str(codex_home)], "deny")
+        self.assertEqual(rules[str(first)], "write")
+        self.assertEqual(rules[str(adapter._task_temp.path)], "write")
+        self.assertEqual(rules[":root"], "deny")
+        self.assertEqual(launch.call_args.kwargs["env"]["TMPDIR"], str(adapter._task_temp.path))
         self.assertIn(
             f"permissions.{adapter._permissions_profile}.network.enabled=false", launch_argv,
         )

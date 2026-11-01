@@ -474,6 +474,8 @@ class LocalCandidateTests(unittest.TestCase):
                 self.token_limit = token_limit
                 self.limits = [token_limit]
                 self.__class__.instances.append(self)
+            def _validate_task_temp(self):
+                pass  # This test isolates thread/token reuse, not filesystem policy.
             def execute(self, prompt, schema, thread_id=None, return_thread=False):
                 self.turn += 1
                 return {"output": {"summary": "done", "known_risks": []},
