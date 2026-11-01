@@ -20,10 +20,11 @@ from unittest.mock import patch
 
 from harness.codex import AppServerCodex
 from harness.factory import FactoryBlocked, READY, git
-from harness.factory_container import argv_for, recover, remove_owned, resources_for
+from harness.factory_container import argv_for, recover, remove_owned, resources_for, temporary_binding
 from harness.factory_remote import Remote
 from harness.factory_runtime import FactoryAppServer, LocalRuntime, RuntimeFailure
 from harness.factory_test_service import ProjectPostgres
+from harness.task_temp import allocate_directory
 import test_factory_controller_gates as controller_fixtures
 from test_factory_controller_gates import CONTAINER
 from test_factory_usage_scope import notification
@@ -250,21 +251,70 @@ class LifetimeAndAuthTests(unittest.TestCase):
 
     def test_durable_recovery_is_bound_and_does_not_replay_validation(self):
         with tempfile.TemporaryDirectory() as root:
-            directory = Path(root); temporary = directory / "cmh-validation-12345678"; temporary.mkdir(mode=0o700)
+            directory = Path(root)
             transcript = directory / "operation.raw"; name = "cmh-validate-" + "a" * 32
             spec = {"mission_id": "this"}; target = {"head": "a" * 40, "mission_scope_sha256": "b" * 64}
-            record = {"target": target, "mission_id": "this", "policy": CONTAINER, "profile": "targeted",
+            binding = temporary_binding(spec, target, name, transcript)
+            temporary, fd, identity = allocate_directory(directory, "cmh-validation-", binding)
+            os.close(fd)  # Simulate interruption: no held allocation fd survives.
+            marker = temporary / "owned-marker"; marker.write_text("original allocation")
+            record = {"version": 3, "target_sha256": binding["target_sha256"],
+                      "mission_id": "this", "policy": CONTAINER, "profile": "targeted",
                       "container_name": name, "temporary_directory": str(temporary),
+                      "temporary_directory_identity": identity,
                       "resources": resources_for(name, spec, target, False)}
-            plan = transcript.with_suffix(".container.json"); plan.write_text(json.dumps(record)); plan.chmod(0o600)
+            plan = transcript.with_suffix(".container.json")
+            moved = directory / "original-allocation"
+            rejected_cases = {}
             with patch("harness.factory_container.remove_owned", return_value=(True, 0)) as rm, \
-                    patch("harness.factory_container.subprocess.Popen") as launch:
-                rejected = recover(CONTAINER, {"mission_id": "other"}, target, ["make", "verify-targeted"], transcript)
-                self.assertFalse(rejected["cleanup_confirmed"]); rm.assert_not_called(); self.assertTrue(temporary.exists())
+                    patch("harness.factory_container.subprocess.Popen") as launch, \
+                    patch("harness.factory_container.subprocess.run") as run:
+                for kind in ("legacy", "version2", "missing-identity", "missing-nonce", "mission", "operation", "target", "resource", "replaced"):
+                    changed = copy.deepcopy(record)
+                    if kind in ("legacy", "version2"):
+                        changed.pop("temporary_directory_identity")
+                        if kind == "legacy":
+                            changed.pop("version"); changed.pop("target_sha256"); changed["target"] = target
+                        else:
+                            changed["version"] = 2
+                    if kind == "missing-identity": changed.pop("temporary_directory_identity")
+                    if kind == "missing-nonce": changed["temporary_directory_identity"].pop("nonce")
+                    if kind == "operation": changed["temporary_directory_identity"]["binding"]["operation_id"] = "other"
+                    if kind == "target": changed["target_sha256"] = "0" * 64
+                    if kind == "resource": changed["resources"][0]["labels"]["cmh.validation.mission"] = "other"
+                    if kind == "replaced":
+                        temporary.rename(moved); temporary.mkdir(mode=0o700)
+                        (temporary / "owned-marker").write_text("replacement must survive")
+                    raw = json.dumps(changed).encode(); plan.write_bytes(raw); plan.chmod(0o600)
+                    try:
+                        with self.subTest(kind=kind):
+                            rejected = recover(CONTAINER, {"mission_id": "other"} if kind == "mission" else spec,
+                                               target, ["make", "verify-targeted"], transcript)
+                            self.assertEqual(rejected["status"], "UNKNOWN", rejected)
+                            self.assertFalse(rejected["cleanup_confirmed"])
+                            self.assertFalse(rejected["operation_replayed"])
+                            rm.assert_not_called(); launch.assert_not_called(); run.assert_not_called()
+                            self.assertEqual(plan.read_bytes(), raw)
+                            self.assertEqual((moved if kind == "replaced" else temporary).stat().st_ino, identity["inode"])
+                            self.assertEqual((moved / "owned-marker").read_text() if kind == "replaced" else marker.read_text(), "original allocation")
+                            if kind == "replaced": self.assertEqual(marker.read_text(), "replacement must survive")
+                            rejected_cases[kind] = rejected
+                    finally:
+                        if kind == "replaced":
+                            marker.unlink(); temporary.rmdir(); moved.rename(temporary)  # Exact test replacement only.
+                raw = json.dumps(record).encode(); plan.write_bytes(raw); plan.chmod(0o600)
                 result = recover(CONTAINER, spec, target, ["make", "verify-targeted"], transcript)
-                self.assertTrue(result["cleanup_confirmed"]); self.assertFalse(result["operation_replayed"])
+                self.assertTrue(result["cleanup_confirmed"], result); self.assertFalse(result["operation_replayed"])
+                self.assertTrue(result["temporary_directory_cleanup_confirmed"])
+                self.assertEqual(result["temporary_directory_identity"], identity)
                 self.assertFalse(temporary.exists()); self.assertEqual(rm.call_count, 2); launch.assert_not_called()
-            self.assertEqual(json.loads(plan.read_text()), record)
+                run.assert_not_called()
+                self.assertEqual(rm.call_args_list[0].args, (name, name, record["resources"][0]["labels"]))
+                self.assertEqual(rm.call_args_list[1].args, (name + "-dependencies", name, record["resources"][1]["labels"]))
+            self.assertEqual(plan.read_bytes(), raw)
+            from test_factory_contract_binding import evidence
+            evidence("durable-recovery", {"record": record, "recovery": result, "rejected": rejected_cases,
+                "record_unchanged": True, "validation_launches": 0, "external_io": "remove_owned double only"})
 
     def test_both_controller_hops_keep_only_trusted_auth_and_agents_receive_none(self):
         with tempfile.TemporaryDirectory() as root:

@@ -181,24 +181,37 @@ class ContainerContractTests(unittest.TestCase):
         self.assertNotEqual(result["status"], "PASS")
         self.assertFalse(self.double.calls, "a mismatched approved base must be caught before resource creation")
 
-    def test_large_legal_target_written_by_real_runner_can_recover(self):
-        self.large_candidate()
-        self.double.cleanup_blocked = True
-        with self.double.hooks():
-            result = self.gate()
-        lifecycle = Path(result["lifecycle_record"])
-        raw = lifecycle.read_bytes()
-        self.double.cleanup_blocked = False
-        with self.double.hooks():
-            recovered = recover(fixtures.CONTAINER, self.spec, self.target, ["make", "verify-targeted"],
-                                self.root / "gate.raw")
-        evidence("large-lifecycle", {"file_count": len(self.target["files"]), "record_bytes": len(raw),
-            "record": json.loads(raw), "recovery": recovered, "clients_reaped": all(p.poll() is not None for p in self.double.clients)})
-        self.assertLessEqual(len(raw), 65536)
-        self.assertTrue(recovered["cleanup_confirmed"], recovered)
-        self.assertFalse(recovered["operation_replayed"])
-        self.assertEqual(lifecycle.read_bytes(), raw)
-        self.assertFalse(self.double.resources)
+    def test_small_and_large_legal_targets_written_by_real_runner_can_recover(self):
+        for size in ("small", "large"):
+            with self.subTest(size=size):
+                if size == "large":
+                    self.large_candidate()
+                self.double.cleanup_blocked = True
+                with self.double.hooks():
+                    result = self.gate(size)
+                lifecycle = Path(result["lifecycle_record"])
+                raw = lifecycle.read_bytes()
+                record = json.loads(raw)
+                self.assertEqual(record["version"], 3)
+                self.assertEqual(record["temporary_directory_identity"], result["temporary_directory_identity"])
+                self.assertTrue(Path(record["temporary_directory"]).is_dir())
+                self.double.cleanup_blocked = False
+                calls, clients = len(self.double.calls), len(self.double.clients)
+                with self.double.hooks():
+                    recovered = recover(fixtures.CONTAINER, self.spec, self.target, ["make", "verify-targeted"],
+                                        self.root / (size + ".raw"))
+                evidence(size + "-lifecycle", {"file_count": len(self.target["files"]), "record_bytes": len(raw),
+                    "record": record, "recovery": recovered,
+                    "clients_reaped": all(p.poll() is not None for p in self.double.clients)})
+                self.assertLessEqual(len(raw), 65536)
+                self.assertTrue(recovered["cleanup_confirmed"], recovered)
+                self.assertTrue(recovered["temporary_directory_cleanup_confirmed"])
+                self.assertFalse(Path(record["temporary_directory"]).exists())
+                self.assertFalse(recovered["operation_replayed"])
+                self.assertEqual(lifecycle.read_bytes(), raw)
+                self.assertFalse(self.double.resources)
+                self.assertEqual(len(self.double.clients), clients, "cleanup-only recovery must not launch clients")
+                self.assertTrue(all(phase == "rm" for phase, _ in self.double.calls[calls:]))
 
     def test_record_capacity_is_checked_before_resource_dispatch(self):
         resources = resources_for("cmh-validate-" + "a" * 32, self.spec, self.target, False)
@@ -221,26 +234,41 @@ class ContainerContractTests(unittest.TestCase):
         data = raw if raw is not None else json.dumps(record, sort_keys=True).encode()
         path.write_bytes(data)
         path.chmod(0o600)
-        with patch("harness.factory_container.remove_owned", return_value=(True, 0)) as remove:
+        with patch("harness.factory_container.remove_owned", return_value=(True, 0)) as remove, \
+                patch("harness.factory_container.subprocess.Popen") as launch, \
+                patch("harness.factory_container.subprocess.run") as run:
             result = recover(fixtures.CONTAINER, self.spec, expected_target or self.target,
                              ["make", "verify-targeted"], transcript)
+        launch.assert_not_called()
+        run.assert_not_called()
         self.assertEqual(path.read_bytes(), data)
         return result, remove
 
-    def test_legacy_small_and_large_records_recover_without_rewriting(self):
-        small = self.legacy_record(self.target)
-        result, remove = self.recover_record(small)
-        self.assertTrue(result["cleanup_confirmed"], result)
-        self.assertEqual(remove.call_count, 2)
-        self.assertFalse(Path(small["temporary_directory"]).exists())
-        self.large_candidate()
-        large = self.legacy_record(self.target)
-        self.assertGreater(len(json.dumps(large).encode()), 65536)
-        result, remove = self.recover_record(large)
-        evidence("legacy-lifecycle", {"large_record_bytes": len(json.dumps(large).encode()), "recovery": result})
-        self.assertTrue(result["cleanup_confirmed"], result)
-        self.assertEqual(remove.call_count, 2)
-        self.assertEqual(remove.call_args_list[0].args, (large["container_name"], large["container_name"], large["resources"][0]["labels"]))
+    def test_legacy_small_and_large_records_are_unknown_without_rewriting_or_cleanup(self):
+        for size in ("small", "large"):
+            with self.subTest(size=size):
+                if size == "large":
+                    self.large_candidate()
+                record = self.legacy_record(self.target)
+                temporary = Path(record["temporary_directory"])
+                marker = temporary / "owned-marker"
+                marker.write_text("legacy resource must be preserved")
+                info = temporary.stat()
+                record_bytes = len(json.dumps(record).encode())
+                if size == "large":
+                    self.assertGreater(record_bytes, 65536)
+                else:
+                    self.assertLess(record_bytes, 65536)
+                result, remove = self.recover_record(record)
+                self.assertEqual(result["status"], "UNKNOWN", result)
+                self.assertFalse(result["cleanup_confirmed"])
+                self.assertFalse(result["temporary_directory_cleanup_confirmed"])
+                self.assertFalse(result["operation_replayed"])
+                remove.assert_not_called()
+                self.assertEqual((temporary.stat().st_dev, temporary.stat().st_ino), (info.st_dev, info.st_ino))
+                self.assertEqual(marker.read_text(), "legacy resource must be preserved")
+                evidence("legacy-" + size + "-lifecycle", {"record_bytes": record_bytes, "recovery": result,
+                    "directory_preserved": True, "record_unchanged": True, "external_calls": 0})
 
     def test_compact_format_retains_64k_cap_even_with_large_expected_target(self):
         self.large_candidate()
