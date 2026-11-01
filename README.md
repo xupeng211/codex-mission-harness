@@ -32,7 +32,7 @@ python3 -m pip install --index-url https://pypi.org/simple -e .
 
 已有本仓库时可以从虚拟环境步骤开始；该 GitHub 仓库为私有仓库，需要有访问权限并先完成 `gh auth login`。
 
-以后打开新的终端时，进入这个目录，执行 `source .venv/bin/activate`，就可以使用 `harness`。
+以后打开新的终端时，进入这个目录，执行 `source .venv/bin/activate`，就可以使用 `harness`。以上安装运行时依赖；维护者运行仓库回归前，还需按文末步骤安装测试依赖。
 
 ## 一次性登录、配置项目
 
@@ -167,7 +167,18 @@ Reviewer V2 的 chunk/group/synthesis 和旧 qualification 路径已 deprecated�
 
 [架构说明](docs/FACTORY_ARCHITECTURE.md) · [历史迁移验证](docs/FACTORY_VALIDATION.md)
 
-维护者的本地验证：`make verify`。真实验收脚本 `scripts/factory_acceptance.py` 必须显式提供新输出目录和配置，CI/unit tests 不会发起付费模型调用。
+维护者先在仓库根目录准备独立 Python 环境并安装测试依赖（已有 `.venv` 时复用即可）：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install --disable-pip-version-check --index-url https://pypi.org/simple -e '.[test]'
+```
+
+CI 使用同一条安装命令。`test` extra 提供固定合同权威回归实际执行的
+`pytest==9.0.2` 和 `ruff==0.14.9`，与下述固定 FootballPrediction 源码的依赖一致；
+它们只用于测试，不增加日常运行时依赖。准备好下述固定合同后，在该环境运行
+`make verify`。真实验收脚本 `scripts/factory_acceptance.py` 必须显式提供新输出目录和配置，CI/unit tests 不会发起付费模型调用。
 
 完整 `make verify` / `make test` 必须能读取 FootballPrediction 的完整固定合同源码：
 HEAD `a65464d1e5de498a072ed9a8fdf69ce46bcc04c5`，tree
