@@ -303,6 +303,8 @@ class LifetimeAndAuthTests(unittest.TestCase):
                         if kind == "replaced":
                             marker.unlink(); temporary.rmdir(); moved.rename(temporary)  # Exact test replacement only.
                 raw = json.dumps(record).encode(); plan.write_bytes(raw); plan.chmod(0o600)
+                from test_factory_container_lifecycle import seal_no_clients
+                seal_no_clients(transcript, record)
                 result = recover(CONTAINER, spec, target, ["make", "verify-targeted"], transcript)
                 self.assertTrue(result["cleanup_confirmed"], result); self.assertFalse(result["operation_replayed"])
                 self.assertTrue(result["temporary_directory_cleanup_confirmed"])

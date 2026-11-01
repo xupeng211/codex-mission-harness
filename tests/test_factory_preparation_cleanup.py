@@ -192,9 +192,9 @@ def run_case(mode, root):
                             import harness.factory_container as container
                             source_check = container.source_check
                             report['source_phases'] = []
-                            def source_probe(runtime, request, stage, *args):
+                            def source_probe(runtime, request, stage, *args, **kwargs):
                                 report['source_phases'].append(stage)
-                                return source_check(runtime, request, stage, *args)
+                                return source_check(runtime, request, stage, *args, **kwargs)
                             docker_hooks.enter_context(patch.object(container, 'source_check', side_effect=source_probe))
                         else:
                             docker_hooks.enter_context(double.hooks())

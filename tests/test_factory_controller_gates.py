@@ -9,12 +9,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
 from harness.adapters import GateResult
 from harness.factory import Factory, FactoryBlocked, READY, git
-from harness.factory_container import argv_for, binding, run as container_run, source_fingerprint
+from harness.factory_container import argv_for, binding, source_fingerprint
 from harness.factory_project import validate_review_limits, verify_target, FootballPredictionContract
 from harness.factory_remote import Remote, identity
 from harness.factory_runtime import LocalRuntime
@@ -30,7 +31,7 @@ LIMITS = {"approval_id": "offline-test-only", "max_deepseek_chunks": 2,
           "max_canonical_diff_bytes": 100000, "allow_unknown_provider_usage": True}
 
 
-def local_source_check(runtime, request, phase, log, cancel, deadline):
+def local_source_check(runtime, request, phase, log, cancel, deadline, *, clients=None):
     """Keep real source checks for fixtures whose policy is an in-process stub.
 
     Real cancellable source-query clients are tested separately against the
@@ -214,7 +215,7 @@ class ControllerGatesTests(unittest.TestCase):
                     patch("harness.factory_container.subprocess.Popen", side_effect=popen), \
                     patch("harness.factory_container.subprocess.check_output", side_effect=output), \
                     patch("harness.factory_container.subprocess.run", side_effect=command):
-                result = container_run(runtime, CONTAINER, self.spec, self.cwd, self.target, ["make", "verify-" + profile],
+                result = runtime.container_gate(CONTAINER, self.spec, self.cwd, self.target, ["make", "verify-" + profile],
                                        transcript, timeout)
         finally:
             signal.alarm(0)
@@ -393,11 +394,35 @@ class LiveProtocolDouble(project_fixtures.ProjectRuntime):
         return {**result, "fixture": False, "OFFLINE_DOUBLE": True}
 
     def container_gate(self, policy, spec, cwd, target, command, transcript, timeout):
+        # This double starts NO clients/containers. Explicitly close that plan
+        # with the product allocation/writer/remover; do not exempt fixtures
+        # from Factory's original stop-evidence checks.
+        from harness.factory_container import resources_for, temporary_binding
+        from harness.task_temp import allocate_directory, remove_directory
+        from test_factory_container_lifecycle import seal_no_clients
+        name = "cmh-validate-" + uuid.uuid4().hex
+        directory, fd, allocation = allocate_directory(transcript.parent, "cmh-validation-",
+                                                       temporary_binding(spec, target, name, transcript))
+        record = {"version": 3, "mission_id": spec["mission_id"], "target_sha256": allocation["binding"]["target_sha256"],
+                  "policy": policy, "profile": command[-1][7:], "container_name": name,
+                  "resources": resources_for(name, spec, target, command[-1] != "verify-targeted"),
+                  "temporary_directory": str(directory), "temporary_directory_identity": allocation}
+        lifecycle = transcript.with_suffix(".container.json")
+        try:
+            with lifecycle.open("x") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                json.dump(record, stream, sort_keys=True)
+            proof = seal_no_clients(transcript, record)
+            remove_directory(directory, allocation, held_fd=fd)
+        finally:
+            os.close(fd)
         transcript.write_text("OFFLINE container double; no Docker execution")
         return {"status": "PASS", "exit_code": 0, "target": target, "fixture": False,
                 "profile": command[-1][7:], "image_id": IMAGE, "OFFLINE_DOUBLE": True,
                 "mission_id": spec["mission_id"], "scope_sha256": target["mission_scope_sha256"],
-                "container_policy": policy}
+                "container_policy": policy, "lifecycle_record": str(lifecycle), "client_stop_evidence": proof,
+                "local_clients_stop_confirmed": True, "cleanup_confirmed": True,
+                "dependencies_cleanup_confirmed": True, "temporary_directory_cleanup_confirmed": True}
 
     def project_remote(self, action, policy, spec, cwd, target, body, transcript, timeout, **kwargs):
         transcript.write_text("OFFLINE remote double; no GitHub writes")

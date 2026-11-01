@@ -282,6 +282,14 @@ class ContainerContractTests(unittest.TestCase):
         record["padding"] = "x" * (LIFECYCLE_LIMIT - len(json.dumps(record, sort_keys=True).encode()))
         boundary = json.dumps(record, sort_keys=True).encode()
         self.assertEqual(len(boundary), LIFECYCLE_LIMIT)
+        # Publish a genuine closed no-client plan for these capacity bytes;
+        # changing the record AFTER a stop proof must invalidate its hash.
+        plan = self.root / "legacy.container.json"
+        plan.write_bytes(boundary)
+        journal = self.root / "legacy.container.clients.jsonl"
+        journal.unlink()  # Replace only this fixture's earlier sealed plan.
+        from test_factory_container_lifecycle import seal_no_clients
+        seal_no_clients(self.root / "legacy.raw", record)
         # All other bindings and the original allocation remain valid, so an
         # over-capacity rejection cannot be caused by another invalid field.
         recovered, remove = self.recover_record(record, raw=boundary + b" ")

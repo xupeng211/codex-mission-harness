@@ -10,11 +10,27 @@ import time
 import unittest
 from unittest.mock import patch
 
-from harness.factory_container import remove_owned
+from harness.factory_container import remove_owned, _ClientStops
 from harness.factory_runtime import LocalRuntime
 import test_factory_controller_gates as fixtures
 
 CONTAINER, IMAGE = fixtures.CONTAINER, fixtures.IMAGE
+
+
+def seal_no_clients(transcript, record):
+    """Directory-identity fixtures explicitly launch no clients; close that plan.
+
+    Full gate/Factory tests below and in recovery_stops exercise real clients.
+    This uses the product writer, not a fabricated successful process stop.
+    """
+    runtime = LocalRuntime()
+    execution = runtime.begin_execution(record["mission_id"])
+    clients = _ClientStops(runtime, transcript, record, transcript.with_suffix(".container.json").read_bytes())
+    try:
+        return clients.seal()
+    finally:
+        clients.close()
+        runtime.end_execution(execution)
 
 
 class DockerDouble:

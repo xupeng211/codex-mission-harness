@@ -687,7 +687,8 @@ class Factory:
             if getattr(exc, "remote_cleanup", None) is not None:
                 result["remote_cleanup"] = exc.remote_cleanup
         raw_paths = [p for p in (transcript, transcript.with_suffix(".stderr"), transcript.with_suffix(".proxy.jsonl"),
-                                transcript.with_suffix(".container.json"), transcript.with_suffix(".stdout"),
+                                transcript.with_suffix(".container.json"), transcript.with_suffix(".container.clients.jsonl"),
+                                transcript.with_suffix(".stdout"),
                                 transcript.with_suffix(".cleanup.json"), transcript.with_suffix(".temp.json"),
                                 transcript.with_suffix(".temp.cleanup.jsonl")) if p.is_file()]
         result["raw_evidence"] = [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in raw_paths]
@@ -1418,10 +1419,57 @@ class Factory:
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
             raise FactoryBlocked("UNKNOWN", "temporary cleanup evidence invalid: " + str(error)) from error
 
+    def verify_container_client_stops(self, mission):
+        """Read only; neither a late event nor container absence supplies stops."""
+        if not self.project or self.config["simulation"] or "project_container" not in self.config:
+            return
+        from .factory_container import client_stop_evidence, LIFECYCLE_LIMIT, temporary_binding
+        try:
+            for operation in self.db.execute("SELECT * FROM operations WHERE mission=? AND paid=0 "
+                                             "AND stage IN ('checks','ci')", (mission,)):
+                result = json.loads(operation["result"] or "{}")
+                transcript = self.root / "evidence" / mission / (operation["id"] + ".raw")
+                lifecycle = transcript.with_suffix(".container.json")
+                if not result.get("lifecycle_record") and not lifecycle.exists():
+                    payload = json.loads(operation["input"])
+                    if ("trusted_validation" in self.config
+                            and payload.get("validation") == self.config["trusted_validation"]):
+                        continue  # The distinct formal executor has its own receipt.
+                    raise ValueError("container client lifecycle/stop evidence is missing")
+                with os.fdopen(os.open(lifecycle, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
+                    info = os.fstat(stream.fileno())
+                    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                            or stat.S_IMODE(info.st_mode) & 0o077 or info.st_size > LIFECYCLE_LIMIT):
+                        raise ValueError("untrusted container lifecycle evidence")
+                    raw = stream.read(LIFECYCLE_LIMIT + 1)
+                if len(raw) > LIFECYCLE_LIMIT:
+                    raise ValueError("container lifecycle evidence exceeds capacity")
+                record = json.loads(raw)
+                payload = json.loads(operation["input"])
+                spec = json.loads(self.row(mission)["spec"])
+                identity = record["temporary_directory_identity"]
+                if (not isinstance(identity, dict) or record["mission_id"] != mission
+                        or record.get("target_sha256") != digest(payload["target"])
+                        or identity.get("binding") != temporary_binding(spec, payload["target"], record["container_name"], transcript)):
+                    raise ValueError("container client lifecycle task/operation/target changed")
+                proof = client_stop_evidence(transcript, record, raw)
+                if operation["evidence"]:
+                    self.verify_evidence(operation)
+                    if (json.loads(Path(operation["evidence"]).read_bytes()) != {
+                            "operation": operation["id"], "identity": json.loads(operation["identity"]),
+                            "input": payload, "result": result}
+                            or result.get("local_clients_stop_confirmed") is not True
+                            or result.get("client_stop_evidence") != proof
+                            or {"path": proof["path"], "sha256": proof["sha256"]} not in result.get("raw_evidence", [])):
+                        raise ValueError("container client stop evidence lacks its immutable operation binding")
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise FactoryBlocked("UNKNOWN", "container local clients not confirmed stopped: " + str(error)) from error
+
     def report(self, mission):
         temporary_error = None
         try:
             self.verify_temporary_cleanup(mission)
+            self.verify_container_client_stops(mission)
         except FactoryBlocked as error:
             temporary_error = error.reason
         report = self._report(mission, temporary_error)
@@ -1653,11 +1701,20 @@ class Factory:
                         raise ValueError("completed container cleanup proof is incomplete or mismatched")
                     if all(result.get(key) is True for key in ("cleanup_confirmed", "dependencies_cleanup_confirmed",
                                                               "temporary_directory_cleanup_confirmed")):
+                        # Already-cleaned resources still require original stop
+                        # evidence; the operation's hash is checked above.
+                        from .factory_container import client_stop_evidence
+                        record = json.loads(Path(lifecycle).read_bytes())
+                        proof = client_stop_evidence(transcript, record, Path(lifecycle).read_bytes())
+                        if (result.get("local_clients_stop_confirmed") is not True
+                                or result.get("client_stop_evidence") != proof):
+                            raise ValueError("completed container local stop evidence is missing or changed")
                         continue
                 cleanup = self.runtime.recover_container(self.config["project_container"], spec, payload["target"],
                                                          payload["command"], transcript)
             except Exception as error:
-                cleanup = {"cleanup_confirmed": False, "operation_replayed": False, "error_type": type(error).__name__}
+                cleanup = {"cleanup_confirmed": False, "operation_replayed": False, "status": "UNKNOWN",
+                           "error_type": type(error).__name__}
             cleanups.append(cleanup)
             self.event(mission, "container_cleanup_recovered", {"operation_id": pending["id"], "cleanup": cleanup})
             self.db.commit()  # Append evidence only; the operation/UNKNOWN is immutable.
@@ -1667,6 +1724,7 @@ class Factory:
         try:
             self.verify_temporary_cleanup(mission)
             cleanups = self.recover_interrupted_containers(mission)
+            self.verify_container_client_stops(mission)
             if self.cancel_requested(mission):
                 note = ("; cleanup confirmed" if all(c.get("cleanup_confirmed") for c in cleanups)
                         else "; cleanup not confirmed; see exact operation evidence") if cleanups else ""

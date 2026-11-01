@@ -350,10 +350,10 @@ class RemainingPreparationTests(unittest.TestCase):
         self.double.popen = launch
         # Retain a reference before patching the gate's query function.
         real_query = container.source_check
-        def selected_query(runtime, request, stage, log, event, deadline):
+        def selected_query(runtime, request, stage, log, event, deadline, **kwargs):
             if stage == phase:
-                return real_query(runtime, request, stage, log, event, deadline)
-            return gates.local_source_check(runtime, request, stage, log, event, deadline)
+                return real_query(runtime, request, stage, log, event, deadline, **kwargs)
+            return gates.local_source_check(runtime, request, stage, log, event, deadline, **kwargs)
         def work():
             try:
                 results.append(self.runtime.container_gate(gates.CONTAINER, self.fx.spec, self.fx.cwd,

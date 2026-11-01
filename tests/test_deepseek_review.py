@@ -24,7 +24,7 @@ TEST_SECRET = "unit-test-review-secret"
 def process_is_live(pid):
     try:
         return Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1][0] != "Z"
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return False
 
 _validate = review.validate
@@ -126,6 +126,15 @@ def run_fixture(root, *, large_diff=False):
     return args, Path(args.evidence)
 
 class DeepSeekReceiptTest(unittest.TestCase):
+    def test_process_liveness_helper_accepts_only_disappeared_process_errors(self):
+        for error in (FileNotFoundError(2, "gone"), ProcessLookupError(3, "gone")):
+            with self.subTest(error=type(error).__name__), patch.object(Path, "read_text", side_effect=error):
+                self.assertFalse(process_is_live(123))
+        for error in (PermissionError(13, "denied"), OSError(5, "read failed")):
+            with self.subTest(error=type(error).__name__), patch.object(Path, "read_text", side_effect=error):
+                with self.assertRaises(type(error)):
+                    process_is_live(123)
+
     def test_reviewer_output_is_bounded_before_read_or_receipt(self):
         program = f"import sys;sys.stdout.write('x'*{review.MAX_REVIEW_OUTPUT_BYTES + 1})"
         with self.assertRaisesRegex(ValueError, "output exceeds bound"):

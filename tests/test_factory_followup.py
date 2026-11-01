@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from harness.factory_container import RedactedOutput, remove_owned, resources_for, run as container_run
+from harness.factory_container import RedactedOutput, remove_owned, resources_for
 from harness.factory_runtime import LocalRuntime
 import test_factory_controller_gates as fixtures
 import test_factory_delivery_limits as limits_fixtures
@@ -82,7 +82,7 @@ class CredentialPersistenceTests(unittest.TestCase):
                 patch("harness.factory_container.ProjectPostgres", Service), \
                 patch("harness.factory_container.subprocess.Popen", side_effect=launch), \
                 patch("harness.factory_container.subprocess.run", side_effect=command):
-            result = container_run(LocalRuntime(), fixtures.CONTAINER, fx.spec, fx.cwd, fx.target,
+            result = LocalRuntime().container_gate(fixtures.CONTAINER, fx.spec, fx.cwd, fx.target,
                                    ["make", "verify-pr"], transcript, 5)
         observer.join(5)
         self.assertTrue(ready.is_set(), "output must be persisted before process completion")
@@ -122,7 +122,7 @@ class CancelledRecoveryTests(unittest.TestCase):
         self.f.cancel("feature")
         return old, paid
 
-    def test_cancelled_resume_only_recovers_resources_without_replay_or_settling_unknown(self):
+    def test_cancelled_resume_does_not_accept_adapter_success_without_original_stop_proof(self):
         old, paid = self.interrupted()
         evidence = Path(old["evidence"]).read_bytes()
         with patch.object(self.runtime, "recover_container", create=True,
@@ -130,7 +130,8 @@ class CancelledRecoveryTests(unittest.TestCase):
                 patch.object(self.runtime, "container_gate") as validation, \
                 patch.object(self.f, "prepare", side_effect=AssertionError("cancelled resume must not prepare")):
             result = self.f.run("feature")
-        self.assertEqual(result["DELIVERY_STATUS"], "CANCELLED")
+        self.assertEqual(result["DELIVERY_STATUS"], "UNKNOWN")
+        self.assertIn("not confirmed stopped", " ".join(result["BLOCKERS_REMAINING"]))
         self.assertEqual(cleanup.call_count, 1)
         validation.assert_not_called()
         self.assertEqual(old, dict(self.f.db.execute("SELECT * FROM operations WHERE id=?", (old["id"],)).fetchone()))
@@ -143,8 +144,8 @@ class CancelledRecoveryTests(unittest.TestCase):
                           return_value={"cleanup_confirmed": False, "operation_replayed": False}) as cleanup:
             report = self.f.run("feature")
         self.assertEqual(cleanup.call_count, 1)
-        self.assertIn("cleanup not confirmed", " ".join(report["BLOCKERS_REMAINING"]))
-        self.assertEqual(report["DELIVERY_STATUS"], "CANCELLED")
+        self.assertIn("not confirmed stopped", " ".join(report["BLOCKERS_REMAINING"]))
+        self.assertEqual(report["DELIVERY_STATUS"], "UNKNOWN")
 
     def test_cancelled_resume_refuses_another_tasks_lifecycle_record(self):
         old, _ = self.interrupted()
@@ -160,8 +161,8 @@ class CancelledRecoveryTests(unittest.TestCase):
         with patch.object(self.runtime, "recover_container", create=True, side_effect=LocalRuntime().recover_container), \
                 patch("harness.factory_container.remove_owned") as remove:
             report = self.f.run("feature")
-        self.assertEqual(report["DELIVERY_STATUS"], "CANCELLED")
-        self.assertIn("cleanup not confirmed", " ".join(report["BLOCKERS_REMAINING"]))
+        self.assertEqual(report["DELIVERY_STATUS"], "UNKNOWN")
+        self.assertIn("not confirmed stopped", " ".join(report["BLOCKERS_REMAINING"]))
         remove.assert_not_called()
         self.assertTrue(temporary.exists())
 

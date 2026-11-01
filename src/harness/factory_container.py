@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import io
+import hashlib
 import json
 import math
 import re
@@ -24,6 +25,137 @@ ENV = {"PATH": SAFE_PATH, "HOME": "/nonexistent", "LANG": "C.UTF-8",
        "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
        "GIT_NO_REPLACE_OBJECTS": "1", "GIT_TERMINAL_PROMPT": "0"}
 LIFECYCLE_LIMIT = 65536
+
+
+def client_stop_evidence(transcript, record, lifecycle_raw):
+    """Read only. A closed, complete journal is required even if Docker is absent.
+
+    This records the existing owned-client group proof, not a restart-time PID
+    probe or permission to signal/adopt an old execution. The private evidence
+    directory is Controller-owned; completed operations also bind its raw hash.
+    """
+    path = Path(transcript).with_suffix(".container.clients.jsonl")
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (path.is_symlink() or path.resolve(strict=True) != path or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077
+                or info.st_size > LIFECYCLE_LIMIT):
+            raise ValueError("untrusted container client stop evidence")
+        raw = stream.read(LIFECYCLE_LIMIT + 1)
+    lines = raw.splitlines(keepends=True)
+    if len(raw) > LIFECYCLE_LIMIT or len(lines) < 2 or any(not line.endswith(b"\n") for line in lines):
+        raise ValueError("incomplete or oversized container client stop evidence")
+    rows = [json.loads(line) for line in lines]
+    header, seal = rows[0], rows[-1]
+    if (not isinstance(header, dict) or header.get("event") != "open"
+            or type(header.get("version")) is not int or header["version"] != 1
+            or header.get("operation") != str(transcript)
+            or header.get("lifecycle_sha256") != hashlib.sha256(lifecycle_raw).hexdigest()
+            or header.get("temporary_directory_identity") != record["temporary_directory_identity"]
+            or not re.fullmatch(r"[a-f0-9]{32}", str(header.get("execution_id", "")))):
+        raise ValueError("container client stop task/operation/allocation binding changed")
+    controller = header["controller"]
+    if (not isinstance(controller, dict) or controller["uid"] != os.getuid() or type(controller["pid"]) is not int
+            or controller["pid"] <= 0 or not isinstance(controller["starttime"], str)
+            or not controller["starttime"].isdecimal()):
+        raise ValueError("container client Controller identity is incomplete")
+    if (not isinstance(seal, dict) or seal.get("event") != "sealed"
+            or seal.get("sha256") != hashlib.sha256(b"".join(lines[:-1])).hexdigest()
+            or type(seal.get("clients")) is not int or len(rows) != 2 + seal["clients"] * 3):
+        raise ValueError("container client dispatch phase is not completely sealed")
+    for index in range(seal["clients"]):
+        intent, started, stopped = rows[1 + index * 3:4 + index * 3]
+        if (any(not isinstance(v, dict) or type(v.get("client")) is not int or v["client"] != index + 1
+                for v in (intent, started, stopped))
+                or intent.get("event") != "intent" or started.get("event") != "started"
+                or stopped.get("event") != "stopped" or intent.get("role") not in {"preparation", "validation"}
+                or intent.get("cwd") != record["temporary_directory"]
+                or not re.fullmatch(r"[a-f0-9]{64}", str(intent.get("argv_sha256", "")))):
+            raise ValueError("container client registration is missing or incomplete")
+        identity = started["identity"]
+        if (not isinstance(identity, dict)
+                or any(type(identity.get(k)) is not int for k in ("pid", "ppid", "uid", "pgid", "sid"))
+                or not isinstance(identity.get("starttime"), str) or not identity["starttime"].isdecimal()
+                or identity["pid"] <= 0 or identity["ppid"] != controller["pid"]
+                or identity["uid"] != controller["uid"] or identity["pgid"] != identity["pid"]
+                or identity["sid"] != identity["pid"] or stopped.get("identity") != identity
+                or stopped.get("mission") != record["mission_id"] or stopped.get("confirmed") is not True
+                or stopped.get("leader_reaped") is not True):
+            raise ValueError("container client original owned-group stop is unconfirmed")
+    return {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest(), "clients": seal["clients"]}
+
+
+class _ClientStops:
+    """One gate's append-only dispatch/stop journal. No restart-time adoption.
+
+    Intent is fsynced before Popen. Any partial launch/registration/stop/write
+    leaves an unsealed journal. Only the synchronous gate owner can seal after
+    its last query; sealing disables further dispatch before publishing proof.
+    """
+    def __init__(self, runtime, transcript, record, raw):
+        self.transcript, self.record, self.lifecycle_raw = transcript, record, raw
+        self.path = Path(transcript).with_suffix(".container.clients.jsonl")
+        self.raw, self.count, self.pending, self.closed, self.failed = b"", 0, None, False, False
+        self.stream = self.path.open("xb")
+        os.fchmod(self.stream.fileno(), 0o600)
+        try:
+            self._append({"event": "open", "version": 1, "operation": str(transcript),
+                          "lifecycle_sha256": hashlib.sha256(raw).hexdigest(),
+                          "temporary_directory_identity": record["temporary_directory_identity"],
+                          "execution_id": runtime._execution_id,
+                          "controller": runtime._client_process_identity(os.getpid())})
+            fd = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except BaseException:
+            self.stream.close()
+            raise
+
+    def _append(self, value):
+        try:
+            data = (json.dumps(value, sort_keys=True) + "\n").encode()
+            if self.failed or len(self.raw) + len(data) > LIFECYCLE_LIMIT:
+                raise ValueError("container client stop evidence capacity/write failure")
+            self.stream.write(data)
+            self.stream.flush()
+            os.fsync(self.stream.fileno())
+            self.raw += data
+        except BaseException:
+            self.failed = True
+            raise
+
+    def intent(self, argv, cwd, role):
+        if self.closed or self.pending is not None:
+            raise ValueError("container client dispatch is closed or an earlier stop is unconfirmed")
+        self.count += 1
+        self.pending = "intent"
+        self._append({"event": "intent", "client": self.count, "role": role, "cwd": str(cwd),
+                      "argv_sha256": hashlib.sha256(json.dumps(argv).encode()).hexdigest()})
+
+    def started(self, identity):
+        self._append({"event": "started", "client": self.count, "identity": identity})
+        self.pending = "started"
+
+    def stopped(self, cleanup):
+        self._append({"event": "stopped", "client": self.count,
+                      **{k: cleanup[k] for k in ("identity", "mission", "confirmed", "leader_reaped")}})
+        if self.pending == "started" and cleanup["confirmed"] is True and cleanup["leader_reaped"] is True:
+            self.pending = None
+
+    def seal(self):
+        if self.closed:
+            raise ValueError("container client dispatch was already closed")
+        self.closed = True
+        if self.pending is not None:
+            raise ValueError("container local client stop/registration is incomplete")
+        self._append({"event": "sealed", "clients": self.count, "sha256": hashlib.sha256(self.raw).hexdigest()})
+        return client_stop_evidence(self.transcript, self.record, self.lifecycle_raw)
+
+    def close(self):
+        self.closed = True
+        self.stream.close()
 
 
 class RedactedOutput:
@@ -91,7 +223,7 @@ def check_stopped(cancel, deadline):
 
 
 def _gate_client(runtime, argv, cwd, log, cancel, deadline, *, cleanups, env=ENV,
-                 stderr_log=None, password=None):
+                 stderr_log=None, password=None, clients=None, role="preparation"):
     """One sequential gate client, including main validation, owns its group."""
     from .factory_runtime import RuntimeFailure
     with runtime._execution_lock:
@@ -100,6 +232,8 @@ def _gate_client(runtime, argv, cwd, log, cancel, deadline, *, cleanups, env=ENV
             raise ExecutionStopped("CANCELLED")
         if runtime.current_process is not None or runtime._preparation_client is not None:
             raise RuntimeFailure("another client still owns this execution")
+        if clients is not None:
+            clients.intent(argv, cwd, role)
         proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE if stderr_log is not None else subprocess.STDOUT,
                                 start_new_session=True)
@@ -112,6 +246,8 @@ def _gate_client(runtime, argv, cwd, log, cancel, deadline, *, cleanups, env=ENV
     original_error = None
     try:
         client["identity"] = runtime._client_process_identity(proc.pid)
+        if clients is not None:
+            clients.started(client["identity"])
         def exited():
             with runtime._execution_lock:
                 status = runtime._owned_client_leader(client)
@@ -134,6 +270,12 @@ def _gate_client(runtime, argv, cwd, log, cancel, deadline, *, cleanups, env=ENV
                        "errors": [f"{type(error).__name__}: {error}"]}
         cleanup["exit_code"] = proc.returncode if proc.returncode is not None else client.get("exit_code")
         cleanup["diagnostics_complete"] = original_error is None
+        if clients is not None:
+            try:
+                clients.stopped(cleanup)
+            except (OSError, ValueError) as error:
+                cleanup["stop_evidence_error"] = type(error).__name__
+                cleanup["diagnostics_complete"] = False
         # Diagnostic failure must neither bypass group shutdown nor replace
         # the original command/cancellation error. Try each sink independently.
         for stream in (proc.stdout, getattr(proc, "stderr", None), output, error_output):
@@ -163,21 +305,21 @@ def _gate_client(runtime, argv, cwd, log, cancel, deadline, *, cleanups, env=ENV
     return proc.returncode
 
 
-def prepare_client(runtime, argv, cwd, log, cancel, deadline, *, env=ENV, stderr_log=None):
+def prepare_client(runtime, argv, cwd, log, cancel, deadline, *, env=ENV, stderr_log=None, clients=None):
     """A preparation client belongs to the same execution as validation."""
     try:
         return _gate_client(runtime, argv, cwd, log, cancel, deadline,
-                            cleanups=runtime._preparation_cleanups, env=env, stderr_log=stderr_log)
+                            cleanups=runtime._preparation_cleanups, env=env, stderr_log=stderr_log, clients=clients)
     except BaseException as error:
         if hasattr(error, "client_cleanup"):
             error.preparation_cleanup = error.client_cleanup
         raise
 
 
-def captured_client(runtime, argv, cwd, cancel, deadline, *, env=ENV):
+def captured_client(runtime, argv, cwd, cancel, deadline, *, env=ENV, clients=None):
     output, error = io.BytesIO(), io.BytesIO()
     try:
-        code = prepare_client(runtime, argv, cwd, output, cancel, deadline, env=env, stderr_log=error)
+        code = prepare_client(runtime, argv, cwd, output, cancel, deadline, env=env, stderr_log=error, clients=clients)
     except BaseException as failure:
         # Keep already captured, separate output on failure too. These bytes
         # are not placed in cleanup metadata or interpolated into diagnostics.
@@ -186,7 +328,7 @@ def captured_client(runtime, argv, cwd, cancel, deadline, *, env=ENV):
     return subprocess.CompletedProcess(argv, code, output.getvalue(), error.getvalue())
 
 
-def source_check(runtime, request, phase, log, cancel, deadline):
+def source_check(runtime, request, phase, log, cancel, deadline, *, clients=None):
     """Keep this gate's existing Git/policy/source checks in its process group.
 
     The Controller code and original verifiers are unchanged. Running this
@@ -215,7 +357,7 @@ print(json.dumps(result))
 """
     result = captured_client(runtime,
         [sys.executable, "-I", "-B", "-c", code, str(Path(__file__).resolve().parents[1]), str(request), phase],
-        request.parent, cancel, deadline)
+        request.parent, cancel, deadline, clients=clients)
     if result.returncode:
         log.write(result.stdout + result.stderr)
         raise ValueError("Controller source verification failed")
@@ -336,7 +478,8 @@ def recover(policy, spec, target, command, transcript):
     from .factory import digest
     path = Path(transcript).with_suffix(".container.json")
     result = {"target": target, "mission_id": spec["mission_id"], "cleanup_confirmed": False,
-              "operation_replayed": False, "resources": [], "temporary_directory_cleanup_confirmed": False}
+              "operation_replayed": False, "resources": [], "temporary_directory_cleanup_confirmed": False,
+              "local_clients_stop_confirmed": False}
     temporary_fd = -1
     try:
         # Bound reads still permit diagnosis of old records, but missing original
@@ -377,6 +520,11 @@ def recover(policy, spec, target, command, transcript):
         result["temporary_directory_identity"] = identity
         temporary_fd = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         _validate_directory(temporary_fd, identity)
+        # The journal must be sealed after ALL directory-using clients stopped,
+        # including preparation, source queries, service startup and validation.
+        # Old v3 directory identities without this evidence remain UNKNOWN.
+        result["client_stop_evidence"] = client_stop_evidence(transcript, record, raw)
+        result["local_clients_stop_confirmed"] = True
         for resource in expected:
             cleaned, code = remove_owned(resource["name"], name, resource["labels"])
             result["resources"].append({"name": resource["name"], "cleanup_confirmed": cleaned, "exit_code": code})
@@ -386,6 +534,8 @@ def recover(policy, spec, target, command, transcript):
                              claim_log=Path(transcript).with_suffix(".container.claims.jsonl"))
             result["temporary_directory_cleanup_confirmed"] = True
         result["cleanup_confirmed"] &= result["temporary_directory_cleanup_confirmed"]
+        if not result["cleanup_confirmed"]:
+            result["status"] = "UNKNOWN"
     except (OSError, ValueError, KeyError, TypeError, TaskTempError, subprocess.SubprocessError) as error:
         result["cleanup_confirmed"] = False
         result["temporary_directory_cleanup_confirmed"] = False
@@ -417,6 +567,7 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
     resources = resources_for(name, spec, target, needs_postgres)
     temporary, temporary_fd, temporary_identity = allocate_directory(
         transcript.parent, "cmh-validation-", temporary_binding(spec, target, name, transcript))
+    clients = None
     try:
         workspace = Path(temporary) / "source"
         service = None
@@ -443,6 +594,7 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                 os.fsync(stream.fileno())
             result["lifecycle_record"] = str(lifecycle)
             try:
+                clients = _ClientStops(runtime, transcript, record, raw)
                 check_stopped(cancel, deadline)
                 request = Path(temporary) / "source-check.json"
                 with request.open("x") as stream:
@@ -450,8 +602,8 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                     json.dump({"spec": spec, "cwd": str(cwd), "target": target, "workspace": str(workspace)}, stream)
                 def client(argv, *, env=ENV, timeout):
                     return captured_client(runtime, argv, temporary, cancel,
-                                           min(deadline, time.monotonic() + timeout), env=env)
-                before = source_check(runtime, request, "candidate", log, cancel, deadline)["source"]
+                                           min(deadline, time.monotonic() + timeout), env=env, clients=clients)
+                before = source_check(runtime, request, "candidate", log, cancel, deadline, clients=clients)["source"]
                 result["source_before"] = before
                 image = inspect_image(policy, client=client)
                 dependency_name = name + "-dependencies"
@@ -468,7 +620,7 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                     ):
                         argv = ["git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
                                 "-c", "core.quotePath=false", "-c", "core.fsmonitor=false", "-C", str(repo), *args]
-                        if prepare_client(runtime, argv, temporary, log, cancel, deadline, env=git_env):
+                        if prepare_client(runtime, argv, temporary, log, cancel, deadline, env=git_env, clients=clients):
                             raise RuntimeError("validation source preparation failed")
                     # All original diff helpers consume GITHUB_BASE_REF, not
                     # BASE_REF alone. Pin and verify their ref in this snapshot.
@@ -476,7 +628,7 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                     argv = ["git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
                             "-c", "core.fsmonitor=false", "-C", str(workspace),
                             "rev-parse", "--verify", "refs/remotes/origin/main^{commit}"]
-                    code = prepare_client(runtime, argv, temporary, base_output, cancel, deadline, env=git_env)
+                    code = prepare_client(runtime, argv, temporary, base_output, cancel, deadline, env=git_env, clients=clients)
                     log.write(base_output.getvalue())
                     if code or base_output.getvalue().strip() != target["base"].encode():
                         raise ValueError("validation diff reference differs from approved full BASE")
@@ -484,11 +636,11 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                     create = ["/usr/bin/docker", "create", "--pull=never", "--name", dependency_name, *labels,
                               "--network=none", "--entrypoint=/usr/bin/true", image]
                     if prepare_client(runtime, create, temporary, log, cancel,
-                                            min(deadline, time.monotonic() + 15)):
+                                            min(deadline, time.monotonic() + 15), clients=clients):
                         raise RuntimeError("dependency copy container could not start")
                     copied = prepare_client(runtime,
                         ["/usr/bin/docker", "cp", dependency_name + ":/app/node_modules", str(workspace / "node_modules")],
-                        temporary, log, cancel, min(deadline, time.monotonic() + 60))
+                        temporary, log, cancel, min(deadline, time.monotonic() + 60), clients=clients)
                     result["image_node_dependencies_copied"] = copied == 0
                 finally:
                     cleaned, code = remove_owned(dependency_name, name, resources[1]["labels"])
@@ -496,7 +648,7 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                     if not cleaned:
                         raise RuntimeError("dependency copy container cleanup could not be confirmed")
                 check_stopped(cancel, deadline)
-                snapshot = source_check(runtime, request, "snapshot", log, cancel, deadline)["snapshot"]
+                snapshot = source_check(runtime, request, "snapshot", log, cancel, deadline, clients=clients)["snapshot"]
                 result["snapshot_before"] = snapshot
                 lifetime = max(1, math.ceil(deadline - time.monotonic()))
                 result.update(lifetime_limit_seconds=lifetime, lifetime_kill_grace_seconds=5)
@@ -521,7 +673,8 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                 result["argv"] = argv
                 validation_attempted = True
                 result["exit_code"] = _gate_client(runtime, argv, temporary, log, cancel, deadline,
-                    cleanups=validation_cleanups, password=service.password.encode() if service else None)
+                    cleanups=validation_cleanups, password=service.password.encode() if service else None,
+                    clients=clients, role="validation")
             except ExecutionStopped as error:
                 outcome = error.outcome
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
@@ -551,7 +704,7 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
                     # but give ordinary queries only the remaining gate time.
                     # A stopped execution runs no more source/Git/policy work.
                     try:
-                        final = source_check(runtime, request, "final", log, cancel, deadline)
+                        final = source_check(runtime, request, "final", log, cancel, deadline, clients=clients)
                         after, snapshot_after = final["source"], final["snapshot"]
                         unchanged = before == after and snapshot == snapshot_after and not final["snapshot_dirty"]
                     except ExecutionStopped as error:
@@ -578,6 +731,23 @@ def run(runtime, policy, spec, cwd, target, command, transcript, timeout):
     finally:
         result["temporary_directory_identity"] = temporary_identity
         result["temporary_directory_cleanup_confirmed"] = False
+        result["local_clients_stop_confirmed"] = False
+        result["local_clients_stop_status"] = "UNKNOWN"
+        try:
+            if clients is None:
+                raise ValueError("container client dispatch evidence was not established")
+            result["client_stop_evidence"] = clients.seal()
+            result["local_clients_stop_confirmed"] = True
+            result["local_clients_stop_status"] = "CONFIRMED"
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            result.update(cleanup_confirmed=False, local_clients_stop_error=str(error))
+            # Keep a known timeout/cancel/execution failure distinct from the
+            # UNKNOWN stop fact. Neither can authorize cleanup or delivery.
+            if result.get("status") not in {"TIMEOUT", "CANCELLED", "BLOCKED_ENVIRONMENT"}:
+                result["status"] = "UNKNOWN"
+        finally:
+            if clients is not None:
+                clients.close()
         try:
             if result.get("cleanup_confirmed") is not True or result.get("dependencies_cleanup_confirmed", True) is not True:
                 # A known failed cleanup remains the original failed outcome,

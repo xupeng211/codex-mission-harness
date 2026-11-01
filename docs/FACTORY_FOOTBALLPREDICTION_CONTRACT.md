@@ -173,12 +173,14 @@ Controller 被强制终止时验证仍会到期。首次 Docker 调用前写入�
 RUNNING/UNKNOWN 验证改为通过，也不能自动重跑测试。退出码 137 的原因未被证明时
 仅记录失败，不能冒称一定是 timeout。
 
-新 lifecycle v2 保存完整 target 的规范 JSON SHA256，完整 target 仍在原 operation
+当前 lifecycle v3 保存完整 target 的规范 JSON SHA256及原始目录分配身份，完整 target 仍在原 operation
 证据中；资源、policy、profile 和临时目录继续显式保存。序列化记录最多 64 KiB，
 写入前核对容量，超限时尚未创建任何容器。旧版内嵌 target 的中断记录保持原字节，
 读取上限为可信 operation 中预期 target 的旧版序列化字节数加 64 KiB 元数据余量；
-只接受完整 target 相等的旧格式。v2 自身仍受 64 KiB 限制。未知版本、损坏或身份
-不匹配的记录不能清理，原证据路径、raw hash 和资源归属检查不变。
+旧格式、v2缺少原始分配身份不能授权清理。v3自身仍受64 KiB限制，恢复还要求同操作
+完整的`.container.clients.jsonl`停止证明；旧v3缺证明同样UNKNOWN。未知版本、损坏、
+未封闭或身份不匹配不能清理，原证据路径、raw hash和资源归属检查不变。客户端登记、
+停止凭据的持久化顺序及重启限制见[临时空间合同](DELEGATED_TEMPORARY_WORKSPACE.md)。
 
 干净验证副本显式将 `refs/remotes/origin/main` 写为批准的完整 BASE，并通过同次执行
 的可取消、受剩余 deadline 限制的 Git 客户端回读核实；不匹配时不创建容器。

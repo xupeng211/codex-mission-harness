@@ -122,6 +122,9 @@ class DirectoryIdentityTests(unittest.TestCase):
     def write_record(transcript, record):
         path = transcript.with_suffix(".container.json")
         path.write_text(json.dumps(record)); path.chmod(0o600)
+        if "temporary_directory_identity" in record:
+            from test_factory_container_lifecycle import seal_no_clients
+            seal_no_clients(transcript, record)
 
     def test_interrupted_container_recovers_only_original_allocation(self):
         path, transcript, record, args = self.recovery_fixture("normal")

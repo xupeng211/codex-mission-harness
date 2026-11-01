@@ -372,7 +372,7 @@ class ESLintAuthorityTests(unittest.TestCase):
                 patch.object(container, "prepare_client", side_effect=local_client), \
                 patch.object(container, "remove_owned") as remove:
             # Only the Python/Git source query is real. No Docker client is reached.
-            result = container.run(self.fx.runtime, policy, spec, cwd, target,
+            result = self.fx.runtime.container_gate(policy, spec, cwd, target,
                                    ["make", "verify-targeted"], transcript, 20)
             inspect_image.assert_not_called()
             remove.assert_not_called()
