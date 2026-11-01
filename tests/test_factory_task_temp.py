@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 from harness.codex import AppServerCodex
 from harness.factory_runtime import FactoryAppServer, LocalRuntime
+from test_appserver_shutdown import configuration_only_start
 
 
 PAYLOAD = r'''
@@ -165,6 +166,7 @@ def run_boundary_case(location, read_only=False, legacy=False, named_profile=Fal
                            events=[json.loads(x) for x in completed.stdout.splitlines()], after=marker_facts(markers))
             return {"output": {"summary": "native CLI fixture only", "known_risks": []}}
         stack.enter_context(patch("harness.codex.subprocess.Popen", side_effect=capture))
+        stack.enter_context(patch.object(AppServerCodex, "_start_process", configuration_only_start))
         stack.enter_context(patch.object(FactoryAppServer, "_request", rpc))
         if legacy:
             stack.enter_context(patch("harness.codex.require_builder_qualification"))
@@ -291,6 +293,7 @@ class TaskTempLifecycleTests(unittest.TestCase):
         def launch(argv, *args, **kwargs):
             return inert_process() if "app-server" in list(map(str, argv)) else popen(argv, *args, **kwargs)
         with patch("harness.codex.subprocess.Popen", side_effect=launch), \
+                patch.object(AppServerCodex, "_start_process", configuration_only_start), \
                 patch.object(FactoryAppServer, "_request", return_value={}), \
                 patch.object(FactoryAppServer, "execute", execute):
             yield

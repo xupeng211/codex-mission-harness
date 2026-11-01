@@ -16,6 +16,7 @@ import tempfile
 from pathlib import Path
 
 from .codex import AppServerCodex
+from .appserver_process import process_identity
 from .task_temp import TaskTemp, TaskTempError
 from .model_registry import read_private_token
 from .sandbox import project_gate_invocation, preflight_project_gate, SAFE_PATH
@@ -82,7 +83,9 @@ class FactoryAppServer(AppServerCodex):
 
     def __init__(self, profile: dict, cwd: Path, transcript: Path, timeout: int,
                  denied_roots: list[Path], read_only: bool, reviewer: bool = False, token_limit: int | None = None,
-                 protected_paths: tuple[Path, ...] = ()):
+                 protected_paths: tuple[Path, ...] = (), execution_context=None, owner_callback=None):
+        self._execution_context = execution_context
+        self._owner_callback = owner_callback
         self._policy_cwd = self._canonical_worktree(str(cwd))
         self._forbidden_actions = self._effective_policy(("release",))
         self._configured_forbidden_actions = self._forbidden_actions
@@ -258,7 +261,7 @@ class FactoryAppServer(AppServerCodex):
                 overrides.extend(self._task_temp.environment_overrides())
                 self._native_identity["temporary_workspace"] = self._task_temp.identity
             with transcript.with_suffix(".stderr").open("xb") as stderr:
-                # GNU coreutils supplies a wall-clock watchdog independent of
+                # The installed timeout supplies a wall-clock watchdog independent of
                 # this controller; unknown dispatch stays charged/unreplayed.
                 environment = self._app_server_environment(str(executable), str(cwd), codex_home=home)
                 if self._task_temp is not None:
@@ -268,11 +271,13 @@ class FactoryAppServer(AppServerCodex):
                     # routing belongs to the explicit dedicated proxy config.
                     environment = {k:v for k,v in environment.items() if k.lower() not in {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}}
                     environment["NO_PROXY"] = "127.0.0.1,localhost,::1"
-                self.proc = subprocess.Popen([str(watchdog), "--signal=TERM", "--kill-after=5", str(timeout),
+                self._start_process([str(watchdog), "--signal=TERM", "--kill-after=5", str(timeout),
                                              str(executable), *overrides, "app-server", "--stdio"],
                                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                              stderr=stderr, text=True, bufsize=1, cwd=cwd, start_new_session=True,
-                                             env=environment)
+                                             env=environment, record=transcript.with_suffix(".process.jsonl"))
+                self._native_identity["process_ownership"] = {
+                    "binding": self._execution.binding, "supervisor": self._execution.identity}
         except BaseException:
             self.close()
             raise
@@ -582,12 +587,6 @@ class FactoryAppServer(AppServerCodex):
                 **({"physical_accounting": receipt, "usage_complete": receipt["usage_complete"]} if receipt else {})}
 
     def close(self):
-        proc = getattr(self, "proc", None)
-        if proc and proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
         try:
             super().close()
         finally:
@@ -602,7 +601,7 @@ class FactoryAppServer(AppServerCodex):
                         error.write_bytes(error.read_bytes().replace(relay.nonce.encode(), b"[REDACTED]"))
                 self._proxy_relay = None
             home = getattr(self, "_proxy_home", None)
-            if home:
+            if home and getattr(self, "_process_stop", {}).get("confirmed") is True:
                 home.cleanup()
                 self._proxy_home = None
 
@@ -627,6 +626,7 @@ class LocalRuntime:
         self.container_cancel = threading.Event()
         self._execution_lock = threading.RLock()
         self._active_execution = self._active_mission = None
+        self._execution_id = None
         self._execution_thread = None
 
     def close_session(self):
@@ -654,6 +654,15 @@ class LocalRuntime:
         self._single_binding = None
         return cleanup
 
+    def unconfirmed_appserver(self):
+        server = self._single_server
+        if server is not None and hasattr(server, "_process_stop"):
+            if (server._process_stop.get("confirmed") is not True
+                    or (getattr(server, "_task_temp", None) is not None
+                        and not getattr(server, "_task_temp_cleanup", {}).get("cleanup_confirmed"))):
+                return "AppServer stop or task temporary cleanup remains UNKNOWN; no replacement execution"
+        return None
+
     def begin_execution(self, mission):
         import threading
         with self._execution_lock:
@@ -664,6 +673,7 @@ class LocalRuntime:
             self._validation_cancelled = False
             self._preparation_cleanups = []
             self._active_execution, self._active_mission = self.container_cancel, mission
+            self._execution_id = uuid.uuid4().hex
             self._execution_thread = threading.get_ident()
             return self._active_execution
 
@@ -672,9 +682,11 @@ class LocalRuntime:
             if execution is self._active_execution:
                 # An unconfirmed owned group still owns this execution. Even
                 # Factory.run's outer finally must not admit a new execution.
-                if self._remote_worker is not None or self._preparation_client is not None or self._single_server is not None:
+                if (self._remote_worker is not None or self._preparation_client is not None
+                        or self._single_server is not None or self.current_process is not None):
                     return False
                 self._active_execution = self._active_mission = None
+                self._execution_id = None
                 self._execution_thread = None
                 return True
 
@@ -697,6 +709,14 @@ class LocalRuntime:
                     # bounded cleanup and records any failure. Never reap the
                     # group leader here via Popen.poll().
                     client["cancel_error"] = f"{type(error).__name__}: {error}"
+            elif self._single_server is not None:
+                try:
+                    self._single_server._stop_execution()
+                except TaskTempError:
+                    # Keep the server, TaskTemp and execution slot. Its owning
+                    # finally records UNKNOWN; cancellation must not reap a
+                    # leader or signal an old PGID as a fallback.
+                    pass
             elif proc is not None and proc.poll() is None:
                 try:
                     os.killpg(proc.pid, signal.SIGTERM)
@@ -743,11 +763,13 @@ class LocalRuntime:
             identity["route_identity"] = route
             identity["qualification_identity"] = route_digest(route)
         identity["adapter_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-        dependencies = ["codex.py", "task_temp.py", "factory_proxy.py", "factory_routing.py"] if profile["provider"] == "openai" else ["factory_http.py", "model_registry.py"]
+        dependencies = ["codex.py", "appserver_process.py", "task_temp.py", "factory_proxy.py", "factory_routing.py"] if profile["provider"] == "openai" else ["factory_http.py", "model_registry.py"]
         identity["transport_hashes"] = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in dependencies}
         return identity
 
     def agent(self, role, profile, cwd, payload, transcript, timeout, denied_roots):
+        if self.container_cancel.is_set():
+            raise RuntimeFailure("execution cancelled before AppServer dispatch; no replay", None, None)
         authorized_route = payload.pop("_authorized_route", None)
         if authorized_route is not None and self.profile_identity(profile).get("route_identity") != authorized_route:
             raise RuntimeFailure("task route differs from authorization; no dispatch", None, None)
@@ -786,11 +808,34 @@ class LocalRuntime:
             if hasattr(server, "_native_identity"):
                 server._native_identity["execution_limits"]["token_limit"] = token_limit
         else:
-            server = FactoryAppServer(profile, cwd, transcript, timeout, denied_roots,
-                                      role in ("plan", "review"), role == "review", token_limit,
-                                      protected_paths=protected)
+            def retain_owner(owner):
+                with self._execution_lock:
+                    self._single_server, self._single_binding = owner, binding
+                    self.current_process = owner.proc
+                    if self.container_cancel.is_set():
+                        owner._stop_execution()
+            try:
+                server = FactoryAppServer(profile, cwd, transcript, timeout, denied_roots,
+                                          role in ("plan", "review"), role == "review", token_limit,
+                                          protected_paths=protected,
+                                          execution_context={"mission_id": self._active_mission,
+                                                             "runtime_execution": self._execution_id},
+                                          owner_callback=retain_owner)
+            except BaseException as error:
+                owner = getattr(error, "owner", self._single_server)
+                if owner is not None:
+                    if (getattr(owner, "_process_stop", {}).get("confirmed") is True
+                            and (getattr(owner, "_task_temp", None) is None
+                                 or getattr(owner, "_task_temp_cleanup", {}).get("cleanup_confirmed") is True)):
+                        self._single_server = self._single_binding = self.current_process = None
+                    else:
+                        self._single_server, self._single_binding = owner, binding
+                        self.current_process = getattr(owner, "proc", None)
+                raise
+            # Non-reused servers also own this slot until their close proves
+            # quiescence. This includes initialization/EOF/cancel failures.
+            self._single_server, self._single_binding = server, binding
             if reuse_session:
-                self._single_server, self._single_binding = server, binding
                 errors = transcript.with_suffix(".stderr")
                 if errors.exists():
                     # The child keeps this inode open across turns. Snapshot
@@ -801,6 +846,7 @@ class LocalRuntime:
         if authorized_route is not None and (not server._proxy_relay or
                 server._proxy_relay.policy.identity != authorized_route.get("runtime")):
             server.close()
+            self._single_server = self._single_binding = None
             raise RuntimeFailure("proxy runtime changed before dispatch; new authorization required", None, None)
         self.current_process = server.proc
         server._reuse_session = reuse_session
@@ -845,6 +891,7 @@ class LocalRuntime:
                     # finally; an unconfirmed session cannot pass to a new task.
                     self._single_server, self._single_binding = server, binding
                     raise
+                self._single_server = self._single_binding = None
             self.current_process = None
 
     def second_review(self, profile, cwd, payload, transcript, timeout):
@@ -1017,11 +1064,7 @@ class LocalRuntime:
     @staticmethod
     def _client_process_identity(pid):
         """Linux metadata only; no process environment or command contents."""
-        path = Path(f"/proc/{pid}")
-        fields = (path / "stat").read_text().rsplit(") ", 1)[1].split()
-        return {"pid": pid, "starttime": fields[19], "ppid": int(fields[1]),
-                "pgid": int(fields[2]), "sid": int(fields[3]), "uid": path.stat().st_uid,
-                "state": fields[0]}
+        return process_identity(pid)
 
     def _owned_client_leader(self, worker):
         # All callers hold _execution_lock. A direct child observed with

@@ -1336,7 +1336,7 @@ class Factory:
         try:
             candidate = self.row(mission)["candidate"]
             root = self.root / "evidence" / mission
-            allocations, proofs, native_identities = {}, [], []
+            allocations, proofs, native_identities, process_owners = {}, [], [], {}
             def read(path, expected_hash):
                 info = path.lstat()
                 if (path.is_symlink() or path.resolve(strict=True) != path or not stat.S_ISREG(info.st_mode)
@@ -1351,9 +1351,14 @@ class Factory:
                 raw = result.get("raw_evidence", [])
                 allocation = root / (operation["id"] + ".temp.json")
                 entries = [v for v in raw if v["path"] == str(allocation)]
-                native = (result.get("runtime_identity") or {}).get("native_runtime", {}).get("temporary_workspace")
+                native_runtime = (result.get("runtime_identity") or {}).get("native_runtime", {})
+                native = native_runtime.get("temporary_workspace")
                 if native is not None:
                     native_identities.append(native)
+                    if native_runtime.get("process_ownership") is not None:
+                        if native["path"] in process_owners and process_owners[native["path"]] != native_runtime["process_ownership"]:
+                            raise ValueError("temporary allocation execution ownership changed")
+                        process_owners[native["path"]] = native_runtime["process_ownership"]
                 if entries or allocation.exists() or allocation.is_symlink():
                     if len(entries) != 1 or operation["lane"] != "developer":
                         raise ValueError("temporary allocation lacks original operation binding")
@@ -1391,6 +1396,20 @@ class Factory:
                 rows = [json.loads(line) for line in read(receipt, evidence["sha256"]).splitlines()]
                 if not rows or any(v.get("cleanup_confirmed") is not True or v.get("identity") != identity for v in rows):
                     raise ValueError("temporary cleanup receipt contains unconfirmed or foreign allocation")
+                owner = process_owners.get(identity["path"])
+                for entry in rows:
+                    stop = entry.get("process_stop")
+                    if owner is not None:
+                        binding = owner["binding"]
+                        if (not isinstance(stop, dict) or stop.get("confirmed") is not True
+                                or stop.get("proof") != "ECHILD" or stop.get("binding") != binding
+                                or stop.get("supervisor") != {k:v for k,v in owner["supervisor"].items() if k != "state"}
+                                or binding.get("temporary_workspace") != identity
+                                or binding.get("operation") != str(root / (source + ".raw"))
+                                or binding.get("context", {}).get("mission_id") != mission):
+                            raise ValueError("temporary cleanup lacks its original execution stop proof")
+                    elif stop is not None and stop.get("confirmed") is not True:
+                        raise ValueError("temporary cleanup execution stop is unconfirmed")
                 if event is not None and any(event.get(k) != rows[-1].get(k) for k in ("identity", "cleanup_confirmed", "at")):
                     raise ValueError("temporary cleanup event differs from original receipt")
                 covered.add(source)
@@ -1560,6 +1579,11 @@ class Factory:
                 fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return {**self.report(mission), "DELIVERY_STATUS": "RUNNING", "BLOCKERS_REMAINING": ["another controller owns this mission"]}
+            pending = self.runtime.unconfirmed_appserver() if hasattr(self.runtime, "unconfirmed_appserver") else None
+            if pending:
+                # A retry is a read-only UNKNOWN assessment, not an attempt to
+                # create a replacement execution or reconstruct missing proof.
+                return {**self.report(mission), "DELIVERY_STATUS": "UNKNOWN", "BLOCKERS_REMAINING": [pending]}
             import threading
             stopped = threading.Event()
             execution = self.runtime.begin_execution(mission) if hasattr(self.runtime, "begin_execution") else None

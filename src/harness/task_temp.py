@@ -224,6 +224,8 @@ class TaskTemp:
                   "at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
         if error is not None:
             result["error"] = str(error)
+        if hasattr(self, "_process_stop"):
+            result["process_stop"] = self._process_stop
         if self._record is not None:
             with self.cleanup_log.open("a", encoding="utf-8") as stream:
                 os.fchmod(stream.fileno(), 0o600)

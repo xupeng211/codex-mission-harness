@@ -15,6 +15,7 @@ from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
+from test_appserver_shutdown import configuration_only_start
 
 from harness.adapters import (
     FootballPredictionAdapter, GateResult, ReviewFailureClassification, SimulatedAdapter,
@@ -1126,6 +1127,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         self.assertNotIn("fixture-only-credential-marker", completed.stdout + completed.stderr)
         self.assertEqual((workspace / "write-check.txt").read_text(), "workspace-write-ok")
 
+    @patch.object(AppServerCodex, "_start_process", configuration_only_start)
     def test_codex_policy_is_constructor_bound_to_canonical_git_worktree(self):
         first = Path(self.tmp.name) / "first-policy-repo"
         second = Path(self.tmp.name) / "second-policy-repo"
@@ -1180,6 +1182,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         with self.assertRaisesRegex(RuntimeError, "not constructor-bound"):
             unbound.set_policy((), str(first))
 
+    @patch.object(AppServerCodex, "_start_process", configuration_only_start)
     def test_app_server_uses_explicit_environment_allowlist(self):
         first = Path(self.tmp.name) / "app-server-env-repo"
         subprocess.run(["git", "init", "-q", str(first)], check=True)
@@ -1247,6 +1250,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
                 RuntimeError, "inside the mission worktree"):
             AppServerCodex(worktree=str(repo))
 
+    @patch.object(AppServerCodex, "_start_process", configuration_only_start)
     def test_app_server_executes_the_same_relative_launcher_it_validated(self):
         with tempfile.TemporaryDirectory(prefix="cmh-relative-launcher-", dir=Path.home()) as temp:
             root = Path(temp)
@@ -1917,7 +1921,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
             turn = adapter.turn("thread-1", "work", "/mission-worktree")
         self.assertEqual(turn.text, "")
 
-    def test_app_server_close_terminates_and_reaps_once(self):
+    def test_app_server_close_consumes_stop_proof_once(self):
         class FakeProcess:
             def __init__(self):
                 self.stdin, self.stdout = StringIO(), StringIO()
@@ -1937,13 +1941,18 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
 
         adapter = AppServerCodex.__new__(AppServerCodex)
         adapter.proc = FakeProcess()
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        stopped = Mock(return_value={"confirmed": True, "proof": "configuration_only_fixture", "simulated": True})
+        adapter._execution = SimpleNamespace(stop=stopped)
         adapter.close()
         adapter.close()
-        self.assertEqual((adapter.proc.terminated, adapter.proc.waited), (1, 1))
+        stopped.assert_called_once()
+        self.assertEqual((adapter.proc.terminated, adapter.proc.waited), (0, 0))
         self.assertTrue(adapter.proc.stdin.closed)
         self.assertTrue(adapter.proc.stdout.closed)
 
-    def test_app_server_close_never_masks_a_second_wait_timeout(self):
+    def test_app_server_close_blocks_without_original_ownership(self):
         class StuckProcess:
             stdin, stdout, stderr = StringIO(), StringIO(), None
 
@@ -1961,7 +1970,9 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
 
         adapter = AppServerCodex.__new__(AppServerCodex)
         adapter.proc = StuckProcess()
-        adapter.close()
+        from harness.task_temp import TaskTempError
+        with self.assertRaises(TaskTempError):
+            adapter.close()
 
     def test_gate_pass_is_bound_to_exact_head(self):
         self.journal.update(

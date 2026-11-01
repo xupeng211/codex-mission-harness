@@ -29,11 +29,23 @@ Factory在控制层的操作transcript旁保存不可变`.temp.json`分配身份
 
 Controller遭SIGKILL或宿主崩溃时可能来不及清理，目录及分配记录会保留；没有自动扫前缀“回收”。原有RUNNING/UNKNOWN与no-replay规则继续适用，不能从重启推断旧资源已清理。新建合法会话只创建新目录，绝不借用旧目录；未确认资源需要按准确分配身份处置。此限制不同于正常取消/异常的finally清理。
 
+### AppServer停止依据
+
+Factory（官方/代理、复用/非复用、只读/开发）及legacy AppServer的启动都经过一个专用Linux监护进程。它在派发前启用并核验subreaper和pidfd能力；与Controller通过不向工具继承的私有socket通信。执行身份包含随机execution id、准确worktree、permission profile、TaskTemp原身份、操作transcript及Factory任务/run绑定；监护进程的PID、启动时刻、父进程、uid、session/group和pidfd与该分配一同保留。可信监护代码不得位于委派工作区内。
+
+沿用owned-client的原始身份核验及`waitid(WNOWAIT)`原则，但不照搬“原进程组已空”的完成判断。AppServer或watchdog可以先退出，后代可以`setsid`或double-fork；专用subreaper仍是它们的收养祖先。关闭时只枚举监护进程自己的直接子进程，通过pidfd向尚未回收的准确对象发送TERM，必要时KILL；父进程退出后重复处理被收养的后代。只有`waitpid(-1, WNOHANG)`返回内核`ECHILD`，才确认这个启动子树没有剩余子进程。它不扫描全系统PID，不向历史PGID发组信号，也不信任一次`Popen.poll()/wait()`作为整棵子树停止证明。
+
+顺序是：取得绑定的ECHILD回执、追加停止诊断、允许监护进程退出并回收、关闭stdio、按原目录身份原子清理TaskTemp、追加成功清理凭据，最后释放runtime归属。初始化前已登记执行归属，因此取消也覆盖初始化阶段；派发前已取消则不启动。Factory的`.process.jsonl`只是追加诊断，不能替代清理原件。新的native runtime记录绑定原执行身份，清理原件中的`process_stop`必须与之及任务/操作/目录匹配，后续report/run继续核对原件hash和绑定。
+
+监护进程被提前poll/wait回收、启动身份不符、控制通道断开、证据无法写入或停止无法确认时，关闭返回UNKNOWN，不删TaskTemp、不写成功凭据，保留server/current_process及必要runtime归属。失败是sticky的；重复close或run不重试派发，不用较晚成功遮盖早先UNKNOWN。Controller重启不从历史PID/PGID重建执行归属或重放操作。原操作失败、进程停止确认、目录清理确认是三个独立事实；EOF/超时即使安全清理，也仍是原操作失败。
+
+本机制要求Linux的subreaper、可核验的`/proc`进程元数据及children、pidfd信号、WNOWAIT和Unix私有socket能力；缺失即阻断，不退回单进程/进程组关闭。它依赖可信监护进程单线程独占其子进程的创建、停止和回收，Controller不提前回收监护进程，宿主可信代码不篡改监护代码或控制通道。ECHILD只证明该专用收养子树已结束：不涵盖工具通过既有外部服务另行委派的进程、具有特权的重归属/调试者或攻击Controller的宿主同uid程序。普通fork、double-fork及session/group变化不脱离这个子树；不能证明仍在该边界内的情况保留UNKNOWN。现有禁用外部服务、插件、网络及权限规则继续适用，没有因此新增授权。
+
 ### 清理对象身份及并发边界
 
 Controller先创建一个不向Agent授权的独占0700认领父目录。通过Linux `renameat2(RENAME_NOREPLACE)`、已打开的父目录fd，将公共名字处的对象原子移入该私有目录，再核对被移入对象的原始device/inode、uid、mode及适用的分配标记。只有匹配后，才在私有父目录fd下执行防软链接的`rmtree`。公共名字在核验后被替换，捕获的替代对象不会被递归删除；尽可能用不覆盖目标的原子rename归还。归还受阻时保留在认领目录，错误及追加的`.claims.jsonl`记录准确位置。该日志只是清理计划，不能充当成功凭据，也不授权恢复流程接纳新路径。
 
-并发假设是：委派客户端已按既有关闭规则停止；沙箱只获得原TaskTemp准确路径，不能访问新认领父目录；可信Controller及宿主代码不修改这个私有父目录，也不把外来对象注入所属目录树。允许公共源名字发生并发替换。删除后公共名字若重新出现，保留新对象并返回UNKNOWN。控制层被中断在认领途中时，也不扫描或猜测归属；保留计划和资源供按准确身份处置。
+并发假设是：AppServer委派客户端已按上述原执行身份取得停止证明；沙箱只获得原TaskTemp准确路径，不能访问新认领父目录；可信Controller及宿主代码不修改这个私有父目录，也不把外来对象注入所属目录树。允许公共源名字发生并发替换。删除后公共名字若重新出现，保留新对象并返回UNKNOWN。控制层被中断在认领途中时，也不扫描或猜测归属；保留计划和资源供按准确身份处置。
 
 支持范围为Linux、具有`renameat2` libc入口及`RENAME_NOREPLACE`支持的同一文件系统，Python的fd相对`rmtree`及防软链接能力（本轮为Python 3.14）。平台、文件系统或原子原语不支持时停止清理，返回UNKNOWN；不退回按公开路径删除。这些假设不涵盖可任意改动Controller私有资源的宿主同uid程序。
 
