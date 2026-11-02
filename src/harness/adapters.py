@@ -1720,7 +1720,7 @@ class FootballPredictionAdapter:
             "raise SystemExit(p.main())"
         )
         local = self._call(
-            [sys.executable, "-I", "-B", "-c", preflight_code, str(trusted), worktree,
+            [self._trusted_python_interpreter(), "-I", "-B", "-c", preflight_code, str(trusted), worktree,
              str(body_path), str(scope), base, head], cwd=worktree,
             env={"GH_HOST": "github.com", "PYTHONDONTWRITEBYTECODE": "1",
                  "HOME": "/nonexistent", "PATH": os.defpath, "LANG": "C.UTF-8"},

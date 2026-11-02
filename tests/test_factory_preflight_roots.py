@@ -6,6 +6,8 @@ tests assert its repeated local preflight, never invent a review approval.
 import copy
 import json
 from pathlib import Path
+import shutil
+import sys
 from unittest.mock import Mock, patch
 import unittest
 
@@ -169,6 +171,44 @@ class ThreePreflightDataRootTests(unittest.TestCase):
         spec, cwd, target = self.fx.candidate("scripts/ops/root_probe.py", "# Owner: offline fixture\nprint(1)\n")
         self.assertFalse((self.fx.snapshot / "scripts/ops/root_probe.py").exists())
         self.assert_three_accept(self.probe(spec, cwd, target))
+
+    def test_untrusted_running_python_falls_back_for_all_three_preflights(self):
+        spec, cwd, target = self.fx.candidate("scripts/ops/root_probe.py", "# Owner: offline fixture\nprint(1)\n")
+        p = self.probe(spec, cwd, target)
+        binary = self.fx.fx.root / "unsafe-python"
+        shutil.copyfile(Path(sys.executable).resolve(strict=True), binary)
+        binary.chmod(0o775)
+        link = self.fx.fx.root / "python-link"
+        link.symlink_to(binary)
+        # Exercise real validation, including a replaced symlink target. Neither
+        # unsafe interpreter may run; only the existing trusted fallback may.
+        replacement = self.fx.fx.root / "replacement-python"
+        shutil.copyfile(binary, replacement)
+        replacement.chmod(0o777)
+        for executable in (binary, replacement):
+            with self.subTest(executable=executable.name):
+                link.unlink()
+                link.symlink_to(executable)
+                denied = p.adapter._call([str(link), "--version"])
+                self.assertEqual(denied.returncode, 127)
+                self.assertIn("unsafe ownership or permissions", denied.stderr)
+        replaceable = self.fx.fx.root / "replaceable-bin"
+        replaceable.mkdir(mode=0o700)
+        unsafe_path = replaceable / "python"
+        shutil.copyfile(binary, unsafe_path)
+        unsafe_path.chmod(0o755)
+        replaceable.chmod(0o777)
+        denied = p.adapter._call([str(unsafe_path), "--version"])
+        self.assertEqual(denied.returncode, 127)
+        self.assertIn("unsafe parent directory", denied.stderr)
+        link.unlink()
+        link.symlink_to(binary)
+        with patch("harness.adapters.sys.executable", str(link)):
+            trusted = p.adapter._trusted_python_interpreter()
+            self.assertNotEqual(trusted, str(link.resolve(strict=True)))
+            self.assertEqual(p.adapter._validate_executable(trusted), trusted)
+            self.assert_three_accept(p)
+        self.assertEqual(p.events[1]["argv"][0], trusted)
 
     def test_missing_lifecycle_rejected_by_all_three_without_publication_write(self):
         path = "scripts/ops/root_probe.py"

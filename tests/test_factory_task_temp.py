@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 from harness.codex import AppServerCodex
 from harness.factory_runtime import FactoryAppServer, LocalRuntime
-from test_appserver_shutdown import configuration_only_start
+from test_appserver_shutdown import configuration_only_start, offline_codex_launcher
 
 
 PAYLOAD = r'''
@@ -292,7 +292,8 @@ class TaskTempLifecycleTests(unittest.TestCase):
         popen = subprocess.Popen
         def launch(argv, *args, **kwargs):
             return inert_process() if "app-server" in list(map(str, argv)) else popen(argv, *args, **kwargs)
-        with patch("harness.codex.subprocess.Popen", side_effect=launch), \
+        with offline_codex_launcher(), \
+                patch("harness.codex.subprocess.Popen", side_effect=launch), \
                 patch.object(AppServerCodex, "_start_process", configuration_only_start), \
                 patch.object(FactoryAppServer, "_request", return_value={}), \
                 patch.object(FactoryAppServer, "execute", execute):
@@ -397,7 +398,7 @@ class TaskTempLifecycleTests(unittest.TestCase):
             if "app-server" in list(map(str, argv)):
                 raise RuntimeError("fixture startup failure")
             return popen(argv, *args, **kwargs)
-        with patch("harness.codex.subprocess.Popen", side_effect=launch):
+        with offline_codex_launcher(), patch("harness.codex.subprocess.Popen", side_effect=launch):
             with self.assertRaisesRegex(RuntimeError, "fixture startup failure"):
                 FactoryAppServer(self.profile, self.cwd, self.root / "startup.raw", 10, [], False)
         identity = json.loads((self.root / "startup.temp.json").read_text())

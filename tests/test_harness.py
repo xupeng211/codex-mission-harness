@@ -4629,7 +4629,7 @@ print('BLOCKED:'+('PROC' if home == expected else 'DIRECT_ONLY'))"""
         self.assertEqual(result.status, "PASS")
         self.assertEqual(result.data["reason"], "exact gates")
         self.assertEqual(call.call_count, 2)
-        self.assertEqual(call.call_args_list[0].args[0][0], sys.executable)
+        self.assertEqual(call.call_args_list[0].args[0][0], adapter._trusted_python_interpreter())
         for invocation in call.call_args_list:
             argv = invocation.args[0]
             self.assertEqual(invocation.kwargs["cwd"], str(candidate))

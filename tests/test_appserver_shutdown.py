@@ -65,6 +65,21 @@ def configuration_only_start(server, argv, *, record=None, **kwargs):
         stop=lambda: {"confirmed": True, "proof": "configuration_only_fixture", "simulated": True})
 
 
+@contextlib.contextmanager
+def offline_codex_launcher():
+    """Supply the external launcher prerequisite, retaining real path checks.
+
+    Callers replace the AppServer workload separately. The real system Python
+    is only its launcher identity; timeout and all other resolutions are real.
+    No installed Codex or sandbox invocation is needed by these offline tests.
+    """
+    resolve = AppServerCodex._trusted_executable
+    def lookup(executable, forbidden_root=None):
+        return resolve("/usr/bin/python3" if executable == "codex" else executable, forbidden_root)
+    with patch.object(AppServerCodex, "_trusted_executable", side_effect=lookup):
+        yield
+
+
 class AppServerShutdownTests(unittest.TestCase):
     def setUp(self):
         self.fixture = tempfile.TemporaryDirectory(prefix="appserver-shutdown-")
@@ -125,6 +140,7 @@ class AppServerShutdownTests(unittest.TestCase):
             if initialize_error: raise RuntimeError("fixture initialization failed")
             return {"userAgent": "fixed-local-workload"}
         with contextlib.ExitStack() as stack:
+            stack.enter_context(offline_codex_launcher())
             stack.enter_context(patch.object(AppServerProcess, "start", launch))
             stack.enter_context(patch.object(FactoryAppServer, "_request", initialize))
             if legacy:
