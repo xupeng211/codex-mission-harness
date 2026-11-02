@@ -549,12 +549,14 @@ class PlanningGuardTests(unittest.TestCase):
     def test_foreign_thread_telemetry_cannot_charge_or_interrupt_active_turn(self):
         server = FactoryAppServer.__new__(FactoryAppServer)
         server.events, server.token_limit, server.runtime_identity = [], 32000, {}
+        server._bind_usage_thread("t")
+        server._bind_usage_turn("u")
         usage = {"total": {"inputTokens": 32001, "outputTokens": 0, "totalTokens": 32001}}
-        with patch("harness.codex.AppServerCodex._read_message", return_value={"method": "thread/tokenUsage/updated", "params": {"tokenUsage": usage}}):
-            server._active_thread_id = "active"
-            server._read_message()
-        self.assertFalse(hasattr(server, "usage"))
-        self.assertFalse(getattr(server, "_budget_exceeded", False))
+        with patch("harness.codex.AppServerCodex._read_message", return_value={"method": "thread/tokenUsage/updated", "params": {"threadId": "t", "turnId": "u", "tokenUsage": usage}}):
+            with self.assertRaises(RuntimeFailure) as failure:
+                server._read_message()
+        self.assertEqual(failure.exception.usage, usage)
+        self.assertFalse(failure.exception.usage_complete)
 
 
 if __name__ == "__main__":

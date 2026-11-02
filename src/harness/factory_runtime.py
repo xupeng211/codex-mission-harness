@@ -16,6 +16,8 @@ import tempfile
 from pathlib import Path
 
 from .codex import AppServerCodex
+from .appserver_process import process_identity
+from .task_temp import TaskTemp, TaskTempError
 from .model_registry import read_private_token
 from .sandbox import project_gate_invocation, preflight_project_gate, SAFE_PATH
 from .factory_proxy import validate_transport, ProxyPolicy, ProxyRelay, digest as route_digest
@@ -81,7 +83,9 @@ class FactoryAppServer(AppServerCodex):
 
     def __init__(self, profile: dict, cwd: Path, transcript: Path, timeout: int,
                  denied_roots: list[Path], read_only: bool, reviewer: bool = False, token_limit: int | None = None,
-                 protected_paths: tuple[Path, ...] = ()):
+                 protected_paths: tuple[Path, ...] = (), execution_context=None, owner_callback=None):
+        self._execution_context = execution_context
+        self._owner_callback = owner_callback
         self._policy_cwd = self._canonical_worktree(str(cwd))
         self._forbidden_actions = self._effective_policy(("release",))
         self._configured_forbidden_actions = self._forbidden_actions
@@ -95,12 +99,16 @@ class FactoryAppServer(AppServerCodex):
         self.transport = validate_transport(profile, reviewer)
         self._proxy_relay = None
         self._proxy_home = None
+        self._task_temp = None
         # Built-in OpenAI ignores configured retry overrides. A fresh official
         # provider entry uses native authentication/endpoint selection while
         # disabling ambiguous request replay and transport fallback.
         self._transport_provider = "cmh_openai_" + uuid.uuid4().hex
         self.events: list[dict] = []
         self.usage = None
+        self._usage_thread_id = self._usage_turn_id = None
+        self._usage_by_thread = {}
+        self._usage_scope_errors = []
         self.transcript, self._transcript_bytes = transcript, 0
         self._response_timeout = timeout
         self._end_time = time.monotonic() + timeout
@@ -143,9 +151,12 @@ class FactoryAppServer(AppServerCodex):
             rules[str(Path(self.transport["policy_file"]).parent)] = "deny"
         # The Git database belongs to the controller, not to coding agents.
         rules[str(cwd / ".git")] = "read"
-        # A read-only lane starts with minimal runtime + the exact repository,
-        # rather than inheriting the built-in profile's broad host read grant.
-        overrides = ([] if read_only else ["-c", f'permissions.{self._permissions_profile}.extends=":workspace"']) + [
+        # Preserve workspace-profile metadata protection without inheriting its
+        # grants to the host's shared /tmp and caller-selected TMPDIR.
+        for name in (".agents", ".codex", ".aws"):
+            rules[str(cwd / name)] = "read"
+        # Both lanes start from the existing minimal repository/runtime boundary.
+        overrides = [
                      "-c", f"default_permissions={json.dumps(self._permissions_profile)}",
                      "-c", f"permissions.{self._permissions_profile}.filesystem=" +
                      "{" + ",".join(f"{json.dumps(k)}={json.dumps(v)}" for k, v in rules.items()) + "}",
@@ -158,6 +169,9 @@ class FactoryAppServer(AppServerCodex):
                      "-c", "web_search=\"disabled\"",
                      "-c", "features.multi_agent=false",
                      "-c", "features.multi_agent_v2=false",
+                     # Codex 0.164 keeps the legacy feature keys, but native
+                     # collaboration is controlled by agents.enabled.
+                     "-c", "agents.enabled=false",
                      "-c", "features.apps=false",
                      "-c", "features.hooks=false",
                      # cwd is constructor-verified as the Git repository root;
@@ -232,20 +246,38 @@ class FactoryAppServer(AppServerCodex):
                 self.close()
                 raise
         try:
+            if not read_only:
+                forbidden = [*denied_roots, Path(home), Path(self._source_home)]
+                if self.transport["type"] == "cli_proxy":
+                    forbidden.append(Path(self.transport["policy_file"]).parent)
+                self._task_temp = TaskTemp(self._policy_cwd, self._permissions_profile, forbidden,
+                                           record=transcript.with_suffix(".temp.json"))
+                rules.update(self._task_temp.permission_rules())
+                # Repeated CLI overrides of the *same* inline table replace it.
+                # Emit one complete table, retaining all protected subpaths.
+                key = f"permissions.{self._permissions_profile}.filesystem="
+                index = next(i for i, item in enumerate(overrides) if item.startswith(key))
+                overrides[index] = key + "{" + ",".join(f"{json.dumps(k)}={json.dumps(v)}" for k, v in rules.items()) + "}"
+                overrides.extend(self._task_temp.environment_overrides())
+                self._native_identity["temporary_workspace"] = self._task_temp.identity
             with transcript.with_suffix(".stderr").open("xb") as stderr:
-                # GNU coreutils supplies a wall-clock watchdog independent of
+                # The installed timeout supplies a wall-clock watchdog independent of
                 # this controller; unknown dispatch stays charged/unreplayed.
                 environment = self._app_server_environment(str(executable), str(cwd), codex_home=home)
+                if self._task_temp is not None:
+                    environment.update(self._task_temp.environment())
                 if self.transport["type"] == "cli_proxy":
                     # Codex talks only to the local observer. Upstream network
                     # routing belongs to the explicit dedicated proxy config.
                     environment = {k:v for k,v in environment.items() if k.lower() not in {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}}
                     environment["NO_PROXY"] = "127.0.0.1,localhost,::1"
-                self.proc = subprocess.Popen([str(watchdog), "--signal=TERM", "--kill-after=5", str(timeout),
+                self._start_process([str(watchdog), "--signal=TERM", "--kill-after=5", str(timeout),
                                              str(executable), *overrides, "app-server", "--stdio"],
                                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                              stderr=stderr, text=True, bufsize=1, cwd=cwd, start_new_session=True,
-                                             env=environment)
+                                             env=environment, record=transcript.with_suffix(".process.jsonl"))
+                self._native_identity["process_ownership"] = {
+                    "binding": self._execution.binding, "supervisor": self._execution.identity}
         except BaseException:
             self.close()
             raise
@@ -284,35 +316,131 @@ class FactoryAppServer(AppServerCodex):
             deadline = min(deadline, self._deadline())
         message = super()._read_message(deadline)
         self.events.append(message)
-        params = message.get("params", {})
-        if (message.get("method") == "thread/tokenUsage/updated"
-                and params.get("threadId") == getattr(self, "_active_thread_id", None)
-                and params.get("turnId") is not None
-                and params.get("turnId") == getattr(self, "_active_turn_id", params.get("turnId"))):
-            self.usage = params.get("tokenUsage")
-            from .factory_budget import tokens
-            measured = tokens(self.usage)
-            baseline = tokens(getattr(self, "_turn_usage_baseline", None)) or 0
-            if measured is None or measured < baseline:
-                raise RuntimeFailure("Codex token telemetry missing or regressed", self.usage, self.runtime_identity)
-            if (self.token_limit and measured - baseline > self.token_limit
-                    and not getattr(self, "_budget_exceeded", False)):
-                # Cancel sampling, but keep reading: the last usage notification
-                # can precede an already-queued successful completion. Neither
-                # an interrupt acknowledgement nor final text settles a turn.
+        self._observe_execution_event(message)
+        return message
+
+    def _bind_usage_thread(self, thread_id):
+        previous = getattr(self, "_usage_thread_id", None)
+        if previous is not None and not (getattr(self, "_reuse_session", False) and previous == thread_id):
+            raise RuntimeError("native execution must use one fresh thread")
+        self._usage_thread_id, self._usage_turn_id = thread_id, None
+        self._usage_by_thread, self._usage_scope_errors = {}, []
+        self._early_activity = []
+        self._early_activity_bytes = 0
+        self.usage = None
+
+    def usage_telemetry(self):
+        # Each value is a thread-cumulative snapshot associated with a turn,
+        # NOT a turn delta or a separately billable quantity. Never sum them.
+        return {"thread_id": getattr(self, "_usage_thread_id", None),
+                "turn_id": getattr(self, "_usage_turn_id", None),
+                "by_thread": getattr(self, "_usage_by_thread", {}),
+                "scope_errors": getattr(self, "_usage_scope_errors", []),
+                "early_activity": getattr(self, "_early_activity", []),
+                "scope": ("one authorized turn in the same explicitly reused thread"
+                          if getattr(self, "_reuse_session", False) else "one fresh thread and one authorized turn"),
+                "provider_total_usage": "UNKNOWN", "cross_thread_aggregation": "NOT_PERFORMED"}
+
+    def _usage_failure(self, reason, attribution=None):
+        if attribution is not None:
+            self._usage_scope_errors.append(attribution)
+        raise RuntimeFailure(reason, self.usage, self.runtime_identity,
+                             usage_telemetry=self.usage_telemetry())
+
+    def _accept_root_usage(self, usage):
+        from .factory_budget import tokens
+        count = tokens(usage)
+        baseline = tokens(getattr(self, "_turn_usage_baseline", None)) or 0
+        if count is None or count < baseline:
+            self._usage_failure("native usage is not a valid attributed token count")
+        self.usage = usage
+        if self.token_limit and count - baseline > self.token_limit:
+            if not getattr(self, "_reuse_session", False):
+                self._usage_failure("Codex token telemetry exceeded run allowance")
+            if not getattr(self, "_budget_exceeded", False):
+                # Main's same-thread repair path drains the terminal event
+                # after interrupt; cumulative snapshots are charged as deltas.
                 self._budget_exceeded = True
                 self._end_time = min(self._end_time, time.monotonic() + 5)
                 self.seq += 1
-                assert self.proc.stdin
                 try:
                     self.proc.stdin.write(json.dumps({"id": self.seq, "method": "turn/interrupt",
-                        "params": {"threadId": params["threadId"], "turnId": params["turnId"]}}) + "\n")
+                        "params": {"threadId": self._usage_thread_id, "turnId": self._usage_turn_id}}) + "\n")
                     self.proc.stdin.flush()
                 except OSError:
-                    # A dying process may still have a terminal notification
-                    # buffered on stdout. The same short drain deadline applies.
                     pass
-        return message
+
+    def _bind_usage_turn(self, turn_id):
+        if not isinstance(turn_id, str) or not turn_id:
+            self._usage_failure("native turn identity is missing")
+        if self._usage_turn_id not in (None, turn_id):
+            self._usage_failure("native turn/start response changed the observed turn identity")
+        self._usage_turn_id = turn_id
+        if isinstance(self.runtime_identity, dict):
+            self.runtime_identity.update(thread_id=self._usage_thread_id, turn_id=turn_id)
+        for event in self._early_activity:
+            params = event["params"]
+            observed = params.get("turn", {}).get("id") if isinstance(params.get("turn"), dict) else params.get("turnId")
+            if params.get("threadId") != self._usage_thread_id or observed != turn_id:
+                self._usage_failure("early activity belongs to an unauthorized native thread/turn", event)
+        # Notifications can precede the turn/start response. Attribute them
+        # only after matching the returned turn, never to whichever arrived last.
+        for observed_turn, record in self._usage_by_thread.get(self._usage_thread_id, {}).items():
+            if observed_turn != turn_id:
+                self._usage_failure("usage belongs to another native turn",
+                                    {"threadId": self._usage_thread_id, "turnId": observed_turn})
+            self._accept_root_usage(record["last_token_usage"])
+
+    def _observe_execution_event(self, message):
+        method, params = message.get("method"), message.get("params", {})
+        # Native 0.164 execution notifications in these namespaces carry both
+        # identities, including deltas and errors received before acceptance.
+        activity = isinstance(method, str) and (method.startswith(("turn/", "item/", "model/")) or method == "error")
+        if not isinstance(params, dict):
+            if activity:
+                self._usage_failure("native activity has malformed attribution", message)
+            return
+        item = params.get("item", {})
+        if isinstance(item, dict) and item.get("type") in ("subAgentActivity", "collabAgentToolCall"):
+            self._usage_failure("native delegation observed although disabled",
+                                {"method": method, "threadId": params.get("threadId"),
+                                 "item_type": item["type"], "agentThreadId": item.get("agentThreadId")})
+        if self._usage_thread_id and activity:
+            observed_thread = params.get("threadId")
+            observed_turn = params.get("turn", {}).get("id") if isinstance(params.get("turn"), dict) else params.get("turnId")
+            if ("turn" in params and (not isinstance(params["turn"], dict)
+                    or ("turnId" in params and params["turnId"] != observed_turn))):
+                self._usage_failure("native activity has conflicting turn attribution", message)
+            if self._usage_turn_id is None:
+                size = len(json.dumps(message).encode())
+                if len(self._early_activity) >= 256 or self._early_activity_bytes + size > 262144:
+                    self._usage_failure("early native activity buffer exceeded", message)
+                self._early_activity.append(message)
+                self._early_activity_bytes += size
+            if not all(isinstance(v, str) and v for v in (observed_thread, observed_turn)):
+                self._usage_failure("native activity has no thread/turn attribution", message)
+            if observed_thread != self._usage_thread_id or (self._usage_turn_id and observed_turn != self._usage_turn_id):
+                self._usage_failure("activity belongs to an unauthorized native thread/turn",
+                                    message)
+            if method == "turn/started":
+                self._bind_usage_turn(observed_turn)
+        if method != "thread/tokenUsage/updated":
+            return
+        thread_id, turn_id = params.get("threadId"), params.get("turnId")
+        if not all(isinstance(v, str) and v for v in (thread_id, turn_id)):
+            self._usage_failure("usage notification has no thread/turn attribution",
+                                {"method": method, "threadId": thread_id, "turnId": turn_id,
+                                 "tokenUsage": params.get("tokenUsage")})
+        record = self._usage_by_thread.setdefault(thread_id, {}).setdefault(turn_id, {"notifications": 0})
+        record.update(notifications=record["notifications"] + 1, last_token_usage=params.get("tokenUsage"))
+        if thread_id != self._usage_thread_id:
+            self._usage_failure("usage belongs to an unauthorized native thread",
+                                {"threadId": thread_id, "turnId": turn_id})
+        if self._usage_turn_id is not None:
+            if turn_id != self._usage_turn_id:
+                self._usage_failure("usage belongs to another native turn",
+                                    {"threadId": thread_id, "turnId": turn_id})
+            self._accept_root_usage(params.get("tokenUsage"))
 
     def _request(self, method, params):
         result = super()._request(method, params)
@@ -360,6 +488,7 @@ class FactoryAppServer(AppServerCodex):
                 "reminder_at_remaining_tokens": [max(1, self.token_limit // 4)],
                 "sampling_token_weight": 1.0, "prefill_token_weight": 1.0}
         params["config"]["features"] = features
+        params["config"]["agents"] = {"enabled": False}
         params["config"]["project_root_markers"] = []
         return params
 
@@ -388,6 +517,7 @@ class FactoryAppServer(AppServerCodex):
         # is authoritative until that response binds the accepted turn below.
         if hasattr(self, "_active_turn_id"):
             del self._active_turn_id
+        self._bind_usage_thread(thread_id)
         params = {"threadId": thread_id, "input": [{"type": "text", "text": prompt}],
                   "outputSchema": schema, **self._policy_params(self._policy_cwd)}
         if self.MODEL:
@@ -396,6 +526,7 @@ class FactoryAppServer(AppServerCodex):
             params["effort"] = self.REASONING_EFFORT
         accepted = self._request("turn/start", params)
         turn_id = accepted["turn"]["id"]
+        self._bind_usage_turn(turn_id)
         self._active_turn_id = turn_id
         self.runtime_identity.update(thread_id=thread_id, turn_id=turn_id)
         completed = self._turn_completed(thread_id, turn_id, require_success=False)
@@ -451,31 +582,28 @@ class FactoryAppServer(AppServerCodex):
                 "thread_id": thread_id if return_thread else None, "turn_id": turn_id,
                 "turn_completion": completed, "usage_complete": True,
                 "usage_events": turn_usage,
+                "usage_telemetry": self.usage_telemetry(),
                 "runtime_identity": self.runtime_identity, "model_routing": routed,
                 **({"physical_accounting": receipt, "usage_complete": receipt["usage_complete"]} if receipt else {})}
 
     def close(self):
-        proc = getattr(self, "proc", None)
-        if proc and proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        super().close()
-        relay = getattr(self, "_proxy_relay", None)
-        if relay:
-            relay.close()
-            sources = {self.transcript.with_suffix(".stderr")}
-            if hasattr(self, "_session_stderr"):
-                sources.add(self._session_stderr)
-            for error in sources:
-                if error.exists():
-                    error.write_bytes(error.read_bytes().replace(relay.nonce.encode(), b"[REDACTED]"))
-            self._proxy_relay = None
-        home = getattr(self, "_proxy_home", None)
-        if home:
-            home.cleanup()
-            self._proxy_home = None
+        try:
+            super().close()
+        finally:
+            relay = getattr(self, "_proxy_relay", None)
+            if relay:
+                relay.close()
+                sources = {self.transcript.with_suffix(".stderr")}
+                if hasattr(self, "_session_stderr"):
+                    sources.add(self._session_stderr)
+                for error in sources:
+                    if error.exists():
+                        error.write_bytes(error.read_bytes().replace(relay.nonce.encode(), b"[REDACTED]"))
+                self._proxy_relay = None
+            home = getattr(self, "_proxy_home", None)
+            if home and getattr(self, "_process_stop", {}).get("confirmed") is True:
+                home.cleanup()
+                self._proxy_home = None
 
 
 class LocalRuntime:
@@ -484,27 +612,115 @@ class LocalRuntime:
     simulation = False
 
     def __init__(self):
+        import threading
         self.resource_policy = {}
         self.current_process = None
         self._validation_cancelled = False
         self._single_server = None
         self._single_binding = None
+        self._remote_worker = None
+        # The gate's sequential owned-client slot covers preparation and the
+        # main validation client; retain the existing slot name for callers.
+        self._preparation_client = None
+        self._preparation_cleanups = []
+        self.container_cancel = threading.Event()
+        self._execution_lock = threading.RLock()
+        self._active_execution = self._active_mission = None
+        self._execution_id = None
+        self._execution_thread = None
 
     def close_session(self):
-        if self._single_server is not None:
-            self._single_server.close()
+        server = self._single_server
+        cleanup = None
+        if server is not None:
+            server.close()
+            cleanup = getattr(server, "_task_temp_cleanup", None)
+            if cleanup and server._task_temp.cleanup_log is not None:
+                path = server._task_temp.cleanup_log
+                try:
+                    receipt_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+                    allocation = server._task_temp._record
+                    allocation_hash = hashlib.sha256(allocation.read_bytes()).hexdigest()
+                except OSError as error:
+                    # Retain runtime ownership until both deletion and its proof
+                    # are confirmed; another task cannot inherit this session.
+                    raise TaskTempError("task temporary cleanup receipt is unconfirmed: " + str(path),
+                                        server._task_temp.identity) from error
+                cleanup = {**cleanup, "evidence": {"path": str(path), "sha256": receipt_hash},
+                           "allocation": {"path": str(allocation), "sha256": allocation_hash}}
+            if self.current_process is server.proc:
+                self.current_process = None
         self._single_server = None
         self._single_binding = None
-        self.current_process = None
+        return cleanup
 
-    def cancel(self):
-        self._validation_cancelled = True
-        proc = self.current_process
-        if proc is not None and proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+    def unconfirmed_appserver(self):
+        if self._single_server is not None:
+            # This slot is released only after both shutdown and its complete
+            # cleanup receipt are accepted, including receipt-read failures.
+            return "AppServer still owns this runtime; stop/cleanup is unconfirmed or active; no replacement execution"
+        return None
+
+    def begin_execution(self, mission):
+        import threading
+        with self._execution_lock:
+            if self._active_execution is not None or self.current_process is not None or self._single_server is not None:
+                raise RuntimeError("runtime already belongs to an active execution")
+            # A new identity, not clearing an old task's cancellation latch.
+            self.container_cancel = threading.Event()
+            self._validation_cancelled = False
+            self._preparation_cleanups = []
+            self._active_execution, self._active_mission = self.container_cancel, mission
+            self._execution_id = uuid.uuid4().hex
+            self._execution_thread = threading.get_ident()
+            return self._active_execution
+
+    def end_execution(self, execution):
+        with self._execution_lock:
+            if execution is self._active_execution:
+                # An unconfirmed owned group still owns this execution. Even
+                # Factory.run's outer finally must not admit a new execution.
+                if (self._remote_worker is not None or self._preparation_client is not None
+                        or self._single_server is not None or self.current_process is not None):
+                    return False
+                self._active_execution = self._active_mission = None
+                self._execution_id = None
+                self._execution_thread = None
+                return True
+
+    def cancel(self, execution=None):
+        with self._execution_lock:
+            if execution is None:
+                if self._active_execution is not None:
+                    return False  # Factory watchers must supply their execution identity.
+            elif execution is not self._active_execution:
+                return False  # A delayed callback cannot affect a later mission/run.
+            self._validation_cancelled = True
+            self.container_cancel.set()
+            proc = self.current_process
+            client = self._remote_worker if self._remote_worker is not None else self._preparation_client
+            if client is not None:
+                try:
+                    self._signal_owned_client(client, signal.SIGTERM)
+                except Exception as error:
+                    # The event still cancels work; the owning call performs
+                    # bounded cleanup and records any failure. Never reap the
+                    # group leader here via Popen.poll().
+                    client["cancel_error"] = f"{type(error).__name__}: {error}"
+            elif self._single_server is not None:
+                try:
+                    self._single_server._stop_execution()
+                except TaskTempError:
+                    # Keep the server, TaskTemp and execution slot. Its owning
+                    # finally records UNKNOWN; cancellation must not reap a
+                    # leader or signal an old PGID as a fallback.
+                    pass
+            elif proc is not None and proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            return True
 
     def profile_identity(self, profile):
         identity = {"configured": profile}
@@ -545,11 +761,13 @@ class LocalRuntime:
             identity["route_identity"] = route
             identity["qualification_identity"] = route_digest(route)
         identity["adapter_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-        dependencies = ["codex.py", "factory_proxy.py", "factory_routing.py"] if profile["provider"] == "openai" else ["factory_http.py", "model_registry.py"]
+        dependencies = ["codex.py", "appserver_process.py", "task_temp.py", "factory_proxy.py", "factory_routing.py"] if profile["provider"] == "openai" else ["factory_http.py", "model_registry.py"]
         identity["transport_hashes"] = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in dependencies}
         return identity
 
     def agent(self, role, profile, cwd, payload, transcript, timeout, denied_roots):
+        if self.container_cancel.is_set():
+            raise RuntimeFailure("execution cancelled before AppServer dispatch; no replay", None, None)
         authorized_route = payload.pop("_authorized_route", None)
         if authorized_route is not None and self.profile_identity(profile).get("route_identity") != authorized_route:
             raise RuntimeFailure("task route differs from authorization; no dispatch", None, None)
@@ -577,6 +795,7 @@ class LocalRuntime:
             if self._single_binding != binding:
                 raise RuntimeFailure("single-agent App Server binding changed; no replay", None, None)
             server = self._single_server
+            server._validate_task_temp()
             server.transcript = transcript
             server._transcript_bytes = 0
             server._response_timeout = timeout
@@ -587,11 +806,34 @@ class LocalRuntime:
             if hasattr(server, "_native_identity"):
                 server._native_identity["execution_limits"]["token_limit"] = token_limit
         else:
-            server = FactoryAppServer(profile, cwd, transcript, timeout, denied_roots,
-                                      role in ("plan", "review"), role == "review", token_limit,
-                                      protected_paths=protected)
+            def retain_owner(owner):
+                with self._execution_lock:
+                    self._single_server, self._single_binding = owner, binding
+                    self.current_process = owner.proc
+                    if self.container_cancel.is_set():
+                        owner._stop_execution()
+            try:
+                server = FactoryAppServer(profile, cwd, transcript, timeout, denied_roots,
+                                          role in ("plan", "review"), role == "review", token_limit,
+                                          protected_paths=protected,
+                                          execution_context={"mission_id": self._active_mission,
+                                                             "runtime_execution": self._execution_id},
+                                          owner_callback=retain_owner)
+            except BaseException as error:
+                owner = getattr(error, "owner", self._single_server)
+                if owner is not None:
+                    if (getattr(owner, "_process_stop", {}).get("confirmed") is True
+                            and (getattr(owner, "_task_temp", None) is None
+                                 or getattr(owner, "_task_temp_cleanup", {}).get("cleanup_confirmed") is True)):
+                        self._single_server = self._single_binding = self.current_process = None
+                    else:
+                        self._single_server, self._single_binding = owner, binding
+                        self.current_process = getattr(owner, "proc", None)
+                raise
+            # Non-reused servers also own this slot until their close proves
+            # quiescence. This includes initialization/EOF/cancel failures.
+            self._single_server, self._single_binding = server, binding
             if reuse_session:
-                self._single_server, self._single_binding = server, binding
                 errors = transcript.with_suffix(".stderr")
                 if errors.exists():
                     # The child keeps this inode open across turns. Snapshot
@@ -602,6 +844,7 @@ class LocalRuntime:
         if authorized_route is not None and (not server._proxy_relay or
                 server._proxy_relay.policy.identity != authorized_route.get("runtime")):
             server.close()
+            self._single_server = self._single_binding = None
             raise RuntimeFailure("proxy runtime changed before dispatch; new authorization required", None, None)
         self.current_process = server.proc
         server._reuse_session = reuse_session
@@ -623,9 +866,11 @@ class LocalRuntime:
                     server.runtime_identity["physical_accounting"] = server._proxy_relay.receipt()
                 # Never include upstream error bodies, credentials or transport
                 # exception reprs in a receipt for a proxy failure.
-                raise RuntimeFailure("explicit CLI proxy run failed; no retry or fallback", server.usage, server.runtime_identity) from exc
+                raise RuntimeFailure("explicit CLI proxy run failed; no retry or fallback", server.usage, server.runtime_identity,
+                                     usage_telemetry=server.usage_telemetry()) from exc
             raise RuntimeFailure(str(exc), server.usage, server.runtime_identity,
-                                 usage_complete=getattr(server, "_usage_complete", False)) from exc
+                                 usage_complete=getattr(server, "_usage_complete", False),
+                                 usage_telemetry=server.usage_telemetry()) from exc
         finally:
             if reuse_session and hasattr(server, "_session_stderr"):
                 data = server._session_stderr.read_bytes()
@@ -637,7 +882,14 @@ class LocalRuntime:
                     os.fchmod(errors.fileno(), 0o600)
                     errors.write(chunk)
             if not reuse_session:
-                server.close()
+                try:
+                    server.close()
+                except TaskTempError:
+                    # Keep the exact resource available to Factory's cleanup
+                    # finally; an unconfirmed session cannot pass to a new task.
+                    self._single_server, self._single_binding = server, binding
+                    raise
+                self._single_server = self._single_binding = None
             self.current_process = None
 
     def second_review(self, profile, cwd, payload, transcript, timeout):
@@ -673,6 +925,32 @@ class LocalRuntime:
     def project_policy(self, spec, cwd, paths):
         return FootballPredictionContract().policy(spec, cwd, paths)
 
+    def project_review_admission(self, spec, cwd, target, limits):
+        return FootballPredictionContract().review_admission(spec, cwd, target, limits)
+
+    def container_gate(self, policy, spec, cwd, target, command, transcript, timeout):
+        import threading
+        from .factory_container import run
+        # Direct Controller gates also receive a new task identity. Factory.run
+        # already owns an identity for its full execution, including agents.
+        with self._execution_lock:
+            standalone = self._active_execution is None
+            if standalone:
+                execution = self.begin_execution(spec["mission_id"])
+            elif self._active_mission != spec["mission_id"] or self._execution_thread != threading.get_ident():
+                raise RuntimeError("container gate belongs to a different active execution")
+            if self._remote_worker is not None or self._preparation_client is not None:
+                raise RuntimeFailure("unconfirmed client cleanup blocks another container gate")
+        try:
+            return run(self, policy, spec, cwd, target, command, transcript, timeout)
+        finally:
+            if standalone:
+                self.end_execution(execution)
+
+    def recover_container(self, policy, spec, target, command, transcript):
+        from .factory_container import recover
+        return recover(policy, spec, target, command, transcript)
+
     def prepare_project_review(self, spec, cwd, target, lane, timeout):
         contract = FootballPredictionContract()
         argv, evidence = contract.review_arguments(spec, cwd, target, lane)
@@ -685,6 +963,11 @@ class LocalRuntime:
 
     def project_review(self, spec, cwd, target, lane, transcript, timeout, *, prepared=None):
         contract = FootballPredictionContract()
+        if isinstance(prepared, dict):
+            admission = contract.review_admission(spec, cwd, target, prepared["admission"]["authorization"])
+            if admission != prepared["admission"]:
+                raise ValueError("canonical diff/chunk admission changed before dispatch")
+            prepared = prepared["runner"]
         argv, evidence, environment = prepared if prepared is not None else self.prepare_project_review(
             spec, cwd, target, lane, timeout)
         # Recheck the private directory immediately before launch as well.
@@ -738,6 +1021,9 @@ class LocalRuntime:
         return validate_result(result, policy, spec, cwd, target, self.simulation, api)
 
     def project_final_gate(self, spec, cwd, target, reviews, transcript, timeout, *, context=None):
+        if context is not None and "policy" in context:
+            return self.project_remote("verify", context["policy"], spec, cwd, target,
+                                       context["body"], transcript, timeout, reviews=reviews)
         receipts = {LANES[r["lane"]]: r["canonical_receipt"] for r in reviews}
         gate = FootballPredictionContract().final_gate(spec, cwd, target, receipts, context)
         result = {"status": gate.status, "reason": gate.evidence, "target": target, "fixture": False,
@@ -755,6 +1041,207 @@ class LocalRuntime:
                     artifacts.append({"path": str(copy), "sha256": hashlib.sha256(copy.read_bytes()).hexdigest()})
             result["project_evidence"] = artifacts
         return result
+
+    def project_remote(self, action, policy, spec, cwd, target, body, transcript, timeout, *, reviews=None, previous_head=None):
+        import threading
+        with self._execution_lock:
+            standalone = self._active_execution is None
+            if standalone:
+                execution = self.begin_execution(spec["mission_id"])
+            elif self._active_mission != spec["mission_id"] or self._execution_thread != threading.get_ident():
+                raise RuntimeError("project remote belongs to a different active execution")
+            if self._remote_worker is not None or self._preparation_client is not None:
+                raise RuntimeFailure("unconfirmed client cleanup blocks another dispatch")
+        try:
+            return self._project_remote(action, policy, spec, cwd, target, body, transcript, timeout,
+                                        reviews=reviews, previous_head=previous_head)
+        finally:
+            if standalone:
+                self.end_execution(execution)
+
+    @staticmethod
+    def _client_process_identity(pid):
+        """Linux metadata only; no process environment or command contents."""
+        return process_identity(pid)
+
+    def _owned_client_leader(self, worker):
+        # All callers hold _execution_lock. A direct child observed with
+        # WNOWAIT remains unreaped: the kernel cannot reuse its PID/PGID. No
+        # communicate/poll/wait is allowed until group shutdown is confirmed.
+        proc, expected = worker["process"], worker["identity"]
+        if ((self._remote_worker is not worker and self._preparation_client is not worker)
+                or self.current_process is not proc
+                or self._active_execution is not worker["execution"] or proc.returncode is not None):
+            raise RuntimeFailure("controlled client ownership is no longer current")
+        exited = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        actual = self._client_process_identity(proc.pid)
+        if (expected is None or any(actual[k] != expected[k] for k in expected if k != "state")
+                or actual["ppid"] != os.getpid() or actual["uid"] != os.geteuid()
+                or actual["pgid"] != proc.pid or actual["sid"] != proc.pid):
+            raise RuntimeFailure("controlled client identity/owned session cannot be confirmed")
+        return exited
+
+    def _owned_client_group(self, worker):
+        self._owned_client_leader(worker)
+        leader = worker["identity"]
+        members = []
+        for name in os.listdir("/proc"):
+            if not name.isdecimal():
+                continue
+            try:
+                member = self._client_process_identity(int(name))
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            if member["pgid"] == leader["pgid"]:
+                if member["sid"] != leader["sid"] or member["uid"] != leader["uid"]:
+                    raise RuntimeFailure("controlled group ownership cannot be confirmed")
+                members.append(member)
+        self._owned_client_leader(worker)
+        return members
+
+    def _signal_owned_client(self, worker, sig):
+        with self._execution_lock:
+            self._owned_client_group(worker)
+            # Recheck the unreaped direct-child anchor immediately before
+            # signalling. Never signal this PGID after reaping the leader.
+            self._owned_client_leader(worker)
+            os.killpg(worker["process"].pid, sig)
+
+    def _finish_remote_worker(self, worker, deadline):
+        return self._finish_owned_client(worker, deadline)
+
+    def _finish_owned_client(self, worker, deadline):
+        """Shared by the remote worker and this gate's sequential clients."""
+        record = {"identity": worker["identity"], "mission": worker["mission"], "confirmed": False, "leader_reaped": False,
+                  "members_before": [], "pending_descendant_reap": [], "errors": []}
+        if worker.get("cancel_error"):
+            record["errors"].append(worker["cancel_error"])
+        try:
+            with self._execution_lock:
+                record["members_before"] = self._owned_client_group(worker)
+            if any(p["state"] not in {"Z", "X"} for p in record["members_before"]):
+                self._signal_owned_client(worker, signal.SIGKILL)
+                record["signal"] = "SIGKILL"
+            while True:
+                with self._execution_lock:
+                    members = self._owned_client_group(worker)
+                    if not any(p["state"] not in {"Z", "X"} for p in members):
+                        record["pending_descendant_reap"] = [p for p in members if p["pid"] != worker["process"].pid]
+                        # The leader is known exited; wait(0) does not create a
+                        # new work/cleanup budget. Descendants may await their
+                        # own parent/init reaper; they are no longer running.
+                        worker["process"].wait(timeout=0)
+                        record.update(confirmed=True, leader_reaped=True)
+                        self.current_process = None
+                        if self._remote_worker is worker:
+                            self._remote_worker = None
+                        if self._preparation_client is worker:
+                            self._preparation_client = None
+                        break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("controlled group shutdown unconfirmed within original deadline")
+                time.sleep(min(0.01, remaining))
+        except Exception as error:
+            record["errors"].append(f"{type(error).__name__}: {error}")
+            # Keep both the unreaped anchor and execution identity when we
+            # cannot safely establish group shutdown. No speculative kill,
+            # no new execution, and no claim that cleanup succeeded.
+        return record
+
+    def _project_remote(self, action, policy, spec, cwd, target, body, transcript, timeout, *, reviews=None, previous_head=None):
+        # Trusted Controller worker; development agents never receive this env.
+        from .adapters import FootballPredictionAdapter
+        from .factory_test_service import ExecutionStopped
+        deadline = time.monotonic() + timeout
+        # Startup, work, result delivery and reaping share the original total.
+        # Only a normally exited worker can confirm a CI waiting TIMEOUT.
+        reserve = min(1.0, timeout / 4)
+        worker_deadline, response_deadline = deadline - reserve, deadline - reserve / 2
+        cancel = self.container_cancel
+        env = FootballPredictionAdapter._trusted_subprocess_environment(env={"LANG": "C.UTF-8"})
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+        stderr = transcript.with_suffix(".stderr")
+        argv = [sys.executable, "-m", "harness.factory_remote"]
+        # Regular private capture files let us observe worker exit WITHOUT
+        # communicate() reaping the only kernel ownership anchor. Raw stdout
+        # also survives abnormal/partial worker responses for UNKNOWN evidence.
+        with stderr.open("xb") as errors, transcript.with_suffix(".stdout").open("xb+") as output, \
+                tempfile.TemporaryFile(dir=transcript.parent) as request:
+            os.fchmod(errors.fileno(), 0o600)
+            os.fchmod(output.fileno(), 0o600)
+            request.write(json.dumps({"action": action, "policy": policy, "spec": spec,
+                "cwd": str(cwd), "target": target, "body": body, "transcript": str(transcript),
+                "timeout": timeout, "deadline": worker_deadline, "reviews": reviews, "previous_head": previous_head}).encode())
+            request.seek(0)
+            with self._execution_lock:
+                if cancel.is_set() or self.container_cancel is not cancel:
+                    raise ExecutionStopped("CANCELLED")
+                if time.monotonic() >= worker_deadline:
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                proc = subprocess.Popen(argv, stdin=request, stdout=output, stderr=errors,
+                    text=True, cwd=transcript.parent, env=env, start_new_session=True)
+                self.current_process = proc
+                worker = {"process": proc, "execution": self._active_execution,
+                          "mission": spec["mission_id"], "identity": None}
+                self._remote_worker = worker
+            original_error = None
+            try:
+                worker["identity"] = self._client_process_identity(proc.pid)
+                while True:
+                    if cancel.is_set() or self.container_cancel is not cancel:
+                        raise ExecutionStopped("CANCELLED")
+                    remaining = response_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(argv, timeout)
+                    with self._execution_lock:
+                        exited = self._owned_client_leader(worker)
+                    if exited is not None:
+                        break
+                    cancel.wait(min(0.05, remaining))
+                if cancel.is_set():
+                    raise ExecutionStopped("CANCELLED")
+                if exited.si_code != os.CLD_EXITED or exited.si_status:
+                    raise RuntimeFailure("project PR/CI worker failed; outcome retained as UNKNOWN, no replay")
+            except BaseException as error:
+                original_error = error
+                raise
+            finally:
+                try:
+                    cleanup = self._finish_remote_worker(worker, deadline)
+                except Exception as error:
+                    # Preserve the original execution exception even if the
+                    # cleanup implementation itself unexpectedly fails.
+                    cleanup = {"identity": worker["identity"], "mission": worker["mission"],
+                        "confirmed": False, "leader_reaped": False,
+                        "errors": [f"{type(error).__name__}: {error}"]}
+                cleanup["evidence_written"] = False
+                try:
+                    FootballPredictionAdapter._write_private_file(transcript.with_suffix(".cleanup.json"),
+                        json.dumps({k: v for k, v in cleanup.items() if k != "evidence_written"}), exclusive=True)
+                    cleanup["evidence_written"] = True
+                except Exception as error:
+                    detail = f"cleanup evidence {type(error).__name__}: {error}"
+                    if error.__cause__ is not None:
+                        detail += f"; caused by {type(error.__cause__).__name__}: {error.__cause__}"
+                    cleanup["errors"].append(detail)
+                if original_error is not None:
+                    original_error.remote_cleanup = cleanup
+                    if not cleanup["confirmed"] or not cleanup["evidence_written"]:
+                        original_error.add_note("remote cleanup/evidence unconfirmed; execution outcome remains UNKNOWN")
+                elif not cleanup["confirmed"] or not cleanup["evidence_written"]:
+                    error = RuntimeFailure("remote cleanup/evidence unconfirmed; outcome retained as UNKNOWN, no replay")
+                    error.remote_cleanup = cleanup
+                    raise error
+            output.seek(0)
+            try:
+                if cancel.is_set() or self.container_cancel is not cancel:
+                    raise ExecutionStopped("CANCELLED")
+                result = json.loads(output.read().decode("utf-8"))
+            except Exception as error:
+                error.remote_cleanup = cleanup
+                raise
+            return {**result, "remote_cleanup": cleanup}
 
     def hosted_ci(self, policy, cwd, target, branch, transcript, timeout):
         watchdog = AppServerCodex._trusted_executable("timeout", str(cwd))
@@ -804,7 +1291,8 @@ class LocalRuntime:
 
 
 class RuntimeFailure(RuntimeError):
-    def __init__(self, message, usage=None, identity=None, *, usage_complete=False):
+    def __init__(self, message, usage=None, identity=None, *, usage_complete=False, usage_telemetry=None):
         self.usage, self.identity = usage, identity
         self.usage_complete = usage_complete
+        self.usage_telemetry = usage_telemetry
         super().__init__(message)

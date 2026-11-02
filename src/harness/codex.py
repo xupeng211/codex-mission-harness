@@ -16,6 +16,8 @@ from typing import Protocol
 from .policy import SENSITIVE
 from .model_registry import load_registry
 from .model_qualification import require_builder_qualification
+from .task_temp import TaskTemp, TaskTempError
+from .appserver_process import AppServerProcess
 
 
 @dataclass(frozen=True)
@@ -57,18 +59,22 @@ class AppServerCodex:
         self._permissions_profile = f"cmh_delegated_{uuid.uuid4().hex}"
         codex_home = self._codex_home()
         trusted_executable = self._trusted_executable(executable, self._policy_cwd)
-        app_server_argv = [str(trusted_executable), "-c", f'model="{self.MODEL}"',
-                           "-c", f'model_reasoning_effort="{self.REASONING_EFFORT}"',
-                           "-c", 'default_permissions=":workspace"',
-                           *self._permissions_profile_overrides(codex_home, self._permissions_profile),
-                           "app-server", "--stdio"]
-        self.proc = subprocess.Popen(app_server_argv, stdin=subprocess.PIPE,
-                                     stdout=subprocess.PIPE, text=True, bufsize=1,
-                                     cwd=self._policy_cwd,
-                                     env=self._app_server_environment(
-                                         str(trusted_executable), self._policy_cwd,
-                                         codex_home=codex_home,
-                                     ))
+        self._task_temp = TaskTemp(self._policy_cwd, self._permissions_profile, (codex_home,))
+        try:
+            app_server_argv = [str(trusted_executable), "-c", f'model="{self.MODEL}"',
+                               "-c", f'model_reasoning_effort="{self.REASONING_EFFORT}"',
+                               "-c", f'default_permissions="{self._permissions_profile}"',
+                               *self._permissions_profile_overrides(codex_home, self._permissions_profile, self._task_temp,
+                                                                   trusted_executable),
+                               "app-server", "--stdio"]
+            environment = self._app_server_environment(str(trusted_executable), self._policy_cwd, codex_home=codex_home)
+            environment.update(self._task_temp.environment())
+            self._start_process(app_server_argv, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, text=True, bufsize=1,
+                                cwd=self._policy_cwd, env=environment)
+        except BaseException:
+            self.close()
+            raise
         self.seq = 0
         self._pending_messages: list[dict] = []
         self._reader_queue: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -78,7 +84,7 @@ class AppServerCodex:
                 "clientInfo": {"name": "codex-mission-harness", "version": "0.1"},
                 "capabilities": {"experimentalApi": True},
             })
-        except Exception:
+        except BaseException:
             self.close()
             raise
 
@@ -295,7 +301,8 @@ class AppServerCodex:
         return environment
 
     @staticmethod
-    def _permissions_profile_overrides(codex_home: str, profile: str) -> list[str]:
+    def _permissions_profile_overrides(codex_home: str, profile: str, task_temp: TaskTemp,
+                                       executable: Path | None = None) -> list[str]:
         """Define a per-process workspace profile that cannot read Codex auth.
 
         The inline TOML table keeps the absolute path in a value, so paths with
@@ -303,23 +310,30 @@ class AppServerCodex:
         written into the authenticated CODEX_HOME.
         """
         if (not Path(codex_home).is_absolute()
+                or not isinstance(task_temp, TaskTemp)
                 or not profile.startswith("cmh_delegated_")
                 or not profile.replace("_", "").isalnum()):
             raise RuntimeError("Codex delegated permission profile is invalid")
-        filesystem = "{" + json.dumps(codex_home) + ' = "deny"}'
+        task_temp.validate(task_temp.identity["worktree"], profile)
+        worktree = Path(task_temp.identity["worktree"])
+        executable = executable or AppServerCodex._trusted_executable("codex", str(worktree))
+        runtime = executable.parent.parent if executable.name == "codex.js" and (executable.parent.parent / "package.json").is_file() else executable.parent
+        rules = {":root": "deny", ":minimal": "read", str(worktree): "write", str(runtime): "read",
+                 codex_home: "deny", **task_temp.permission_rules()}
+        for name in (".git", ".agents", ".codex", ".aws"):
+            rules[str(worktree / name)] = "read"
+        filesystem = "{" + ",".join(json.dumps(k) + "=" + json.dumps(v) for k, v in rules.items()) + "}"
         return [
-            "-c", f'permissions.{profile}.extends=":workspace"',
             "-c", f"permissions.{profile}.filesystem={filesystem}",
             "-c", f"permissions.{profile}.network.enabled=false",
-        ]
+        ] + task_temp.environment_overrides()
 
     def set_policy(self, forbidden_actions: tuple[str, ...], cwd: str) -> None:
         """Verify constructor-bound mission controls before a turn is started.
 
-        App Server's workspace-write sandbox is restricted to the mission
-        worktree and has no network access whenever the mission carries a
-        deny-list.  Approval requests are deliberately not auto-approved by
-        this adapter, so an attempted forbidden escape fails closed.
+        The sandbox grants writes only to the bound worktree and the allocated
+        session scratch, with protected subpaths retained and network disabled.
+        Approval requests are never auto-approved by this adapter.
         """
         requested = self._effective_policy(forbidden_actions)
         configured = getattr(self, "_configured_forbidden_actions", None)
@@ -365,6 +379,7 @@ class AppServerCodex:
             raise RuntimeError("Codex sandbox policy is not bound to a mission worktree")
         if cwd != root:
             raise RuntimeError("Codex caller cwd differs from the bound mission worktree")
+        self._validate_task_temp()
         return {
             "approvalPolicy": "never",
             "permissions": getattr(self, "_permissions_profile", "cmh_delegated"),
@@ -374,7 +389,7 @@ class AppServerCodex:
         """Express the turn sandbox equivalently in thread start/resume schema."""
         policy = self._policy_params(cwd)
         root = self._policy_cwd
-        return {
+        params = {
             "cwd": root,
             "model": self.MODEL,
             "approvalPolicy": policy["approvalPolicy"],
@@ -391,11 +406,25 @@ class AppServerCodex:
                 },
             },
         }
+        task_temp = getattr(self, "_task_temp", None)
+        if task_temp is not None:
+            params["config"]["shell_environment_policy"]["set"] = {**task_temp.environment(), "PYTHONDONTWRITEBYTECODE": "1"}
+        return params
+
+    def _validate_task_temp(self):
+        task_temp = getattr(self, "_task_temp", None)
+        if task_temp is not None:
+            task_temp.validate(self._policy_cwd, self._permissions_profile)
 
     def _authority_instructions(self, root: str) -> str:
         denied = ", ".join(self._forbidden_actions)
+        task_temp = getattr(self, "_task_temp", None)
+        temporary = (f"Temporary files may use only the assigned {task_temp.path} (TMPDIR/TMP/TEMP); "
+                     "other tasks' or users' temporary files are not delegated. " if task_temp is not None
+                     else "No writable temporary workspace is delegated. ")
         return (
             f"Mission authority boundary: only source editing inside {root} is delegated. "
+            + temporary +
             f"Controller-only forbidden actions are: {denied}. Never perform, request, or "
             "simulate merge or another forbidden/sensitive action. If one is required, stop "
             "and report the boundary; App Server approval requests are always denied."
@@ -436,24 +465,24 @@ class AppServerCodex:
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                self.close()
+                self._close_after_error("Codex App Server response deadline exceeded")
                 raise RuntimeError("Codex App Server response deadline exceeded")
         else:
             remaining = None
         try:
             kind, payload = self._reader_queue.get(timeout=remaining)
         except queue.Empty:
-            self.close()
+            self._close_after_error("Codex App Server response deadline exceeded")
             raise RuntimeError("Codex App Server response deadline exceeded") from None
         if kind == "error":
-            self.close()
+            self._close_after_error("Codex App Server stdout reader failed")
             raise RuntimeError("Codex App Server stdout reader failed") from payload
         line = payload
         if not isinstance(line, str):
-            self.close()
+            self._close_after_error("Codex App Server stdout reader returned non-text data")
             raise RuntimeError("Codex App Server stdout reader returned non-text data")
         if line == "":
-            self.close()
+            self._close_after_error("Codex App Server exited before sending a response")
             raise RuntimeError("Codex App Server exited before sending a response")
         observer = getattr(self, "_observe_wire_line", None)
         if callable(observer):
@@ -461,46 +490,91 @@ class AppServerCodex:
         try:
             message = json.loads(line)
         except json.JSONDecodeError as exc:
-            self.close()
+            self._close_after_error("Codex App Server emitted malformed JSON")
             raise RuntimeError("Codex App Server emitted malformed JSON") from exc
         if not isinstance(message, dict):
-            self.close()
+            self._close_after_error("Codex App Server emitted a non-object message")
             raise RuntimeError("Codex App Server emitted a non-object message")
         return message
 
+    def _close_after_error(self, operation_error):
+        try:
+            self.close()
+        except TaskTempError as error:
+            # The operation failure and uncertain shutdown are different facts.
+            # Preserve both instead of masking EOF/timeout with cleanup status.
+            error.operation_error = operation_error
+            error.args = (operation_error + "; " + str(error),)
+            raise
+
+    def _start_process(self, argv, *, record=None, **kwargs):
+        temporary = getattr(self, "_task_temp", None)
+        self._execution = AppServerProcess({
+            "worktree": self._policy_cwd, "permission_profile": self._permissions_profile,
+            "temporary_workspace": temporary.identity if temporary is not None else None,
+            "operation": str(getattr(self, "transcript", "legacy-AppServer")),
+            "context": getattr(self, "_execution_context", None),
+        }, record)
+        try:
+            self.proc = self._execution.start(argv, **kwargs)
+        finally:
+            # Startup/handshake failures still belong to this exact adapter.
+            self.proc = self._execution.proc
+            callback = getattr(self, "_owner_callback", None)
+            if callback is not None and self.proc is not None:
+                callback(self)
+
+    def _stop_execution(self):
+        owner = getattr(self, "_execution", None)
+        try:
+            if owner is None:
+                if getattr(self, "proc", None) is not None:
+                    raise RuntimeError("AppServer original execution ownership is missing")
+                result = {"confirmed": True, "proof": "not_started"}
+            else:
+                result = owner.stop()
+            self._process_stop = result
+            return result
+        except Exception as error:
+            self._process_stop = {"confirmed": False, "proof": "UNKNOWN",
+                                  "binding": owner.binding if owner is not None else None,
+                                  "error": str(error)}
+            temporary = getattr(self, "_task_temp", None)
+            identity = temporary.identity if temporary is not None else self._process_stop
+            failure = TaskTempError("AppServer execution stop is UNKNOWN; retain resources and ownership", identity)
+            failure.owner = self
+            raise failure from error
+
     def close(self) -> None:
-        """Idempotently release the App Server process and its stdio pipes."""
+        try:
+            self._close_process()
+        except TaskTempError as error:
+            temporary = getattr(self, "_task_temp", None)
+            if temporary is not None:
+                temporary._process_stop = self._process_stop
+                self._task_temp_cleanup = {"identity": temporary.identity, "cleanup_confirmed": False,
+                                           "process_stop": self._process_stop}
+                try:
+                    temporary._cleanup_event(False, str(error))
+                except OSError:
+                    pass  # UNKNOWN is retained even if its journal cannot be written.
+            raise
+        task_temp = getattr(self, "_task_temp", None)
+        if task_temp is not None:
+            task_temp._process_stop = self._process_stop
+            try:
+                self._task_temp_cleanup = task_temp.close()
+            except TaskTempError as error:
+                error.owner = self
+                raise
+
+    def _close_process(self) -> None:
+        """Confirm the owned child tree before reaping or releasing its pipes."""
         if getattr(self, "_closed", False):
             return
-        self._closed = True
+        self._stop_execution()
         proc = getattr(self, "proc", None)
-        if proc is None:
-            return
-        poll = getattr(proc, "poll", None)
-        try:
-            if callable(poll) and poll() is None:
-                terminate = getattr(proc, "terminate", None)
-                if callable(terminate):
-                    try:
-                        terminate()
-                    except OSError:
-                        pass
-                wait = getattr(proc, "wait", None)
-                if callable(wait):
-                    try:
-                        wait(timeout=5)
-                    except (OSError, subprocess.TimeoutExpired):
-                        kill = getattr(proc, "kill", None)
-                        if callable(kill):
-                            try:
-                                kill()
-                            except OSError:
-                                pass
-                        try:
-                            wait(timeout=5)
-                        except (OSError, subprocess.TimeoutExpired):
-                            pass
-        finally:
+        if proc is not None:
             for stream_name in ("stdin", "stdout", "stderr"):
                 stream = getattr(proc, stream_name, None)
                 close = getattr(stream, "close", None)
@@ -509,6 +583,7 @@ class AppServerCodex:
                         close()
                     except OSError:
                         pass
+        self._closed = True
 
     def _pending(self) -> list[dict]:
         pending = getattr(self, "_pending_messages", None)

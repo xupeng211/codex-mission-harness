@@ -162,6 +162,8 @@ class SelectionTests(unittest.TestCase):
                 self._proxy_relay = None
                 self.errors = transcript.with_suffix(".stderr").open("xb")
                 self.turn = 0
+            def _validate_task_temp(self):
+                pass  # The real adapter's filesystem binding is tested separately.
             def execute(self, *args, **kwargs):
                 self.turn += 1
                 self.errors.write(("turn-"+str(self.turn)+"\n").encode())

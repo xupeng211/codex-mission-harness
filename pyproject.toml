@@ -4,6 +4,11 @@ version = "0.2.0"
 description = "AI software delivery factory governance over official Codex execution and review"
 requires-python = ">=3.11"
 dependencies = ["PyYAML>=6.0,<7"]
+
+[project.optional-dependencies]
+# Authority regressions execute the fixed FootballPrediction contract's tools.
+test = ["pytest==9.0.2", "ruff==0.14.9"]
+
 [project.scripts]
 harness = "harness.cli:main"
 

@@ -35,7 +35,7 @@ ACCEPTED = {"id": 1, "result": {"turn": {"id": "u", "status": "inProgress"}}}
 
 
 class TurnCompletionTests(unittest.TestCase):
-    def server(self, messages, limit=100):
+    def server(self, messages, limit=100, reuse_session=True):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         server = FactoryAppServer.__new__(FactoryAppServer)
@@ -48,6 +48,9 @@ class TurnCompletionTests(unittest.TestCase):
         server._forbidden_actions = ("release",)
         server.MODEL, server.REASONING_EFFORT = "gpt-6.1-sol", "high"
         server.token_limit = limit
+        # Main's local single-agent path explicitly authorizes a reusable
+        # session. One-shot Controller lanes retain their fail-fast policy.
+        server._reuse_session = reuse_session
         server.runtime_identity = {"model": server.MODEL, "provider": "openai"}
         server.transcript, server._transcript_bytes = Path(temporary.name) / "wire.raw", 0
         self.enterContext(patch.object(server, "start_or_resume", return_value="t"))
@@ -79,6 +82,16 @@ class TurnCompletionTests(unittest.TestCase):
         self.assertEqual(requests[1]["params"], {"threadId": "t", "turnId": "u"})
         self.assertLessEqual(server._end_time - time.monotonic(), 5)
         self.assertIn('"method": "turn/completed"', server.transcript.read_text())
+
+    def test_one_shot_overshoot_still_fails_without_certifying_completion(self):
+        server = self.server([ACCEPTED, usage(101), final(), completed()], reuse_session=False)
+        with self.assertRaisesRegex(RuntimeFailure, "exceeded run allowance") as stopped:
+            self.execute(server)
+        self.assertEqual(stopped.exception.usage["total"]["totalTokens"], 101)
+        self.assertFalse(stopped.exception.usage_complete)
+        self.assertFalse(server._usage_complete)
+        self.assertEqual(stopped.exception.usage_telemetry["turn_id"], "u")
+        self.assertNotIn("turn_completion", server.runtime_identity)
 
     def test_over_limit_before_acceptance_response_does_not_lose_completion(self):
         server = self.server([final(), usage(101), completed(),
@@ -195,14 +208,21 @@ class TurnCompletionTests(unittest.TestCase):
         self.assertFalse(server._usage_complete)
 
     def test_foreign_thread_and_old_turn_usage_do_not_overwrite_active_usage(self):
-        server = self.server([ACCEPTED, usage(999, thread="foreign"), usage(888, turn="old"),
-                              usage(20), final(), completed()])
-        self.assertEqual(self.execute(server)["usage"]["total"]["totalTokens"], 20)
-        self.assertFalse(server._budget_exceeded)
+        for invalid in (usage(999, thread="foreign"), usage(888, turn="old")):
+            with self.subTest(params=invalid["params"]):
+                server = self.server([ACCEPTED, usage(20), invalid, final(), completed()])
+                with self.assertRaises(RuntimeFailure) as stopped:
+                    self.execute(server)
+                self.assertEqual(stopped.exception.usage["total"]["totalTokens"], 20)
+                self.assertFalse(stopped.exception.usage_complete)
+                self.assertFalse(server._usage_complete)
+                self.assertFalse(server._budget_exceeded)
 
     def test_budget_drain_timeout_retains_partial_usage(self):
         server = self.server([])
         server._active_thread_id, server._active_turn_id = "t", "u"
+        server._bind_usage_thread("t")
+        server._bind_usage_turn("u")
         server._turn_usage_baseline = None
         with patch("harness.codex.AppServerCodex._read_message", return_value=usage(101)):
             server._read_message()

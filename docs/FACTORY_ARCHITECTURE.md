@@ -69,6 +69,40 @@ Known completed results are reused after envelope and raw-file hash verification
 
 Constructor-bound official permissions allow developer source edits and keep Git metadata read-only. Planner/reviewer have a minimal repository/runtime read profile. Original source, controller/evidence storage and authentication are unavailable to delegated tools. Network is disabled; approval requests are denied. Existing trusted launcher/PATH and environment allowlists are reused.
 
+From the Owner's 2026-11-01 boundary decision, writable delegated sessions use only their exact candidate and a Controller-allocated private temporary workspace. Both roles use the minimal repository/runtime profile; neither inherits the built-in `:workspace` host-temp grants. Developer scratch is bound to the canonical worktree and fresh permission profile, outside the candidate and protected roots, and verified before reuse and cleanup. Shared host `/tmp`, other sessions' scratch and candidate-selected paths are not delegated. Read-only roles receive no writable scratch. See [the temporary workspace contract](DELEGATED_TEMPORARY_WORKSPACE.md) for lifecycle, failure and recovery limits. This new rule does not reclassify historical reviews or authorization.
+
+### Native delegation and usage compatibility
+
+Codex 0.164.0 still recognizes the legacy `features.multi_agent` and
+`features.multi_agent_v2` fields, but its native collaboration instructions
+remain present with those fields false. The adapter also sets the documented
+`agents.enabled=false` at process startup and in the thread configuration.
+Offline native configuration checks and prompt rendering verify those inputs;
+they do not prove that a real Provider turn will finish successfully.
+
+Each adapter invocation binds one fresh thread and its accepted turn before
+using token telemetry. Notifications retain their thread/turn attribution;
+foreign activity or native delegation stops execution as UNKNOWN. If a usage
+notification precedes the turn/start response, it is retained and matched to
+the accepted turn before affecting the cutoff. Unexpected delegation can
+already have incurred work when its notification arrives, so this guard is
+not a physical spending guarantee.
+
+`usage_telemetry` preserves per-thread/per-turn cumulative snapshots in the
+existing operation evidence, including on failure. A snapshot's `total` is
+not a turn delta; `last` is not added to `total`, and cached input is already
+included in input. Parent/child snapshots are never summed as a bill. Failed
+execution still retains the original full reservation alongside attributable
+partial usage. No historical accounting is rewritten or settled by this fix.
+
+An independent patch review may instead use a manual Controller with the
+official App Server `thread/start` and `turn/start.outputSchema` interfaces,
+the pinned rubric, the existing direct DeepSeek worker and exact-source
+validator. It need not invoke `Factory` or this adapter. Such evidence must
+identify its actual path; it is not a Factory delivery receipt, and does not
+demonstrate autonomous Factory orchestration. Native telemetry and rollout
+budgets cannot establish a physical cost hard cap.
+
 Configured MCP/plugins are explicitly disabled: empty TOML tables merge and do not clear inherited servers. Hooks/apps are disabled. The cwd is the verified Git root, so parent project-root probing is disabled while repository instructions remain available. Tests reuse bubblewrap: clean env, no network, read-only source/Git metadata, sanitized Git config, private logs. Missing isolation fails closed.
 
 Only proven local tests, configured CI commands, required reviews and final target/evidence reconciliation produce READY. Read-only status also rejects stale HEAD or changed evidence. Major product decisions, budget exhaustion, capacity and uncertainty produce explicit blockers. Human approval records exact target and reason; no automatic final merge/release code exists in the factory. Fixtures cannot receive live approval.

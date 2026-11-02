@@ -2,7 +2,7 @@
 
 Reads the exact project commit into temporary fixtures, never its working tree.
 Set FOOTBALLPREDICTION_CONTRACT_REPO when the read-only source is not a sibling.
-Missing source is an explicit skip, not a canonical integration PASS.
+Missing/stale source is a mandatory prerequisite error, never an integration PASS.
 """
 from __future__ import annotations
 
@@ -19,24 +19,21 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from harness.adapters import FootballPredictionAdapter
-from harness.factory import Factory, FactoryBlocked, digest, git
+from harness.adapters import FootballPredictionAdapter, GateResult
+from harness.factory import Factory, FactoryBlocked, digest, git, validate_mission
 from harness.factory_fixture import fixture_config
 from harness.factory_project import BACKENDS, LANES, FootballPredictionContract, sha256
 from harness.factory_runtime import LocalRuntime
+from footballprediction_contract import CONTRACT_HEAD as PROJECT_BASE, require_source
 
 
-PROJECT_BASE = "05dc75eb9c2e9e5ec042840d91fee4a3d480ce60"
 DRIVER = Path(__file__).parent / "fixtures/footballprediction_fake_backend.py"
 
 
 class CanonicalRuntimeIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        source = Path(os.environ.get("FOOTBALLPREDICTION_CONTRACT_REPO",
-            str(Path(__file__).resolve().parents[2] / "FootballPrediction")))
-        if not source.is_dir():
-            raise unittest.SkipTest("real canonical source unavailable; integration UNVERIFIED")
+        source = require_source()
         cls.snapshot_tmp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.snapshot_tmp.cleanup)
         cls.snapshot = Path(cls.snapshot_tmp.name)
@@ -66,6 +63,9 @@ class CanonicalRuntimeIntegrationTests(unittest.TestCase):
             "forbidden_side_effects": ["No live providers"]}
         self.runtime = LocalRuntime()
         self.config = {**fixture_config(), "simulation": False, "project_contract": "footballprediction"}
+        self.config["project_review_limits"] = {"approval_id": "offline-fake-provider-test-only",
+            "max_deepseek_chunks": 4, "max_canonical_diff_bytes": 100000,
+            "allow_unknown_provider_usage": True}
         # No developer lane is invoked. Avoid unrelated authenticated profile probes.
         with patch.object(self.runtime, "profile_identity", return_value={"offline_test": True}):
             self.f = Factory(self.root / "state", self.config, self.runtime)
@@ -160,6 +160,225 @@ class CanonicalRuntimeIntegrationTests(unittest.TestCase):
     def test_lf_scope_passes_original_deepseek_validator(self):
         spec, cwd, target = self.candidate()
         self.assertEqual(self.review(spec, cwd, target, "second_reviewer")["status"], "PASS")
+
+    def test_actual_canonical_chunks_exceed_authority_before_reservation_or_fake_backend(self):
+        spec, cwd, target = self.candidate()
+        (cwd / "score.py").write_text("\n".join(f"value_{i} = {i}" for i in range(2600)) + "\n")
+        target = self.f.checkpoint(spec, cwd)
+        limits = {**self.config["project_review_limits"], "max_deepseek_chunks": 8}
+        plan = self.runtime.project_review_admission(spec, cwd, target, limits)
+        self.assertGreater(plan["deepseek_backend_runs"], 1)
+        self.assertEqual(plan["canonical_diff_sha256"], plan["chunk_manifest"]["full_diff_sha256"])
+        with self.assertRaises(ValueError):
+            self.runtime.project_review_admission(spec, cwd, target, {**limits, "max_deepseek_chunks": 1})
+        # Enforce the same rejection through Factory's real prepare-before-reserve path.
+        with patch.object(self.runtime, "project_review_admission", side_effect=lambda s, c, t, ignored:
+                FootballPredictionContract().review_admission(s, c, t, {**limits, "max_deepseek_chunks": 1})):
+            with self.assertRaises(FactoryBlocked): self.review(spec, cwd, target, "second_reviewer")
+        self.assertEqual(self.starts, [])
+        self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM operations WHERE paid=1").fetchone()[0], 0)
+
+    def test_pr_body_uses_original_trusted_preflight(self):
+        spec, cwd, target = self.candidate()
+        body = f"""## Summary
+Offline fixture changes score.
+## Scope
+| Field | Value |
+| --- | --- |
+| Task type | source-code |
+| Workflow class | CRITICAL |
+| Mission ID | feature |
+| Mission scope contract | {self.path} |
+| Changed paths | score.py, {self.path} |
+| Authorized paths | score.py, {self.path} |
+| Excluded paths | none |
+| Runtime behavior changed | yes |
+| Business progress | Offline interface test |
+## Documentation Impact
+| Field | Value |
+| --- | --- |
+| Capability changed? | no |
+| Milestone changed? | no |
+| Canonical entrypoint changed? | no |
+| Current blocker changed? | no |
+| Data/model/authorization contract changed? | no |
+| Repository structure/authority navigation changed? | no |
+| Project vision / target-state changed? | no |
+| Source-of-truth docs updated | no |
+| Updated authoritative docs | none |
+| If not updated, explicit reason | Synthetic score fixture preserves all project contracts and lifecycle boundaries. |
+## Tests
+Offline fixture only.
+## Risk
+No network, DB, model or production operations.
+## Rollback
+Revert the isolated fixture commit.
+## Strict Review Evidence
+| Field | Value |
+| --- | --- |
+| Version | 1 |
+| Task type | CRITICAL |
+| Provider | codex-cli, claude-code-deepseek |
+| Reviewed full SHA | {target['head']} |
+| Result | PASS |
+| Timestamp | 2026-10-28T00:00:00Z |
+"""
+        path = FootballPredictionContract().validate_pr_body(spec, cwd, target, body)
+        self.assertEqual(path.read_text(), body)
+        with self.assertRaises(ValueError):
+            FootballPredictionContract().validate_pr_body(spec, cwd, target, body.replace("CRITICAL", "NORMAL"))
+
+    def publication_candidate(self, newline="\n"):
+        from harness.factory_remote import render_body
+        from test_factory_controller_gates import DELIVERY
+        from test_factory_preflight_inspection import publication_body
+        spec, cwd, target = self.candidate()
+        template = publication_body(self, target).replace(
+            "Offline source-policy contract probe.", "离线 UTF-8 正文 probe.").replace("\n", newline)
+        spec = validate_mission({**spec, "pr_body_template": template})
+        reviews = [{"lane": "reviewer", "canonical_receipt": str(self.root / "MISSING-CODEX.json"),
+                    "canonical_receipt_data": {"review_completed_at": "2026-10-28T00:00:00Z"}}]
+        body = render_body(DELIVERY, spec, target, reviews, [])
+        self.assertEqual(spec["pr_body_template"], template)
+        self.assertEqual(body.count("\r\n"), template.rstrip().count("\r\n"))
+        return spec, cwd, target, body, reviews
+
+    def repeated_publication(self, newline):
+        from harness.factory_remote import run as remote_run
+        from test_factory_contract_binding import evidence
+        from test_factory_controller_gates import DELIVERY, FakeRemote
+        spec, cwd, target, body, reviews = self.publication_candidate(newline)
+        events, preflights = [], []
+
+        class RecordingRemote(FakeRemote):
+            # Actual Remote publication/idempotency/observation code, with only
+            # the existing Git/GitHub API response double at its I/O boundary.
+            def publish(remote, *args, **kwargs):
+                events.append("publish")
+                return super().publish(*args, **kwargs)
+
+            def observe(remote, *args, **kwargs):
+                events.append("observe")
+                return super().observe(*args, **kwargs)
+
+            def ci(remote, *args, **kwargs):
+                events.append("ci:wait" if kwargs["wait"] else "ci:read")
+                return super().ci(*args, **kwargs)
+
+        remote = RecordingRemote(cwd, self.root / "remote.raw", spec, target, body)
+        remote.adapter = adapter = FootballPredictionAdapter()
+        original_call = adapter._call
+        current_action = None
+
+        def original_preflight(argv, **kwargs):
+            result = original_call(argv, **kwargs)
+            path = Path(argv[-4])
+            preflights.append({"action": current_action, "exit_code": result.returncode,
+                "cwd": kwargs["cwd"], "trusted_root": argv[-6], "base": argv[-2], "head": argv[-1],
+                "body_path": str(path), "body_sha256": sha256(path.read_bytes())})
+            return result
+
+        cached = cwd.parent / ".cmh-publication" / (sha256(body.encode("utf-8")) + ".md")
+        first_stat = None
+        outcomes = []
+        with patch("harness.factory_remote.Remote", return_value=remote), \
+                patch.object(adapter, "_call", side_effect=original_preflight), \
+                patch.object(adapter, "ci", return_value=GateResult("PASS", "OFFLINE CI facts only")):
+            for index, action in enumerate(("publish", "reconcile", "ci", "verify", "publish")):
+                current_action = action
+                result = remote_run(action, DELIVERY, spec, cwd, target, body,
+                    self.root / f"publication-{index}.raw", 5, reviews=reviews)
+                outcomes.append({"action": action, "status": result["status"]})
+                if action == "verify":
+                    # The original final gate still refuses absent dual receipts.
+                    # Only the cache/body admission and remote paths are proved.
+                    self.assertEqual(result["status"], "BLOCKED_EXTERNAL")
+                    self.assertIn("both canonical receipts", result["reason"])
+                else:
+                    self.assertEqual(result["status"], "PASS")
+                self.assertEqual(cached.read_bytes(), body.encode("utf-8"))
+                self.assertEqual(cached.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(cached.parent.stat().st_mode & 0o777, 0o700)
+                current_stat = (cached.stat().st_ino, cached.stat().st_mtime_ns)
+                if first_stat is None: first_stat = current_stat
+                self.assertEqual(current_stat, first_stat, "重复检查不得重写已批准正文")
+        self.assertEqual(events, ["publish", "observe", "observe", "ci:wait", "observe",
+                                  "ci:read", "observe", "ci:read", "observe", "publish", "observe"])
+        self.assertEqual(remote.writes, ["push", "create"], "同一正文不得重复发布写入")
+        self.assertEqual([row["action"] for row in preflights], [row["action"] for row in outcomes])
+        for row in preflights:
+            self.assertEqual(row["exit_code"], 0)
+            self.assertEqual(row["trusted_root"], str(self.snapshot))
+            self.assertEqual((row["cwd"], row["base"], row["head"]), (str(cwd), target["base"], target["head"]))
+            self.assertEqual(row["body_sha256"], sha256(body.encode("utf-8")))
+        self.assertEqual(self.starts, [])
+        evidence(self.id(), {"OFFLINE_ONLY": True, "original_rules_baseline": PROJECT_BASE,
+            "body_sha256": sha256(body.encode("utf-8")), "body_crlf_count": body.count("\r\n"),
+            "outcomes": outcomes, "remote_events": events, "write_double_events": remote.writes,
+            "original_preflights": preflights, "final_gate": "blocked by original missing dual-receipt requirement"})
+
+    def test_lf_body_repeats_actual_publication_observation_and_ci_paths(self):
+        self.repeated_publication("\n")
+
+    def test_crlf_body_repeats_actual_publication_observation_and_ci_paths(self):
+        self.repeated_publication("\r\n")
+
+    def test_cached_body_rejects_actual_changes_including_only_newline_bytes(self):
+        spec, cwd, target, body, _ = self.publication_candidate()
+        adapter = FootballPredictionAdapter()
+        contract = FootballPredictionContract(adapter)
+        path = contract.validate_pr_body(spec, cwd, target, body)
+        original = body.encode("utf-8")
+        for modified in (original.replace(b"\n", b"\r\n"), original + b" ", original.replace(b"probe", b"other")):
+            with self.subTest(modified_sha256=sha256(modified)):
+                path.write_bytes(modified)
+                with patch.object(adapter, "_call", wraps=adapter._call) as preflight:
+                    with self.assertRaisesRegex(ValueError, "publication body evidence changed"):
+                        contract.validate_pr_body(spec, cwd, target, body)
+                preflight.assert_not_called()
+                self.assertEqual(path.read_bytes(), modified, "拒绝不得改写原证据")
+
+    def test_publication_cache_symlinks_and_wrong_path_type_are_rejected(self):
+        spec, cwd, target, body, _ = self.publication_candidate()
+        contract = FootballPredictionContract()
+        path = contract.validate_pr_body(spec, cwd, target, body)
+        victim = self.root / "unrelated-body.md"
+        victim.write_bytes(body.encode("utf-8"))
+        victim.chmod(0o640)
+        path.unlink()
+        for destination in (victim, self.root / "missing-body.md"):
+            with self.subTest(destination=destination):
+                path.symlink_to(destination)
+                with self.assertRaises((ValueError, RuntimeError)):
+                    contract.validate_pr_body(spec, cwd, target, body)
+                path.unlink()
+        path.parent.rmdir()
+        path.parent.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaises(RuntimeError): contract.validate_pr_body(spec, cwd, target, body)
+        path.parent.unlink()
+        path.parent.write_text("not an evidence directory")
+        with self.assertRaises(RuntimeError): contract.validate_pr_body(spec, cwd, target, body)
+        self.assertEqual(victim.read_bytes(), body.encode("utf-8"))
+        self.assertEqual(victim.stat().st_mode & 0o777, 0o640)
+        self.assertFalse((self.root / "missing-body.md").exists())
+
+    def test_crlf_invalid_metadata_and_wrong_target_still_prevent_publication(self):
+        from harness.factory_remote import run as remote_run
+        from test_factory_controller_gates import DELIVERY, FakeRemote
+        spec, cwd, target, body, reviews = self.publication_candidate("\r\n")
+        remote = FakeRemote(cwd, self.root / "remote.raw", spec, target, body)
+        remote.adapter = FootballPredictionAdapter()
+        with patch("harness.factory_remote.Remote", return_value=remote):
+            with self.assertRaisesRegex(ValueError, "canonical PR body/scope preflight rejected"):
+                remote_run("publish", DELIVERY, spec, cwd, target, body.replace("CRITICAL", "NORMAL"),
+                    self.root / "invalid-metadata.raw", 5, reviews=reviews)
+            for key, value in (("head", "0" * 40), ("mission_scope_sha256", "0" * 64)):
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    remote_run("publish", DELIVERY, spec, cwd, {**target, key: value}, body,
+                        self.root / (key + ".raw"), 5, reviews=reviews)
+        self.assertEqual(remote.writes, [])
+        self.assertIsNone(remote.raw)
+        self.assertEqual(self.starts, [])
 
     def test_crlf_scope_passes_original_validator_and_one_byte_tamper_rejected(self):
         spec, cwd, target = self.candidate("\r\n")

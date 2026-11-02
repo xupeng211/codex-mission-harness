@@ -240,8 +240,11 @@ class DeliveryLimitsTests(unittest.TestCase):
 
     def test_partial_failed_usage_cannot_settle_unknown_reservation(self):
         from harness.factory_runtime import RuntimeFailure
+        telemetry = {"thread_id": "root", "turn_id": "run", "provider_total_usage": "UNKNOWN",
+                     "by_thread": {"child": {"run": {"last_token_usage": {"total": {"totalTokens": 900}}}}}}
         def failed(transcript):
-            raise RuntimeFailure('connection lost after a previous response', {'input_tokens': 30, 'output_tokens': 10})
+            raise RuntimeFailure('connection lost after a previous response', {'input_tokens': 30, 'output_tokens': 10},
+                                 usage_telemetry=telemetry)
         with self.assertRaises(FactoryBlocked):
             self.f.operation('feature', 'partial', 'plan', 'developer', {}, {}, True, failed)
         data = self.f.report('feature')['BUDGET_USED']
@@ -249,6 +252,9 @@ class DeliveryLimitsTests(unittest.TestCase):
         self.assertEqual(data['partial_usage_runs'], 1)
         self.assertEqual(data['unknown_token_reservation'], 100)
         self.assertEqual(data['committed_tokens'], 140)
+        operation = self.f.db.execute('SELECT * FROM operations WHERE key=?', ('partial',)).fetchone()
+        self.f.verify_evidence(operation)
+        self.assertEqual(json.loads(operation['result'])['usage_telemetry'], telemetry)
         with self.assertRaisesRegex(FactoryBlocked, 'unresolved operation prevents a new paid dispatch'):
             self.paid('next', {'input_tokens': 0, 'output_tokens': 0})
 

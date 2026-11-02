@@ -9,16 +9,41 @@ jobs:
       matrix:
         python-version: ['3.11', '3.12', '3.13', '3.14']
     steps:
+      - name: Prepare private test directories
+        run: |
+          umask 077
+          export FOOTBALLPREDICTION_CONTRACT_REPO="$RUNNER_TEMP/footballprediction-contract"
+          export TMPDIR="$RUNNER_TEMP/harness-tmp"
+          export XDG_CACHE_HOME="$RUNNER_TEMP/harness-cache"
+          export PYTHONPYCACHEPREFIX="$RUNNER_TEMP/harness-pycache"
+          printf '%s\n' \
+            "FOOTBALLPREDICTION_CONTRACT_REPO=$FOOTBALLPREDICTION_CONTRACT_REPO" \
+            "TMPDIR=$TMPDIR" \
+            "XDG_CACHE_HOME=$XDG_CACHE_HOME" \
+            "PYTHONPYCACHEPREFIX=$PYTHONPYCACHEPREFIX" >> "$GITHUB_ENV"
+          mkdir -m 700 "$TMPDIR" "$XDG_CACHE_HOME" "$PYTHONPYCACHEPREFIX"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Prepare pinned read-only FootballPrediction contract
+        timeout-minutes: 5
+        env:
+          GIT_TERMINAL_PROMPT: '0'
+        run: |
+          umask 077
+          git init "$FOOTBALLPREDICTION_CONTRACT_REPO"
+          git -C "$FOOTBALLPREDICTION_CONTRACT_REPO" -c credential.helper= fetch --no-tags --depth=1 https://github.com/xupeng211/FootballPrediction.git a65464d1e5de498a072ed9a8fdf69ce46bcc04c5
+          git -C "$FOOTBALLPREDICTION_CONTRACT_REPO" -c advice.detachedHead=false checkout --detach FETCH_HEAD
+          chmod -R a-w "$FOOTBALLPREDICTION_CONTRACT_REPO"
+          python3 -B tests/footballprediction_contract.py
       - name: Install sandbox dependency
         timeout-minutes: 5
         run: |
           sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
           sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y bubblewrap
-      - run: python -m pip install --disable-pip-version-check -e .
+      - name: Install project and test dependencies
+        run: python3 -m pip install --disable-pip-version-check --index-url https://pypi.org/simple -e '.[test]'
       - run: make verify
       - name: Build and verify installed wheel
         run: |

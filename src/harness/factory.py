@@ -14,6 +14,7 @@ import math
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import time
 import uuid
@@ -23,7 +24,7 @@ from .factory_runtime import LocalRuntime, RuntimeFailure, official_rubric, VEND
 from .sandbox import SAFE_PATH
 from .factory_budget import accounting, operation_token_limit, planning_limits
 from .factory_project import (PROJECT, OFFLINE_PASS, LANES, BACKENDS, approved_scope,
-                              materialize_scope, scope_binding, review_manifest)
+                              materialize_scope, scope_binding, review_manifest, validate_review_limits)
 from . import factory_candidate as candidate_stage
 
 
@@ -106,7 +107,8 @@ def validate_config(raw: dict) -> dict:
     """Operator policy is separate from the customer's product requirement."""
     allowed = {"version", "simulation", "budget", "max_rounds", "timeout_seconds", "checks", "ci",
                "profiles", "independent_review_required", "max_review_bytes", "max_context_bytes", "repository", "hosted_ci", "project_contract",
-               "trusted_validation", "project_pr_ci", "local_acceptance", "model_routing"}
+               "trusted_validation", "project_pr_ci", "local_acceptance", "model_routing",
+               "project_container", "project_delivery", "project_review_limits"}
     if not isinstance(raw, dict) or set(raw) - allowed or type(raw.get("version")) is not int or raw.get("version") != 1:
         raise ValueError("invalid factory configuration")
     config = json.loads(encoded(raw))
@@ -136,6 +138,23 @@ def validate_config(raw: dict) -> dict:
         validate_policy(config["project_pr_ci"])
         if "trusted_validation" not in config:
             raise ValueError("project PR readiness also requires trusted formal validation")
+    for key in ("project_container", "project_delivery", "project_review_limits"):
+        if key in config and config.get("project_contract") != PROJECT:
+            raise ValueError("project execution policies require explicit FootballPrediction contract")
+    if "project_container" in config:
+        from .factory_container import validate_policy, PROFILES
+        validate_policy(config["project_container"])
+        if any(not isinstance(cmd, list) or any(not isinstance(x, str) for x in cmd) or tuple(cmd) not in PROFILES
+               for kind in ("checks", "ci") for cmd in config.get(kind, [])):
+            raise ValueError("project container gates require exact canonical make profiles")
+    if "project_delivery" in config:
+        from .factory_remote import validate_policy
+        validate_policy(config["project_delivery"])
+    if "project_review_limits" in config:
+        validate_review_limits(config["project_review_limits"])
+    if ({"trusted_validation", "project_pr_ci"} & set(config)
+            and {"project_container", "project_delivery"} & set(config)):
+        raise ValueError("trusted QA/PR CI and Controller execution policies cannot be mixed")
     budget = config.get("budget")
     budget_fields = {"max_agent_runs", "max_total_tokens", "max_run_tokens", "max_wall_seconds",
                      "max_first_turn_tokens", "max_repair_incremental_tokens"}
@@ -214,13 +233,16 @@ def policy_identity(config):
 
 
 def validate_mission(raw):
-    keys = {"version", "mission_id", "repository", "objective", "acceptance", "constraints", "scope", "base", "mission_scope_file", "approved_mission_scope", "delivery_mode", "local_candidate_authorization", "model_routing"}
+    keys = {"version", "mission_id", "repository", "objective", "acceptance", "constraints", "scope", "base", "mission_scope_file", "approved_mission_scope", "delivery_mode", "local_candidate_authorization", "model_routing", "pr_body_template"}
     if not isinstance(raw, dict) or set(raw) - keys or type(raw.get("version")) is not int or raw.get("version") != 2:
         raise ValueError("factory missions require version 2")
     mission = json.loads(encoded(raw))
     if "model_routing" in mission:
         from .factory_routing import validate_request
         validate_request(mission["model_routing"])
+    if "pr_body_template" in mission and (not isinstance(mission["pr_body_template"], str)
+            or not mission["pr_body_template"].strip() or len(mission["pr_body_template"].encode()) > 60000):
+        raise ValueError("invalid Controller PR body template")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}", mission.get("mission_id", "")):
         raise ValueError("invalid mission_id")
     repo = Path(mission["repository"]).resolve(strict=True)
@@ -485,13 +507,21 @@ class Factory:
     def prepare(self, mission):
         row = self.row(mission)
         spec, cwd = json.loads(row["spec"]), Path(row["candidate"])
+        from .factory_remote import project_branch
+        # Local-only candidates keep the mission branch used by execution and
+        # revalidation; the BASE suffix belongs to project publication.
+        branch = (project_branch(spec) if self.project and not candidate_stage.requested(spec)
+                  else f"factory/{mission}")
         if row["status"] == "CREATED":
             if cwd.exists():
                 raise FactoryBlocked("UNKNOWN", "candidate preparation interrupted; unverified path was not reused")
             cwd.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if self.project:
+                private_dir(self.root / "candidates")
+                private_dir(cwd.parent)
             git(Path(spec["repository"]), "clone", "--no-local", "--no-hardlinks", "--no-checkout", "--", spec["repository"], str(cwd))
             git(cwd, "remote", "remove", "origin")
-            git(cwd, "checkout", "-b", f"factory/{mission}", spec["base"])
+            git(cwd, "checkout", "-b", branch, spec["base"])
             if self.project:
                 materialize_scope(spec, cwd, git)
                 if not candidate_stage.requested(spec):
@@ -501,6 +531,8 @@ class Factory:
             raise FactoryBlocked("UNKNOWN", "candidate isolation identity is invalid")
         if (cwd / ".git" / "objects" / "info" / "alternates").exists():
             raise FactoryBlocked("UNKNOWN", "candidate must not share a writable Git database")
+        if self.project and git(cwd, "branch", "--show-current") != branch:
+            raise FactoryBlocked("UNKNOWN", "candidate branch differs from task publication identity; no branch recreated")
         return spec, cwd
 
     def target(self, spec, cwd):
@@ -586,7 +618,7 @@ class Factory:
         if paid and effective_limit is not None:
             identity = {**identity, "operation_token_limit": effective_limit}
         if paid:
-            uncertain = self.db.execute("SELECT id FROM operations WHERE mission=? AND status IN ('RUNNING','UNKNOWN') LIMIT 1", (mission,)).fetchone()
+            uncertain = self.uncertain_operations(mission)
             if uncertain:
                 raise FactoryBlocked("UNKNOWN", "unresolved operation prevents a new paid dispatch; no replay or refund")
             has_paid = self.db.execute("SELECT 1 FROM operations WHERE mission=? AND paid=1 LIMIT 1", (mission,)).fetchone()
@@ -650,7 +682,15 @@ class Factory:
                               "usage": getattr(exc, "usage", None),
                               "runtime_identity": getattr(exc, "identity", None),
                               "usage_complete": getattr(exc, "usage_complete", False)}, "UNKNOWN"
-        raw_paths = [p for p in (transcript, transcript.with_suffix(".stderr"), transcript.with_suffix(".proxy.jsonl")) if p.is_file()]
+            if getattr(exc, "usage_telemetry", None) is not None:
+                result["usage_telemetry"] = exc.usage_telemetry
+            if getattr(exc, "remote_cleanup", None) is not None:
+                result["remote_cleanup"] = exc.remote_cleanup
+        raw_paths = [p for p in (transcript, transcript.with_suffix(".stderr"), transcript.with_suffix(".proxy.jsonl"),
+                                transcript.with_suffix(".container.json"), transcript.with_suffix(".container.clients.jsonl"),
+                                transcript.with_suffix(".stdout"),
+                                transcript.with_suffix(".cleanup.json"), transcript.with_suffix(".temp.json"),
+                                transcript.with_suffix(".temp.cleanup.jsonl")) if p.is_file()]
         result["raw_evidence"] = [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in raw_paths]
         data = encoded({"operation": operation_id, "identity": identity, "input": payload, "result": result}).encode()
         with evidence.open("xb") as stream:
@@ -677,6 +717,31 @@ class Factory:
         if status != "COMPLETE":
             raise FactoryBlocked("UNKNOWN", f"{stage} failed; retained raw evidence and consumed run reservation: {result['error']}")
         return result
+
+    def uncertain_operations(self, mission):
+        """Keep UNKNOWN rows intact; re-derive narrowly bound recovery evidence."""
+        resolved = set()
+        for event in self.db.execute("SELECT payload FROM events WHERE mission=? AND kind='publication_reconciled'", (mission,)):
+            value = json.loads(event[0])
+            proof = self.db.execute("SELECT * FROM operations WHERE mission=? AND key=?", (mission, value["evidence_key"])).fetchone()
+            if proof is None or proof["status"] != "COMPLETE" or proof["stage"] != "project_reconcile":
+                raise FactoryBlocked("UNKNOWN", "publication reconciliation evidence missing")
+            self.verify_evidence(proof)
+            result = json.loads(proof["result"])
+            original = self.db.execute("SELECT * FROM operations WHERE id=? AND mission=?", (value["operation_id"], mission)).fetchone()
+            if (original is None or original["stage"] != "project_publish" or result.get("status") != "PASS"
+                    or result.get("target") != json.loads(original["input"])["target"]
+                    or result.get("fixture") is not False):
+                raise FactoryBlocked("UNKNOWN", "publication reconciliation binding invalid")
+            resolved.add(value["operation_id"])
+        for event in self.db.execute("SELECT payload FROM events WHERE mission=? AND kind='remote_observation_recovered'", (mission,)):
+            value = json.loads(event[0])
+            original = self.db.execute("SELECT * FROM operations WHERE mission=? AND id=?", (mission, value["operation_id"])).fetchone()
+            proof = self.db.execute("SELECT * FROM operations WHERE mission=? AND key=?", (mission, value["evidence_key"])).fetchone()
+            self.validate_observation_recovery(mission, original, proof)
+            resolved.add(original["id"])
+        return [op for op in self.db.execute("SELECT * FROM operations WHERE mission=? AND status IN ('RUNNING','UNKNOWN')", (mission,))
+                if op["id"] not in resolved]
 
     def verify_evidence(self, operation):
         evidence = Path(operation["evidence"] or "")
@@ -797,8 +862,15 @@ class Factory:
                 # intermediate directory group-writable under umask 0002.
                 private_dir(self.root / "candidates")
                 private_dir(Path(cwd).parent)
-                return self.runtime.prepare_project_review(spec, cwd, target, lane,
+                if not self.config["simulation"]:
+                    if self.target(spec, cwd) != target:
+                        raise ValueError("candidate changed before review admission")
+                    admission = self.runtime.project_review_admission(spec, cwd, target, self.config.get("project_review_limits"))
+                    self.event(spec["mission_id"], "review_admission", {"lane": lane, "admission": admission})
+                    self.db.commit()
+                runner = self.runtime.prepare_project_review(spec, cwd, target, lane,
                     self.operation_timeout(spec["mission_id"]))
+                return runner if self.config["simulation"] else {"runner": runner, "admission": admission}
             except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
                 raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", f"canonical local preparation failed: {exc}") from exc
         result = self.operation(spec["mission_id"], key, "review", lane, identity, payload, True,
@@ -827,13 +899,156 @@ class Factory:
                 "canonical_receipt": checked.artifact, "canonical_receipt_data": checked.data,
                 "review_range": target["review_range"], "fixture": self.config["simulation"]}
 
-    def project_final_gate(self, spec, cwd, target, reviews, ci=None):
+    def observation_result(self, spec, payload, result):
+        from .factory_remote import identity
+        branch, _ = identity(payload["policy"], spec, payload["target"])
+        expected = payload.get("expected_pr")
+        if (not isinstance(result, dict) or result.get("target") != payload["target"] or result.get("fixture") is not False
+                or result.get("repository") != payload["policy"]["repository"] or result.get("pr_repo") != payload["policy"]["repository"]
+                or result.get("branch") != branch or result.get("pr_base_sha") != payload["target"]["base"]
+                or result.get("body_sha256") != hashlib.sha256(payload["body"].encode()).hexdigest()
+                or type(result.get("pr_number")) is not int or result["pr_number"] <= 0
+                or (expected is not None and expected != {k: result[k] for k in ("pr_number", "pr_repo", "pr_base_sha")})):
+            raise FactoryBlocked("UNKNOWN", "remote observation does not bind the exact repository/PR/candidate/body")
+        return result
+
+    def validate_observation_recovery(self, mission, original, proof):
+        """Re-derive a narrow read-only recovery from immutable operation evidence."""
+        stages = {"project_reconcile": "reconcile", "project_ci": "ci", "project_verify": "verify"}
+        if (not self.project or original is None or proof is None or original["paid"] or proof["paid"]
+                or original["status"] != "UNKNOWN" or proof["status"] != "COMPLETE"
+                or original["stage"] not in stages or original["stage"] != proof["stage"]
+                or original["lane"] != "github" or proof["lane"] != "github"
+                or original["ended"] is None or proof["started"] < original["ended"] or original["id"] == proof["id"]):
+            raise FactoryBlocked("UNKNOWN", "recovery is restricted to ended unpaid remote observations")
+        payload = json.loads(original["input"])
+        if (payload != json.loads(proof["input"]) or payload.get("action") != stages[original["stage"]]
+                or not isinstance(payload.get("expected_pr"), dict)
+                or payload["policy"] != self.config.get("project_delivery")):
+            raise FactoryBlocked("UNKNOWN", "observation kind/policy/known PR binding changed")
+        spec = json.loads(self.row(mission)["spec"])
+        # The new observation checks the current candidate before becoming
+        # COMPLETE. A historical exact-target relation remains evidence about
+        # that target; it does not certify any later candidate's delivery.
+        for operation in (original, proof):
+            self.verify_evidence(operation)
+            envelope = json.loads(Path(operation["evidence"]).read_text())
+            if (envelope != {"operation": operation["id"], "identity": json.loads(operation["identity"]),
+                            "input": payload, "result": json.loads(operation["result"])}
+                    or json.loads(operation["identity"]) != payload):
+                raise FactoryBlocked("UNKNOWN", "observation evidence differs from durable operation binding")
+        result = self.observation_result(spec, payload, json.loads(proof["result"]))
+        if result.get("status") != "PASS":
+            raise FactoryBlocked("UNKNOWN", "fresh observation did not establish successful verification")
+
+    def project_remote_read(self, action, spec, cwd, target, body, reviews=None, expected_pr=None):
+        if action not in {"reconcile", "ci", "verify"}:
+            raise FactoryBlocked("UNKNOWN", "only canonical read-only observation kinds are supported")
+        self.require_project_validation(spec, cwd, target)
+        payload = {"target": target, "policy": self.config["project_delivery"], "body": body,
+                   "action": action, "reviews": reviews or [], "expected_pr": None}
+        # A first discovery may establish a PR, but cannot retroactively prove
+        # an unknown numeric PR. Automatic recovery requires a previously bound PR.
+        if expected_pr is None:
+            for old in self.db.execute("SELECT * FROM operations WHERE mission=? AND paid=0 AND lane='github' AND status='COMPLETE' ORDER BY started DESC", (spec["mission_id"],)):
+                old_payload = json.loads(old["input"])
+                if all(old_payload.get(k) == payload[k] for k in ("target", "policy", "body")):
+                    self.verify_evidence(old)
+                    expected_pr = self.observation_result(spec, payload, json.loads(old["result"]))
+                    break
+        if expected_pr is not None:
+            keys = {"pr_number", "pr_repo", "pr_base_sha"}
+            if set(expected_pr) == keys:
+                if (type(expected_pr["pr_number"]) is not int or expected_pr["pr_number"] <= 0
+                        or expected_pr["pr_repo"] != payload["policy"]["repository"]
+                        or expected_pr["pr_base_sha"] != target["base"]):
+                    raise FactoryBlocked("UNKNOWN", "invalid expected numeric PR binding")
+                payload["expected_pr"] = dict(expected_pr)
+            else:
+                checked = self.observation_result(spec, payload, expected_pr)
+                payload["expected_pr"] = {k: checked[k] for k in keys}
+        key = digest({"action": action, **payload, "observation": uuid.uuid4().hex})
+        def observe(transcript):
+            result = self.runtime.project_remote(action, payload["policy"], spec, cwd, target, body, transcript,
+                                                 self.operation_timeout(spec["mission_id"]), reviews=reviews)
+            self.observation_result(spec, payload, result)
+            if self.target(spec, cwd) != target:
+                raise FactoryBlocked("UNKNOWN", "candidate changed during remote operation")
+            return result
+        result = self.operation(spec["mission_id"], key, "project_reconcile" if action == "reconcile" else "project_" + action,
+            "github", payload, payload, False, observe)
+        if result.get("status") == "PASS" and payload["expected_pr"] is not None:
+            proof = self.db.execute("SELECT * FROM operations WHERE mission=? AND key=?", (spec["mission_id"], key)).fetchone()
+            for original in self.uncertain_operations(spec["mission_id"]):
+                if original["status"] != "UNKNOWN" or original["stage"] != proof["stage"] or original["input"] != encoded(payload):
+                    continue
+                self.validate_observation_recovery(spec["mission_id"], original, proof)
+                self.event(spec["mission_id"], "remote_observation_recovered", {"operation_id": original["id"], "evidence_key": key})
+            self.db.commit()
+        return {**result, "evidence_key": key}
+
+    def recover_publication(self, spec, cwd, operation):
+        payload = json.loads(operation["input"])
+        if self.target(spec, cwd) != payload["target"] or payload["policy"] != self.config.get("project_delivery"):
+            raise FactoryBlocked("UNKNOWN", "uncertain publication belongs to another candidate/policy; no write retried")
+        proof = self.project_remote_read("reconcile", spec, cwd, payload["target"], payload["body"])
+        if proof["status"] != "PASS":
+            raise FactoryBlocked("UNKNOWN", "uncertain publication could not be observed; no write retried")
+        self.event(spec["mission_id"], "publication_reconciled", {"operation_id": operation["id"], "evidence_key": proof["evidence_key"]})
+        self.db.commit()
+        return proof
+
+    def project_pr_ci(self, spec, cwd, target, reviews, validations):
+        from .factory_remote import render_body
+        policy = self.config.get("project_delivery")
+        if policy is None:
+            raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "Controller project PR publication policy missing")
+        if self.target(spec, cwd) != target:
+            raise FactoryBlocked("UNKNOWN", "candidate changed before PR publication")
+        required = self.require_project_validation(spec, cwd, target)
+        required_keys = {item["evidence_key"] for item in required}
+        validations = [item for item in validations if item.get("evidence_key") not in required_keys] + required
+        body = render_body(policy, spec, target, reviews, validations)
+        payload = {"target": target, "policy": policy, "body": body}
+        key = digest({"project_publish": payload})
+        old = self.db.execute("SELECT * FROM operations WHERE mission=? AND key=?", (spec["mission_id"], key)).fetchone()
+        if old is not None and old["status"] != "COMPLETE":
+            publication = self.recover_publication(spec, cwd, old)
+        else:
+            previous_head = None
+            for previous in self.db.execute("SELECT * FROM operations WHERE mission=? AND stage IN ('project_publish','project_reconcile') AND status='COMPLETE' ORDER BY started", (spec["mission_id"],)):
+                self.verify_evidence(previous)
+                value = json.loads(previous["result"])
+                if value.get("status") == "PASS":
+                    previous_head = value["target"]["head"]
+            publication = self.operation(spec["mission_id"], key, "project_publish", "github", payload, payload, False,
+                lambda transcript: self.runtime.project_remote("publish", policy, spec, cwd, target, body, transcript,
+                    self.operation_timeout(spec["mission_id"]), previous_head=previous_head))
+            if publication.get("status") != "PASS" or publication.get("target") != target or publication.get("fixture") is not False:
+                raise FactoryBlocked("UNKNOWN", "publication did not establish exact live PR identity")
+            # Cached success is never current remote truth.
+            publication = self.project_remote_read("reconcile", spec, cwd, target, body, expected_pr=publication)
+        ci = self.project_remote_read("ci", spec, cwd, target, body, expected_pr=publication)
+        if ci["status"] not in {"PASS", "FAIL"}:
+            raise FactoryBlocked("BLOCKED_CI", ci.get("reason", "required exact PR checks are unfinished/unknown"))
+        return {"publication": publication, "ci": ci, "body": body}
+
+    def project_final_gate(self, spec, cwd, target, reviews, remote=None):
+        self.require_project_validation(spec, cwd, target)
         if {r["lane"] for r in reviews} != set(LANES) or any(r["status"] != "PASS" for r in reviews):
             raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "both validated canonical receipts are required")
         context = None
         if "project_pr_ci" in self.config:
-            context = self.project_ci_context(spec, cwd, target, ci or [])
-        payload = {"target": target, "receipts": {r["backend"]: r["canonical_receipt"] for r in reviews}, "context": context}
+            context = self.project_ci_context(spec, cwd, target, remote or [])
+        if not self.config["simulation"] and "project_delivery" in self.config:
+            if remote is None or remote["ci"]["status"] != "PASS":
+                raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "exact live PR/CI context missing")
+            checked = self.project_remote_read("verify", spec, cwd, target, remote["body"], reviews, expected_pr=remote["publication"])
+            if checked["status"] != "PASS":
+                raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", checked.get("reason", "canonical final gate rejected delivery"))
+            return checked
+        payload = {"target": target, "receipts": {r["backend"]: r["canonical_receipt"] for r in reviews},
+                   **({"context": context} if context is not None else {})}
         key = digest({"project_final_gate": payload})
         result = self.operation(spec["mission_id"], key, "project_gate", "project", payload, payload, False,
             lambda transcript: self.runtime.project_final_gate(spec, cwd, target, reviews, transcript,
@@ -898,6 +1113,109 @@ class Factory:
         except Exception as exc:
             raise FactoryBlocked("BLOCKED_PUBLICATION_AUTH", str(exc)) from exc
 
+    def project_validation_binding(self, spec, cwd, target):
+        """Bind new strict executions to this task, source, contract and executor.
+
+        The full target is reconstructed by the existing trusted-base policy
+        path, never from a caller's profile declaration or reduced path list.
+        No old gate/fixture result is upgraded to this execution format.
+        """
+        if self.target(spec, cwd) != target:
+            raise FactoryBlocked("UNKNOWN", "validation candidate/task/policy changed")
+        from .factory_project import tracked_source_digest
+        try:
+            source = tracked_source_digest(cwd, target["head"], require_committed=True)
+        except (OSError, ValueError) as exc:
+            raise FactoryBlocked("UNKNOWN", "validation source bytes/mode changed: " + str(exc)) from exc
+        policy = self.config.get("project_container")
+        if policy is None or "strict" not in policy["profiles"] or not policy.get("postgres_image_id"):
+            raise FactoryBlocked("BLOCKED_VALIDATION", "make verify-strict requires Controller authorization and pinned dev/PostgreSQL images; no profile added or downgraded")
+        implementations = ("factory.py", "factory_container.py", "factory_test_service.py",
+                           "factory_runtime.py", "factory_project.py", "adapters.py")
+        return {"version": "factory-strict-execution/v1", "mission_id": spec["mission_id"],
+                "spec_sha256": digest(spec), "target": target, "profile": "strict", "source_sha256": source,
+                "container_policy": policy, "simulation": self.config["simulation"],
+                "timeout_seconds": self.config["timeout_seconds"],
+                "executor_sha256": digest({name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+                                           for name in implementations})}
+
+    def check_project_strict_result(self, spec, target, result):
+        if (result.get("status") != "PASS" or type(result.get("exit_code")) is not int or result["exit_code"] != 0
+                or result.get("profile") != "strict" or result.get("fixture") is not False
+                or result.get("target") != target or result.get("mission_id") != spec["mission_id"]
+                or result.get("scope_sha256") != target["mission_scope_sha256"]
+                or result.get("container_policy") != self.config["project_container"]
+                or result.get("image_id") != self.config["project_container"]["image_id"]):
+            raise FactoryBlocked("BLOCKED_VALIDATION", "current make verify-strict has no bound successful container execution")
+
+    def require_project_validation(self, spec, cwd, target):
+        """Consume actual strict success before publication, recovery and READY.
+
+        STRICT's pre-PR requirement comes from the fixed original contract.
+        NORMAL and CRITICAL retain their existing paths; simulation never
+        establishes live success. Configuration only permits execution.
+        """
+        if not self.project or self.config["simulation"]:
+            return []
+        current = self.target(spec, cwd)
+        if current != target:
+            raise FactoryBlocked("UNKNOWN", "validation candidate/task/policy changed")
+        workflow = current["project_policy"].get("workflow_class")
+        if workflow not in {"NORMAL", "STRICT", "CRITICAL"}:
+            raise FactoryBlocked("BLOCKED_VALIDATION", "original workflow classification unavailable")
+        if "trusted_validation" in self.config:
+            if workflow not in {"STRICT", "CRITICAL"}:
+                return []
+            # Main's formal executor has its own established evidence schema.
+            # Consume its actual strict operation; never translate it into a
+            # Controller container receipt or accept a configured profile alone.
+            from .factory_project import tracked_source_digest
+            from .factory_validation import validate_result
+            tracked_source_digest(cwd, target["head"], require_committed=True)
+            for op in self.db.execute("SELECT * FROM operations WHERE mission=? AND stage='checks' "
+                                      "AND lane='local' AND status='COMPLETE' ORDER BY started DESC",
+                                      (spec["mission_id"],)):
+                payload = json.loads(op["input"])
+                if (op["paid"] or op["ended"] is None
+                        or set(payload) != {"command", "target", "round", "validation", "mission_id"}
+                        or payload["command"] != ["make", "verify-strict"]
+                        or payload["target"] != target or payload["mission_id"] != spec["mission_id"]
+                        or payload["validation"] != self.config["trusted_validation"]
+                        or json.loads(op["identity"]) != {"target": target}):
+                    continue
+                self.verify_evidence(op)
+                result = json.loads(op["result"])
+                if json.loads(Path(op["evidence"]).read_text()) != {
+                        "operation": op["id"], "identity": {"target": target},
+                        "input": payload, "result": result}:
+                    raise FactoryBlocked("UNKNOWN", "trusted strict operation envelope changed")
+                try:
+                    validate_result(result, self.config["trusted_validation"], spec, target, "strict", False)
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    raise FactoryBlocked("BLOCKED_VALIDATION", "trusted strict execution rejected: " + str(exc)) from exc
+                if result["status"] != "PASS":
+                    raise FactoryBlocked("BLOCKED_VALIDATION", "trusted strict execution failed")
+                return [{**result, "evidence_key": op["key"]}]
+            raise FactoryBlocked("BLOCKED_VALIDATION", "current successful trusted strict execution is missing; configuration or old evidence cannot substitute")
+        if workflow != "STRICT":
+            return []
+        binding = self.project_validation_binding(spec, cwd, target)
+        payload = {"command": ["make", "verify-strict"], "target": target, "validation_binding": binding}
+        key = digest({"canonical_validation": binding})
+        op = self.db.execute("SELECT * FROM operations WHERE mission=? AND key=?", (spec["mission_id"], key)).fetchone()
+        if (op is None or op["status"] != "COMPLETE" or op["stage"] not in {"checks", "ci"}
+                or op["lane"] != "local" or op["paid"] or op["ended"] is None
+                or json.loads(op["input"]) != payload
+                or json.loads(op["identity"]) != {"target": target, "validation_binding": binding}):
+            raise FactoryBlocked("BLOCKED_VALIDATION", "STRICT requires an actually successful current make verify-strict before PR; configured targeted/PR or unexecuted strict cannot substitute; no extra dispatch authorized")
+        self.verify_evidence(op)
+        result = json.loads(op["result"])
+        if json.loads(Path(op["evidence"]).read_text()) != {
+                "operation": op["id"], "identity": json.loads(op["identity"]), "input": payload, "result": result}:
+            raise FactoryBlocked("UNKNOWN", "strict operation envelope/binding changed")
+        self.check_project_strict_result(spec, target, result)
+        return [{**result, "evidence_key": key}]
+
     def gates(self, spec, cwd, target, kind, round_):
         candidate_stage.check_dispatch(self, spec["mission_id"], kind)
         if candidate_stage.requested(spec) and kind == "checks":
@@ -910,21 +1228,50 @@ class Factory:
             payload = {"command": command, "target": target, "round": round_,
                        **({"validation": validation, "mission_id": spec["mission_id"]} if validation else {})}
             key = digest({"kind": kind, "index": index, **payload})
-            result = self.operation(spec["mission_id"], key, kind, "local", {"target": target}, payload, False,
-                                    lambda transcript: self.runtime.project_validation(validation, spec, command, cwd, target, transcript, self.operation_timeout(spec["mission_id"]))
-                                    if validation else self.runtime.gate(command, cwd, target, transcript, self.operation_timeout(spec["mission_id"])))
+            strict = False
             if validation:
-                from .factory_validation import validate_result, profile_for
-                try:
-                    validate_result(result, validation, spec, target, profile_for(command), self.config["simulation"])
-                except Exception as exc:
-                    raise FactoryBlocked("UNKNOWN", "trusted validation rejected: " + str(exc)) from exc
+                result = self.operation(spec["mission_id"], key, kind, "local", {"target": target}, payload, False,
+                                        lambda transcript: self.runtime.project_validation(validation, spec, command, cwd, target, transcript, self.operation_timeout(spec["mission_id"]))
+                                        if validation else self.runtime.gate(command, cwd, target, transcript, self.operation_timeout(spec["mission_id"])))
+                if validation:
+                    from .factory_validation import validate_result, profile_for
+                    try:
+                        validate_result(result, validation, spec, target, profile_for(command), self.config["simulation"])
+                    except Exception as exc:
+                        raise FactoryBlocked("UNKNOWN", "trusted validation rejected: " + str(exc)) from exc
+            else:
+                identity = {"target": target}
+                strict = self.project and not self.config["simulation"] and command == ["make", "verify-strict"]
+                if strict:
+                    binding = self.project_validation_binding(spec, cwd, target)
+                    payload = {"command": command, "target": target, "validation_binding": binding}
+                    identity = {"target": target, "validation_binding": binding}
+                    # Same valid strict execution can satisfy checks/ci and resume;
+                    # a new round alone does not require another expensive run.
+                    key = digest({"canonical_validation": binding})
+                def invoke(transcript):
+                    if self.project and not self.config["simulation"]:
+                        if "project_container" not in self.config:
+                            raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "Controller container policy is required; host fallback forbidden")
+                        return self.runtime.container_gate(self.config["project_container"], spec, cwd, target, command,
+                                                           transcript, self.operation_timeout(spec["mission_id"]))
+                    return self.runtime.gate(command, cwd, target, transcript, self.operation_timeout(spec["mission_id"]))
+                result = self.operation(spec["mission_id"], key, kind, "local", identity, payload, False, invoke)
+                if self.project and not self.config["simulation"]:
+                    if (result.get("target") != target or result.get("fixture") is not False
+                            or result.get("image_id") != self.config["project_container"]["image_id"]):
+                        raise FactoryBlocked("UNKNOWN", "container evidence identity mismatch")
+                    if result.get("status") not in {"PASS", "FAIL"}:
+                        raise FactoryBlocked("BLOCKED_VALIDATION", result.get("status", "container validation unavailable"))
             if result.get("status") not in ("PASS", "FAIL") or type(result.get("exit_code")) is not int or (result["status"] == "PASS") != (result["exit_code"] == 0):
                 raise FactoryBlocked("UNKNOWN", "test/CI command lacks a proven exit status")
             if self.target(spec, cwd) != target:
                 raise FactoryBlocked("UNKNOWN", "test/CI changed the reviewed target")
+            if strict and result["status"] == "PASS":
+                self.check_project_strict_result(spec, target, result)
             results.append({**result, "evidence_key": key})
         if kind == "ci" and "project_pr_ci" in self.config:
+            self.require_project_validation(spec, cwd, target)
             policy = self.config["project_pr_ci"]
             approval = self.publication_approval(spec, target)
             payload = {"target": target, "policy": policy, "approval_id": approval["approval_id"],
@@ -985,8 +1332,147 @@ class Factory:
             results.append({**result, "evidence_key": key, "department": "hosted_ci"})
         return results
 
+    def verify_temporary_cleanup(self, mission):
+        """Read only: every allocation needs its original, bound cleanup proof."""
+        try:
+            candidate = self.row(mission)["candidate"]
+            root = self.root / "evidence" / mission
+            allocations, proofs, native_identities, process_owners = {}, [], [], {}
+            def read(path, expected_hash):
+                info = path.lstat()
+                if (path.is_symlink() or path.resolve(strict=True) != path or not stat.S_ISREG(info.st_mode)
+                        or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077 or info.st_size > 65536):
+                    raise ValueError("untrusted temporary cleanup evidence")
+                data = path.read_bytes()
+                if hashlib.sha256(data).hexdigest() != expected_hash:
+                    raise ValueError("temporary cleanup evidence hash changed")
+                return data
+            for operation in self.db.execute("SELECT * FROM operations WHERE mission=?", (mission,)):
+                result = json.loads(operation["result"] or "{}")
+                raw = result.get("raw_evidence", [])
+                allocation = root / (operation["id"] + ".temp.json")
+                entries = [v for v in raw if v["path"] == str(allocation)]
+                native_runtime = (result.get("runtime_identity") or {}).get("native_runtime", {})
+                native = native_runtime.get("temporary_workspace")
+                if native is not None:
+                    native_identities.append(native)
+                    if native_runtime.get("process_ownership") is not None:
+                        if native["path"] in process_owners and process_owners[native["path"]] != native_runtime["process_ownership"]:
+                            raise ValueError("temporary allocation execution ownership changed")
+                        process_owners[native["path"]] = native_runtime["process_ownership"]
+                if entries or allocation.exists() or allocation.is_symlink():
+                    if len(entries) != 1 or operation["lane"] != "developer":
+                        raise ValueError("temporary allocation lacks original operation binding")
+                    self.verify_evidence(operation)
+                    original = json.loads(Path(operation["evidence"]).read_bytes())
+                    if original != {"operation": operation["id"], "identity": json.loads(operation["identity"]),
+                                    "input": json.loads(operation["input"]), "result": result}:
+                        raise ValueError("temporary allocation differs from immutable operation evidence")
+                    identity = json.loads(read(allocation, entries[0]["sha256"]))
+                    if (not isinstance(identity, dict) or identity.get("worktree") != candidate
+                            or Path(identity["path"]).parent != Path("/tmp")
+                            or identity.get("uid") != os.getuid() or identity.get("mode") != "0o700"
+                            or any(type(identity.get(k)) is not int for k in ("device", "inode"))
+                            or not isinstance(identity.get("permission_profile"), str)):
+                        raise ValueError("temporary allocation candidate/directory identity differs")
+                    allocations[operation["id"]] = (identity, entries[0])
+                    receipt = allocation.with_suffix(".cleanup.jsonl")
+                    proofs.extend((operation["id"], v, None) for v in raw if v["path"] == str(receipt))
+            for event in self.db.execute("SELECT payload FROM events WHERE mission=? AND kind='agent_temporary_cleanup' ORDER BY sequence", (mission,)):
+                payload = json.loads(event[0])
+                if payload.get("cleanup_confirmed") is not True:
+                    raise ValueError("task temporary cleanup is unconfirmed; no replay or resource adoption")
+                source = payload.get("operation_id")
+                if (payload.get("mission_id") != mission or source not in allocations
+                        or payload.get("allocation") != allocations[source][1]
+                        or payload.get("identity") != allocations[source][0]):
+                    raise ValueError("temporary cleanup event task/operation/allocation binding differs")
+                proofs.append((source, payload["evidence"], payload))
+            covered = set()
+            for source, evidence, event in proofs:
+                identity, allocation = allocations[source]
+                receipt = Path(allocation["path"]).with_suffix(".cleanup.jsonl")
+                if evidence["path"] != str(receipt):
+                    raise ValueError("temporary cleanup receipt path binding differs")
+                rows = [json.loads(line) for line in read(receipt, evidence["sha256"]).splitlines()]
+                if not rows or any(v.get("cleanup_confirmed") is not True or v.get("identity") != identity for v in rows):
+                    raise ValueError("temporary cleanup receipt contains unconfirmed or foreign allocation")
+                owner = process_owners.get(identity["path"])
+                for entry in rows:
+                    stop = entry.get("process_stop")
+                    if owner is not None:
+                        binding = owner["binding"]
+                        if (not isinstance(stop, dict) or stop.get("confirmed") is not True
+                                or stop.get("proof") != "ECHILD" or stop.get("binding") != binding
+                                or stop.get("supervisor") != {k:v for k,v in owner["supervisor"].items() if k != "state"}
+                                or binding.get("temporary_workspace") != identity
+                                or binding.get("operation") != str(root / (source + ".raw"))
+                                or binding.get("context", {}).get("mission_id") != mission):
+                            raise ValueError("temporary cleanup lacks its original execution stop proof")
+                    elif stop is not None and stop.get("confirmed") is not True:
+                        raise ValueError("temporary cleanup execution stop is unconfirmed")
+                if event is not None and any(event.get(k) != rows[-1].get(k) for k in ("identity", "cleanup_confirmed", "at")):
+                    raise ValueError("temporary cleanup event differs from original receipt")
+                covered.add(source)
+            if covered != set(allocations) or any(v not in [a[0] for a in allocations.values()] for v in native_identities):
+                raise ValueError("temporary allocation has no confirmed cleanup proof")
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+            raise FactoryBlocked("UNKNOWN", "temporary cleanup evidence invalid: " + str(error)) from error
+
+    def verify_container_client_stops(self, mission):
+        """Read only; neither a late event nor container absence supplies stops."""
+        if not self.project or self.config["simulation"] or "project_container" not in self.config:
+            return
+        from .factory_container import client_stop_evidence, LIFECYCLE_LIMIT, temporary_binding
+        try:
+            for operation in self.db.execute("SELECT * FROM operations WHERE mission=? AND paid=0 "
+                                             "AND stage IN ('checks','ci')", (mission,)):
+                result = json.loads(operation["result"] or "{}")
+                transcript = self.root / "evidence" / mission / (operation["id"] + ".raw")
+                lifecycle = transcript.with_suffix(".container.json")
+                if not result.get("lifecycle_record") and not lifecycle.exists():
+                    payload = json.loads(operation["input"])
+                    if ("trusted_validation" in self.config
+                            and payload.get("validation") == self.config["trusted_validation"]):
+                        continue  # The distinct formal executor has its own receipt.
+                    raise ValueError("container client lifecycle/stop evidence is missing")
+                with os.fdopen(os.open(lifecycle, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
+                    info = os.fstat(stream.fileno())
+                    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                            or stat.S_IMODE(info.st_mode) & 0o077 or info.st_size > LIFECYCLE_LIMIT):
+                        raise ValueError("untrusted container lifecycle evidence")
+                    raw = stream.read(LIFECYCLE_LIMIT + 1)
+                if len(raw) > LIFECYCLE_LIMIT:
+                    raise ValueError("container lifecycle evidence exceeds capacity")
+                record = json.loads(raw)
+                payload = json.loads(operation["input"])
+                spec = json.loads(self.row(mission)["spec"])
+                identity = record["temporary_directory_identity"]
+                if (not isinstance(identity, dict) or record["mission_id"] != mission
+                        or record.get("target_sha256") != digest(payload["target"])
+                        or identity.get("binding") != temporary_binding(spec, payload["target"], record["container_name"], transcript)):
+                    raise ValueError("container client lifecycle task/operation/target changed")
+                proof = client_stop_evidence(transcript, record, raw)
+                if operation["evidence"]:
+                    self.verify_evidence(operation)
+                    if (json.loads(Path(operation["evidence"]).read_bytes()) != {
+                            "operation": operation["id"], "identity": json.loads(operation["identity"]),
+                            "input": payload, "result": result}
+                            or result.get("local_clients_stop_confirmed") is not True
+                            or result.get("client_stop_evidence") != proof
+                            or {"path": proof["path"], "sha256": proof["sha256"]} not in result.get("raw_evidence", [])):
+                        raise ValueError("container client stop evidence lacks its immutable operation binding")
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise FactoryBlocked("UNKNOWN", "container local clients not confirmed stopped: " + str(error)) from error
+
     def report(self, mission):
-        report = self._report(mission)
+        temporary_error = None
+        try:
+            self.verify_temporary_cleanup(mission)
+            self.verify_container_client_stops(mission)
+        except FactoryBlocked as error:
+            temporary_error = error.reason
+        report = self._report(mission, temporary_error)
         if "model_routing" in self.config:
             from .factory_routing import observation
             event = self.db.execute("SELECT payload FROM events WHERE mission=? AND kind='submitted'", (mission,)).fetchone()
@@ -995,8 +1481,11 @@ class Factory:
             report["MODEL_ROUTING"] = observation(decision, operations)
         return report
 
-    def _report(self, mission):
+    def _report(self, mission, temporary_error=None):
+        from .factory_remote import project_branch
         row = self.row(mission)
+        if temporary_error is not None:
+            row = {**dict(row), "status": "UNKNOWN", "reason": temporary_error}
         operations = self.db.execute("SELECT * FROM operations WHERE mission=? ORDER BY started", (mission,)).fetchall()
         events = self.db.execute("SELECT kind,payload FROM events WHERE mission=? ORDER BY sequence", (mission,)).fetchall()
         spec = json.loads(row["spec"])
@@ -1007,13 +1496,17 @@ class Factory:
         delivery = deliveries[-1] if deliveries else {}
         preflights = [json.loads(e["payload"]) for e in events if e["kind"] == "prepaid_preflight"]
         status, reason = row["status"], row["reason"]
+        fresh = None
         if status == READY or self.project and status == OFFLINE_PASS:
             try:
                 spec, cwd = json.loads(row["spec"]), Path(row["candidate"])
-                if self.project and status == READY and (self.config["simulation"] or "project_pr_ci" not in self.config):
+                if self.project and status == READY and (self.config["simulation"] or not {"project_pr_ci", "project_delivery"} & set(self.config)):
                     raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "live readiness requires explicit PR CI and live evidence")
                 if self.target(spec, cwd) != delivery.get("target"):
                     raise FactoryBlocked("UNKNOWN", "delivery HEAD/tree/scope changed after verification")
+                for validation in self.require_project_validation(spec, cwd, delivery["target"]):
+                    if validation["evidence_key"] not in delivery["evidence_keys"]:
+                        raise FactoryBlocked("UNKNOWN", "required strict operation absent from delivery evidence")
                 if not delivery.get("target", {}).get("files") or not isinstance(delivery.get("implemented"), str) or not delivery["implemented"].strip():
                     raise FactoryBlocked("UNKNOWN", "delivery implementation/change evidence is missing")
                 expected_lanes = {"reviewer", "second_reviewer"} if self.config["independent_review_required"] else {"reviewer"}
@@ -1064,15 +1557,21 @@ class Factory:
                     if gate["evidence_key"] not in delivery["evidence_keys"] or gate.get("fixture") is not self.config["simulation"]:
                         raise FactoryBlocked("UNKNOWN", "project gate evidence is incomplete")
                     op = self.db.execute("SELECT * FROM operations WHERE mission=? AND key=?", (mission, gate["evidence_key"])).fetchone()
-                    if (op is None or op["stage"] != "project_gate" or json.loads(op["result"]).get("status") != "PASS"
+                    if (op is None or op["stage"] != ("project_verify" if not self.config["simulation"] and "project_delivery" in self.config else "project_gate") or json.loads(op["result"]).get("status") != "PASS"
                             or json.loads(op["result"]).get("target") != delivery["target"]):
                         raise FactoryBlocked("UNKNOWN", "project final gate evidence is missing or rejected")
+                    if not self.config["simulation"] and "project_delivery" in self.config:
+                        fresh = self.project_remote_read("verify", spec, cwd, delivery["target"], delivery["remote"]["body"], delivery["reviews"], expected_pr=delivery["remote"]["publication"])
+                        if fresh["status"] != "PASS":
+                            raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", fresh.get("reason", "remote PR/CI/final gate is no longer current"))
             except FactoryBlocked as exc:
                 status, reason = exc.status, exc.reason
             except Exception as exc:
                 status, reason = "UNKNOWN", str(exc)
         verified = status == READY or self.project and status == OFFLINE_PASS
+        operations = self.db.execute("SELECT * FROM operations WHERE mission=? ORDER BY started", (mission,)).fetchall()
         return {"MISSION": mission, "DELIVERY_STATUS": status,
+                "CURRENT_REMOTE_VERIFICATION": fresh if fresh is not None else "NOT_RUN",
                 "PREPAID_PREFLIGHT": preflights[-1] if preflights else "NOT_RUN",
                 "IMPLEMENTED": delivery.get("implemented", "UNKNOWN"),
                 "TEST_RESULT": delivery.get("tests", "UNKNOWN") if verified else "UNKNOWN",
@@ -1080,19 +1579,22 @@ class Factory:
                 "REVIEW_RESULT": delivery.get("reviews", "UNKNOWN") if verified else "UNKNOWN",
                 "BLOCKERS_REMAINING": ["live validation, exact PR/CI and business delivery are not established"] if self.project and status == OFFLINE_PASS else [] if status == READY else [reason or status],
                 "PROJECT_CONTRACT": PROJECT if self.project else "NOT_CONFIGURED",
-                "PROJECT_ACCEPTANCE": "OFFLINE_FIXTURE_ONLY" if self.project and status == OFFLINE_PASS else "MERGE_READY" if self.project and status == READY else "NOT_ESTABLISHED",
+                "PROJECT_ACCEPTANCE": "OFFLINE_FIXTURE_ONLY" if self.project and status == OFFLINE_PASS else ("MERGE_READY" if "project_pr_ci" in self.config else "EXACT_PR_PREMERGE_VERIFIED") if self.project and status == READY else "NOT_ESTABLISHED",
                 "DONE": False,
                 "KNOWN_RISKS": delivery.get("risks", []),
                 "BUDGET_USED": {**accounting(operations, self.config["budget"]),
                                 "money": "UNKNOWN" if not self.config["simulation"] else "FIXTURE_NO_PROVIDER_COST"},
                 "LOCAL_CI": delivery.get("ci", "UNKNOWN") if status == READY else "UNKNOWN",
-                "HOSTED_CI": delivery.get("hosted_ci", "NOT_CONFIGURED") if status == READY else "UNKNOWN" if {"hosted_ci", "project_pr_ci"} & set(self.config) else "NOT_CONFIGURED",
+                "HOSTED_CI": delivery.get("hosted_ci", "NOT_CONFIGURED") if status == READY else "UNKNOWN" if {"hosted_ci", "project_pr_ci", "project_delivery"} & set(self.config) else "NOT_CONFIGURED",
                 "PROJECT_PR_CI": [r.get("context") for r in delivery.get("validation_results", {}).get("ci", [])
                                   if r.get("department") == "project_pr_ci"] if verified else "NOT_ESTABLISHED",
+                "PROJECT_PR": delivery.get("remote", {}).get("publication", "NOT_RUN") if verified else "UNKNOWN",
                 "TARGET_HEAD": delivery.get("target", {}).get("head", "UNKNOWN"),
                 "EXACT_TARGET": delivery.get("target", "UNKNOWN"),
                 "DELIVERY_EVIDENCE": [op["evidence"] for op in operations if op["evidence"]],
-                "CANDIDATE": row["candidate"], "CANDIDATE_BRANCH": f"factory/{mission}", "SIMULATION": self.config["simulation"],
+                "CANDIDATE": row["candidate"],
+                "CANDIDATE_BRANCH": project_branch(json.loads(row["spec"])) if self.project else f"factory/{mission}",
+                "SIMULATION": self.config["simulation"],
                 "HUMAN_APPROVAL_REQUIRED": ["merge", "release"], "MERGE_PERFORMED": False}
 
     def cancel_requested(self, mission):
@@ -1125,36 +1627,137 @@ class Factory:
                 fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return {**self.report(mission), "DELIVERY_STATUS": "RUNNING", "BLOCKERS_REMAINING": ["another controller owns this mission"]}
+            pending = self.runtime.unconfirmed_appserver() if hasattr(self.runtime, "unconfirmed_appserver") else None
+            if pending:
+                # A retry is a read-only UNKNOWN assessment, not an attempt to
+                # create a replacement execution or reconstruct missing proof.
+                return {**self.report(mission), "DELIVERY_STATUS": "UNKNOWN", "BLOCKERS_REMAINING": [pending]}
             import threading
             stopped = threading.Event()
+            execution = self.runtime.begin_execution(mission) if hasattr(self.runtime, "begin_execution") else None
             def watch_cancel():
                 while not stopped.wait(0.2):
                     if self.cancel_requested(mission) and hasattr(self.runtime, "cancel"):
-                        self.runtime.cancel()
+                        if execution is not None:
+                            self.runtime.cancel(execution)
+                        else:
+                            self.runtime.cancel()
             if hasattr(self.runtime, "resource_policy"):
                 self.runtime.resource_policy = self.config["budget"]
             watcher = threading.Thread(target=watch_cancel, daemon=True)
             watcher.start()
+            cleanup = None
             try:
-                return self._run(mission)
+                result = self._run(mission)
             finally:
                 stopped.set()
                 watcher.join(timeout=1)
-                if hasattr(self.runtime, "close_session"):
-                    self.runtime.close_session()
+                try:
+                    if hasattr(self.runtime, "close_session"):
+                        from .task_temp import TaskTempError
+                        try:
+                            cleanup = self.runtime.close_session()
+                        except TaskTempError as error:
+                            self.event(mission, "agent_temporary_cleanup", {"cleanup_confirmed": False,
+                                       "identity": error.identity, "error": str(error)})
+                            self.state(mission, "UNKNOWN", str(error))
+                            raise FactoryBlocked("UNKNOWN", str(error)) from error
+                        if cleanup is not None:
+                            cleanup = {**cleanup, "mission_id": mission,
+                                       "operation_id": Path(cleanup.get("allocation", {}).get("path", "")).name.removesuffix(".temp.json")}
+                            self.event(mission, "agent_temporary_cleanup", cleanup)
+                            self.db.commit()
+                finally:
+                    if execution is not None:
+                        self.runtime.end_execution(execution)
+            # Single-session receipts are created only by the finally above.
+            # Do not return the earlier, pre-cleanup delivery assessment.
+            return self.report(mission) if cleanup is not None else result
+
+    def recover_interrupted_containers(self, mission):
+        """Cleanup only: no candidate preparation, dispatch replay or settlement."""
+        cleanups = []
+        if not self.project or self.config["simulation"] or "project_container" not in self.config:
+            return cleanups
+        spec = json.loads(self.row(mission)["spec"])
+        for pending in self.db.execute("SELECT * FROM operations WHERE mission=? AND paid=0 "
+                                       "AND stage IN ('checks','ci') AND status IN ('RUNNING','UNKNOWN','COMPLETE')",
+                                       (mission,)).fetchall():
+            try:
+                payload = json.loads(pending["input"])
+                transcript = self.root / "evidence" / mission / (pending["id"] + ".raw")
+                if pending["status"] == "COMPLETE":
+                    # COMPLETE means the check returned, not that all its
+                    # resources disappeared. Trust only its immutable proof.
+                    self.verify_evidence(pending)
+                    result = json.loads(pending["result"])
+                    proof = json.loads(Path(pending["evidence"]).read_text())
+                    lifecycle = str(transcript.with_suffix(".container.json"))
+                    if (proof != {"operation": pending["id"], "identity": json.loads(pending["identity"]),
+                                  "input": payload, "result": result}
+                            or result.get("target") != payload["target"] or result.get("mission_id") != mission
+                            or result.get("lifecycle_record") != lifecycle
+                            or not any(raw["path"] == lifecycle for raw in result.get("raw_evidence", []))):
+                        raise ValueError("completed container cleanup proof is incomplete or mismatched")
+                    if all(result.get(key) is True for key in ("cleanup_confirmed", "dependencies_cleanup_confirmed",
+                                                              "temporary_directory_cleanup_confirmed")):
+                        # Already-cleaned resources still require original stop
+                        # evidence; the operation's hash is checked above.
+                        from .factory_container import client_stop_evidence
+                        record = json.loads(Path(lifecycle).read_bytes())
+                        proof = client_stop_evidence(transcript, record, Path(lifecycle).read_bytes())
+                        if (result.get("local_clients_stop_confirmed") is not True
+                                or result.get("client_stop_evidence") != proof):
+                            raise ValueError("completed container local stop evidence is missing or changed")
+                        continue
+                cleanup = self.runtime.recover_container(self.config["project_container"], spec, payload["target"],
+                                                         payload["command"], transcript)
+            except Exception as error:
+                cleanup = {"cleanup_confirmed": False, "operation_replayed": False, "status": "UNKNOWN",
+                           "error_type": type(error).__name__}
+            cleanups.append(cleanup)
+            self.event(mission, "container_cleanup_recovered", {"operation_id": pending["id"], "cleanup": cleanup})
+            self.db.commit()  # Append evidence only; the operation/UNKNOWN is immutable.
+        return cleanups
 
     def _run(self, mission):
         try:
+            self.verify_temporary_cleanup(mission)
+            cleanups = self.recover_interrupted_containers(mission)
+            self.verify_container_client_stops(mission)
             if self.cancel_requested(mission):
-                raise FactoryBlocked("CANCELLED", "user cancelled; no dispatch or resume is authorized")
+                note = ("; cleanup confirmed" if all(c.get("cleanup_confirmed") for c in cleanups)
+                        else "; cleanup not confirmed; see exact operation evidence") if cleanups else ""
+                raise FactoryBlocked("CANCELLED", "user cancelled; no dispatch or validation replay authorized" + note)
             authority_spec = json.loads(self.row(mission)["spec"])
             if candidate_stage.requested(authority_spec):
                 return self._run_local_candidate(authority_spec, Path(self.row(mission)["candidate"]), self.row(mission))
             spec, cwd = self.prepare(mission)
             row = self.row(mission)
-            uncertain = self.db.execute("SELECT id FROM operations WHERE mission=? AND status IN ('RUNNING','UNKNOWN') LIMIT 1", (mission,)).fetchone()
+            for pending in self.uncertain_operations(mission):
+                if pending["id"] not in {p["id"] for p in self.uncertain_operations(mission)}:
+                    continue
+                if self.project and pending["stage"] == "project_publish":
+                    self.recover_publication(spec, cwd, pending)
+                    self.state(mission, "PR_CI", "publication observed; original UNKNOWN/reservation retained")
+                    row = self.row(mission)
+            for pending in self.uncertain_operations(mission):
+                if pending["id"] not in {p["id"] for p in self.uncertain_operations(mission)}:
+                    continue
+                payload = json.loads(pending["input"])
+                if (self.project and pending["status"] == "UNKNOWN" and not pending["paid"]
+                        and pending["stage"] in {"project_reconcile", "project_ci", "project_verify"}
+                        and payload.get("expected_pr") and payload.get("action")
+                        and payload.get("policy") == self.config.get("project_delivery")
+                        and self.target(spec, cwd) == payload.get("target")):
+                    proof = self.project_remote_read(payload["action"], spec, cwd, payload["target"], payload["body"],
+                                                     payload["reviews"], expected_pr=payload["expected_pr"])
+                    if proof["status"] == "PASS" and row["status"] == "UNKNOWN":
+                        self.state(mission, "PR_CI", "fresh exact read-only evidence; original UNKNOWN retained")
+                        row = self.row(mission)
+            uncertain = self.uncertain_operations(mission)
             if uncertain:
-                raise FactoryBlocked("UNKNOWN", f"unresolved operation {uncertain[0]}; no duplicate paid dispatch was authorized")
+                raise FactoryBlocked("UNKNOWN", f"unresolved operation {uncertain[0]['id']}; no duplicate paid dispatch was authorized")
             if self.project and row["status"] == OFFLINE_PASS:
                 return self.report(mission)
             if row["status"] == READY:
@@ -1186,7 +1789,7 @@ class Factory:
                 # First-paid operation rechecks preflight and appends a fresh
                 # event. Preserve spec, policy, round, submission time and usage.
                 self.state(mission, "PLAN")
-            elif row["status"] in ("UNKNOWN", "BLOCKED_BUDGET", "BLOCKED_SCOPE", "BLOCKED_LIMIT"):
+            elif row["status"] in ("UNKNOWN", "BLOCKED_BUDGET", "BLOCKED_SCOPE", "BLOCKED_LIMIT", "BLOCKED_VALIDATION"):
                 return self.report(mission)
             planning_payload = {"objective": spec["objective"], "acceptance": spec["acceptance"], "constraints": spec["constraints"],
                                 "scope": spec["scope"], "instruction": "Act as technical lead. Understand the repository, plan a minimal complete solution and acceptance tests. Decide ordinary engineering questions yourself. Only unresolved major product ambiguity, safety, independence, budget or irreversible changes belong in decisions_required. Do not edit files. Return plan, bounded tasks, acceptance and decisions_required."}
@@ -1237,6 +1840,7 @@ class Factory:
                 feedback = [{"department": kind, "result": result} for kind, results in (("test", tests), ("ci", ci)) for result in results if result["status"] != "PASS"]
                 reviews = []
                 if not feedback:
+                    self.require_project_validation(spec, cwd, target)
                     self.state(mission, "REVIEW")
                     lanes = ["reviewer", "second_reviewer"] if self.config["independent_review_required"] else ["reviewer"]
                     # Do not send the first lane's findings/results to the second.
@@ -1246,9 +1850,16 @@ class Factory:
                         if review["status"] != "PASS":
                             feedback.append({"department": lane, "findings": review["findings"], "explanation": review["output"]["overall_explanation"]})
                 if not feedback:
+                    remote = None
+                    if self.project and not self.config["simulation"] and "project_delivery" in self.config:
+                        self.state(mission, "PR_CI")
+                        remote = self.project_pr_ci(spec, cwd, target, reviews, tests + ci)
+                        if remote["ci"]["status"] != "PASS":
+                            feedback.append({"department": "pr_ci", "result": remote["ci"]})
+                if not feedback:
                     if self.target(spec, cwd) != target:
                         raise FactoryBlocked("UNKNOWN", "final delivery target changed after gates")
-                    project_gate = self.project_final_gate(spec, cwd, target, reviews, ci) if self.project else None
+                    project_gate = self.project_final_gate(spec, cwd, target, reviews, ci if "project_pr_ci" in self.config else remote) if self.project else None
                     delivery = {"target": target, "implemented": work["summary"], "risks": work["known_risks"],
                                 "tests": "PASS", "ci": "PASS", "hosted_ci": "PASS" if {"hosted_ci", "project_pr_ci"} & set(self.config) else "NOT_CONFIGURED", "reviews": reviews,
                                 "evidence_keys": [op[0] for op in self.db.execute("SELECT key FROM operations WHERE mission=? AND status='COMPLETE'", (mission,))]}
@@ -1256,6 +1867,8 @@ class Factory:
                         delivery.update(project_gate=project_gate, validation_results={"checks": tests, "ci": ci})
                         if self.config["simulation"]:
                             delivery.update(tests="OFFLINE_FIXTURE_PASS", ci="OFFLINE_FIXTURE_PASS")
+                        elif "project_delivery" in self.config:
+                            delivery.update(remote=remote, hosted_ci="EXACT_PR_CHECKS_PASS")
                     self.event(mission, "delivery", delivery)
                     self.state(mission, OFFLINE_PASS if self.project and self.config["simulation"] else READY)
                     return self.report(mission)
