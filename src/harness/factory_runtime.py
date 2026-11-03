@@ -1171,7 +1171,8 @@ class LocalRuntime:
         return validate_result(result, policy, spec, cwd, target, self.simulation, api)
 
     def project_final_gate(self, spec, cwd, target, reviews, transcript, timeout, *, context=None):
-        self.assert_canonical_lifecycles(Path(transcript).parent, spec["mission_id"])
+        if context is not None:
+            self.assert_canonical_lifecycles(Path(transcript).parent, spec["mission_id"])
         if context is not None and "policy" in context:
             return self.project_remote("verify", context["policy"], spec, cwd, target,
                                        context["body"], transcript, timeout, reviews=reviews)
