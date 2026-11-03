@@ -165,6 +165,20 @@ class CanonicalRuntimeIntegrationTests(unittest.TestCase):
             self.f.project_final_gate(spec, cwd, target, reviews)
         self.assertNotIn(self.f.row("feature")["status"], {"READY_FOR_USER_ACCEPTANCE", "MERGE_READY", "DONE"})
 
+    def test_restarted_runtime_blocks_before_reservation_for_unfinished_validator(self):
+        spec, cwd, target = self.candidate()
+        evidence = self.f.root / "evidence" / spec["mission_id"]
+        evidence.mkdir(mode=0o700, parents=True, exist_ok=True)
+        pending = evidence / ("0" * 32 + ".validator-" + "1" * 32 + ".input.json")
+        pending.write_text("{}"); pending.chmod(0o600)
+        with patch.object(self.runtime, "prepare_project_review") as prepare:
+            with self.assertRaisesRegex(FactoryBlocked, "UNKNOWN"):
+                self.review(spec, cwd, target, "reviewer")
+            prepare.assert_not_called()
+        self.assertEqual(self.starts, [])
+        self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM operations").fetchone()[0], 0)
+        self.assertEqual(pending.read_text(), "{}")
+
     def test_lf_scope_passes_original_deepseek_validator(self):
         spec, cwd, target = self.candidate()
         self.assertEqual(self.review(spec, cwd, target, "second_reviewer")["status"], "PASS")

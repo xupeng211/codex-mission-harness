@@ -369,7 +369,10 @@ GateResult。两条 canonical 路线、模型、认证隔离、独立性与 rece
 调用原 consumer；不能补签历史停止凭据或借用其他操作。发布和最终 merge-ready 再次
 检查两条原始审核证停，最终 canonical consumer 也须受监督。超时/取消保存真实停止
 原件但不消费结论；归属、停止或证据 UNKNOWN 保留运行槽、现场和 reservation，阻断
-依赖派发。重启后原不完整 operation 仍 UNKNOWN，不自动重派收费操作。
+依赖派发。重启后原不完整 operation 仍 UNKNOWN，不自动重派收费操作。每次 Factory operation、
+原 consumer 重验及最终 gate 先扫描本任务 evidence 目录中已有的监督原件及 validator
+request；缺少对应 ECHILD、同次路径绑定或原 request 字节即 UNKNOWN。该只读恢复前置
+检查不补签、不清理现场，也不让尚未完成的本地 validator 被重启后的新验证绕过。
 这些是本地完整性证明，不提供 hostile same-UID 或 privileged process 抵抗。
 
 离线回归使用真实本地 Linux 进程树、原监督器和原 validator；仅模型/认证、historical

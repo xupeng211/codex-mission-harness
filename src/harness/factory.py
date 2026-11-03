@@ -597,6 +597,11 @@ class Factory:
     def operation(self, mission, key, stage, lane, identity, payload, paid, invoke, prepare=None):
         """Reserve before dispatch. A lost response is never replayed under a new guise."""
         candidate_stage.check_dispatch(self, mission, stage)
+        if self.project and not self.config["simulation"] and isinstance(self.runtime, LocalRuntime):
+            try:
+                self.runtime.assert_canonical_lifecycles(self.root / "evidence" / mission, mission)
+            except Exception as error:
+                raise FactoryBlocked("UNKNOWN", str(error)) from error
         routing_decision = None
         if paid and lane == "developer" and "model_routing" in self.config:
             spec = json.loads(self.row(mission)["spec"])

@@ -135,6 +135,25 @@ while not Path({str(info)!r}).exists():time.sleep(.005)
         with self.assertRaises(RuntimeFailure): self.run_step(name="replacement")
         with self.assertRaises(RuntimeError): self.runtime.begin_execution("other")
 
+    def test_restart_cannot_bypass_pending_validator_or_borrow_another_stop(self):
+        spec, target = {"mission_id": "fixture"}, {"base": "a" * 40, "head": "b" * 40}
+        reviews = offline_review_summaries(self.root, spec, self.cwd, target)
+        runtime = LocalRuntime()  # no in-memory owner inherited
+        runtime.assert_canonical_lifecycles(self.root, "fixture")
+        pending = self.root / ("0" * 32 + ".validator-" + "1" * 32 + ".input.json")
+        pending.write_text("{}"); pending.chmod(0o600)
+        before = set(self.root.iterdir())
+        with patch.object(AppServerProcess, "start") as dispatch:
+            with self.assertRaisesRegex(RuntimeFailure, "UNKNOWN"):
+                runtime.project_validate_review(spec, self.cwd, target, "reviewer", reviews[0]["canonical_execution"])
+            dispatch.assert_not_called()
+        self.assertEqual(before, set(self.root.iterdir()), "no retro-signing or replacement validation")
+        pending.unlink()  # remove only this test's injected pre-launch crash fixture
+        first, second = [Path(r["canonical_execution"]["review_lifecycle"]["path"]) for r in reviews]
+        second.write_bytes(first.read_bytes())
+        with self.assertRaisesRegex(RuntimeFailure, "UNKNOWN"):
+            runtime.assert_canonical_lifecycles(self.root, "fixture")
+
     def test_validator_descendants_stop_before_gate_result_is_returned(self):
         """Only the consumer workload is substituted; real supervision runs."""
         spec, target = {"mission_id": "fixture"}, {"base": "a" * 40, "head": "b" * 40}

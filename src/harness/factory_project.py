@@ -557,6 +557,7 @@ def review_process_binding(spec, cwd, target, lane, result):
     return {"stage": "canonical-review", "mission": spec["mission_id"],
             "cwd": str(Path(cwd).resolve()), "target": target, "lane": lane,
             "operation": result["stdout_path"], "argv": result["executed_runner_argv"],
+            "lifecycle": str(Path(result["stdout_path"]).with_suffix(".review")),
             "evidence_dir": str(evidence), "evidence_identity": [info.st_dev, info.st_ino, info.st_uid]}
 
 

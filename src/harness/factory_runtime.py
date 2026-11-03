@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import time
@@ -976,6 +977,52 @@ class LocalRuntime:
         environment = contract.adapter.review_environment(LANES[lane], worktree=str(cwd), base=target["base"])
         return argv, evidence, environment
 
+    def assert_canonical_lifecycles(self, directory, mission):
+        """Recovery guard over this task's original supervisor sidecars only.
+
+        No stop records are created or repaired here. An incomplete validator
+        remains UNKNOWN even after a Controller restart, before any dispatch.
+        """
+        directory = Path(directory)
+        if not directory.exists():
+            return
+        def read(path):
+            info = path.lstat()
+            if (path.is_symlink() or path.resolve(strict=True) != path or not path.is_file()
+                    or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_nlink != 1
+                    or info.st_size > 1024 * 1024):
+                raise RuntimeFailure("canonical lifecycle original is not private/bounded")
+            return path.read_bytes()
+        logs = set()
+        for path in directory.iterdir():
+            if path.name.endswith((".review.process.jsonl", ".raw.process.jsonl")) or re.fullmatch(
+                    r"[0-9a-f]{32}\.validator-[0-9a-f]{32}\.process\.jsonl", path.name):
+                logs.add(path.with_name(path.name.removesuffix(".process.jsonl")))
+            if re.fullmatch(r"(?:[0-9a-f]{32}|report-final-[0-9a-f]{32})(?:\.validator-[0-9a-f]{32})?\.input\.json", path.name):
+                stem = path.name.removesuffix(".input.json")
+                logs.add(path.with_name(stem if ".validator-" in stem else stem + ".raw"))
+        for log in sorted(logs):
+            try:
+                journal = log.with_suffix(log.suffix + ".process.jsonl")
+                # validate_supervised_stop performs the private-file, original
+                # event sequence and ECHILD checks after extracting the binding.
+                first = json.loads(read(journal).splitlines()[0])
+                binding = {k: v for k, v in first["binding"].items() if k != "execution_id"}
+                if (binding.get("mission") != mission or binding.get("lifecycle") != str(log)
+                        or binding.get("stage") not in {"canonical-review", "canonical-validator", "canonical-final-gate"}):
+                    raise RuntimeError("canonical operation/lifecycle identity differs")
+                request = log.with_suffix(log.suffix + ".input.json") if binding["stage"] == "canonical-validator" else log.with_suffix(".input.json")
+                if "request_sha256" in binding and hashlib.sha256(read(request)).hexdigest() != binding["request_sha256"]:
+                    raise RuntimeError("canonical original request differs")
+                stop_path = log.with_suffix(log.suffix + ".stop.json")
+                doc = json.loads(read(stop_path))
+                if doc["outcome"] not in {"complete", "failed", "timeout", "cancelled"}:
+                    raise RuntimeError("canonical outcome UNKNOWN")
+                validate_supervised_stop({"path": str(stop_path), "sha256": hashlib.sha256(read(stop_path)).hexdigest()},
+                                         binding, outcome=doc["outcome"])
+            except Exception as error:
+                raise RuntimeFailure("canonical lifecycle UNKNOWN; retained originals; no dispatch: " + log.name) from error
+
     def _supervised_review_step(self, binding, argv, cwd, environment, transcript, timeout, *, stdin=None):
         """Reuse the existing task Controller's per-operation subreaper sequence."""
         if self._review_owner is not None or self.container_cancel.is_set():
@@ -1066,6 +1113,7 @@ class LocalRuntime:
 
     def project_validate_review(self, spec, cwd, target, lane, result):
         from .factory_project import validate_review_stop, verify_target
+        self.assert_canonical_lifecycles(Path(result["stdout_path"]).parent, spec["mission_id"])
         validate_review_stop(spec, cwd, target, lane, result)
         verify_target(spec, cwd, target)
         # Each revalidation has a fresh unpaid operation; it cannot re-sign the
@@ -1087,7 +1135,7 @@ class LocalRuntime:
         binding = {"stage": "canonical-validator", "mission": spec["mission_id"], "target": target,
                    "lane": lane, "operation": result["stdout_path"], "argv": argv,
                    "review_lifecycle": result["review_lifecycle"], "inputs": snapshot,
-                   "request_sha256": hashlib.sha256(request.read_bytes()).hexdigest()}
+                   "request_sha256": hashlib.sha256(request.read_bytes()).hexdigest(), "lifecycle": str(log)}
         environment = FootballPredictionContract().adapter.review_environment(
             "deepseek", worktree=str(cwd), base=target["base"])
         with request.open("rb") as stream:
@@ -1123,6 +1171,7 @@ class LocalRuntime:
         return validate_result(result, policy, spec, cwd, target, self.simulation, api)
 
     def project_final_gate(self, spec, cwd, target, reviews, transcript, timeout, *, context=None):
+        self.assert_canonical_lifecycles(Path(transcript).parent, spec["mission_id"])
         if context is not None and "policy" in context:
             return self.project_remote("verify", context["policy"], spec, cwd, target,
                                        context["body"], transcript, timeout, reviews=reviews)
@@ -1143,7 +1192,8 @@ class LocalRuntime:
                     "r=FootballPredictionContract().final_gate(**json.load(sys.stdin)); print(json.dumps(asdict(r)))")
             argv = [sys.executable, "-I", "-B", "-c", code, str(Path(__file__).resolve().parents[1])]
             binding = {"stage": "canonical-final-gate", "mission": spec["mission_id"], "target": target,
-                       "argv": argv, "request_sha256": hashlib.sha256(request.read_bytes()).hexdigest()}
+                       "argv": argv, "request_sha256": hashlib.sha256(request.read_bytes()).hexdigest(),
+                       "operation": str(transcript), "lifecycle": str(transcript)}
             environment = FootballPredictionContract().adapter.review_environment("deepseek", worktree=str(cwd), base=target["base"])
             with request.open("rb") as stream:
                 status, proof = self._supervised_review_step(binding, argv, cwd, environment, transcript, timeout, stdin=stream)
@@ -1174,6 +1224,7 @@ class LocalRuntime:
         return result
 
     def project_remote(self, action, policy, spec, cwd, target, body, transcript, timeout, *, reviews=None, previous_head=None):
+        self.assert_canonical_lifecycles(Path(transcript).parent, spec["mission_id"])
         import threading
         with self._execution_lock:
             standalone = self._active_execution is None
@@ -1290,11 +1341,14 @@ class LocalRuntime:
             from .adapters import FootballPredictionAdapter
             environment = FootballPredictionAdapter._trusted_subprocess_environment(env={"LANG": "C.UTF-8"})
             environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+            request_path = Path(transcript).with_suffix(".input.json")
+            with request_path.open("x") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                json.dump(request_value, stream); stream.flush(); os.fsync(stream.fileno())
             binding = {"stage": "canonical-final-gate", "mission": spec["mission_id"],
-                       "target": target, "argv": argv, "request_sha256": hashlib.sha256(
-                           json.dumps(request_value, sort_keys=True).encode()).hexdigest()}
-            with tempfile.TemporaryFile() as request:
-                request.write(json.dumps(request_value).encode()); request.seek(0)
+                       "target": target, "argv": argv, "request_sha256": hashlib.sha256(request_path.read_bytes()).hexdigest(),
+                       "operation": str(transcript), "lifecycle": str(transcript)}
+            with request_path.open("rb") as request:
                 code, proof = self._supervised_review_step(
                     binding, argv, Path(transcript).parent, environment, transcript, timeout, stdin=request)
             if code != 0:
@@ -1302,7 +1356,7 @@ class LocalRuntime:
             result = json.loads(Path(transcript).read_text())
             return {**result, "validation_lifecycle": proof, "project_evidence": [
                 {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-                for path in (remote_log, Path(proof["path"]), Path(transcript).with_suffix(
+                for path in (remote_log, request_path, Path(proof["path"]), Path(transcript).with_suffix(
                     Path(transcript).suffix + ".process.jsonl")) if path.is_file()]}
         # Trusted Controller worker; development agents never receive this env.
         from .adapters import FootballPredictionAdapter
