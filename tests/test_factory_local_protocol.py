@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from harness.appserver_process import AppServerProcess, process_identity
 from harness.factory import Factory, git
 from harness.codex import AppServerCodex
 from harness.factory_budget import planning_limits
@@ -268,11 +272,72 @@ class NativeProtocolTests(unittest.TestCase):
         self.assertEqual(self.factory.target(self.spec, self.cwd), target)
 
     def test_runtime_watchdog_expires_without_controller_reads_or_model_inference(self):
-        server = FactoryAppServer({"provider": "openai", "model": "offline-protocol-no-inference", "codex_home": str(self.auth)},
-                                  self.cwd, self.root / "watchdog.raw", 1, [self.root / "state", self.source], True)
+        initialized, reader_paused, resume_reads = (threading.Event() for _ in range(3))
+        streams = []
+        start = AppServerProcess.start
+
+        def capture(owner, argv, **kwargs):
+            proc = start(owner, argv, **kwargs)
+            streams.extend((proc.stdin, proc.stdout))
+            stdout = proc.stdout
+
+            def read_line():
+                if initialized.is_set():
+                    reader_paused.set()
+                    resume_reads.wait()
+                line = stdout.readline()
+                if line and json.loads(line).get("id") == 1:
+                    initialized.set()
+                return line
+
+            # Forward real I/O; audit every outgoing message and stop draining
+            # stdout after the initialize response, before waiting for expiry.
+            proc.stdin = Mock(wraps=proc.stdin)
+            proc.stdout = Mock(wraps=stdout)
+            proc.stdout.readline.side_effect = read_line
+            return proc
+
+        self.addCleanup(resume_reads.set)
+        with patch.object(AppServerProcess, "start", capture):
+            server = FactoryAppServer({"provider": "openai", "model": "offline-protocol-no-inference", "codex_home": str(self.auth)},
+                                      self.cwd, self.root / "watchdog.raw", 1, [self.root / "state", self.source], True)
         self.addCleanup(server.close)
-        code = server.proc.wait(timeout=3)
-        self.assertNotEqual(code, 0)
+        self.addCleanup(resume_reads.set)
+        owner = server._execution
+        payload = owner.payload
+        self.assertTrue(reader_paused.wait(timeout=1))
+        self.assertNotIn(process_identity(payload["pid"])["state"], ("Z", "X"))
+        deadline = time.monotonic() + 3
+        while process_identity(payload["pid"])["state"] not in ("Z", "X"):
+            self.assertLess(time.monotonic(), deadline, "watchdog payload did not expire autonomously")
+            time.sleep(.01)
+        # Observe autonomous completion BEFORE stop/close. The supervisor is
+        # still the unreaped ownership anchor, not the timeout payload.
+        self.assertFalse(resume_reads.is_set())
+        self.assertEqual(process_identity(payload["pid"])["starttime"], payload["starttime"])
+        self.assertNotIn(process_identity(server.proc.pid)["state"], ("Z", "X"))
+        self.assertIsNone(server.proc.returncode)
+        self.assertIsNone(owner.stopped)
+        self.assertIsNone(owner.failure)
+        resume_reads.set()
+        server.close()
+        stop = server._process_stop
+        self.assertTrue(stop["confirmed"])
+        self.assertEqual(stop["proof"], "ECHILD")
+        self.assertEqual(stop["binding"], owner.binding)
+        self.assertEqual(stop["signals"], [], "close must not cause the observed timeout exit")
+        status = next(v["status"] for v in stop["reaped"] if v["pid"] == payload["pid"])
+        self.assertEqual(os.waitstatus_to_exitcode(status), 124)
+        self.assertEqual(server.proc.returncode, 0)
+        self.assertFalse(Path(f"/proc/{server.proc.pid}").exists())
+        self.assertTrue(all(not Path(f'/proc/{v["pid"]}').exists() for v in stop["reaped"]))
+        self.assertIsNone(owner.pidfd)
+        self.assertEqual(owner.channel.fileno(), -1)
+        self.assertTrue(all(stream.closed for stream in streams))
+        self.assertIsNone(server._task_temp)
+        self.assertFalse(list(self.root.glob("*.temp.json")))
+        messages = [json.loads(call.args[0]) for call in server.proc.stdin.write.call_args_list]
+        self.assertEqual([message["method"] for message in messages], ["initialize", "initialized"])
         self.assertFalse(any(e.get("method") == "turn/started" for e in server.events))
 
 
