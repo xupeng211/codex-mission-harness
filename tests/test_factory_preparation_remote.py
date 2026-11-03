@@ -408,6 +408,19 @@ class ReportExecutionIsolationTests(unittest.TestCase):
                 LocalRuntime.__init__(self)
                 self.real_controller = False
 
+            def project_review(self, spec, cwd, target, lane, transcript, timeout, **kwargs):
+                # Synthetic receipt workload still supplies a real same-operation
+                # ECHILD proof; the mixed runtime must not bypass production checks.
+                from harness.factory_project import review_process_binding
+                result = fixtures.LiveProtocolDouble.project_review(self, spec, cwd, target, lane, transcript, timeout, **kwargs)
+                argv = [sys.executable, "-I", "-B", "-c", "pass"]
+                result["executed_runner_argv"] = argv
+                binding = review_process_binding(spec, cwd, target, lane, result)
+                _, proof = self._supervised_review_step(binding, argv, cwd, {"PATH": "/usr/bin:/bin"},
+                                                       transcript.with_suffix(".review"), timeout)
+                result["review_lifecycle"] = proof
+                return result
+
             def project_remote(self, *args, **kwargs):
                 method = LocalRuntime.project_remote if self.real_controller else fixtures.LiveProtocolDouble.project_remote
                 return method(self, *args, **kwargs)
@@ -424,11 +437,14 @@ class ReportExecutionIsolationTests(unittest.TestCase):
         original_popen, starts = subprocess.Popen, []
 
         def local_observation(argv, *args, **kwargs):
-            if argv != [sys.executable, "-m", "harness.factory_remote"]:
+            if "harness.factory_remote" not in argv:
                 return original_popen(argv, *args, **kwargs)
             starts.append(runtime._active_execution)
             code = "import json,sys; json.load(sys.stdin); print(" + repr(json.dumps(observation)) + ")"
-            return original_popen([sys.executable, "-I", "-B", "-c", code], *args, **kwargs)
+            payload = [sys.executable, "-I", "-B", "-c", code]
+            # Preserve the real subreaper when replacing only its remote workload.
+            command = [*argv[:argv.index("--") + 1], *payload] if "--" in argv else payload
+            return original_popen(command, *args, **kwargs)
 
         with patch("harness.factory_runtime.subprocess.Popen", side_effect=local_observation):
             self.assertEqual(fx.f.report("feature")["DELIVERY_STATUS"], READY)

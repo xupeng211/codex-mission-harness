@@ -201,6 +201,12 @@ def run(action, policy, spec, cwd, target, body, transcript, timeout, reviews=No
     contract = FootballPredictionContract(remote.adapter)
     verify_target(spec, Path(cwd), target)
     contract.validate_pr_body(spec, Path(cwd), target, body)
+    if action in {"publish", "verify"}:
+        from .factory_project import validate_review_stop
+        if {r["lane"] for r in reviews or []} != set(LANES):
+            raise ValueError("publication/final gate requires both original review lifecycles")
+        for review in reviews:
+            validate_review_stop(spec, Path(cwd), target, review["lane"], review["canonical_execution"])
     if action == "publish":
         return remote.publish(policy, spec, target, body, previous_head)
     if action == "reconcile":
@@ -212,7 +218,7 @@ def run(action, policy, spec, cwd, target, body, transcript, timeout, reviews=No
         receipts = {LANES[r["lane"]]: r["canonical_receipt"] for r in reviews or []}
         gate = contract.final_gate(spec, Path(cwd), target, receipts, context={
             "pr_number": result["pr_number"], "pr_repo": result["pr_repo"], "pr_base_sha": result["pr_base_sha"],
-            "ci_status": "PASS"})
+            "ci_status": "PASS"}, executions={r["lane"]: r["canonical_execution"] for r in reviews})
         # Recheck identity/checks after the local final gate as well.
         after = remote.ci(policy, spec, target, body, wait=False)
         if after["status"] != "PASS":

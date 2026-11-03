@@ -548,6 +548,31 @@ def protect_eslint_authority(spec, cwd):
             pending.extend((p, (*ancestors, path), False) for p in dependencies(config, path))
 
 
+def review_process_binding(spec, cwd, target, lane, result):
+    evidence = Path(result["evidence_dir"])
+    info = evidence.stat()
+    if (evidence.resolve(strict=True) != evidence or not evidence.is_dir()
+            or info.st_uid != os.getuid() or info.st_mode & 0o077):
+        raise ValueError("review evidence directory identity is unsafe")
+    return {"stage": "canonical-review", "mission": spec["mission_id"],
+            "cwd": str(Path(cwd).resolve()), "target": target, "lane": lane,
+            "operation": result["stdout_path"], "argv": result["executed_runner_argv"],
+            "evidence_dir": str(evidence), "evidence_identity": [info.st_dev, info.st_ino, info.st_uid]}
+
+
+def validate_review_stop(spec, cwd, target, lane, result):
+    from .appserver_process import validate_supervised_stop
+    reference = result["review_lifecycle"]
+    operation = Path(result["stdout_path"])
+    if (Path(reference["path"]) != operation.with_suffix(".review.stop.json")
+            or operation.resolve(strict=True) != operation):
+        raise ValueError("review stop proof belongs to another operation")
+    code = validate_supervised_stop(reference, review_process_binding(spec, cwd, target, lane, result))
+    if code != result["exit_code"]:
+        raise ValueError("review stop proof exit differs from runner result")
+    return code
+
+
 class FootballPredictionContract:
     """Reuse trusted-base execution and original project receipt validators."""
 
@@ -688,7 +713,10 @@ print(json.dumps({'canonical_diff_sha256':hashlib.sha256(diff).hexdigest(), 'can
 
     def validate_review(self, spec, cwd, target, lane, result):
         """Always re-run the original validator, including on cached operations."""
+        cwd = Path(cwd)
         reviewer = LANES[lane]
+        if isinstance(self.adapter, FootballPredictionAdapter):
+            validate_review_stop(spec, cwd, target, lane, result)
         checked = self.adapter.review_result(
             reviewer, worktree=str(cwd), base=target["base"], head=target["head"],
             mission_id=spec["mission_id"], scope_file=str(cwd / target["mission_scope_file"]),
@@ -711,13 +739,19 @@ print(json.dumps({'canonical_diff_sha256':hashlib.sha256(diff).hexdigest(), 'can
             raise ValueError("runner exit contradicts canonical verdict")
         return checked
 
-    def final_gate(self, spec=None, cwd=None, target=None, receipts=None, context=None):
+    def final_gate(self, spec=None, cwd=None, target=None, receipts=None, context=None, executions=None):
         # Factory supplies validated PR context; the original project command
         # still rechecks scope, receipts, governance and remote merge readiness.
         if context is None:
             return GateResult("BLOCKED_EXTERNAL", "canonical agent-merge-ready requires phase-2 exact PR/CI context")
+        cwd = Path(cwd)
         if set(receipts or {}) != set(LANES.values()):
             return GateResult("BLOCKED_EXTERNAL", "both canonical receipts are required by Factory")
+        if isinstance(self.adapter, FootballPredictionAdapter):
+            if set(executions or {}) != set(LANES):
+                raise ValueError("canonical final gate requires original review lifecycle evidence")
+            for lane, result in executions.items():
+                validate_review_stop(spec, cwd, target, lane, result)
         return self.adapter.merge_ready(
             worktree=str(cwd), base=target["base"], head=target["head"], mission_id=spec["mission_id"],
             scope_file=str(cwd / target["mission_scope_file"]), receipts=receipts,

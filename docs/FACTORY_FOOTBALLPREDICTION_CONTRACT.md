@@ -353,3 +353,37 @@ Factory all-findings（包括 P3）返工 barrier 不变。没有新增计费或
 
 真实容器检查、离线代码检查、真实远端、正式审核与业务验收必须分别报告。
 本轮真实 PR writes/paid reviews/business mission 为 NOT_RUN，未改变安装入口。
+
+## Canonical 审核的生命周期前置条件
+
+正式 `LocalRuntime.project_review` 复用 `AppServerProcess` 的 Linux subreaper、
+pidfd 与 unreaped supervisor：外层 payload 退出后，先停止并收回同次后代，取得
+ECHILD，再保存 owner-only 原始 JSONL、停止记录及哈希。DeepSeek 原 runner 使用
+`--retain-invocation`，保留私有现场。父进程退出、receipt 出现或目录被清理均不构成证明。
+绑定覆盖 mission、lane、完整 target、命令、operation raw 路径及 evidence 目录身份；
+验证器重新核对原件和操作绑定后，才调用 trusted BASE 的原 canonical validator。
+validator 自身也由同一现有监督器独立监管，整树停止、退出及输入不变均确认后才消费
+GateResult。两条 canonical 路线、模型、认证隔离、独立性与 receipt 协议保持原样。
+
+缓存、报告与恢复先核验原 paid operation 的证停及原始文件哈希，再以新的本地验证操作
+调用原 consumer；不能补签历史停止凭据或借用其他操作。发布和最终 merge-ready 再次
+检查两条原始审核证停，最终 canonical consumer 也须受监督。超时/取消保存真实停止
+原件但不消费结论；归属、停止或证据 UNKNOWN 保留运行槽、现场和 reservation，阻断
+依赖派发。重启后原不完整 operation 仍 UNKNOWN，不自动重派收费操作。
+这些是本地完整性证明，不提供 hostile same-UID 或 privileged process 抵抗。
+
+离线回归使用真实本地 Linux 进程树、原监督器和原 validator；仅模型/认证、historical
+wrapper compatibility 和远端 I/O 为明确替身。固定旧合同 fixture 早于 retain flag，
+仅测试 driver 去掉该旧 parser 不支持的参数；正式 argv 仍强制 retain。真实 Provider、
+正常登录现场、真实不可停止进程、容器与 GitHub 交付尚未验证，不能据此宣布业务闭环。
+
+## 本任务可采用的 PR 授权
+
+`project_container` / `project_delivery` 的现有自动发布路线可以由一次明确的任务授权
+覆盖创建和更新本任务专属 PR。Owner 的授权必须同时限定 scope、模型/预算/返工/时长、
+固定测试镜像和临时 DB、专属分支及同一 PR，并批准可信正文模板按实际证据渲染。
+当前 scope/local required validation/current-HEAD 双审及生命周期证据均通过后，现有
+`project_pr_ci` 才创建或更新，再观察准确 HEAD 的 required CI 和调用原 merge-ready。
+不与另一套 `trusted_validation` / `project_pr_ci` 配置混配；后者保留其原 exact-head
+人工发布审批和 first-paid 限制。此说明没有授予当前任务任何收费或远端权限；未来
+Owner 可批准完整有界业务试点，最终 Merge 仍另行决定，不含部署。

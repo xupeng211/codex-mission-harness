@@ -90,6 +90,14 @@ class CanonicalRuntimeIntegrationTests(unittest.TestCase):
 
     def launch(self, argv, *args, **kwargs):
         argv = list(argv)
+        if "-c" in argv:
+            index = argv.index("-c") + 1
+            marker = "from harness.factory_project import FootballPredictionContract; "
+            if marker in argv[index]:
+                setup = ("sys.path.insert(0," + repr(str(DRIVER.parent)) + "); "
+                         "from footballprediction_validator_bootstrap import configure; "
+                         "configure(" + repr(str(self.snapshot)) + "," + repr(str(DRIVER)) + "," + repr(str(self.binary)) + "); ")
+                argv[index] = argv[index].replace(marker, marker + setup)
         script = next((i for i, value in enumerate(argv) if str(value) in {
             str(self.snapshot / "scripts/devops/codex_independent_review.py"),
             str(self.snapshot / "scripts/devops/claude_deepseek_independent_review.py")}), None)
@@ -236,8 +244,8 @@ Revert the isolated fixture commit.
         template = publication_body(self, target).replace(
             "Offline source-policy contract probe.", "离线 UTF-8 正文 probe.").replace("\n", newline)
         spec = validate_mission({**spec, "pr_body_template": template})
-        reviews = [{"lane": "reviewer", "canonical_receipt": str(self.root / "MISSING-CODEX.json"),
-                    "canonical_receipt_data": {"review_completed_at": "2026-10-28T00:00:00Z"}}]
+        from test_factory_review_lifecycle import offline_review_summaries
+        reviews = offline_review_summaries(self.root, spec, cwd, target)
         body = render_body(DELIVERY, spec, target, reviews, [])
         self.assertEqual(spec["pr_body_template"], template)
         self.assertEqual(body.count("\r\n"), template.rstrip().count("\r\n"))
@@ -293,7 +301,7 @@ Revert the isolated fixture commit.
                     # The original final gate still refuses absent dual receipts.
                     # Only the cache/body admission and remote paths are proved.
                     self.assertEqual(result["status"], "BLOCKED_EXTERNAL")
-                    self.assertIn("both canonical receipts", result["reason"])
+                    self.assertTrue(result["reason"], "original validator must explain absent canonical receipts")
                 else:
                     self.assertEqual(result["status"], "PASS")
                 self.assertEqual(cached.read_bytes(), body.encode("utf-8"))

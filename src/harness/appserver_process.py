@@ -11,6 +11,7 @@ import ctypes
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import socket
@@ -177,6 +178,57 @@ class AppServerProcess:
                 except Exception:
                     pass  # The failure remains sticky even if evidence cannot be appended.
                 raise RuntimeError(self.failure) from error
+
+
+def validate_supervised_stop(reference, expected, *, outcome="complete"):
+    """Recheck the task Controller's durable ECHILD/event/command binding.
+
+    This is local integrity evidence, not hostile-same-uid attestation. Old
+    operations without these original records cannot acquire a stop proof.
+    """
+    def read(path, limit=1024 * 1024):
+        path = Path(path)
+        if not path.is_absolute() or path.resolve(strict=True) != path:
+            raise RuntimeError("supervised evidence path changed")
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                    or info.st_size > limit):
+                raise RuntimeError("supervised evidence is not private/bounded")
+            return stream.read(limit + 1)
+    raw = read(reference["path"])
+    if hashlib.sha256(raw).hexdigest() != reference["sha256"]:
+        raise RuntimeError("supervised stop evidence changed")
+    doc = json.loads(raw)
+    stop_path = Path(reference["path"])
+    if doc["journal"] != str(stop_path.with_name(stop_path.name.removesuffix(".stop.json") + ".process.jsonl")):
+        raise RuntimeError("supervised journal belongs to another operation")
+    journal = read(doc["journal"])
+    if hashlib.sha256(journal).hexdigest() != doc["journal_sha256"]:
+        raise RuntimeError("supervised process journal changed")
+    rows = [json.loads(line) for line in journal.splitlines()]
+    binding = doc["binding"]
+    if (set(binding) != set(expected) | {"execution_id"}
+            or {k: v for k, v in binding.items() if k != "execution_id"} != expected
+            or not isinstance(binding["execution_id"], str) or re.fullmatch(r"[0-9a-f]{32}", binding["execution_id"]) is None
+            or [v.get("event") for v in rows] != ["allocated", "started", "stopped"]
+            or any(v.get("binding") != binding for v in rows)):
+        raise RuntimeError("supervised operation/target binding mismatch")
+    supervisor, payload, stop = doc["supervisor"], doc["payload"], doc["stop"]
+    if (doc["supervisor_exit"] != 0 or stop.get("event") != "stopped"
+            or stop.get("binding") != binding or stop.get("confirmed") is not True
+            or stop.get("proof") != "ECHILD" or doc["outcome"] != outcome
+            or stop.get("supervisor") != {k: v for k, v in supervisor.items() if k != "state"}
+            or any(v.get("supervisor") != supervisor for v in rows)
+            or rows[1].get("payload") != payload or rows[2].get("result") != stop
+            or rows[0].get("helper_sha256") != hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+            or rows[0].get("argv_sha256") != hashlib.sha256(json.dumps(expected["argv"]).encode()).hexdigest()):
+        raise RuntimeError("supervised ECHILD/identity/command proof is unconfirmed")
+    matches = [v for v in stop["reaped"] if v["pid"] == payload["pid"]]
+    if len(matches) != 1 or doc["exit_code"] != os.waitstatus_to_exitcode(matches[0]["status"]):
+        raise RuntimeError("supervised payload exit is unconfirmed")
+    return doc["exit_code"]
 
 
 def _stop_children():
