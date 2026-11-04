@@ -1034,6 +1034,8 @@ class LocalRuntime:
             owner = AppServerProcess(binding, record=journal)
             self._review_owner = owner
         outcome = "complete"
+        startup_confirmed = False
+        operation_error = None
         try:
             with transcript.open("xb") as out, transcript.with_suffix(transcript.suffix + ".stderr").open("xb") as err:
                 os.fchmod(out.fileno(), 0o600); os.fchmod(err.fileno(), 0o600)
@@ -1050,6 +1052,7 @@ class LocalRuntime:
                 else:
                     owner.start(argv, cwd=str(cwd), env=environment,
                                 stdin=stdin if stdin is not None else subprocess.DEVNULL, stdout=out, stderr=err)
+                startup_confirmed = True
                 deadline = time.monotonic() + timeout
                 while True:
                     actual = process_identity(owner.payload["pid"])
@@ -1062,12 +1065,21 @@ class LocalRuntime:
                     if time.monotonic() >= deadline:
                         outcome = "timeout"; break
                     time.sleep(.02)
-        except BaseException:
+        except BaseException as error:
+            operation_error = error
             outcome = "failed"
             raise
         finally:
             # Even timeout/cancel/fault must stop only this allocation's tree.
             stop = owner.stop()
+            if not startup_confirmed:
+                # stop() can prove no supervisor was started, or ECHILD after
+                # an unconfirmed launch, without establishing a payload exit.
+                # Preserve that distinction and the startup cause. Neither is
+                # a complete canonical lifecycle: retain ownership/originals,
+                # and never manufacture a payload or a consumable stop record.
+                raise RuntimeFailure("canonical startup failed before payload confirmation; stop="
+                                     + stop["proof"] + "; lifecycle evidence UNKNOWN; retained supervision") from operation_error
             matches = [v for v in stop.get("reaped", []) if v["pid"] == owner.payload["pid"]]
             if len(matches) != 1:
                 raise RuntimeFailure("canonical payload exit UNKNOWN; retained supervision")

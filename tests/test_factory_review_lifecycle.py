@@ -135,6 +135,125 @@ while not Path({str(info)!r}).exists():time.sleep(.005)
         with self.assertRaises(RuntimeFailure): self.run_step(name="replacement")
         with self.assertRaises(RuntimeError): self.runtime.begin_execution("other")
 
+    def assert_startup_failed(self, log, argv, cwd, *, request=None):
+        binding = {"stage": "canonical-review", "mission": "fixture",
+                   "lifecycle": str(log), "argv": argv}
+        with patch("harness.factory_runtime.validate_supervised_stop") as consumer:
+            with self.assertRaises(RuntimeFailure) as caught:
+                self.runtime._supervised_review_step(binding, argv, cwd,
+                    {"PATH": "/usr/bin:/bin"}, log, 3, request=request)
+            consumer.assert_not_called()
+        error = caught.exception
+        self.assertIn("startup failed before payload confirmation", str(error))
+        self.assertIsNotNone(error.__cause__, "preserve the actual startup error explicitly")
+        self.assertFalse(log.with_suffix(log.suffix + ".stop.json").exists(),
+                         "an incomplete start must not acquire a canonical completion record")
+        self.assertIsNotNone(self.runtime.unconfirmed_appserver())
+        with self.assertRaises(RuntimeError): self.runtime.begin_execution("replacement")
+        return error, self.runtime._review_owner
+
+    def test_no_supervisor_start_preserves_error_and_not_started_without_fabricating_echild(self):
+        for request_present in (False, True):
+            with self.subTest(request=request_present):
+                self.runtime = LocalRuntime()
+                log = self.root / (("a" if request_present else "b") * 32 + ".review")
+                path = log.with_suffix(".input.json")
+                request = (path, b"{}") if request_present else None
+                error, owner = self.assert_startup_failed(log,
+                    [sys.executable, "-I", "-B", "-c", "pass"], self.cwd / "absent", request=request)
+                self.assertIsInstance(error.__cause__, FileNotFoundError)
+                self.assertIsNone(owner.proc)
+                self.assertEqual(owner.stopped["proof"], "not_started")
+                self.assertEqual(owner.stopped["binding"], owner.binding)
+                self.assertIn("stop=not_started", str(error))
+                self.assertFalse(log.with_suffix(log.suffix + ".process.jsonl").exists())
+                if request_present:
+                    self.assertEqual(path.read_bytes(), b"{}", "retain the original request")
+                    with self.assertRaisesRegex(RuntimeFailure, "UNKNOWN"):
+                        LocalRuntime().assert_canonical_lifecycles(self.root, "fixture")
+
+    def test_real_supervisor_payload_exec_failure_keeps_startup_diagnosis_and_echild_original(self):
+        log = self.root / ("c" * 32 + ".review")
+        error, owner = self.assert_startup_failed(log, [str(self.root / "no-executable")], self.cwd)
+        self.assertIn("payload startup unconfirmed", str(error.__cause__))
+        self.assertEqual(owner.stopped["proof"], "ECHILD")
+        self.assertEqual(owner.stopped["reaped"], [])
+        self.assertEqual(owner.proc.returncode, 0)
+        self.assertFalse(Path(f"/proc/{owner.proc.pid}").exists())
+        with self.assertRaisesRegex(RuntimeFailure, "UNKNOWN"):
+            LocalRuntime().assert_canonical_lifecycles(self.root, "fixture")
+
+    def test_startup_ack_binding_faults_stop_real_tree_before_reporting_incomplete_identity(self):
+        import harness.appserver_process as protocol
+        receive = protocol._receive
+        for event in ("ready", "started", "started_receive_error"):
+            with self.subTest(event=event):
+                self.runtime = LocalRuntime()
+                log = self.root / ({"ready": "d", "started": "e", "started_receive_error": "9"}[event] * 32 + ".review")
+                def mismatch(channel):
+                    value = receive(channel)
+                    if event == "started_receive_error" and value.get("event") == "started":
+                        raise TimeoutError("injected startup acknowledgement receive failure")
+                    return {**value, "binding": {"wrong": "operation"}} if value.get("event") == event else value
+                with patch.object(protocol, "_receive", side_effect=mismatch):
+                    error, owner = self.assert_startup_failed(log,
+                        [sys.executable, "-I", "-B", "-c", "import time; time.sleep(30)"], self.cwd)
+                if event == "started_receive_error":
+                    self.assertIsInstance(error.__cause__, TimeoutError)
+                    self.assertIn("acknowledgement receive failure", str(error.__cause__))
+                else:
+                    self.assertIn("handshake differs" if event == "ready" else "payload startup unconfirmed",
+                                  str(error.__cause__))
+                self.assertEqual(owner.stopped["proof"], "ECHILD")
+                self.assertEqual(owner.proc.returncode, 0)
+                self.assertFalse(Path(f"/proc/{owner.proc.pid}").exists())
+                self.assertEqual(len(owner.stopped["reaped"]), int(event != "ready"))
+                for child in owner.stopped["reaped"]:
+                    self.assertFalse(Path(f"/proc/{child['pid']}").exists())
+                with self.assertRaisesRegex(RuntimeFailure, "UNKNOWN"):
+                    LocalRuntime().assert_canonical_lifecycles(self.root, "fixture")
+
+    def test_startup_and_stop_binding_fault_preserves_sticky_unknown_before_payload_access(self):
+        import harness.appserver_process as protocol
+        receive = protocol._receive
+        originals = []
+        def mismatch(channel):
+            value = receive(channel)
+            originals.append(value)
+            if value.get("event") in ("started", "stopped"):
+                return {**value, "binding": {"wrong": "operation"}}
+            return value
+        log = self.root / ("f" * 32 + ".review")
+        argv = [sys.executable, "-I", "-B", "-c", "import time; time.sleep(30)"]
+        try:
+            with patch.object(protocol, "_receive", side_effect=mismatch), \
+                    self.assertRaisesRegex(RuntimeError, "AppServer stop UNKNOWN") as caught:
+                self.runtime._supervised_review_step(
+                    {"stage": "canonical-review", "mission": "fixture", "lifecycle": str(log), "argv": argv},
+                    argv, self.cwd, {"PATH": "/usr/bin:/bin"}, log, 3)
+            owner = self.runtime._review_owner
+            self.assertIsNone(owner.stopped)
+            self.assertIsNotNone(owner.failure)
+            self.assertIsNone(owner.proc.returncode, "UNKNOWN must not release the supervisor")
+            self.assertIsNotNone(caught.exception.__cause__)
+            with self.assertRaisesRegex(RuntimeError, "UNKNOWN"): owner.stop()
+            with self.assertRaises(RuntimeError): self.runtime.begin_execution("replacement")
+            with self.assertRaisesRegex(RuntimeFailure, "UNKNOWN"):
+                LocalRuntime().assert_canonical_lifecycles(self.root, "fixture")
+            self.assertFalse(log.with_suffix(log.suffix + ".stop.json").exists())
+        finally:
+            # Test-only exact-resource teardown: the real, unmodified reply is
+            # known to this fault injector, NOT accepted by the runtime. No
+            # product failure flag or completion record is changed/repaired.
+            owner = self.runtime._review_owner
+            stopped = [v for v in originals if v.get("event") == "stopped"]
+            if owner is not None and stopped and stopped[-1].get("proof") == "ECHILD":
+                self.assertEqual(stopped[-1]["binding"], owner.binding)
+                protocol._send(owner.channel, {"command": "release", "binding": owner.binding})
+                self.assertEqual(owner.proc.wait(timeout=2), 0)
+                owner.channel.close()
+                os.close(owner.pidfd)
+
     def test_restart_cannot_bypass_pending_validator_or_borrow_another_stop(self):
         spec, target = {"mission_id": "fixture"}, {"base": "a" * 40, "head": "b" * 40}
         reviews = offline_review_summaries(self.root, spec, self.cwd, target)
