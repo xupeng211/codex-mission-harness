@@ -1023,21 +1023,32 @@ class LocalRuntime:
             except Exception as error:
                 raise RuntimeFailure("canonical lifecycle UNKNOWN; retained originals; no dispatch: " + log.name) from error
 
-    def _supervised_review_step(self, binding, argv, cwd, environment, transcript, timeout, *, stdin=None):
+    def _supervised_review_step(self, binding, argv, cwd, environment, transcript, timeout, *, stdin=None, request=None):
         """Reuse the existing task Controller's per-operation subreaper sequence."""
-        if self._review_owner is not None or self.container_cancel.is_set():
-            raise RuntimeFailure("canonical lifecycle occupied or cancelled; no dispatch")
         transcript = Path(transcript)
         journal = transcript.with_suffix(transcript.suffix + ".process.jsonl")
         stop_path = transcript.with_suffix(transcript.suffix + ".stop.json")
-        owner = AppServerProcess(binding, record=journal)
-        self._review_owner = owner
+        with self._execution_lock:
+            if self._review_owner is not None or self.container_cancel.is_set():
+                raise RuntimeFailure("canonical lifecycle occupied or cancelled; no dispatch")
+            owner = AppServerProcess(binding, record=journal)
+            self._review_owner = owner
         outcome = "complete"
         try:
             with transcript.open("xb") as out, transcript.with_suffix(transcript.suffix + ".stderr").open("xb") as err:
                 os.fchmod(out.fileno(), 0o600); os.fchmod(err.fileno(), 0o600)
-                owner.start(argv, cwd=str(cwd), env=environment,
-                            stdin=stdin if stdin is not None else subprocess.DEVNULL, stdout=out, stderr=err)
+                if request is not None:
+                    # Admit this operation before persisting its request. A
+                    # pre-launch cancellation must not leave a pending input
+                    # that recovery mistakes for an unconfirmed invocation.
+                    path, raw = request
+                    with path.open("xb+") as stream:
+                        os.fchmod(stream.fileno(), 0o600)
+                        stream.write(raw); stream.flush(); os.fsync(stream.fileno()); stream.seek(0)
+                        owner.start(argv, cwd=str(cwd), env=environment, stdin=stream, stdout=out, stderr=err)
+                else:
+                    owner.start(argv, cwd=str(cwd), env=environment,
+                                stdin=stdin if stdin is not None else subprocess.DEVNULL, stdout=out, stderr=err)
                 deadline = time.monotonic() + timeout
                 while True:
                     actual = process_identity(owner.payload["pid"])
@@ -1112,6 +1123,24 @@ class LocalRuntime:
         return result
 
     def project_validate_review(self, spec, cwd, target, lane, result):
+        import threading
+        with self._execution_lock:
+            standalone = self._active_execution is None
+            if standalone:
+                execution = self.begin_execution(spec["mission_id"])
+            elif self._active_mission != spec["mission_id"] or self._execution_thread != threading.get_ident():
+                raise RuntimeError("canonical validation belongs to a different active execution")
+        try:
+            with self._execution_lock:
+                if (self.container_cancel.is_set() or self._review_owner is not None
+                        or self._remote_worker is not None or self._preparation_client is not None):
+                    raise RuntimeFailure("canonical lifecycle occupied or cancelled; no dispatch")
+            return self._project_validate_review(spec, cwd, target, lane, result)
+        finally:
+            if standalone:
+                self.end_execution(execution)
+
+    def _project_validate_review(self, spec, cwd, target, lane, result):
         from .factory_project import validate_review_stop, verify_target
         self.assert_canonical_lifecycles(Path(result["stdout_path"]).parent, spec["mission_id"])
         validate_review_stop(spec, cwd, target, lane, result)
@@ -1121,8 +1150,7 @@ class LocalRuntime:
         log = Path(result["stdout_path"]).with_suffix(".validator-" + uuid.uuid4().hex)
         request = log.with_suffix(log.suffix + ".input.json")
         value = {"spec": spec, "cwd": str(cwd), "target": target, "lane": lane, "result": result}
-        with request.open("x") as stream:
-            os.fchmod(stream.fileno(), 0o600); json.dump(value, stream); stream.flush(); os.fsync(stream.fileno())
+        request_bytes = json.dumps(value).encode()
         code = ("import sys,json; from dataclasses import asdict; sys.path.insert(0,sys.argv[1]); "
                 "from harness.factory_project import FootballPredictionContract; "
                 "v=json.load(sys.stdin); r=FootballPredictionContract().validate_review("
@@ -1135,11 +1163,12 @@ class LocalRuntime:
         binding = {"stage": "canonical-validator", "mission": spec["mission_id"], "target": target,
                    "lane": lane, "operation": result["stdout_path"], "argv": argv,
                    "review_lifecycle": result["review_lifecycle"], "inputs": snapshot,
-                   "request_sha256": hashlib.sha256(request.read_bytes()).hexdigest(), "lifecycle": str(log)}
+                   "request_sha256": hashlib.sha256(request_bytes).hexdigest(), "lifecycle": str(log),
+                   "runtime_execution": self._execution_id}
         environment = FootballPredictionContract().adapter.review_environment(
             "deepseek", worktree=str(cwd), base=target["base"])
-        with request.open("rb") as stream:
-            status, proof = self._supervised_review_step(binding, argv, cwd, environment, log, 60, stdin=stream)
+        status, proof = self._supervised_review_step(binding, argv, cwd, environment, log, 60,
+                                                   request=(request, request_bytes))
         if status != 0:
             raise RuntimeFailure("canonical validator did not establish a verdict; evidence retained")
         validate_review_stop(spec, cwd, target, lane, result)
@@ -1195,7 +1224,8 @@ class LocalRuntime:
             binding = {"stage": "canonical-final-gate", "mission": spec["mission_id"], "target": target,
                        "argv": argv, "request_sha256": hashlib.sha256(request.read_bytes()).hexdigest(),
                        "operation": str(transcript), "lifecycle": str(transcript)}
-            environment = FootballPredictionContract().adapter.review_environment("deepseek", worktree=str(cwd), base=target["base"])
+            from .adapters import FootballPredictionAdapter
+            environment = FootballPredictionAdapter._trusted_subprocess_environment(env={"LANG": "C.UTF-8"})
             with request.open("rb") as stream:
                 status, proof = self._supervised_review_step(binding, argv, cwd, environment, transcript, timeout, stdin=stream)
             if status != 0:
