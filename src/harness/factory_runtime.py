@@ -1042,9 +1042,10 @@ class LocalRuntime:
                     # pre-launch cancellation must not leave a pending input
                     # that recovery mistakes for an unconfirmed invocation.
                     path, raw = request
-                    with path.open("xb+") as stream:
+                    with path.open("xb") as stream:
                         os.fchmod(stream.fileno(), 0o600)
-                        stream.write(raw); stream.flush(); os.fsync(stream.fileno()); stream.seek(0)
+                        stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+                    with path.open("rb") as stream:
                         owner.start(argv, cwd=str(cwd), env=environment, stdin=stream, stdout=out, stderr=err)
                 else:
                     owner.start(argv, cwd=str(cwd), env=environment,

@@ -42,7 +42,10 @@ class ReviewRegressionTests(unittest.TestCase):
         """Replace only semantic consumer workload; keep actual argv/stop binding."""
         runtime = runtime or self.runtime
         original = runtime._supervised_review_step
-        default = "import json; print(json.dumps({'status':'PASS','evidence':'OFFLINE semantic consumer only','artifact':None,'data':{}}))"
+        default = ("import fcntl,json,os,sys; "
+                   "assert fcntl.fcntl(0,fcntl.F_GETFL)&os.O_ACCMODE==os.O_RDONLY; "
+                   "request=json.load(sys.stdin); assert request['lane']=='reviewer'; "
+                   "print(json.dumps({'status':'PASS','evidence':'OFFLINE semantic consumer only','artifact':None,'data':{}}))")
         def step(binding, argv, *args, **kwargs):
             if before:
                 before(binding)
