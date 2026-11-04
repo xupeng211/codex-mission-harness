@@ -1228,19 +1228,18 @@ class LocalRuntime:
             value = {"spec": spec, "cwd": str(cwd), "target": target,
                      "receipts": {LANES[r["lane"]]: r["canonical_receipt"] for r in reviews},
                      "context": context, "executions": executions}
-            with request.open("x") as stream:
-                os.fchmod(stream.fileno(), 0o600); json.dump(value, stream)
+            request_bytes = json.dumps(value).encode()
             code = ("import sys,json; from dataclasses import asdict; sys.path.insert(0,sys.argv[1]); "
                     "from harness.factory_project import FootballPredictionContract; "
                     "r=FootballPredictionContract().final_gate(**json.load(sys.stdin)); print(json.dumps(asdict(r)))")
             argv = [sys.executable, "-I", "-B", "-c", code, str(Path(__file__).resolve().parents[1])]
             binding = {"stage": "canonical-final-gate", "mission": spec["mission_id"], "target": target,
-                       "argv": argv, "request_sha256": hashlib.sha256(request.read_bytes()).hexdigest(),
+                       "argv": argv, "request_sha256": hashlib.sha256(request_bytes).hexdigest(),
                        "operation": str(transcript), "lifecycle": str(transcript)}
             from .adapters import FootballPredictionAdapter
             environment = FootballPredictionAdapter._trusted_subprocess_environment(env={"LANG": "C.UTF-8"})
-            with request.open("rb") as stream:
-                status, proof = self._supervised_review_step(binding, argv, cwd, environment, transcript, timeout, stdin=stream)
+            status, proof = self._supervised_review_step(binding, argv, cwd, environment, transcript, timeout,
+                                                       request=(request, request_bytes))
             if status != 0:
                 raise RuntimeFailure("canonical final consumer unconfirmed; retained evidence")
             verify_target(spec, cwd, target)
@@ -1386,15 +1385,13 @@ class LocalRuntime:
             environment = FootballPredictionAdapter._trusted_subprocess_environment(env={"LANG": "C.UTF-8"})
             environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
             request_path = Path(transcript).with_suffix(".input.json")
-            with request_path.open("x") as stream:
-                os.fchmod(stream.fileno(), 0o600)
-                json.dump(request_value, stream); stream.flush(); os.fsync(stream.fileno())
+            request_bytes = json.dumps(request_value).encode()
             binding = {"stage": "canonical-final-gate", "mission": spec["mission_id"],
-                       "target": target, "argv": argv, "request_sha256": hashlib.sha256(request_path.read_bytes()).hexdigest(),
+                       "target": target, "argv": argv, "request_sha256": hashlib.sha256(request_bytes).hexdigest(),
                        "operation": str(transcript), "lifecycle": str(transcript)}
-            with request_path.open("rb") as request:
-                code, proof = self._supervised_review_step(
-                    binding, argv, Path(transcript).parent, environment, transcript, timeout, stdin=request)
+            code, proof = self._supervised_review_step(
+                binding, argv, Path(transcript).parent, environment, transcript, timeout,
+                request=(request_path, request_bytes))
             if code != 0:
                 raise RuntimeFailure("canonical final gate failed; supervised evidence retained")
             result = json.loads(Path(transcript).read_text())

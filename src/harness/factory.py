@@ -701,7 +701,7 @@ class Factory:
         if self.project:
             sidecars = [transcript.with_suffix(suffix) for suffix in (
                 ".review", ".review.stderr", ".review.process.jsonl", ".review.stop.json",
-                ".raw.process.jsonl", ".raw.stop.json", ".remote.jsonl", ".input.json")]
+                ".raw.stderr", ".raw.process.jsonl", ".raw.stop.json", ".remote.jsonl", ".input.json")]
             sidecars.extend(transcript.parent.glob(transcript.stem + ".validator-*"))
             raw_paths.extend(p for p in sidecars if p.is_file() and not p.is_symlink() and p not in raw_paths)
         result["raw_evidence"] = [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in raw_paths]

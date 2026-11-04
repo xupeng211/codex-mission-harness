@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 from harness.adapters import FootballPredictionAdapter
 from harness.appserver_process import AppServerProcess
-from harness.factory import READY
+from harness.factory import READY, FactoryBlocked
 from harness.factory_runtime import LocalRuntime, RuntimeFailure
 from test_factory_review_lifecycle import offline_review_summaries
 import test_factory_controller_gates as fixtures
@@ -197,6 +197,112 @@ print({json.dumps(pr)!r})
         self.assertEqual(before, set(self.root.iterdir()))
         self.assertIsNone(self.runtime._active_execution)
         self.runtime.assert_canonical_lifecycles(self.root, "fixture")
+
+    def test_final_gate_cancel_before_admission_creates_no_request_in_either_route(self):
+        for remote in (False, True):
+            with self.subTest(remote=remote):
+                directory = self.root / ("cancel-remote" if remote else "cancel-local")
+                directory.mkdir(mode=0o700)
+                active = self.runtime.begin_execution("fixture")
+                before = set(directory.iterdir())
+                original = self.runtime._supervised_review_step
+                def cancel_then_admit(*args, **kwargs):
+                    self.assertTrue(self.runtime.cancel(active))
+                    return original(*args, **kwargs)
+                try:
+                    with patch("harness.factory_project.verify_target"), \
+                            patch.object(FootballPredictionAdapter, "_trusted_subprocess_environment", return_value={"PATH": os.defpath}), \
+                            patch.object(self.runtime, "_supervised_review_step", side_effect=cancel_then_admit), \
+                            patch.object(AppServerProcess, "start") as dispatch:
+                        with self.assertRaisesRegex(RuntimeFailure, "cancelled"):
+                            self.runtime.project_final_gate(self.spec, self.cwd, self.target, self.reviews,
+                                directory / (("a" if remote else "b") * 32 + ".raw"), 3,
+                                context={"policy": {}, "body": "OFFLINE"} if remote else {})
+                        dispatch.assert_not_called()
+                    self.assertTrue(active.is_set(), "do not reset the admitted task's cancellation")
+                    self.assertIsNone(self.runtime._review_owner)
+                    self.assertEqual(before, set(directory.iterdir()), "no unstarted request or process sidecars")
+                    self.runtime.assert_canonical_lifecycles(directory, "fixture")
+                    LocalRuntime().assert_canonical_lifecycles(directory, "fixture")
+                finally:
+                    self.runtime.end_execution(active)
+
+    @contextmanager
+    def final_consumer(self, runtime, *, exit_code=0):
+        """Substitute only final consumer semantics; keep production request IO and supervision."""
+        original = runtime._supervised_review_step
+        def step(binding, argv, *args, **kwargs):
+            code = ("import fcntl,json,sys; from pathlib import Path; "
+                    "assert fcntl.fcntl(0,fcntl.F_GETFL)&3==0; "
+                    "v=json.load(sys.stdin); "
+                    "Path(v['transcript']).write_text('OFFLINE remote observation') if 'action' in v else None; "
+                    "print('OFFLINE supervised diagnostic',file=sys.stderr); "
+                    "print(json.dumps({'status':'PASS','reason':'OFFLINE','evidence':'OFFLINE','data':{}})); "
+                    f"sys.exit({exit_code})")
+            actual = [sys.executable, "-I", "-B", "-c", code]
+            return original({**binding, "argv": actual}, actual, *args, **kwargs)
+        with patch("harness.factory_project.verify_target"), \
+                patch.object(FootballPredictionAdapter, "_trusted_subprocess_environment", return_value={"PATH": os.defpath}), \
+                patch.object(runtime, "_supervised_review_step", side_effect=step):
+            yield
+
+    def test_admitted_final_gates_retain_readonly_bound_request_and_real_stop(self):
+        import hashlib
+        from harness.appserver_process import validate_supervised_stop
+        for remote in (False, True):
+            with self.subTest(remote=remote), self.final_consumer(self.runtime):
+                transcript = self.root / (("c" if remote else "d") * 32 + ".raw")
+                gate = self.runtime.project_final_gate(self.spec, self.cwd, self.target, self.reviews,
+                    transcript, 3, context={"policy": {}, "body": "OFFLINE"} if remote else {})
+                request = transcript.with_suffix(".input.json")
+                raw = request.read_bytes()
+                value = json.loads(raw)
+                self.assertEqual(value["target"], self.target)
+                self.assertEqual(request.stat().st_mode & 0o777, 0o600)
+                proof = gate["validation_lifecycle"]
+                doc = json.loads(Path(proof["path"]).read_text())
+                self.assertEqual(doc["binding"]["request_sha256"], hashlib.sha256(raw).hexdigest())
+                expected = {k: v for k, v in doc["binding"].items() if k != "execution_id"}
+                self.assertEqual(validate_supervised_stop(proof, expected), 0)
+                self.assertEqual(doc["stop"]["proof"], "ECHILD")
+                self.assertEqual(doc["supervisor_exit"], 0)
+                self.assertIsNone(self.runtime._review_owner)
+                self.runtime.assert_canonical_lifecycles(self.root, "fixture")
+
+    def test_factory_binds_raw_stderr_for_both_final_routes_including_unknown(self):
+        fx = fixtures.FactoryLiveProtocolTests()
+        fx.setUp(); self.addCleanup(fx.doCleanups)
+        runtime = LocalRuntime()
+        fx.f.runtime = runtime
+        directory = fx.f.root / "evidence" / "feature"
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        spec = {**self.spec, "mission_id": "feature"}
+        reviews = offline_review_summaries(directory, spec, self.cwd, self.target)
+        for remote, exit_code in ((False, 0), (True, 0), (True, 9)):
+            with self.subTest(remote=remote, exit_code=exit_code), self.final_consumer(runtime, exit_code=exit_code):
+                key = f"offline-final-{remote}-{exit_code}"
+                def invoke(transcript):
+                    return runtime.project_final_gate(spec, self.cwd, self.target, reviews, transcript, 3,
+                        context={"policy": {}, "body": "OFFLINE"} if remote else {})
+                if exit_code:
+                    with self.assertRaises(FactoryBlocked):
+                        fx.f.operation("feature", key, "final_gate", "controller", {}, {}, False, invoke)
+                else:
+                    fx.f.operation("feature", key, "final_gate", "controller", {}, {}, False, invoke)
+                operation = fx.f.db.execute("SELECT * FROM operations WHERE key=?", (key,)).fetchone()
+                self.assertEqual(operation["status"], "UNKNOWN" if exit_code else "COMPLETE")
+                result = json.loads(operation["result"])
+                stderr = directory / (operation["id"] + ".raw.stderr")
+                self.assertIn("OFFLINE supervised diagnostic", stderr.read_text())
+                fx.f.verify_evidence(operation)
+                original = stderr.read_bytes()
+                try:
+                    stderr.write_bytes(original + b"changed")
+                    with self.assertRaisesRegex(FactoryBlocked, "raw execution evidence"):
+                        fx.f.verify_evidence(operation)
+                finally:
+                    stderr.write_bytes(original)  # only this test's synthetic diagnostic
+                self.assertIn(str(stderr), {v["path"] for v in result["raw_evidence"]})
 
     def test_late_old_cancel_does_not_stop_a_live_standalone_validator(self):
         old = self.runtime.begin_execution("old")
