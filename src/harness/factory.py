@@ -597,6 +597,11 @@ class Factory:
     def operation(self, mission, key, stage, lane, identity, payload, paid, invoke, prepare=None):
         """Reserve before dispatch. A lost response is never replayed under a new guise."""
         candidate_stage.check_dispatch(self, mission, stage)
+        if self.project and not self.config["simulation"] and isinstance(self.runtime, LocalRuntime):
+            try:
+                self.runtime.assert_canonical_lifecycles(self.root / "evidence" / mission, mission)
+            except Exception as error:
+                raise FactoryBlocked("UNKNOWN", str(error)) from error
         routing_decision = None
         if paid and lane == "developer" and "model_routing" in self.config:
             spec = json.loads(self.row(mission)["spec"])
@@ -691,6 +696,14 @@ class Factory:
                                 transcript.with_suffix(".stdout"),
                                 transcript.with_suffix(".cleanup.json"), transcript.with_suffix(".temp.json"),
                                 transcript.with_suffix(".temp.cleanup.jsonl")) if p.is_file()]
+        # Also bind this operation's retained lifecycle originals on UNKNOWN;
+        # no recursive scan of retained reviewer HOME or credentials.
+        if self.project:
+            sidecars = [transcript.with_suffix(suffix) for suffix in (
+                ".review", ".review.stderr", ".review.process.jsonl", ".review.stop.json",
+                ".raw.stderr", ".raw.process.jsonl", ".raw.stop.json", ".remote.jsonl", ".input.json")]
+            sidecars.extend(transcript.parent.glob(transcript.stem + ".validator-*"))
+            raw_paths.extend(p for p in sidecars if p.is_file() and not p.is_symlink() and p not in raw_paths)
         result["raw_evidence"] = [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in raw_paths]
         data = encoded({"operation": operation_id, "identity": identity, "input": payload, "result": result}).encode()
         with evidence.open("xb") as stream:
@@ -744,6 +757,16 @@ class Factory:
                 if op["id"] not in resolved]
 
     def verify_evidence(self, operation):
+        if (self.project and not self.config["simulation"] and operation["stage"] == "review"
+                and isinstance(self.runtime, LocalRuntime)):
+            from .factory_project import validate_review_stop
+            result = json.loads(operation["result"])
+            expected = self.root / "evidence" / operation["mission"] / (operation["id"] + ".raw")
+            if result.get("stdout_path") != str(expected):
+                raise FactoryBlocked("UNKNOWN", "review lifecycle belongs to another paid operation")
+            spec = json.loads(self.row(operation["mission"])["spec"])
+            validate_review_stop(spec, Path(self.row(operation["mission"])["candidate"]),
+                                 json.loads(operation["identity"])["target"], operation["lane"], result)
         evidence = Path(operation["evidence"] or "")
         if not evidence.is_file() or evidence.is_symlink() or evidence.resolve() != evidence or hashlib.sha256(evidence.read_bytes()).hexdigest() != operation["evidence_hash"]:
             raise FactoryBlocked("UNKNOWN", "operation evidence is missing or changed")
@@ -880,6 +903,8 @@ class Factory:
         if self.target(spec, cwd) != target:
             raise FactoryBlocked("UNKNOWN", "canonical reviewer changed the exact target")
         try:
+            self.verify_evidence(self.db.execute(
+                "SELECT * FROM operations WHERE mission=? AND key=?", (spec["mission_id"], key)).fetchone())
             checked = self.runtime.project_validate_review(spec, cwd, target, lane, result)
             if checked.status not in {"PASS", "FAIL"} or not checked.artifact or not isinstance(checked.data, dict):
                 raise ValueError("project validator has no current receipt verdict")
@@ -888,7 +913,7 @@ class Factory:
                 raise ValueError("canonical receipt omitted findings")
             if result.get("fixture", False) is not self.config["simulation"]:
                 raise ValueError("fixture/live canonical evidence mismatch")
-        except (ValueError, KeyError, TypeError, OSError) as exc:
+        except (ValueError, KeyError, TypeError, OSError, RuntimeError) as exc:
             raise FactoryBlocked("UNKNOWN", f"canonical receipt validation failed: {exc}") from exc
         # Do not lower the existing Factory barrier without an Owner decision.
         status = "PASS" if checked.status == "PASS" and not findings else "FAIL"
@@ -897,6 +922,7 @@ class Factory:
                 "evidence_key": key, "provider": "openai" if lane == "reviewer" else "deepseek",
                 "lane": lane, "backend": BACKENDS[LANES[lane]], "target": target,
                 "canonical_receipt": checked.artifact, "canonical_receipt_data": checked.data,
+                "canonical_execution": result,
                 "review_range": target["review_range"], "fixture": self.config["simulation"]}
 
     def observation_result(self, spec, payload, result):
@@ -1023,7 +1049,7 @@ class Factory:
                     previous_head = value["target"]["head"]
             publication = self.operation(spec["mission_id"], key, "project_publish", "github", payload, payload, False,
                 lambda transcript: self.runtime.project_remote("publish", policy, spec, cwd, target, body, transcript,
-                    self.operation_timeout(spec["mission_id"]), previous_head=previous_head))
+                    self.operation_timeout(spec["mission_id"]), reviews=reviews, previous_head=previous_head))
             if publication.get("status") != "PASS" or publication.get("target") != target or publication.get("fixture") is not False:
                 raise FactoryBlocked("UNKNOWN", "publication did not establish exact live PR identity")
             # Cached success is never current remote truth.
@@ -1548,11 +1574,11 @@ class Factory:
                     if "project_pr_ci" in self.config:
                         context = self.project_ci_context(spec, cwd, delivery["target"], delivery.get("validation_results", {}).get("ci", []))
                         if not self.config["simulation"]:
-                            from .factory_project import FootballPredictionContract
-                            checked = FootballPredictionContract().final_gate(spec, cwd, delivery["target"],
-                                {LANES[r["lane"]]: r["canonical_receipt"] for r in delivery["reviews"]}, context)
-                            if checked.status != "PASS":
-                                raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", checked.evidence)
+                            transcript = self.root / "evidence" / mission / ("report-final-" + uuid.uuid4().hex + ".raw")
+                            fresh = self.runtime.project_final_gate(spec, cwd, delivery["target"],
+                                delivery["reviews"], transcript, 60, context=context)
+                            if fresh["status"] != "PASS":
+                                raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", fresh.get("reason", "canonical final consumer unconfirmed"))
                     gate = delivery["project_gate"]
                     if gate["evidence_key"] not in delivery["evidence_keys"] or gate.get("fixture") is not self.config["simulation"]:
                         raise FactoryBlocked("UNKNOWN", "project gate evidence is incomplete")

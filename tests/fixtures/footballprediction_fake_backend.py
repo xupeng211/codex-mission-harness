@@ -11,6 +11,10 @@ from types import SimpleNamespace
 
 snapshot, mode, binary, *arguments = sys.argv[1:]
 sys.path.insert(0, snapshot)
+# Pinned historical wrapper predates retain mode. Assert the production argv
+# carries it, then adapt only this offline historical runner parser.
+if mode == "deepseek" and "--retain-invocation" in arguments:
+    arguments.remove("--retain-invocation")
 
 
 def record_call():

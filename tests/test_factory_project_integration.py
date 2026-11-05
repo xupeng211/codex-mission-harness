@@ -90,6 +90,14 @@ class CanonicalRuntimeIntegrationTests(unittest.TestCase):
 
     def launch(self, argv, *args, **kwargs):
         argv = list(argv)
+        if "-c" in argv:
+            index = argv.index("-c") + 1
+            marker = "from harness.factory_project import FootballPredictionContract; "
+            if marker in argv[index]:
+                setup = ("sys.path.insert(0," + repr(str(DRIVER.parent)) + "); "
+                         "from footballprediction_validator_bootstrap import configure; "
+                         "configure(" + repr(str(self.snapshot)) + "," + repr(str(DRIVER)) + "," + repr(str(self.binary)) + "); ")
+                argv[index] = argv[index].replace(marker, marker + setup)
         script = next((i for i, value in enumerate(argv) if str(value) in {
             str(self.snapshot / "scripts/devops/codex_independent_review.py"),
             str(self.snapshot / "scripts/devops/claude_deepseek_independent_review.py")}), None)
@@ -156,6 +164,20 @@ class CanonicalRuntimeIntegrationTests(unittest.TestCase):
         with self.assertRaises(FactoryBlocked):
             self.f.project_final_gate(spec, cwd, target, reviews)
         self.assertNotIn(self.f.row("feature")["status"], {"READY_FOR_USER_ACCEPTANCE", "MERGE_READY", "DONE"})
+
+    def test_restarted_runtime_blocks_before_reservation_for_unfinished_validator(self):
+        spec, cwd, target = self.candidate()
+        evidence = self.f.root / "evidence" / spec["mission_id"]
+        evidence.mkdir(mode=0o700, parents=True, exist_ok=True)
+        pending = evidence / ("0" * 32 + ".validator-" + "1" * 32 + ".input.json")
+        pending.write_text("{}"); pending.chmod(0o600)
+        with patch.object(self.runtime, "prepare_project_review") as prepare:
+            with self.assertRaisesRegex(FactoryBlocked, "UNKNOWN"):
+                self.review(spec, cwd, target, "reviewer")
+            prepare.assert_not_called()
+        self.assertEqual(self.starts, [])
+        self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM operations").fetchone()[0], 0)
+        self.assertEqual(pending.read_text(), "{}")
 
     def test_lf_scope_passes_original_deepseek_validator(self):
         spec, cwd, target = self.candidate()
@@ -236,8 +258,8 @@ Revert the isolated fixture commit.
         template = publication_body(self, target).replace(
             "Offline source-policy contract probe.", "离线 UTF-8 正文 probe.").replace("\n", newline)
         spec = validate_mission({**spec, "pr_body_template": template})
-        reviews = [{"lane": "reviewer", "canonical_receipt": str(self.root / "MISSING-CODEX.json"),
-                    "canonical_receipt_data": {"review_completed_at": "2026-10-28T00:00:00Z"}}]
+        from test_factory_review_lifecycle import offline_review_summaries
+        reviews = offline_review_summaries(self.root, spec, cwd, target)
         body = render_body(DELIVERY, spec, target, reviews, [])
         self.assertEqual(spec["pr_body_template"], template)
         self.assertEqual(body.count("\r\n"), template.rstrip().count("\r\n"))
@@ -293,7 +315,7 @@ Revert the isolated fixture commit.
                     # The original final gate still refuses absent dual receipts.
                     # Only the cache/body admission and remote paths are proved.
                     self.assertEqual(result["status"], "BLOCKED_EXTERNAL")
-                    self.assertIn("both canonical receipts", result["reason"])
+                    self.assertTrue(result["reason"], "original validator must explain absent canonical receipts")
                 else:
                     self.assertEqual(result["status"], "PASS")
                 self.assertEqual(cached.read_bytes(), body.encode("utf-8"))

@@ -984,7 +984,7 @@ class FootballPredictionAdapter:
                     "--run-id", attempt_id, "--json"]
         if reviewer == "deepseek":
             return [python, "-I", "-B",
-                    str(trusted / "scripts/devops/claude_deepseek_independent_review.py"), *common]
+                    str(trusted / "scripts/devops/claude_deepseek_independent_review.py"), *common, "--retain-invocation"]
         raise ValueError(f"unsupported independent reviewer: {reviewer}")
 
     def review(self, reviewer: str, head: str) -> GateResult:

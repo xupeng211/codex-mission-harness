@@ -115,8 +115,10 @@ class PublicationDataRootTests(unittest.TestCase):
                 remote.command.assert_not_called()
                 remote.api.assert_not_called()
             else:
+                from test_factory_review_lifecycle import offline_review_summaries
+                reviews = offline_review_summaries(self.fx.root, spec, cwd, target)
                 self.assertEqual(remote_run("publish", gates.DELIVERY, spec, cwd, target,
-                    publication_body(self.fx, target), self.fx.root / "publication.raw", 5)["status"], "PASS")
+                    publication_body(self.fx, target), self.fx.root / "publication.raw", 5, reviews=reviews)["status"], "PASS")
                 remote.publish.assert_called_once()
         self.assertEqual(self.fx.starts, [], "no provider may be called")
         self.assertEqual(self.rules, {p.relative_to(self.snapshot).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()

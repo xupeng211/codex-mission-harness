@@ -1,9 +1,11 @@
 """Thin, bounded execution adapters. Codex owns coding and review intelligence."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import time
@@ -15,13 +17,21 @@ import urllib.parse
 import tempfile
 from pathlib import Path
 
+from .adapters import GateResult
 from .codex import AppServerCodex
-from .appserver_process import process_identity
+from .appserver_process import AppServerProcess, process_identity, validate_supervised_stop
 from .task_temp import TaskTemp, TaskTempError
 from .model_registry import read_private_token
 from .sandbox import project_gate_invocation, preflight_project_gate, SAFE_PATH
 from .factory_proxy import validate_transport, ProxyPolicy, ProxyRelay, digest as route_digest
 from .factory_project import FootballPredictionContract, LANES
+
+
+@dataclass(frozen=True)
+class SupervisedReviewResult(GateResult):
+    """Controller lifecycle references; canonical receipt data stays unchanged."""
+    validation_lifecycle: dict | None = None
+    validation_evidence: tuple = ()
 
 
 VENDOR = Path(__file__).parent / "vendor" / "codex"
@@ -618,6 +628,7 @@ class LocalRuntime:
         self._validation_cancelled = False
         self._single_server = None
         self._single_binding = None
+        self._review_owner = None
         self._remote_worker = None
         # The gate's sequential owned-client slot covers preparation and the
         # main validation client; retain the existing slot name for callers.
@@ -655,6 +666,8 @@ class LocalRuntime:
         return cleanup
 
     def unconfirmed_appserver(self):
+        if self._review_owner is not None:
+            return "canonical review process stop/evidence UNKNOWN; no replacement execution"
         if self._single_server is not None:
             # This slot is released only after both shutdown and its complete
             # cleanup receipt are accepted, including receipt-read failures.
@@ -664,7 +677,7 @@ class LocalRuntime:
     def begin_execution(self, mission):
         import threading
         with self._execution_lock:
-            if self._active_execution is not None or self.current_process is not None or self._single_server is not None:
+            if self._active_execution is not None or self.current_process is not None or self._single_server is not None or self._review_owner is not None:
                 raise RuntimeError("runtime already belongs to an active execution")
             # A new identity, not clearing an old task's cancellation latch.
             self.container_cancel = threading.Event()
@@ -681,7 +694,8 @@ class LocalRuntime:
                 # An unconfirmed owned group still owns this execution. Even
                 # Factory.run's outer finally must not admit a new execution.
                 if (self._remote_worker is not None or self._preparation_client is not None
-                        or self._single_server is not None or self.current_process is not None):
+                        or self._single_server is not None or self.current_process is not None
+                        or self._review_owner is not None):
                     return False
                 self._active_execution = self._active_mission = None
                 self._execution_id = None
@@ -699,6 +713,8 @@ class LocalRuntime:
             self.container_cancel.set()
             proc = self.current_process
             client = self._remote_worker if self._remote_worker is not None else self._preparation_client
+            if self._review_owner is not None:
+                return True  # Owner loop observes the latch; never poll/reap/kill its anchor.
             if client is not None:
                 try:
                     self._signal_owned_client(client, signal.SIGTERM)
@@ -961,7 +977,131 @@ class LocalRuntime:
         environment = contract.adapter.review_environment(LANES[lane], worktree=str(cwd), base=target["base"])
         return argv, evidence, environment
 
+    def assert_canonical_lifecycles(self, directory, mission):
+        """Recovery guard over this task's original supervisor sidecars only.
+
+        No stop records are created or repaired here. An incomplete validator
+        remains UNKNOWN even after a Controller restart, before any dispatch.
+        """
+        directory = Path(directory)
+        if not directory.exists():
+            return
+        def read(path):
+            info = path.lstat()
+            if (path.is_symlink() or path.resolve(strict=True) != path or not path.is_file()
+                    or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_nlink != 1
+                    or info.st_size > 1024 * 1024):
+                raise RuntimeFailure("canonical lifecycle original is not private/bounded")
+            return path.read_bytes()
+        logs = set()
+        for path in directory.iterdir():
+            if path.name.endswith((".review.process.jsonl", ".raw.process.jsonl")) or re.fullmatch(
+                    r"[0-9a-f]{32}\.validator-[0-9a-f]{32}\.process\.jsonl", path.name):
+                logs.add(path.with_name(path.name.removesuffix(".process.jsonl")))
+            if re.fullmatch(r"(?:[0-9a-f]{32}|report-final-[0-9a-f]{32})(?:\.validator-[0-9a-f]{32})?\.input\.json", path.name):
+                stem = path.name.removesuffix(".input.json")
+                logs.add(path.with_name(stem if ".validator-" in stem else stem + ".raw"))
+        for log in sorted(logs):
+            try:
+                journal = log.with_suffix(log.suffix + ".process.jsonl")
+                # validate_supervised_stop performs the private-file, original
+                # event sequence and ECHILD checks after extracting the binding.
+                first = json.loads(read(journal).splitlines()[0])
+                binding = {k: v for k, v in first["binding"].items() if k != "execution_id"}
+                if (binding.get("mission") != mission or binding.get("lifecycle") != str(log)
+                        or binding.get("stage") not in {"canonical-review", "canonical-validator", "canonical-final-gate"}):
+                    raise RuntimeError("canonical operation/lifecycle identity differs")
+                request = log.with_suffix(log.suffix + ".input.json") if binding["stage"] == "canonical-validator" else log.with_suffix(".input.json")
+                if "request_sha256" in binding and hashlib.sha256(read(request)).hexdigest() != binding["request_sha256"]:
+                    raise RuntimeError("canonical original request differs")
+                stop_path = log.with_suffix(log.suffix + ".stop.json")
+                doc = json.loads(read(stop_path))
+                if doc["outcome"] not in {"complete", "failed", "timeout", "cancelled"}:
+                    raise RuntimeError("canonical outcome UNKNOWN")
+                validate_supervised_stop({"path": str(stop_path), "sha256": hashlib.sha256(read(stop_path)).hexdigest()},
+                                         binding, outcome=doc["outcome"])
+            except Exception as error:
+                raise RuntimeFailure("canonical lifecycle UNKNOWN; retained originals; no dispatch: " + log.name) from error
+
+    def _supervised_review_step(self, binding, argv, cwd, environment, transcript, timeout, *, stdin=None, request=None):
+        """Reuse the existing task Controller's per-operation subreaper sequence."""
+        transcript = Path(transcript)
+        journal = transcript.with_suffix(transcript.suffix + ".process.jsonl")
+        stop_path = transcript.with_suffix(transcript.suffix + ".stop.json")
+        with self._execution_lock:
+            if self._review_owner is not None or self.container_cancel.is_set():
+                raise RuntimeFailure("canonical lifecycle occupied or cancelled; no dispatch")
+            owner = AppServerProcess(binding, record=journal)
+            self._review_owner = owner
+        outcome = "complete"
+        startup_confirmed = False
+        operation_error = None
+        try:
+            with transcript.open("xb") as out, transcript.with_suffix(transcript.suffix + ".stderr").open("xb") as err:
+                os.fchmod(out.fileno(), 0o600); os.fchmod(err.fileno(), 0o600)
+                if request is not None:
+                    # Admit this operation before persisting its request. A
+                    # pre-launch cancellation must not leave a pending input
+                    # that recovery mistakes for an unconfirmed invocation.
+                    path, raw = request
+                    with path.open("xb") as stream:
+                        os.fchmod(stream.fileno(), 0o600)
+                        stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+                    with path.open("rb") as stream:
+                        owner.start(argv, cwd=str(cwd), env=environment, stdin=stream, stdout=out, stderr=err)
+                else:
+                    owner.start(argv, cwd=str(cwd), env=environment,
+                                stdin=stdin if stdin is not None else subprocess.DEVNULL, stdout=out, stderr=err)
+                startup_confirmed = True
+                deadline = time.monotonic() + timeout
+                while True:
+                    actual = process_identity(owner.payload["pid"])
+                    if any(actual[k] != owner.payload[k] for k in ("pid", "ppid", "uid", "starttime")):
+                        raise RuntimeError("canonical payload identity changed")
+                    if self.container_cancel.is_set():
+                        outcome = "cancelled"; break
+                    if actual["state"] in ("Z", "X"):
+                        break
+                    if time.monotonic() >= deadline:
+                        outcome = "timeout"; break
+                    time.sleep(.02)
+        except BaseException as error:
+            operation_error = error
+            outcome = "failed"
+            raise
+        finally:
+            # Even timeout/cancel/fault must stop only this allocation's tree.
+            stop = owner.stop()
+            if not startup_confirmed:
+                # stop() can prove no supervisor was started, or ECHILD after
+                # an unconfirmed launch, without establishing a payload exit.
+                # Preserve that distinction and the startup cause. Neither is
+                # a complete canonical lifecycle: retain ownership/originals,
+                # and never manufacture a payload or a consumable stop record.
+                raise RuntimeFailure("canonical startup failed before payload confirmation; stop="
+                                     + stop["proof"] + "; lifecycle evidence UNKNOWN; retained supervision") from operation_error
+            matches = [v for v in stop.get("reaped", []) if v["pid"] == owner.payload["pid"]]
+            if len(matches) != 1:
+                raise RuntimeFailure("canonical payload exit UNKNOWN; retained supervision")
+            code = os.waitstatus_to_exitcode(matches[0]["status"])
+            doc = {"binding": owner.binding, "supervisor": owner.identity, "payload": owner.payload,
+                   "supervisor_exit": owner.proc.returncode, "stop": stop, "exit_code": code,
+                   "outcome": outcome, "journal": str(journal),
+                   "journal_sha256": hashlib.sha256(journal.read_bytes()).hexdigest()}
+            with stop_path.open("x") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(json.dumps(doc, sort_keys=True)); stream.flush(); os.fsync(stream.fileno())
+            reference = {"path": str(stop_path), "sha256": hashlib.sha256(stop_path.read_bytes()).hexdigest()}
+            validate_supervised_stop(reference, binding, outcome=outcome)
+            # Clear only after the full original stop record is durable. On
+            # UNKNOWN, owner/evidence remain attached and no new step may start.
+            self._review_owner = None
+        if outcome != "complete":
+            raise RuntimeFailure("canonical operation " + outcome + "; no verdict consumed")
+        return code, reference
+
     def project_review(self, spec, cwd, target, lane, transcript, timeout, *, prepared=None):
+        from .factory_project import review_process_binding
         contract = FootballPredictionContract()
         if isinstance(prepared, dict):
             admission = contract.review_admission(spec, cwd, target, prepared["admission"]["authorization"])
@@ -970,37 +1110,89 @@ class LocalRuntime:
             prepared = prepared["runner"]
         argv, evidence, environment = prepared if prepared is not None else self.prepare_project_review(
             spec, cwd, target, lane, timeout)
-        # Recheck the private directory immediately before launch as well.
         contract.adapter._validate_review_evidence_dir(evidence)
-        stderr = transcript.with_suffix(".stderr")
-        with transcript.open("xb") as output, stderr.open("xb") as errors:
-            os.fchmod(output.fileno(), 0o600)
-            os.fchmod(errors.fileno(), 0o600)
-            proc = subprocess.Popen(argv, cwd=cwd, env=environment, stdout=output,
-                                    stderr=errors, start_new_session=True)
-            self.current_process = proc
-            try:
-                code = proc.wait(timeout=timeout + 6)
-            except BaseException:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait()
-                raise
-            finally:
-                self.current_process = None
-        result = {"stdout_path": str(transcript), "stderr_path": str(stderr),
-                  "evidence_dir": str(evidence), "exit_code": code, "fixture": False,
+        transcript = Path(transcript)
+        result = {"stdout_path": str(transcript), "stderr_path": str(transcript.with_suffix(".review.stderr")),
+                  "evidence_dir": str(evidence), "fixture": False,
                   "executed_runner_argv": argv, "usage": None, "usage_complete": False}
-        checked = contract.validate_review(spec, cwd, target, lane, result)
-        # Reference actual artifacts, not reconstructed CLI provenance. The
-        # project's validator verifies the underlying receipt/raw evidence.
+        binding = review_process_binding(spec, cwd, target, lane, result)
+        review_log = transcript.with_suffix(".review")
+        code, reference = self._supervised_review_step(binding, argv, cwd, environment, review_log, timeout)
+        # Canonical stdout remains the operation's stable raw artifact. Preserve
+        # review logs rather than rename the files named by stop provenance.
+        with transcript.open("xb") as stream:
+            os.fchmod(stream.fileno(), 0o600); stream.write(review_log.read_bytes())
+        result.update(exit_code=code, review_lifecycle=reference)
         result["project_evidence"] = [{"path": str(path.resolve()),
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
             for path in evidence.iterdir() if path.is_file() and not path.is_symlink()]
+        for path in (review_log, review_log.with_suffix(".review.stderr"),
+                     review_log.with_suffix(".review.process.jsonl"), Path(reference["path"])):
+            result["project_evidence"].append({"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+        checked = self.project_validate_review(spec, cwd, target, lane, result)
+        result["validation_lifecycle"] = checked.validation_lifecycle
+        result["project_evidence"].extend(checked.validation_evidence)
         result["canonical_receipt"] = checked.artifact
         return result
 
     def project_validate_review(self, spec, cwd, target, lane, result):
-        return FootballPredictionContract().validate_review(spec, cwd, target, lane, result)
+        import threading
+        with self._execution_lock:
+            standalone = self._active_execution is None
+            if standalone:
+                execution = self.begin_execution(spec["mission_id"])
+            elif self._active_mission != spec["mission_id"] or self._execution_thread != threading.get_ident():
+                raise RuntimeError("canonical validation belongs to a different active execution")
+        try:
+            with self._execution_lock:
+                if (self.container_cancel.is_set() or self._review_owner is not None
+                        or self._remote_worker is not None or self._preparation_client is not None):
+                    raise RuntimeFailure("canonical lifecycle occupied or cancelled; no dispatch")
+            return self._project_validate_review(spec, cwd, target, lane, result)
+        finally:
+            if standalone:
+                self.end_execution(execution)
+
+    def _project_validate_review(self, spec, cwd, target, lane, result):
+        from .factory_project import validate_review_stop, verify_target
+        self.assert_canonical_lifecycles(Path(result["stdout_path"]).parent, spec["mission_id"])
+        validate_review_stop(spec, cwd, target, lane, result)
+        verify_target(spec, cwd, target)
+        # Each revalidation has a fresh unpaid operation; it cannot re-sign the
+        # original runner proof or replay a paid reviewer. Keep every original.
+        log = Path(result["stdout_path"]).with_suffix(".validator-" + uuid.uuid4().hex)
+        request = log.with_suffix(log.suffix + ".input.json")
+        value = {"spec": spec, "cwd": str(cwd), "target": target, "lane": lane, "result": result}
+        request_bytes = json.dumps(value).encode()
+        code = ("import sys,json; from dataclasses import asdict; sys.path.insert(0,sys.argv[1]); "
+                "from harness.factory_project import FootballPredictionContract; "
+                "v=json.load(sys.stdin); r=FootballPredictionContract().validate_review("
+                "v['spec'],v['cwd'],v['target'],v['lane'],v['result']); print(json.dumps(asdict(r)))")
+        argv = [sys.executable, "-I", "-B", "-c", code, str(Path(__file__).resolve().parents[1])]
+        snapshot = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                    for p in (Path(result["stdout_path"]), Path(result["stderr_path"]))}
+        for raw in result.get("project_evidence", []):
+            snapshot[raw["path"]] = raw["sha256"]
+        binding = {"stage": "canonical-validator", "mission": spec["mission_id"], "target": target,
+                   "lane": lane, "operation": result["stdout_path"], "argv": argv,
+                   "review_lifecycle": result["review_lifecycle"], "inputs": snapshot,
+                   "request_sha256": hashlib.sha256(request_bytes).hexdigest(), "lifecycle": str(log),
+                   "runtime_execution": self._execution_id}
+        environment = FootballPredictionContract().adapter.review_environment(
+            "deepseek", worktree=str(cwd), base=target["base"])
+        status, proof = self._supervised_review_step(binding, argv, cwd, environment, log, 60,
+                                                   request=(request, request_bytes))
+        if status != 0:
+            raise RuntimeFailure("canonical validator did not establish a verdict; evidence retained")
+        validate_review_stop(spec, cwd, target, lane, result)
+        verify_target(spec, cwd, target)
+        if any(hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest for path, digest in snapshot.items()):
+            raise RuntimeFailure("canonical evidence changed during validation")
+        artifacts = tuple({"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            for path in (request, log, log.with_suffix(log.suffix + ".stderr"),
+                         log.with_suffix(log.suffix + ".process.jsonl"), Path(proof["path"])))
+        return SupervisedReviewResult(**json.loads(log.read_text()),
+                                      validation_lifecycle=proof, validation_evidence=artifacts)
 
     def project_validation(self, policy, spec, command, cwd, target, transcript, timeout):
         from .factory_validation import run
@@ -1021,9 +1213,41 @@ class LocalRuntime:
         return validate_result(result, policy, spec, cwd, target, self.simulation, api)
 
     def project_final_gate(self, spec, cwd, target, reviews, transcript, timeout, *, context=None):
+        if context is not None:
+            self.assert_canonical_lifecycles(Path(transcript).parent, spec["mission_id"])
         if context is not None and "policy" in context:
             return self.project_remote("verify", context["policy"], spec, cwd, target,
                                        context["body"], transcript, timeout, reviews=reviews)
+        if context is not None:
+            from .factory_project import validate_review_stop, verify_target
+            executions = {r["lane"]: r["canonical_execution"] for r in reviews}
+            for lane, result in executions.items():
+                validate_review_stop(spec, cwd, target, lane, result)
+            verify_target(spec, cwd, target)
+            request = Path(transcript).with_suffix(".input.json")
+            value = {"spec": spec, "cwd": str(cwd), "target": target,
+                     "receipts": {LANES[r["lane"]]: r["canonical_receipt"] for r in reviews},
+                     "context": context, "executions": executions}
+            request_bytes = json.dumps(value).encode()
+            code = ("import sys,json; from dataclasses import asdict; sys.path.insert(0,sys.argv[1]); "
+                    "from harness.factory_project import FootballPredictionContract; "
+                    "r=FootballPredictionContract().final_gate(**json.load(sys.stdin)); print(json.dumps(asdict(r)))")
+            argv = [sys.executable, "-I", "-B", "-c", code, str(Path(__file__).resolve().parents[1])]
+            binding = {"stage": "canonical-final-gate", "mission": spec["mission_id"], "target": target,
+                       "argv": argv, "request_sha256": hashlib.sha256(request_bytes).hexdigest(),
+                       "operation": str(transcript), "lifecycle": str(transcript)}
+            from .adapters import FootballPredictionAdapter
+            environment = FootballPredictionAdapter._trusted_subprocess_environment(env={"LANG": "C.UTF-8"})
+            status, proof = self._supervised_review_step(binding, argv, cwd, environment, transcript, timeout,
+                                                       request=(request, request_bytes))
+            if status != 0:
+                raise RuntimeFailure("canonical final consumer unconfirmed; retained evidence")
+            verify_target(spec, cwd, target)
+            gate = json.loads(Path(transcript).read_text())
+            return {"status": gate["status"], "reason": gate["evidence"], "target": target,
+                    "fixture": False, "canonical_gate": gate["data"], "validation_lifecycle": proof,
+                    "project_evidence": [{"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                        for path in (request, Path(proof["path"]), Path(transcript).with_suffix(Path(transcript).suffix + ".process.jsonl"))]}
         receipts = {LANES[r["lane"]]: r["canonical_receipt"] for r in reviews}
         gate = FootballPredictionContract().final_gate(spec, cwd, target, receipts, context)
         result = {"status": gate.status, "reason": gate.evidence, "target": target, "fixture": False,
@@ -1043,6 +1267,7 @@ class LocalRuntime:
         return result
 
     def project_remote(self, action, policy, spec, cwd, target, body, transcript, timeout, *, reviews=None, previous_head=None):
+        self.assert_canonical_lifecycles(Path(transcript).parent, spec["mission_id"])
         import threading
         with self._execution_lock:
             standalone = self._active_execution is None
@@ -1150,6 +1375,30 @@ class LocalRuntime:
         return record
 
     def _project_remote(self, action, policy, spec, cwd, target, body, transcript, timeout, *, reviews=None, previous_head=None):
+        if action == "verify":
+            remote_log = Path(transcript).with_suffix(".remote.jsonl")
+            request_value = {"action": action, "policy": policy, "spec": spec, "cwd": str(cwd),
+                             "target": target, "body": body, "transcript": str(remote_log),
+                             "timeout": timeout, "reviews": reviews, "previous_head": previous_head}
+            argv = [sys.executable, "-m", "harness.factory_remote"]
+            from .adapters import FootballPredictionAdapter
+            environment = FootballPredictionAdapter._trusted_subprocess_environment(env={"LANG": "C.UTF-8"})
+            environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+            request_path = Path(transcript).with_suffix(".input.json")
+            request_bytes = json.dumps(request_value).encode()
+            binding = {"stage": "canonical-final-gate", "mission": spec["mission_id"],
+                       "target": target, "argv": argv, "request_sha256": hashlib.sha256(request_bytes).hexdigest(),
+                       "operation": str(transcript), "lifecycle": str(transcript)}
+            code, proof = self._supervised_review_step(
+                binding, argv, Path(transcript).parent, environment, transcript, timeout,
+                request=(request_path, request_bytes))
+            if code != 0:
+                raise RuntimeFailure("canonical final gate failed; supervised evidence retained")
+            result = json.loads(Path(transcript).read_text())
+            return {**result, "validation_lifecycle": proof, "project_evidence": [
+                {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                for path in (remote_log, request_path, Path(proof["path"]), Path(transcript).with_suffix(
+                    Path(transcript).suffix + ".process.jsonl")) if path.is_file()]}
         # Trusted Controller worker; development agents never receive this env.
         from .adapters import FootballPredictionAdapter
         from .factory_test_service import ExecutionStopped
