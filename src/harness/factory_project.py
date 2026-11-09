@@ -657,13 +657,29 @@ def git(*args):
 if git('rev-parse','HEAD').decode().strip()!=t['head'] or git('status','--porcelain','--untracked-files=all'):
     raise ValueError('admission candidate changed')
 diff=git('diff','--binary','--no-ext-diff',t['base']+'...'+t['head'])
-source_mission=getattr(chunks, 'SOURCE_CONTEXT_MISSION', None)
-chunked=len(diff)>chunks.MAX_CHUNK_DIFF_BYTES or v['mission_id']==source_mission
 kwargs=dict(base_sha=t['base'], head_sha=t['head'], mission_id=v['mission_id'],
     mission_scope_sha256=t['mission_scope_sha256'])
-if source_mission is not None:
-    kwargs.update(repo_root=root, source_context_version=chunks.SOURCE_CONTEXT_VERSION if v['mission_id']==source_mission else None)
+# Match the trusted runner's selector, including frozen inputs below 32KB.
+# Older bases expose either the original single-context API or no context API.
+# A present but broken selector/legacy interface must fail, never fall back.
+source_version=None
+if hasattr(chunks, 'source_context_version_for'):
+    source_version=chunks.source_context_version_for(v['mission_id'])
+    kwargs.update(repo_root=root, source_context_version=source_version)
+elif hasattr(chunks, 'SOURCE_CONTEXT_MISSION') or hasattr(chunks, 'SOURCE_CONTEXT_VERSION'):
+    source_mission=chunks.SOURCE_CONTEXT_MISSION
+    legacy_version=chunks.SOURCE_CONTEXT_VERSION
+    if (not isinstance(source_mission, str) or not source_mission
+            or not isinstance(legacy_version, str) or not legacy_version):
+        raise ValueError('invalid legacy source context interface')
+    source_version=legacy_version if v['mission_id']==source_mission else None
+    kwargs.update(repo_root=root, source_context_version=source_version)
+if source_version is not None and (not isinstance(source_version, str) or not source_version):
+    raise ValueError('invalid selected source context version')
 manifest=chunks.plan(diff, **kwargs)
+if getattr(manifest, 'source_context_version', None)!=source_version:
+    raise ValueError('canonical source context version mismatch')
+chunked=len(diff)>chunks.MAX_CHUNK_DIFF_BYTES or source_version is not None
 sizes=[len(chunks.build_chunk_prompt(chunk=c, source=diff[c.start:c.end], manifest=manifest,
     scope_sha=t['mission_scope_sha256']).encode()) for c in manifest.chunks] if chunked else []
 if any(n>chunks.MAX_CHUNK_PROMPT_BYTES for n in sizes): raise ValueError('canonical prompt capacity exceeded')
