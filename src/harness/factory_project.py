@@ -562,6 +562,12 @@ def review_process_binding(spec, cwd, target, lane, result):
 
 
 def validate_review_stop(spec, cwd, target, lane, result):
+    if result.get("backend") == "antigravity-cli":
+        from .factory_antigravity import validate_stop
+        if lane != "second_reviewer" or result["mission_id"] != spec["mission_id"]:
+            raise ValueError("Antigravity lifecycle mission/lane mismatch")
+        validate_stop(result, target)
+        return result["exit_code"]
     from .appserver_process import validate_supervised_stop
     reference = result["review_lifecycle"]
     operation = Path(result["stdout_path"])
@@ -762,13 +768,27 @@ print(json.dumps({'canonical_diff_sha256':hashlib.sha256(diff).hexdigest(), 'can
         if context is None:
             return GateResult("BLOCKED_EXTERNAL", "canonical agent-merge-ready requires phase-2 exact PR/CI context")
         cwd = Path(cwd)
-        if set(receipts or {}) != set(LANES.values()):
+        if set(receipts or {}) not in (set(LANES.values()), {"codex", "antigravity"}):
             return GateResult("BLOCKED_EXTERNAL", "both canonical receipts are required by Factory")
         if isinstance(self.adapter, FootballPredictionAdapter):
             if set(executions or {}) != set(LANES):
                 raise ValueError("canonical final gate requires original review lifecycle evidence")
             for lane, result in executions.items():
                 validate_review_stop(spec, cwd, target, lane, result)
+        if "antigravity" in receipts:
+            # The Factory second-review requirement is separate from native
+            # project policy. Never pass an AGY document as a DS receipt.
+            from .factory_antigravity import validate
+            if ("claude-code-deepseek" in target["project_policy"]["required_backends"]
+                    or not executions):
+                return GateResult("BLOCKED_EXTERNAL", "native project requires DeepSeek; no substitution authorized")
+            result = executions["second_reviewer"]
+            if receipts["antigravity"] != result["stdout_path"]:
+                raise ValueError("Antigravity report artifact mismatch")
+            _, _, verdict, findings = validate(result, target, result["review_root"])
+            if verdict != "PASS" or findings:
+                return GateResult("FAIL", "Antigravity second review requires rework")
+            receipts = {"codex": receipts["codex"]}
         return self.adapter.merge_ready(
             worktree=str(cwd), base=target["base"], head=target["head"], mission_id=spec["mission_id"],
             scope_file=str(cwd / target["mission_scope_file"]), receipts=receipts,

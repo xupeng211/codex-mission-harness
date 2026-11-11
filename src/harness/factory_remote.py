@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .adapters import FootballPredictionAdapter
 from .factory_project import FootballPredictionContract, LANES, verify_target
+from .factory_antigravity import receipts as review_receipts
 from .sandbox import SAFE_PATH
 
 
@@ -206,6 +207,12 @@ def run(action, policy, spec, cwd, target, body, transcript, timeout, reviews=No
         if {r["lane"] for r in reviews or []} != set(LANES):
             raise ValueError("publication/final gate requires both original review lifecycles")
         for review in reviews:
+            if review.get("backend") == "antigravity-cli":
+                from .factory_antigravity import validate
+                result = review["canonical_execution"]
+                _, _, verdict, findings = validate(result, target, result["review_root"])
+                if verdict != "PASS" or findings:
+                    raise ValueError("Antigravity review requires rework before publication")
             validate_review_stop(spec, Path(cwd), target, review["lane"], review["canonical_execution"])
     if action == "publish":
         return remote.publish(policy, spec, target, body, previous_head)
@@ -215,7 +222,7 @@ def run(action, policy, spec, cwd, target, body, transcript, timeout, reviews=No
         result = remote.ci(policy, spec, target, body, wait=action == "ci")
         if action == "ci" or result["status"] != "PASS":
             return result
-        receipts = {LANES[r["lane"]]: r["canonical_receipt"] for r in reviews or []}
+        receipts = review_receipts(reviews or [])
         gate = contract.final_gate(spec, Path(cwd), target, receipts, context={
             "pr_number": result["pr_number"], "pr_repo": result["pr_repo"], "pr_base_sha": result["pr_base_sha"],
             "ci_status": "PASS"}, executions={r["lane"]: r["canonical_execution"] for r in reviews})

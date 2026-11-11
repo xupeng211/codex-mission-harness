@@ -134,6 +134,54 @@ class CanonicalRuntimeIntegrationTests(unittest.TestCase):
         with patch("harness.factory_preflight.inspect_prepaid", return_value={"status": "PASS", "findings": []}):
             return self.f.project_review(spec, cwd, target, lane)
 
+    def configure_antigravity(self, workflow):
+        from harness.factory_antigravity import identity
+        self.scope["workflow_class"] = workflow
+        self.config["max_context_bytes"] = 16 * 1024 * 1024
+        cli = self.root / "agy-offline"
+        shutil.copyfile(Path(__file__).parent / "fixtures/antigravity_cli.py", cli)
+        cli.chmod(0o700)
+        cli.with_suffix(".mode").write_text("normal")
+        self.config["profiles"]["second_reviewer"] = {"provider": "antigravity", "backend": "antigravity-cli",
+            "model": "gemini-4-argon-medium", "effort": "medium", "cli_path": str(cli)}
+        self.f.close()
+        with patch.object(self.runtime, "profile_identity", side_effect=lambda p:
+                          identity(p) if p["provider"] == "antigravity" else {"offline_test": True}):
+            self.f = Factory(self.root / "agy-state", self.config, self.runtime)
+        return cli
+
+    def test_antigravity_strict_project_actual_launch_and_final_consumer(self):
+        from harness.factory_antigravity import receipts
+        cli = self.configure_antigravity("STRICT")
+        spec, cwd, target = self.candidate()
+        with patch("harness.factory_preflight.inspect_prepaid", return_value={"status": "PASS", "findings": []}):
+            reviews = [self.f.review(spec, cwd, target, lane) for lane in LANES]
+        self.assertEqual([r["status"] for r in reviews], ["PASS", "PASS"])
+        self.assertEqual([r["backend"] for r in reviews], ["codex-cli", "antigravity-cli"])
+        self.assertEqual(len(cli.with_suffix(".calls").read_text().splitlines()), 1)
+        self.assertEqual([mode for mode, _ in self.starts], ["codex"])
+        contract = FootballPredictionContract()
+        with patch.object(contract.adapter, "merge_ready", return_value=GateResult("PASS", "offline native gate")) as merge:
+            gate = contract.final_gate(spec, cwd, target, receipts(reviews), {"ci_status": "PASS"},
+                                       {r["lane"]: r["canonical_execution"] for r in reviews})
+        self.assertEqual(gate.status, "PASS")
+        self.assertEqual(merge.call_args.kwargs["receipts"], {"codex": reviews[0]["canonical_receipt"]})
+        self.assertTrue(merge.call_args.kwargs["use_project_policy"])
+        self.f.verify_evidence(self.f.db.execute("SELECT * FROM operations WHERE lane='second_reviewer'").fetchone())
+        # Route the same real evidence through the existing supervised final
+        # consumer, without network I/O: missing remote context remains blocked.
+        result = self.runtime.project_final_gate(spec, cwd, target, reviews, self.f.root / "evidence" / spec["mission_id"] / "offline-final.raw", 5)
+        self.assertEqual(result["status"], "BLOCKED_EXTERNAL")
+
+    def test_antigravity_cannot_replace_project_native_deepseek_requirement(self):
+        cli = self.configure_antigravity("CRITICAL")
+        spec, cwd, target = self.candidate()
+        for lane in LANES:
+            with self.assertRaisesRegex(FactoryBlocked, "requires DeepSeek"):
+                self.f.review(spec, cwd, target, lane)
+        self.assertFalse(cli.with_suffix(".calls").exists())
+        self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM operations").fetchone()[0], 0)
+
     def test_fresh_mission_both_real_runners_and_validators_with_fake_backends(self):
         spec, cwd, target = self.candidate()
         self.assertFalse((cwd.parent / ".cmh-review-evidence").exists())

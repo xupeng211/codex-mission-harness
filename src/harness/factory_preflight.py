@@ -322,6 +322,7 @@ def inspect_prepaid(spec, config):
     repo, commit = Path(spec["repository"]), spec["base"]
     from .factory_candidate import requested as local_requested
     local_mode = local_requested(spec)
+    agy = config.get("profiles", {}).get("second_reviewer", {}).get("provider") == "antigravity"
     findings = []
     def add(level, check, detail, **values):
         findings.append({"level": level, "check": check, "detail": detail, **values})
@@ -339,7 +340,7 @@ def inspect_prepaid(spec, config):
         add("UNVERIFIED", "independent_context", "canonical reviewer reads exact diff and relevant source; full-repository prompt capacity is not the contract")
         if "trusted_validation" in config or "project_pr_ci" in config:
             add("UNVERIFIED", "project_final_gate", "canonical receipts and current exact PR/CI must pass before live readiness")
-            if not config["simulation"]:
+            if not config["simulation"] and not agy:
                 add("HARD_BLOCKER", "first_paid_execution", "canonical DeepSeek outer operation may execute up to 64 backend calls; physical cost ceiling is unproven and first live paid execution remains blocked")
         else:
             if not config.get("project_delivery"):
@@ -347,13 +348,14 @@ def inspect_prepaid(spec, config):
             else:
                 add("UNVERIFIED", "project_final_gate", "Controller PR/CI bridge configured; remote permissions, PR checks and final gate remain unverified")
             if not config["simulation"]:
-                if not config.get("project_review_limits"):
+                if not agy and not config.get("project_review_limits"):
                     add("HARD_BLOCKER", "first_paid_execution", "canonical DeepSeek outer operation may execute up to 64 backend calls; physical cost ceiling is unproven and first live paid execution remains blocked")
                 if not config.get("project_container"):
                     add("HARD_BLOCKER", "project_container", "Controller container executor policy missing; host fallback is forbidden")
                 from .factory_project import validate_review_limits
                 try:
-                    validate_review_limits(config.get("project_review_limits"))
+                    if not agy:
+                        validate_review_limits(config.get("project_review_limits"))
                     if not spec.get("pr_body_template"):
                         raise ValueError("Controller PR body template is missing")
                 except ValueError as exc:
@@ -369,6 +371,14 @@ def inspect_prepaid(spec, config):
                 add("WARNING", "independent_context", "baseline fits; implementation can still exceed capacity", **capacity)
         except (OSError, ValueError, subprocess.SubprocessError):
             add("UNVERIFIED", "independent_context", "committed text capacity could not be determined within the static scan")
+    if agy:
+        add("UNVERIFIED", "antigravity_access", "cached login, model entitlement, current proxy route and cash cost remain unverified; one logical start, no fallback")
+        try:
+            capacity = text_capacity(repo, commit, config["max_context_bytes"])
+            if capacity["text_bytes_lower_bound"] > capacity["limit_bytes"]:
+                add("HARD_BLOCKER", "independent_context", "Antigravity full-source input exceeds capacity; no truncation", **capacity)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            add("UNVERIFIED", "independent_context", "Antigravity input capacity not established")
     add("UNVERIFIED", "final_diff", "future diff size, binary changes, submodules and review coverage cannot be certified before implementation")
     if not config["simulation"]:
         for executable in ("bwrap", "timeout"):

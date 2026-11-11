@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "budget": {
+    "max_agent_runs": 35,
+    "max_total_tokens": 8400000,
+    "max_run_tokens": 240000,
+    "max_wall_seconds": 21600
+  },
+  "max_rounds": 5,
+  "timeout_seconds": 600,
+  "independent_review_required": true,
+  "max_review_bytes": 1048576,
+  "max_context_bytes": 2097152,
+  "checks": [
+    [
+      "make",
+      "verify"
+    ]
+  ],
+  "ci": [
+    [
+      "make",
+      "lint"
+    ]
+  ],
+  "profiles": {
+    "developer": {
+      "provider": "openai",
+      "transport": {
+        "type": "official"
+      }
+    },
+    "reviewer": {
+      "provider": "openai",
+      "transport": {
+        "type": "official"
+      }
+    },
+    "second_reviewer": {
+      "provider": "antigravity",
+      "backend": "antigravity-cli",
+      "model": "gemini-4-argon-medium",
+      "effort": "medium",
+      "cli_path": "/absolute/path/to/agy"
+    }
+  }
+}

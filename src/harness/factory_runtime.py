@@ -25,6 +25,7 @@ from .model_registry import read_private_token
 from .sandbox import project_gate_invocation, preflight_project_gate, SAFE_PATH
 from .factory_proxy import validate_transport, ProxyPolicy, ProxyRelay, digest as route_digest
 from .factory_project import FootballPredictionContract, LANES
+from .factory_antigravity import receipts as review_receipts
 
 
 @dataclass(frozen=True)
@@ -739,6 +740,9 @@ class LocalRuntime:
             return True
 
     def profile_identity(self, profile):
+        if profile["provider"] == "antigravity":
+            from .factory_antigravity import identity
+            return identity(profile)
         identity = {"configured": profile}
         if profile["provider"] == "openai":
             transport = validate_transport(profile)
@@ -909,6 +913,9 @@ class LocalRuntime:
             self.current_process = None
 
     def second_review(self, profile, cwd, payload, transcript, timeout):
+        if profile["provider"] == "antigravity":
+            from .factory_antigravity import run
+            return run(self, profile, cwd, payload, transcript, timeout)
         # A separate bounded process makes cancellation, controller death and
         # total wall-clock independent of socket per-read timeout behavior.
         watchdog = AppServerCodex._trusted_executable("timeout", str(cwd))
@@ -1009,7 +1016,7 @@ class LocalRuntime:
                 first = json.loads(read(journal).splitlines()[0])
                 binding = {k: v for k, v in first["binding"].items() if k != "execution_id"}
                 if (binding.get("mission") != mission or binding.get("lifecycle") != str(log)
-                        or binding.get("stage") not in {"canonical-review", "canonical-validator", "canonical-final-gate"}):
+                        or binding.get("stage") not in {"canonical-review", "canonical-validator", "canonical-final-gate", "antigravity-review"}):
                     raise RuntimeError("canonical operation/lifecycle identity differs")
                 request = log.with_suffix(log.suffix + ".input.json") if binding["stage"] == "canonical-validator" else log.with_suffix(".input.json")
                 if "request_sha256" in binding and hashlib.sha256(read(request)).hexdigest() != binding["request_sha256"]:
@@ -1033,6 +1040,8 @@ class LocalRuntime:
                 raise RuntimeFailure("canonical lifecycle occupied or cancelled; no dispatch")
             owner = AppServerProcess(binding, record=journal)
             self._review_owner = owner
+        started_utc = time.time()
+        started_monotonic = time.monotonic()
         outcome = "complete"
         startup_confirmed = False
         operation_error = None
@@ -1086,7 +1095,10 @@ class LocalRuntime:
             code = os.waitstatus_to_exitcode(matches[0]["status"])
             doc = {"binding": owner.binding, "supervisor": owner.identity, "payload": owner.payload,
                    "supervisor_exit": owner.proc.returncode, "stop": stop, "exit_code": code,
-                   "outcome": outcome, "journal": str(journal),
+                   "outcome": outcome, "started_utc": started_utc, "ended_utc": time.time(),
+                   "started_monotonic": started_monotonic, "ended_monotonic": time.monotonic(),
+                   "timeout_seconds": timeout, "controller_timeout_triggered": outcome == "timeout",
+                   "cancel_observed": outcome == "cancelled", "journal": str(journal),
                    "journal_sha256": hashlib.sha256(journal.read_bytes()).hexdigest()}
             with stop_path.open("x") as stream:
                 os.fchmod(stream.fileno(), 0o600)
@@ -1226,7 +1238,7 @@ class LocalRuntime:
             verify_target(spec, cwd, target)
             request = Path(transcript).with_suffix(".input.json")
             value = {"spec": spec, "cwd": str(cwd), "target": target,
-                     "receipts": {LANES[r["lane"]]: r["canonical_receipt"] for r in reviews},
+                     "receipts": review_receipts(reviews),
                      "context": context, "executions": executions}
             request_bytes = json.dumps(value).encode()
             code = ("import sys,json; from dataclasses import asdict; sys.path.insert(0,sys.argv[1]); "
@@ -1248,7 +1260,7 @@ class LocalRuntime:
                     "fixture": False, "canonical_gate": gate["data"], "validation_lifecycle": proof,
                     "project_evidence": [{"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                         for path in (request, Path(proof["path"]), Path(transcript).with_suffix(Path(transcript).suffix + ".process.jsonl"))]}
-        receipts = {LANES[r["lane"]]: r["canonical_receipt"] for r in reviews}
+        receipts = review_receipts(reviews)
         gate = FootballPredictionContract().final_gate(spec, cwd, target, receipts, context)
         result = {"status": gate.status, "reason": gate.evidence, "target": target, "fixture": False,
                   "canonical_gate": gate.data}

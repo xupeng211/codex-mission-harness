@@ -17,6 +17,10 @@ harness delivery
 
 Codex 开发/规划可显式选择 [CLI proxy transport](docs/CLI_PROXY_TRANSPORT.md)，与官方 transport 分开配置。proxy OpenAI reviewer 尚未合格；DeepSeek reviewer 仍直接连接 Provider。developer route 可用不等于完整双 Provider Factory 已重新通过验收。
 
+第二审可显式选择 [Antigravity CLI 候选接入](docs/antigravity-second-review.zh.md)，
+配置见 `config/factory.antigravity.example.json`。该适配链已做离线模拟，尚待一次真实接入验收；
+没有自动回退，也不能替代项目原生政策明确要求的 DeepSeek receipt。
+
 ## 第一次安装与打开
 
 安装 Python 3.11+、Git、Node.js 和 bubblewrap；GitHub Actions 项目还需要 GitHub CLI (`gh`)。Ubuntu 的系统组件可用 `sudo apt install python3-venv git bubblewrap` 安装。

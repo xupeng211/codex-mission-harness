@@ -26,6 +26,7 @@ from .factory_budget import accounting, operation_token_limit, planning_limits
 from .factory_project import (PROJECT, OFFLINE_PASS, LANES, BACKENDS, approved_scope,
                               materialize_scope, scope_binding, review_manifest, validate_review_limits)
 from . import factory_candidate as candidate_stage
+from .factory_antigravity import artifact as review_artifact
 
 
 READY = "READY_FOR_USER_ACCEPTANCE"
@@ -199,15 +200,15 @@ def validate_config(raw: dict) -> dict:
     if not isinstance(profiles, dict) or set(profiles) != expected:
         raise ValueError("profiles must define the required execution lanes")
     for lane, profile in profiles.items():
-        if not isinstance(profile, dict) or set(profile) - {"provider", "model", "effort", "codex_profile", "codex_home", "token_file", "max_output_tokens", "transport"}:
+        if not isinstance(profile, dict) or set(profile) - {"provider", "model", "effort", "codex_profile", "codex_home", "token_file", "max_output_tokens", "transport", "backend", "cli_path"}:
             raise ValueError("invalid lane profile")
-        expected_provider = "deepseek" if lane == "second_reviewer" else "openai"
-        if profile.get("provider") != expected_provider:
+        expected_provider = profile.get("provider") if lane == "second_reviewer" else "openai"
+        if expected_provider not in ({"deepseek", "antigravity"} if lane == "second_reviewer" else {"openai"}) or profile.get("provider") != expected_provider:
             raise ValueError("independent review requires genuinely different providers")
         if expected_provider == "openai":
             from .factory_proxy import validate_transport
             validate_transport(profile, reviewer=lane == "reviewer")
-        elif profile.get("transport", {"type": "direct"}) != {"type": "direct"}:
+        elif expected_provider == "deepseek" and profile.get("transport", {"type": "direct"}) != {"type": "direct"}:
             raise ValueError("DeepSeek reviewer remains a direct official provider; endpoint override forbidden")
         for field in ("model", "codex_profile"):
             if field in profile and (not isinstance(profile[field], str) or not re.fullmatch(r"[A-Za-z0-9_.:-]+", profile[field])):
@@ -216,7 +217,15 @@ def validate_config(raw: dict) -> dict:
             raise ValueError("invalid Codex reasoning effort")
         if "codex_home" in profile and (not isinstance(profile["codex_home"], str) or not Path(profile["codex_home"]).is_absolute()):
             raise ValueError("codex_home must be an absolute private authentication directory")
-        if lane == "second_reviewer":
+        if expected_provider == "antigravity":
+            if (set(profile) != {"provider", "backend", "model", "effort", "cli_path"}
+                    or profile["backend"] != "antigravity-cli" or not profile.get("model")
+                    or not profile["model"].startswith("gemini-") or profile.get("effort") != "medium"
+                    or not isinstance(profile.get("cli_path"), str) or not Path(profile["cli_path"]).is_absolute()):
+                raise ValueError("Antigravity requires explicit backend, Gemini model, medium effort and absolute cli_path")
+        elif {"backend", "cli_path"} & set(profile):
+            raise ValueError("backend/cli_path are only supported for Antigravity second review")
+        if expected_provider == "deepseek":
             if not profile.get("model") or not Path(profile.get("token_file", "")).is_absolute():
                 raise ValueError("DeepSeek requires a model and an absolute private token file")
             bounded_int(profile.get("max_output_tokens", 8192), "max_output_tokens", 1, 32768)
@@ -360,7 +369,7 @@ class Factory:
         self.project = self.config.get("project_contract") == PROJECT
         self.profile_identities = {lane: self.runtime.profile_identity(profile) if hasattr(self.runtime, "profile_identity") else {"configured": profile, "fixture": True}
                                    for lane, profile in self.config["profiles"].items()
-                                   if (not self.project or lane == "developer") and not (lane == "developer" and "model_routing" in self.config)}
+                                   if (not self.project or lane == "developer" or profile["provider"] == "antigravity") and not (lane == "developer" and "model_routing" in self.config)}
         self._routing_identities = {}
         requested_root = Path(root).absolute()
         metadata = [parent / ".git" for parent in (requested_root, *requested_root.parents)]
@@ -562,6 +571,8 @@ class Factory:
                 # Local candidates keep the project scope boundary without
                 # entering the formal review path.
                 target["project_policy"] = self.runtime.project_policy(spec, cwd, files)
+                if self.config["profiles"].get("second_reviewer", {}).get("provider") == "antigravity":
+                    target["project_policy"]["factory_required_backends"] = ["codex-cli", "antigravity-cli"]
             except (ValueError, OSError, UnicodeError, subprocess.SubprocessError) as exc:
                 raise FactoryBlocked("BLOCKED_SCOPE", str(exc)) from exc
         elif spec.get("mission_scope_file"):
@@ -597,7 +608,8 @@ class Factory:
     def operation(self, mission, key, stage, lane, identity, payload, paid, invoke, prepare=None):
         """Reserve before dispatch. A lost response is never replayed under a new guise."""
         candidate_stage.check_dispatch(self, mission, stage)
-        if self.project and not self.config["simulation"] and isinstance(self.runtime, LocalRuntime):
+        if (not self.config["simulation"] and isinstance(self.runtime, LocalRuntime)
+                and (self.project or self.config["profiles"].get("second_reviewer", {}).get("provider") == "antigravity")):
             try:
                 self.runtime.assert_canonical_lifecycles(self.root / "evidence" / mission, mission)
             except Exception as error:
@@ -698,11 +710,13 @@ class Factory:
                                 transcript.with_suffix(".temp.cleanup.jsonl")) if p.is_file()]
         # Also bind this operation's retained lifecycle originals on UNKNOWN;
         # no recursive scan of retained reviewer HOME or credentials.
-        if self.project:
+        if self.project or identity.get("engine") == "antigravity-cli":
             sidecars = [transcript.with_suffix(suffix) for suffix in (
                 ".review", ".review.stderr", ".review.process.jsonl", ".review.stop.json",
                 ".raw.stderr", ".raw.process.jsonl", ".raw.stop.json", ".remote.jsonl", ".input.json")]
             sidecars.extend(transcript.parent.glob(transcript.stem + ".validator-*"))
+            sidecars.extend(transcript.parent.glob(transcript.stem + ".agy-*"))
+            sidecars.extend(transcript.with_suffix(".agy-input").rglob("*"))
             raw_paths.extend(p for p in sidecars if p.is_file() and not p.is_symlink() and p not in raw_paths)
         result["raw_evidence"] = [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in raw_paths]
         data = encoded({"operation": operation_id, "identity": identity, "input": payload, "result": result}).encode()
@@ -757,8 +771,12 @@ class Factory:
                 if op["id"] not in resolved]
 
     def verify_evidence(self, operation):
+        result = json.loads(operation["result"])
+        if result.get("backend") == "antigravity-cli":
+            from .factory_antigravity import validate
+            validate(result, json.loads(operation["identity"])["target"], result["review_root"])
         if (self.project and not self.config["simulation"] and operation["stage"] == "review"
-                and isinstance(self.runtime, LocalRuntime)):
+                and isinstance(self.runtime, LocalRuntime) and result.get("backend") != "antigravity-cli"):
             from .factory_project import validate_review_stop
             result = json.loads(operation["result"])
             expected = self.root / "evidence" / operation["mission"] / (operation["id"] + ".raw")
@@ -812,36 +830,44 @@ class Factory:
         return path
 
     def review(self, spec, cwd, target, lane):
-        if self.project:
+        self.check_review_backend(target)
+        if self.project and self.config["profiles"][lane]["provider"] != "antigravity":
             return self.project_review(spec, cwd, target, lane)
         profile = self.config["profiles"][lane]
+        agy = profile["provider"] == "antigravity"
         review_cwd = self.review_context(spec, cwd, target, lane)
         from .factory_runtime import REVIEW_SCHEMA
         payload = {"objective": spec["objective"], "acceptance": spec["acceptance"], "constraints": spec["constraints"],
-                   "target": target, "review_root": str(review_cwd), "required_output_schema": REVIEW_SCHEMA,
+                   "target": target, "mission_id": spec["mission_id"], "review_root": str(review_cwd), "required_output_schema": REVIEW_SCHEMA,
                    "instruction": "Review the ENTIRE base..head diff and surrounding repository code using the official rubric. Return JSON matching required_output_schema. Every absolute_file_path must be under review_root, NOT target.repository; source lines must overlap this diff. Do not modify code.",
                    "diff": git(review_cwd, "diff", "--no-ext-diff", "--no-textconv", "--binary", "--no-renames", target["base"], target["head"], "--")}
         if lane == "second_reviewer":
             if "GIT binary patch" in payload["diff"]:
                 raise FactoryBlocked("BLOCKED_SCOPE", "independent text reviewer cannot certify binary changes")
-            context, size = {}, 0
+            context, size, excluded = {}, 0, []
             for name in filter(None, git(review_cwd, "ls-tree", "-r", "--name-only", "-z", target["head"]).split("\0")):
                 mode = git(review_cwd, "ls-tree", target["head"], "--", name).split()[0]
                 if mode not in ("100644", "100755"):
+                    excluded.append(name)
                     continue
                 try:
                     text = git(review_cwd, "show", f"{target['head']}:{name}")
                 except UnicodeDecodeError:
+                    excluded.append(name)
                     continue
                 if "\0" in text:
+                    excluded.append(name)
                     continue
                 size += len(text.encode())
                 if size > self.config["max_context_bytes"]:
                     raise FactoryBlocked("BLOCKED_SCOPE", "independent full source context exceeds authorized capacity; nothing was truncated")
                 context[name] = text
             payload["repository_context"] = context
+            payload["excluded_files"] = excluded
+        if agy:
+            payload["expected_runtime_identity"] = self.profile_identities[lane]
         rubric = json.loads((VENDOR / "provenance.json").read_text())
-        identity = {"target": target, "profile": self.profile_identities[lane], "engine": "codex-official-rubric-structured-turn" if lane == "reviewer" else "deepseek-chat-completions",
+        identity = {"target": target, "profile": self.profile_identities[lane], "engine": "codex-official-rubric-structured-turn" if lane == "reviewer" else "antigravity-cli" if agy else "deepseek-chat-completions",
                     "rubric": rubric}
         key = digest(identity)
         if lane == "reviewer":
@@ -853,26 +879,41 @@ class Factory:
                                                                    self.operation_timeout(spec["mission_id"]))
         # Only a PROVEN completed result can get one fresh formatting/source
         # validation attempt. Dispatch uncertainty is never retried by operation().
-        for attempt in range(2):
+        attempts = 1 if agy else 2
+        for attempt in range(attempts):
             attempt_key = key if attempt == 0 else digest({"review": key, "validation_attempt": attempt})
             result = self.operation(spec["mission_id"], attempt_key, "review", lane, identity, payload, True, invoke)
             if self.target(spec, review_cwd) != target:
                 raise FactoryBlocked("UNKNOWN", "reviewer mutated its exact target")
             try:
-                verdict, findings = review_verdict(result.get("output"), review_cwd, target)
+                if agy:
+                    if result.get("runtime_identity") != self.profile_identities[lane]:
+                        raise ValueError("Antigravity executable/configuration changed before dispatch")
+                    from .factory_antigravity import validate
+                    _, output, verdict, findings = validate(result, target, review_cwd)
+                else:
+                    verdict, findings = review_verdict(result.get("output"), review_cwd, target)
             except (ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
                 self.event(spec["mission_id"], "review_validation_unknown", {"key": attempt_key, "reason": str(exc)})
                 self.db.commit()
-                if attempt == 1:
+                if attempt == attempts - 1:
                     raise FactoryBlocked("UNKNOWN", f"review contract/source validation failed after bounded recovery: {exc}") from exc
             else:
                 key = attempt_key
                 break
-        return {"status": verdict, "findings": findings, "output": result["output"], "evidence_key": key,
+        return {**({"backend": "antigravity-cli", "review_artifact": result["stdout_path"],
+                    "canonical_execution": result} if agy else {}),
+                "status": verdict, "findings": findings, "output": result["output"], "evidence_key": key,
                 "provider": profile["provider"], "profile": profile, "profile_identity": self.profile_identities[lane],
                 "lane": lane, "target": target}
 
+    def check_review_backend(self, target):
+        if (self.project and self.config["profiles"].get("second_reviewer", {}).get("provider") == "antigravity"
+                and "claude-code-deepseek" in target["project_policy"]["required_backends"]):
+            raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "project-native policy requires DeepSeek; Antigravity cannot impersonate that receipt")
+
     def project_review(self, spec, cwd, target, lane):
+        self.check_review_backend(target)
         identity = {"target": target, "backend": BACKENDS[LANES[lane]],
                     "policy": target["project_policy"], "engine": "project-canonical-runner"}
         payload = {"target": target, "review_range": target["review_range"], "lane": lane}
@@ -885,15 +926,18 @@ class Factory:
                 # intermediate directory group-writable under umask 0002.
                 private_dir(self.root / "candidates")
                 private_dir(Path(cwd).parent)
+                agy_second = self.config["profiles"]["second_reviewer"]["provider"] == "antigravity"
                 if not self.config["simulation"]:
                     if self.target(spec, cwd) != target:
                         raise ValueError("candidate changed before review admission")
-                    admission = self.runtime.project_review_admission(spec, cwd, target, self.config.get("project_review_limits"))
+                    admission = ({"backend": "codex-cli", "target": target, "logical_launches": 1}
+                                 if agy_second else self.runtime.project_review_admission(
+                                     spec, cwd, target, self.config.get("project_review_limits")))
                     self.event(spec["mission_id"], "review_admission", {"lane": lane, "admission": admission})
                     self.db.commit()
                 runner = self.runtime.prepare_project_review(spec, cwd, target, lane,
                     self.operation_timeout(spec["mission_id"]))
-                return runner if self.config["simulation"] else {"runner": runner, "admission": admission}
+                return runner if self.config["simulation"] or agy_second else {"runner": runner, "admission": admission}
             except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
                 raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", f"canonical local preparation failed: {exc}") from exc
         result = self.operation(spec["mission_id"], key, "review", lane, identity, payload, True,
@@ -1073,7 +1117,7 @@ class Factory:
             if checked["status"] != "PASS":
                 raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", checked.get("reason", "canonical final gate rejected delivery"))
             return checked
-        payload = {"target": target, "receipts": {r["backend"]: r["canonical_receipt"] for r in reviews},
+        payload = {"target": target, "receipts": {r["backend"]: review_artifact(r) for r in reviews},
                    **({"context": context} if context is not None else {})}
         key = digest({"project_final_gate": payload})
         result = self.operation(spec["mission_id"], key, "project_gate", "project", payload, payload, False,
@@ -1551,6 +1595,13 @@ class Factory:
                         op = self.db.execute("SELECT * FROM operations WHERE mission=? AND key=?", (mission, key)).fetchone()
                         if op is None or op["stage"] != "review" or op["lane"] != review["lane"]:
                             raise FactoryBlocked("UNKNOWN", "review operation identity mismatch")
+                        if review.get("backend") == "antigravity-cli":
+                            from .factory_antigravity import validate
+                            result = json.loads(op["result"])
+                            _, _, verdict, findings = validate(result, delivery["target"], result["review_root"])
+                            if verdict != "PASS" or findings or review["profile_identity"] != self.profile_identities[review["lane"]]:
+                                raise FactoryBlocked("UNKNOWN", "Antigravity evidence no longer approves recorded target/profile")
+                            continue
                         checked = self.runtime.project_validate_review(spec, cwd, delivery["target"], review["lane"], json.loads(op["result"]))
                         if (checked.status != "PASS" or checked.artifact != review["canonical_receipt"]
                                 or checked.data != review["canonical_receipt_data"] or checked.data.get("findings")
