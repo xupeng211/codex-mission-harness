@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
 import unittest
 from unittest.mock import patch
 
-from harness.factory import Factory, FactoryBlocked, git, READY
+from harness.factory import Factory, FactoryBlocked, git, READY, binary_changes
 from harness.factory_fixture import fixture_config, AcceptanceRuntime
 from harness.factory_runtime import LocalRuntime
 from harness.factory_antigravity import identity, proxy_facts
@@ -50,6 +52,101 @@ class AntigravityIntegrationTests(unittest.TestCase):
     def review(self):
         with patch("harness.factory_preflight.inspect_prepaid", return_value={"status": "PASS", "findings": []}):
             return self.f.review(self.spec, self.cwd, self.target, "second_reviewer")
+
+    def test_text_binary_marker_in_context_added_deleted_lines_and_path_reaches_mock_cli(self):
+        # Put the marker in the BASE too, so the real diff contains all three
+        # hunk line kinds, rather than testing a hand-written patch string.
+        (self.repo / "score.py").write_text(
+            '# context: GIT binary patch\n'
+            'def score():\n    return 1\n'
+            '# removed: GIT binary patch\n')
+        git(self.repo, "add", ".")
+        git(self.repo, "-c", "user.name=Fixture", "-c", "user.email=f@localhost", "commit", "-qm", "marker baseline")
+        base = git(self.repo, "rev-parse", "HEAD")
+        self.f.submit({**self.spec, "mission_id": "marker-text", "base": base})
+        self.spec, self.cwd = self.f.prepare("marker-text")
+        (self.cwd / "score.py").write_text(
+            '# context: GIT binary patch\n'
+            'def score():\n    return 2\n'
+            'marker = "GIT binary patch"\n')
+        name = 'tests/-GIT binary patch \t"中文\n.txt'
+        (self.cwd / "tests").mkdir()
+        (self.cwd / name).write_text('assert "GIT binary patch"\n')
+        self.target = self.f.checkpoint(self.spec, self.cwd)
+        diff = git(self.cwd, "diff", "--no-ext-diff", "--no-textconv", "--binary", "--no-renames", base, self.target["head"])
+        for line in (' # context: GIT binary patch', '-# removed: GIT binary patch', '+marker = "GIT binary patch"'):
+            self.assertIn(line, diff)
+        self.assertFalse(binary_changes(self.cwd, self.target))
+        result = self.review()
+        self.assertEqual(result["backend"], "antigravity-cli")
+        self.assertEqual(len(self.cli.with_suffix(".calls").read_text().splitlines()), 1)
+        self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM operations WHERE mission='marker-text'").fetchone()[0], 1)
+        packet = json.loads((Path(result["canonical_execution"]["workspace"]) / "review-input.json").read_text())
+        self.assertEqual(packet["diff"], diff)
+        self.assertIn(name, packet["input_files"])
+
+    def test_real_binary_add_modify_delete_and_git_binary_attribute_block_before_reservation(self):
+        for kind in ("add", "modify", "delete", "attribute"):
+            with self.subTest(kind=kind):
+                name = f'GIT binary patch {kind}\t\n.bin'
+                path = self.repo / name
+                if kind in {"modify", "delete"}:
+                    path.write_bytes(b"before\0binary\n")
+                if kind == "attribute":
+                    (self.repo / ".gitattributes").write_text("*.bin -diff\n")
+                git(self.repo, "add", ".")
+                git(self.repo, "-c", "user.name=Fixture", "-c", "user.email=f@localhost", "commit", "--allow-empty", "-qm", "binary baseline")
+                base = git(self.repo, "rev-parse", "HEAD")
+                mission = "binary-" + kind
+                self.f.submit({**self.spec, "mission_id": mission, "base": base})
+                self.spec, self.cwd = self.f.prepare(mission)
+                if kind == "delete":
+                    (self.cwd / name).unlink()
+                else:
+                    (self.cwd / name).write_bytes(b"text forced binary\n" if kind == "attribute" else b"after\0binary\n")
+                self.target = self.f.checkpoint(self.spec, self.cwd)
+                self.assertTrue(binary_changes(self.cwd, self.target))
+                with patch.object(self.runtime, "second_review") as dispatch:
+                    with self.assertRaises(FactoryBlocked) as blocked:
+                        self.review()
+                    self.assertEqual(blocked.exception.status, "BLOCKED_SCOPE")
+                    dispatch.assert_not_called()
+                self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM operations WHERE mission=?", (mission,)).fetchone()[0], 0)
+        self.assertFalse(self.cli.with_suffix(".calls").exists())
+
+    def test_numstat_failure_or_unclassifiable_records_block_before_reservation(self):
+        cases = (b"", b"1\t0\tscore.py", b"x\t0\tscore.py\0", b"-\t0\tscore.py\0",
+                 b"1\t0\t\0", b"1\t0\tscore.py\0\0", b"1\t0\tunrelated.py\0",
+                 b"1\t0\tscore.py\0" * 2, "1\t0\tscore.py\0",
+                 subprocess.CalledProcessError(1, ["git", "diff"]),
+                 subprocess.TimeoutExpired(["git", "diff"], 60), OSError("offline Git failure"))
+        for value in cases:
+            with self.subTest(value=value):
+                def checked_git(repo, *args, **kwargs):
+                    if "--numstat" in args:
+                        if isinstance(value, Exception):
+                            raise value
+                        return value
+                    return git(repo, *args, **kwargs)
+                with patch("harness.factory.git", side_effect=checked_git), \
+                     patch.object(self.runtime, "second_review") as dispatch:
+                    with self.assertRaises(FactoryBlocked) as blocked:
+                        self.review()
+                    self.assertEqual(blocked.exception.status, "UNKNOWN")
+                    dispatch.assert_not_called()
+                self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM operations").fetchone()[0], 0)
+
+    def test_real_numstat_preserves_non_utf8_tab_and_newline_filename(self):
+        name = b'GIT binary patch-\xff\t\n.dat'
+        path = os.fsencode(self.repo) + b"/" + name
+        for contents, binary in ((b"text marker GIT binary patch\n", False), (b"real\0binary\n", True)):
+            with open(path, "wb") as stream:
+                stream.write(contents)
+            git(self.repo, "add", ".")
+            git(self.repo, "-c", "user.name=Fixture", "-c", "user.email=f@localhost", "commit", "-qm", "filename bytes")
+            target = {"base": self.spec["base"], "head": git(self.repo, "rev-parse", "HEAD"),
+                      "files": [os.fsdecode(name)]}
+            self.assertEqual(binary_changes(self.repo, target), binary)
 
     def test_real_adapter_success_cache_version_and_private_evidence(self):
         result = self.review()

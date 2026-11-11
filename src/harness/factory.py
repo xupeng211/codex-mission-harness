@@ -86,7 +86,7 @@ def private_dir(path: Path) -> Path:
     return path.resolve()
 
 
-def git(repo: Path, *args: str) -> str:
+def git(repo: Path, *args: str, raw: bool = False) -> str | bytes:
     env = {"PATH": SAFE_PATH, "HOME": "/nonexistent", "LANG": "C.UTF-8",
            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
            "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_OPTIONAL_LOCKS": "0",
@@ -94,8 +94,37 @@ def git(repo: Path, *args: str) -> str:
     data = subprocess.check_output(["git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
                                     "-c", "core.quotePath=false",
                                     "-c", "core.fsmonitor=false", "-C", str(repo), *args],
-                                   env=env, stderr=subprocess.PIPE, timeout=60).decode()
+                                   env=env, stderr=subprocess.PIPE, timeout=60)
+    if raw:
+        return data
+    data = data.decode()
     return data if args[0] in ("diff", "show") and "--name-only" not in args else data.rstrip("\n")
+
+
+def binary_changes(repo: Path, target: dict) -> bool:
+    """Use Git's binary counts, never patch text or filenames, as evidence.
+
+    With renames disabled, each -z record is counts<TAB>path<NUL>. Split only
+    the first two tabs: names may contain tabs, newlines or non-UTF-8 bytes.
+    """
+    data = git(repo, "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+               "--numstat", "-z", target["base"], target["head"], "--", raw=True)
+    if not isinstance(data, bytes) or (data and not data.endswith(b"\0")):
+        raise ValueError("incomplete Git numstat records")
+    paths, binary = set(), False
+    for record in data.split(b"\0")[:-1]:
+        fields = record.split(b"\t", 2)
+        if len(fields) != 3 or not fields[2] or fields[2] in paths:
+            raise ValueError("invalid Git numstat record/path")
+        added, deleted, path = fields
+        paths.add(path)
+        if (added, deleted) == (b"-", b"-"):
+            binary = True
+        elif not (re.fullmatch(rb"[0-9]+", added) and re.fullmatch(rb"[0-9]+", deleted)):
+            raise ValueError("unknown Git numstat counts")
+    if paths != {os.fsencode(name) for name in target["files"]}:
+        raise ValueError("Git numstat path inventory differs from exact target")
+    return binary
 
 
 def bounded_int(value, name, lower, upper):
@@ -842,7 +871,11 @@ class Factory:
                    "instruction": "Review the ENTIRE base..head diff and surrounding repository code using the official rubric. Return JSON matching required_output_schema. Every absolute_file_path must be under review_root, NOT target.repository; source lines must overlap this diff. Do not modify code.",
                    "diff": git(review_cwd, "diff", "--no-ext-diff", "--no-textconv", "--binary", "--no-renames", target["base"], target["head"], "--")}
         if lane == "second_reviewer":
-            if "GIT binary patch" in payload["diff"]:
+            try:
+                binary = binary_changes(review_cwd, target)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                raise FactoryBlocked("UNKNOWN", "independent binary-change detection failed; no dispatch") from exc
+            if binary:
                 raise FactoryBlocked("BLOCKED_SCOPE", "independent text reviewer cannot certify binary changes")
             context, size, excluded = {}, 0, []
             for name in filter(None, git(review_cwd, "ls-tree", "-r", "--name-only", "-z", target["head"]).split("\0")):
