@@ -25,6 +25,25 @@ PROJECT = "footballprediction"
 OFFLINE_PASS = "OFFLINE_CONTRACT_PASS"
 LANES = {"reviewer": "codex", "second_reviewer": "deepseek"}
 BACKENDS = {"codex": "codex-cli", "deepseek": "claude-code-deepseek"}
+
+
+def review_lanes(target):
+    """An explicit choice, never a fallback after a provider failure."""
+    mode = target.get("review_mode", "dual")
+    if mode == "dual":
+        return tuple(LANES)
+    policy = target.get("project_policy", {})
+    if (mode != "single_openai" or policy.get("workflow_class") not in {"NORMAL", "STRICT"}
+            or policy.get("single_review_eligible") is not True):
+        raise ValueError("single OpenAI review requires canonical NORMAL/STRICT task/path eligibility")
+    return ("reviewer",)
+
+
+def configured_review_lanes(config):
+    return ("reviewer", "second_reviewer") if (config.get("review_mode", "dual") == "dual"
+        and config["independent_review_required"]) else ("reviewer",)
+
+
 VALIDATION_AUTHORITY_PATHS = frozenset({
     "package-lock.json", "pyproject.toml", "pytest.ini", "ruff.toml", ".ruff.toml",
     "mypy.ini", ".mypy.ini", ".eslintrc.json", ".eslintrc", ".eslintrc.js", ".eslintrc.cjs",
@@ -181,7 +200,10 @@ def verify_target(spec, cwd, target):
         raise ValueError("candidate mission/scope mismatch")
     review_manifest(cwd, target, git)
     tracked_source_digest(cwd, target["head"], require_committed=True)
-    return FootballPredictionContract().policy(spec, cwd, files)
+    contract = FootballPredictionContract()
+    if target.get("review_mode", "dual") != "dual":
+        return contract.policy(spec, cwd, files, review_mode=target["review_mode"])
+    return contract.policy(spec, cwd, files)
 
 
 def tracked_source_digest(cwd, head, *, require_committed=False):
@@ -580,7 +602,7 @@ class FootballPredictionContract:
     def __init__(self, adapter=None):
         self.adapter = adapter or FootballPredictionAdapter()
 
-    def policy(self, spec, cwd, paths):
+    def policy(self, spec, cwd, paths, *, review_mode="dual"):
         for path in paths:
             if (path in self.adapter.REVIEW_CONTRACT_PATHS
                     or path in VALIDATION_AUTHORITY_PATHS
@@ -605,23 +627,32 @@ scope = MissionScope.from_mapping(json.loads(value['scope']))
 if scope.mission_id != value['mission_id']: raise ValueError('mission identity mismatch')
 errors = validate_mission_scope(value['paths'], scope)
 if errors: raise ValueError('; '.join(errors))
-required = required_backends(scope.workflow_class)
+if value['review_mode'] not in {'single_openai', 'dual'}: raise ValueError('unknown review mode')
+if value['review_mode']=='single_openai' and scope.workflow_class not in {'NORMAL','STRICT'}:
+    raise ValueError('single OpenAI review cannot waive CRITICAL dual review')
+required = required_backends(scope.workflow_class,
+    selected_backend='codex-cli' if value['review_mode']=='single_openai' else None)
 eligible = load_active_backend_eligibility(Path('docs/agentic/independent_review_backends.json'))
 if any(scope.workflow_class not in eligible.get(b, ()) for b in required):
     raise ValueError('required project backend is not eligible')
-print(json.dumps({'workflow_class': scope.workflow_class, 'required_backends': list(required),
- 'codex_model': REVIEW_MODEL_PINNED, 'codex_effort': REVIEW_REASONING_EFFORT_PINNED}))
+policy={'workflow_class': scope.workflow_class, 'required_backends': list(required),
+ 'codex_model': REVIEW_MODEL_PINNED, 'codex_effort': REVIEW_REASONING_EFFORT_PINNED}
+if value['review_mode']=='single_openai':
+    from scripts.ops.helpers.strict_review_evidence import _strict_classification_reasons, _critical_classification_reasons
+    policy['single_review_eligible'] = not _critical_classification_reasons(value['paths'], scope.task_type) and (
+        scope.workflow_class=='STRICT' or not _strict_classification_reasons(value['paths'], scope.task_type))
+print(json.dumps(policy))
 """
         result = subprocess.run(
             [self.adapter._trusted_python_interpreter(), "-I", "-B", "-c", query],
             cwd=trusted, env=self.adapter._trusted_git_environment(),
             input=json.dumps({"scope": approved_scope(spec)["content"],
-                              "mission_id": spec["mission_id"], "paths": paths}),
+                              "mission_id": spec["mission_id"], "paths": paths, "review_mode": review_mode}),
             text=True, capture_output=True, timeout=30, check=False)
         if result.returncode:
             raise ValueError("canonical scope/policy rejected Controller input or changed paths")
         policy = json.loads(result.stdout)
-        policy["factory_required_backends"] = list(BACKENDS.values())
+        policy["factory_required_backends"] = (["codex-cli"] if review_mode == "single_openai" else list(BACKENDS.values()))
         policy["factory_p3_blocks"] = True
         return policy
 
@@ -642,8 +673,13 @@ print(json.dumps({'workflow_class': scope.workflow_class, 'required_backends': l
 
     def review_admission(self, spec, cwd, target, limits):
         """Run only the base's pure planner, never a provider or candidate module."""
+        policy = verify_target(spec, cwd, target)
+        if review_lanes(target) == ("reviewer",):
+            review_lanes({**target, "project_policy": policy})
+            return {"target": target, "authorization": limits, "review_mode": "single_openai",
+                    "codex_outer_operations": 1, "second_reviewer": "NOT_ENABLED",
+                    "provider_internal_requests": "UNKNOWN", "physical_cost_cap": "UNKNOWN"}
         validate_review_limits(limits)
-        verify_target(spec, cwd, target)
         trusted = self.adapter._trusted_base_checkout(str(cwd), target["base"])
         query = """
 import hashlib, json, subprocess, sys
@@ -762,14 +798,19 @@ print(json.dumps({'canonical_diff_sha256':hashlib.sha256(diff).hexdigest(), 'can
         if context is None:
             return GateResult("BLOCKED_EXTERNAL", "canonical agent-merge-ready requires phase-2 exact PR/CI context")
         cwd = Path(cwd)
-        if set(receipts or {}) != set(LANES.values()):
-            return GateResult("BLOCKED_EXTERNAL", "both canonical receipts are required by Factory")
+        lanes = review_lanes(target)
+        if set(receipts or {}) != {LANES[lane] for lane in lanes}:
+            return GateResult("BLOCKED_EXTERNAL", "selected canonical receipts are required by Factory")
+        single = lanes == ("reviewer",)
+        if single:
+            policy = verify_target(spec, cwd, target)
+            review_lanes({**target, "project_policy": policy})
         if isinstance(self.adapter, FootballPredictionAdapter):
-            if set(executions or {}) != set(LANES):
+            if set(executions or {}) != set(lanes):
                 raise ValueError("canonical final gate requires original review lifecycle evidence")
             for lane, result in executions.items():
                 validate_review_stop(spec, cwd, target, lane, result)
         return self.adapter.merge_ready(
             worktree=str(cwd), base=target["base"], head=target["head"], mission_id=spec["mission_id"],
             scope_file=str(cwd / target["mission_scope_file"]), receipts=receipts,
-            use_project_policy=True, **context)
+            use_project_policy=not single, **context)

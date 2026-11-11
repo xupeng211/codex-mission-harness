@@ -24,7 +24,8 @@ from .factory_runtime import LocalRuntime, RuntimeFailure, official_rubric, VEND
 from .sandbox import SAFE_PATH
 from .factory_budget import accounting, operation_token_limit, planning_limits
 from .factory_project import (PROJECT, OFFLINE_PASS, LANES, BACKENDS, approved_scope,
-                              materialize_scope, scope_binding, review_manifest, validate_review_limits)
+                              materialize_scope, scope_binding, review_manifest, validate_review_limits,
+                              review_lanes, configured_review_lanes)
 from . import factory_candidate as candidate_stage
 
 
@@ -108,7 +109,7 @@ def validate_config(raw: dict) -> dict:
     allowed = {"version", "simulation", "budget", "max_rounds", "timeout_seconds", "checks", "ci",
                "profiles", "independent_review_required", "max_review_bytes", "max_context_bytes", "repository", "hosted_ci", "project_contract",
                "trusted_validation", "project_pr_ci", "local_acceptance", "model_routing",
-               "project_container", "project_delivery", "project_review_limits"}
+               "project_container", "project_delivery", "project_review_limits", "review_mode"}
     if not isinstance(raw, dict) or set(raw) - allowed or type(raw.get("version")) is not int or raw.get("version") != 1:
         raise ValueError("invalid factory configuration")
     config = json.loads(encoded(raw))
@@ -117,9 +118,13 @@ def validate_config(raw: dict) -> dict:
     for key in ("simulation", "independent_review_required"):
         if type(config[key]) is not bool:
             raise ValueError(f"{key} must be boolean")
+    if "review_mode" in config:
+        if (not isinstance(config["review_mode"], str) or config["review_mode"] not in {"single_openai", "dual"}
+                or not config["independent_review_required"]):
+            raise ValueError("review_mode must explicitly select single_openai or dual with independent review enabled")
     if "project_contract" in config:
         if config["project_contract"] != PROJECT or not config["independent_review_required"]:
-            raise ValueError("project mode is explicit and retains both independent reviewers")
+            raise ValueError("project mode is explicit and requires independent review")
         if "hosted_ci" in config:
             raise ValueError("project mode requires explicit PR CI; push CI is incompatible")
     if {"trusted_validation", "project_pr_ci"} & set(config) and config.get("project_contract") != PROJECT:
@@ -195,7 +200,7 @@ def validate_config(raw: dict) -> dict:
         if not isinstance(hosted["workflows"], list) or not hosted["workflows"] or len(set(hosted["workflows"])) != len(hosted["workflows"]) or any(not isinstance(w, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+\.ya?ml", w) for w in hosted["workflows"]):
             raise ValueError("hosted CI requires exact workflow filenames")
     profiles = config.get("profiles")
-    expected = {"developer", "reviewer", "second_reviewer"} if config["independent_review_required"] else {"developer", "reviewer"}
+    expected = {"developer", *configured_review_lanes(config)}
     if not isinstance(profiles, dict) or set(profiles) != expected:
         raise ValueError("profiles must define the required execution lanes")
     for lane, profile in profiles.items():
@@ -525,7 +530,15 @@ class Factory:
             if self.project:
                 materialize_scope(spec, cwd, git)
                 if not candidate_stage.requested(spec):
-                    self.runtime.project_policy(spec, cwd, [spec["mission_scope_file"]])
+                    paths = [spec["mission_scope_file"]]
+                    if self.config.get("review_mode") == "single_openai":
+                        scope = json.loads(approved_scope(spec)["content"])
+                        if scope.get("authorized_prefixes"):
+                            raise FactoryBlocked("BLOCKED_SCOPE", "single-review pilot requires exact authorized paths")
+                        paths = scope["authorized_paths"]
+                    policy = self.project_policy(spec, cwd, paths)
+                    if self.config.get("review_mode") == "single_openai":
+                        review_lanes({"review_mode": "single_openai", "project_policy": policy})
             self.state(mission, "PLAN")
         if cwd.resolve() != cwd or not (cwd / ".git").is_dir() or (cwd / ".git").is_symlink():
             raise FactoryBlocked("UNKNOWN", "candidate isolation identity is invalid")
@@ -561,7 +574,10 @@ class Factory:
                     target["review_range"] = review_manifest(cwd, target, git)
                 # Local candidates keep the project scope boundary without
                 # entering the formal review path.
-                target["project_policy"] = self.runtime.project_policy(spec, cwd, files)
+                target["project_policy"] = self.project_policy(spec, cwd, files)
+                if self.config.get("review_mode") == "single_openai":
+                    target["review_mode"] = "single_openai"
+                    review_lanes(target)
             except (ValueError, OSError, UnicodeError, subprocess.SubprocessError) as exc:
                 raise FactoryBlocked("BLOCKED_SCOPE", str(exc)) from exc
         elif spec.get("mission_scope_file"):
@@ -581,6 +597,11 @@ class Factory:
                 if git(cwd, "rev-parse", spec["base"] + ":" + path) != git(cwd, "rev-parse", head + ":" + path):
                     raise FactoryBlocked("BLOCKED_SCOPE", "authorized hosted workflow was changed; its success cannot certify this task")
         return target
+
+    def project_policy(self, spec, cwd, paths):
+        if self.config.get("review_mode") == "single_openai":
+            return self.runtime.project_policy(spec, cwd, paths, review_mode="single_openai")
+        return self.runtime.project_policy(spec, cwd, paths)
 
     def checkpoint(self, spec, cwd):
         if self.project:
@@ -873,6 +894,8 @@ class Factory:
                 "lane": lane, "target": target}
 
     def project_review(self, spec, cwd, target, lane):
+        if lane not in review_lanes(target) or lane not in configured_review_lanes(self.config):
+            raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "review lane is not enabled")
         identity = {"target": target, "backend": BACKENDS[LANES[lane]],
                     "policy": target["project_policy"], "engine": "project-canonical-runner"}
         payload = {"target": target, "review_range": target["review_range"], "lane": lane}
@@ -1061,8 +1084,8 @@ class Factory:
 
     def project_final_gate(self, spec, cwd, target, reviews, remote=None):
         self.require_project_validation(spec, cwd, target)
-        if {r["lane"] for r in reviews} != set(LANES) or any(r["status"] != "PASS" for r in reviews):
-            raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "both validated canonical receipts are required")
+        if {r["lane"] for r in reviews} != set(review_lanes(target)) or any(r["status"] != "PASS" for r in reviews):
+            raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "selected validated canonical receipts are required")
         context = None
         if "project_pr_ci" in self.config:
             context = self.project_ci_context(spec, cwd, target, remote or [])
@@ -1535,7 +1558,7 @@ class Factory:
                         raise FactoryBlocked("UNKNOWN", "required strict operation absent from delivery evidence")
                 if not delivery.get("target", {}).get("files") or not isinstance(delivery.get("implemented"), str) or not delivery["implemented"].strip():
                     raise FactoryBlocked("UNKNOWN", "delivery implementation/change evidence is missing")
-                expected_lanes = {"reviewer", "second_reviewer"} if self.config["independent_review_required"] else {"reviewer"}
+                expected_lanes = set(configured_review_lanes(self.config))
                 if {r["lane"] for r in delivery.get("reviews", [])} != expected_lanes:
                     raise FactoryBlocked("UNKNOWN", "required independent reviewer evidence is missing")
                 for key in delivery["evidence_keys"]:
@@ -1597,6 +1620,8 @@ class Factory:
         verified = status == READY or self.project and status == OFFLINE_PASS
         operations = self.db.execute("SELECT * FROM operations WHERE mission=? ORDER BY started", (mission,)).fetchall()
         return {"MISSION": mission, "DELIVERY_STATUS": status,
+                "REVIEW_MODE": "single_openai" if configured_review_lanes(self.config) == ("reviewer",) else "dual",
+                "SECOND_REVIEW_STATUS": "NOT_ENABLED" if configured_review_lanes(self.config) == ("reviewer",) else "REQUIRED",
                 "CURRENT_REMOTE_VERIFICATION": fresh if fresh is not None else "NOT_RUN",
                 "PREPAID_PREFLIGHT": preflights[-1] if preflights else "NOT_RUN",
                 "IMPLEMENTED": delivery.get("implemented", "UNKNOWN"),
@@ -1796,7 +1821,7 @@ class Factory:
                 # source, replaying tests or calling the unaffected provider.
                 delivery = json.loads(self.db.execute("SELECT payload FROM events WHERE mission=? AND kind='delivery' ORDER BY sequence DESC LIMIT 1", (mission,)).fetchone()[0])
                 self.state(mission, "REVIEW")
-                lanes = ["reviewer", "second_reviewer"] if self.config["independent_review_required"] else ["reviewer"]
+                lanes = configured_review_lanes(self.config)
                 reviews = [self.review(spec, cwd, delivery["target"], lane) for lane in lanes]
                 feedback = [{"department": r["lane"], "findings": r["findings"], "explanation": r["output"]["overall_explanation"]} for r in reviews if r["status"] != "PASS"]
                 if not feedback:
@@ -1830,7 +1855,7 @@ class Factory:
                 raise FactoryBlocked("UNKNOWN", "technical lead task count is outside the bounded contract")
             if row["round"] == 0 and "max_total_tokens" in self.config["budget"]:
                 remaining = self.config["budget"]["max_agent_runs"] - self.db.execute("SELECT COUNT(*) FROM operations WHERE mission=? AND paid=1", (mission,)).fetchone()[0]
-                if len(plan["tasks"]) + (2 if self.config["independent_review_required"] else 1) > remaining:
+                if len(plan["tasks"]) + len(configured_review_lanes(self.config)) > remaining:
                     raise FactoryBlocked("BLOCKED_BUDGET", "plan cannot fit implementation and independent review in authorized remaining runs")
             feedback = []
             if row["round"]:
@@ -1868,7 +1893,7 @@ class Factory:
                 if not feedback:
                     self.require_project_validation(spec, cwd, target)
                     self.state(mission, "REVIEW")
-                    lanes = ["reviewer", "second_reviewer"] if self.config["independent_review_required"] else ["reviewer"]
+                    lanes = configured_review_lanes(self.config)
                     # Do not send the first lane's findings/results to the second.
                     for lane in lanes:
                         review = self.review(spec, cwd, target, lane)

@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 from .adapters import FootballPredictionAdapter
-from .factory_project import FootballPredictionContract, LANES, verify_target
+from .factory_project import FootballPredictionContract, LANES, verify_target, review_lanes
 from .sandbox import SAFE_PATH
 
 
@@ -203,8 +203,8 @@ def run(action, policy, spec, cwd, target, body, transcript, timeout, reviews=No
     contract.validate_pr_body(spec, Path(cwd), target, body)
     if action in {"publish", "verify"}:
         from .factory_project import validate_review_stop
-        if {r["lane"] for r in reviews or []} != set(LANES):
-            raise ValueError("publication/final gate requires both original review lifecycles")
+        if {r["lane"] for r in reviews or []} != set(review_lanes(target)):
+            raise ValueError("publication/final gate requires selected original review lifecycles")
         for review in reviews:
             validate_review_stop(spec, Path(cwd), target, review["lane"], review["canonical_execution"])
     if action == "publish":

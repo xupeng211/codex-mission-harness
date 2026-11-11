@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "repository": "/home/xupeng/FootballPrediction.clean-dev",
+  "project_contract": "footballprediction",
+  "review_mode": "single_openai",
+  "independent_review_required": true,
+  "budget": {
+    "max_agent_runs": 5,
+    "max_total_tokens": 600000,
+    "max_run_tokens": 120000,
+    "max_wall_seconds": 7200
+  },
+  "max_rounds": 2,
+  "timeout_seconds": 900,
+  "max_review_bytes": 32768,
+  "checks": [["make", "verify-strict"]],
+  "ci": [["make", "verify-pr"]],
+  "profiles": {
+    "developer": {
+      "provider": "openai",
+      "model": "gpt-6.1-sol",
+      "effort": "medium",
+      "codex_home": "/home/xupeng/.codex-harness-official",
+      "transport": {"type": "official"}
+    },
+    "reviewer": {
+      "provider": "openai",
+      "transport": {"type": "official"}
+    }
+  },
+  "project_container": {
+    "image_id": "sha256:7c4993ba149012d0336607b90aea855446857f86ac3dd615b8727a4f49e172b3",
+    "postgres_image_id": "sha256:72b75a9e60891118b5221c08771145c2191987d521ac1ad64d31d7421d15db49",
+    "profiles": ["strict", "pr"]
+  },
+  "project_delivery": {
+    "repository": "xupeng211/FootballPrediction",
+    "base_branch": "main"
+  }
+}

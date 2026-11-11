@@ -1,5 +1,9 @@
 # AI Software Delivery Factory
 
+2026-11-12 单审恢复候选：显式 `review_mode=single_openai` 复用原 OpenAI 独立审核和返工，
+第二审标记未启用；默认双审及 CRITICAL 门槛保留。配置、当前版本、离线证据与下一次
+业务提案见 [恢复单审记录](docs/RESTORE_SINGLE_REVIEW_20261112.md)；该候选尚待独立验收，未启动真实试点。
+
 FootballPrediction 的显式项目合同模式见 [阶段 1 合同适配](docs/FACTORY_FOOTBALLPREDICTION_CONTRACT.md)。
 它仅完成离线合同接入，fixture 成功不代表真实业务交付；Docker 与 PR CI 尚待后续阶段。
 

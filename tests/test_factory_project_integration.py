@@ -165,6 +165,51 @@ class CanonicalRuntimeIntegrationTests(unittest.TestCase):
             self.f.project_final_gate(spec, cwd, target, reviews)
         self.assertNotIn(self.f.row("feature")["status"], {"READY_FOR_USER_ACCEPTANCE", "MERGE_READY", "DONE"})
 
+    def test_single_real_runner_validator_and_final_consumer_without_deepseek(self):
+        config = copy.deepcopy(self.config)
+        config["review_mode"] = "single_openai"
+        config["profiles"].pop("second_reviewer")
+        config.pop("project_review_limits")
+        self.scope["workflow_class"] = "STRICT"
+        with patch.object(self.runtime, "profile_identity", return_value={"offline_test": True}):
+            self.f = Factory(self.root / "single-state", config, self.runtime)
+        self.addCleanup(self.f.close)
+        spec, cwd, target = self.candidate()
+        plan = self.runtime.project_review_admission(spec, cwd, target, None)
+        self.assertEqual(plan["second_reviewer"], "NOT_ENABLED")
+        self.assertNotIn("deepseek_backend_runs", plan)
+        review = self.review(spec, cwd, target, "reviewer")
+        self.assertEqual(review["status"], "PASS")
+        self.assertEqual([mode for mode, _ in self.starts], ["codex"])
+        self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM operations WHERE lane='second_reviewer'").fetchone()[0], 0)
+        with self.assertRaisesRegex(FactoryBlocked, "not enabled"):
+            self.review(spec, cwd, target, "second_reviewer")
+        contract = FootballPredictionContract()
+        with patch.object(contract.adapter, "merge_ready", return_value=GateResult("PASS", "OFFLINE final call double")) as final:
+            gate = contract.final_gate(spec, cwd, target, {"codex": review["canonical_receipt"]},
+                context={"pr_number": 1, "pr_repo": "fixture/repo", "pr_base_sha": target["base"], "ci_status": "PASS"},
+                executions={"reviewer": review["canonical_execution"]})
+        self.assertEqual(gate.status, "PASS")
+        self.assertFalse(final.call_args.kwargs["use_project_policy"])
+        self.assertEqual(set(final.call_args.kwargs["receipts"]), {"codex"})
+
+    def test_single_canonical_classifier_rejects_declared_normal_high_risk_paths(self):
+        spec, cwd, target = self.candidate()
+        scope = copy.deepcopy(self.scope)
+        for workflow, high in (("NORMAL", "src/database/pilot.py"), ("NORMAL", "src/api/pilot.py"),
+                               ("STRICT", "database/migrations/pilot.sql")):
+            scope["workflow_class"] = workflow
+            scope["authorized_paths"] = [high, self.path]
+            content = json.dumps(scope) + "\n"
+            changed = {**spec, "approved_mission_scope": {**spec["approved_mission_scope"],
+                "content": content, "sha256": sha256(content.encode())}}
+            policy = FootballPredictionContract().policy(changed, cwd, [high, self.path], review_mode="single_openai")
+            self.assertFalse(policy["single_review_eligible"])
+            from harness.factory_project import review_lanes
+            with self.assertRaises(ValueError):
+                review_lanes({"review_mode": "single_openai", "project_policy": policy})
+        self.assertEqual(self.starts, [])
+
     def test_restarted_runtime_blocks_before_reservation_for_unfinished_validator(self):
         spec, cwd, target = self.candidate()
         evidence = self.f.root / "evidence" / spec["mission_id"]

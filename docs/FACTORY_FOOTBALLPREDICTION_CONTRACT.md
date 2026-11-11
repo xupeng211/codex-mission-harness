@@ -390,3 +390,8 @@ wrapper compatibility 和远端 I/O 为明确替身。固定旧合同 fixture �
 不与另一套 `trusted_validation` / `project_pr_ci` 配置混配；后者保留其原 exact-head
 人工发布审批和 first-paid 限制。此说明没有授予当前任务任何收费或远端权限；未来
 Owner 可批准完整有界业务试点，最终 Merge 仍另行决定，不含部署。
+## 2026-11-12 有限单审恢复候选
+
+下文原双审合同继续适用于默认/显式 dual。显式 single_openai 的局部接缝、
+原 NORMAL/STRICT 分类与 CRITICAL 双审边界、待独立验收状态及下一轮执行提案见
+[恢复单审记录](RESTORE_SINGLE_REVIEW_20261112.md)。这不修改原项目权威或追认历史证据。
