@@ -25,7 +25,9 @@ Harness 本地 origin/main 停在 `6db80276361fb74dd7272e70a3577eabcc978fc7`；
 
 FootballPrediction 正式入口始终是 `/home/xupeng/FootballPrediction.clean-dev`：
 branch=main，HEAD=origin/main=`93cef9a02ece47ac4450bb696e8671af19022b8d`，工作区干净；
-只读 GitHub ref 查询也返回该 SHA。本轮未写该仓库。
+只读 GitHub ref 查询也返回该 SHA。本轮未修改该仓库的业务源码、分支或 HEAD。
+调用原 adapter 校验当前 BASE 时，它在已有 `/home/xupeng/.cmh-trusted-base/` 内登记了
+该准确 SHA 的 detached 可信工作树；这是既有缓存位置，不作为正式项目入口或新报告目录。
 已读取该入口的 AGENTS.md、docs/AGENT_WORKFLOW.md（含 V1）、README canonical 入口、
 能力索引及当前 milestone/status；其他历史目录不作为当前项目。
 #1957 及此前已完成交付保持 DONE，不重做、不降级历史结论。
@@ -84,10 +86,14 @@ NO_VERDICT、旧 HEAD 均 UNKNOWN 且不重派；第二审显式派发被拒绝�
 ## 下一次真实小任务提案
 
 任务 ID：`FP_TEAM_URL_TRAILING_PATH_FIX_20261112`。
-问题：`src/utils/teams/url_tools.py::extract_team_names_from_url` 的路径正则未锚定末尾，
-会把多余子路径当作有效比赛。这与 #1957 的空队名问题不同。
+候选问题：`src/utils/teams/url_tools.py::extract_team_names_from_url` 的路径正则未锚定末尾，
+会把多余子路径解析成比赛队名。这与 #1957 的空队名问题不同。
 依据是当前函数、既有 `tests/unit/test_team_url_tools.py` 的 supported/unsupported URL
 与 query/fragment 约定，以及当前源码只读复现；没有发明新联赛、队名或采集需求。
+CONFIRMED 是下表中的当前结果；现有测试尚未明确规定额外子路径是否合法。
+**需要 Owner 决定的唯一业务差异**：是否只接受比赛页本身，拒绝其后多余 path（建议）；
+若本来就要支持比赛下级页面提取队名，此行为不能直接认定为 bug，应取消这个候选，另选任务。
+本轮没有把建议当成已经获批的新需求。
 
 当前实际结果：
 
@@ -246,4 +252,49 @@ prepaid/container preflight、锁文件/QA 字节及临时服务绑定。没有�
 
 ## 最终验收记录
 
-待本地完整验证完成后填写。本候选独立审核状态始终为 NOT_RUN。
+准确实现/测试/配置提交：`95c9c9c830e401675850845409c6529247ea139d`。
+下一次提案使用这一候选实现；必须先取得其独立验收，不能把该 SHA 当成已经批准运行。
+后续本记录的补充提交只修改本文件；源码/测试/配置与此实现提交一致：
+
+```text
+src tree    = 504c469ef068a7d92c444158f80a100f28690cfe
+tests tree  = 18daa821e69d0336c379a1f6816cecfa354f0565
+config tree = e91de14e00c3bf9aecf2dcba65fbb5ad2863590a
+```
+
+CONFIRMED：
+
+- 固定实现提交的 `FOOTBALLPREDICTION_CONTRACT_REPO=/home/xupeng/codex-mission-harness/build/footballprediction-contract-a65464 make verify`
+  退出码 0，**1169 项通过 / 338.392 秒**；合同源、compileall 与完整 unittest 均执行。
+- `test_factory_project` / `test_factory_project_integration` / `test_factory_preflight_roots`
+  定向合计 52 项通过；完整最终回归也覆盖它们。
+- 当前正式项目 `93cef9a02ece47ac4450bb696e8671af19022b8d` 原始 Git 源码的追加集成 2 项通过，
+  其中包括伪称 NORMAL 的高风险路径、STRICT 下 migration 的 CRITICAL 分类拒绝。
+  可复跑：`FOOTBALLPREDICTION_CONTRACT_REPO=$PWD/build/footballprediction-contract-a65464 PYTHONPATH=src:tests .venv/bin/python build/current-single-review-probe.py`。
+- 当前正式源码既有 URL 定向测试 154 项通过；这是纯函数检查，不替代 verify-strict/PR CI。
+- 新配置合法；原开发员和 canonical reviewer 的本地配置校验通过，两镜像准确 ID 在本地存在。
+  原 `inspect_prepaid` 对当前 BASE + 配置的静态检查为 NO_KNOWN_HARD_BLOCKER，
+  model_inference_calls=0、project_commands_executed=0。该 presence probe 没有完整获批 mission/正文，
+  不构成发布授权、正式 profile 成功或模型访问证明。
+- 初轮全量回归曾失败（36 failures / 29 errors），原因包括旧替身收到新增默认 keyword；
+  已恢复 dual 的原三参数调用和字段集合，仅 single 路径传新选择，随后完整回归通过。
+  没有用忽略失败或降低门槛取得上述最终结果。
+- 交付前复核 FootballPrediction main/HEAD/工作区及第二审分支/HEAD/工作区均保持原样干净。
+
+日志保存在既有 Harness `build/` 下，不散落主文件夹；它们是本地离线证据，不是独立审核回执：
+
+```text
+build/single-review-95c9c9c-verify.log
+  sha256=d1a4ed8ad9617d52e3e08a1d8a5c91dc1880b5f2532e00c6abc9c98a7ed0c51b
+build/current-single-review-probe.log
+  sha256=d1de6c809370a3af31f7b31f1defad09435dc049f8b8514d9a62d57a29068e07
+build/current-single-review-preflight.json
+  sha256=f6fb5e9ea452c5c59b664b38c27661e5534a75609e0eb74dcc18d3d16cd3295b
+```
+
+INFERRED / 需 Owner 决定：URL 多余子路径应被拒绝，而不是受支持的比赛下级页面。
+
+UNKNOWN / NOT_RUN：Harness 补丁独立审核、真实模型访问/内部用量/金额、当前完整业务
+strict/pr profile、真实业务开发/返工、真实 PR required CI 和最终 merge-ready。
+本轮模型调用=0、push=NO、PR=NO、Merge=NO、deploy=NO；只读 GitHub main ref 查询不作为 CI 证据。
+没有重启 #1957 或其他 DONE 任务，没有合并第二审候选，也没有自动采纳本地修正。
