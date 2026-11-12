@@ -7,9 +7,11 @@ import signal
 import subprocess
 import threading
 import time
+import traceback
 import unittest
 from unittest.mock import patch
 
+from harness import factory_container
 from harness.factory_container import remove_owned, _ClientStops
 from harness.factory_runtime import LocalRuntime
 import test_factory_controller_gates as fixtures
@@ -160,9 +162,15 @@ class PreparationTests(unittest.TestCase):
 
     def test_clone_deadline_prevents_all_dependency_dispatch(self):
         self.double.mode = "clone_deadline"
+        # The clone's final wait advances offset past this original deadline.
+        # Unlike target-stage tests, preparation must exhaust the whole budget.
+        started = self.double.clock()
+        self.double.clock = lambda: started
         with self.double.hooks(): result = self.gate()
         self.assertEqual(result["status"], "TIMEOUT")
         self.assertEqual(self.double.calls, [])
+        self.assertFalse(self.double.ready.is_set())
+        self.assert_stopped_cleanup(result)
 
     def test_cancellation_after_create_skips_copy_and_cleans_resource(self):
         self.double.mode = "create_cancel"
@@ -186,17 +194,70 @@ class PreparationTests(unittest.TestCase):
         self.assertNotIn("run", [p for p, _ in self.double.calls])
         self.assertFalse(self.double.resources)
 
+    def assert_stopped_cleanup(self, result):
+        for key in ("cleanup_confirmed", "preparation_cleanup_confirmed",
+                    "local_clients_stop_confirmed", "temporary_directory_cleanup_confirmed"):
+            self.assertTrue(result[key], result)
+        self.assertEqual(result["local_clients_stop_status"], "CONFIRMED", result)
+        self.assertTrue(result["preparation_clients"], result)
+        for client in result["preparation_clients"]:
+            self.assertTrue(client["confirmed"] and client["leader_reaped"], client)
+        self.assertFalse(Path(result["temporary_directory_identity"]["path"]).exists())
+        self.assertIsNone(self.runtime.current_process)
+        self.assertIsNone(self.runtime._preparation_client)
+        self.assertIsNone(self.runtime._active_execution)
+        self.assertFalse(self.double.resources)
+
     def blocked_client(self, phase, cancel):
         self.double.mode = phase + "_blocked"
-        results, errors = [], []
+        results, errors, target = [], [], {}
+        clock = self.double.clock
+        started = clock()
+        if not cancel:
+            # Isolate target-client timing from real Git preparation latency.
+            # clone_deadline above separately tests exhaustion before dispatch.
+            self.double.clock = lambda: started
+        consume = factory_container.consume_output
+        finish = self.runtime._finish_owned_client
+
+        def consume_target(proc, output, event, deadline, **kwargs):
+            if self.double.ready.is_set() and proc is self.double.clients[-1]:
+                client = self.runtime._preparation_client
+                self.assertIs(self.runtime.current_process, proc)
+                self.assertIs(client["process"], proc)
+                self.assertIs(client["execution"], self.runtime._active_execution)
+                self.assertEqual(client["identity"]["pid"], proc.pid)
+                self.assertFalse(target, "target client consumed twice")
+                target.update(process=proc, work_deadline=deadline)
+                # Use most of the ORIGINAL 0.3s budget, retaining its cleanup
+                # reserve. From here both work and cleanup use real elapsed time.
+                self.assertAlmostEqual(deadline, started + 0.225)
+                resumed = clock()
+                self.double.offset = deadline - started - 0.02
+                self.double.clock = lambda: started + clock() - resumed
+            return consume(proc, output, event, deadline, **kwargs)
+
+        def finish_target(client, deadline):
+            if client["process"] is target.get("process"):
+                target["cleanup_deadline"] = deadline
+            return finish(client, deadline)
+
+        def diagnostic():
+            return (f"results={results!r}; errors={errors!r}; calls={self.double.calls!r}; "
+                    f"ready={self.double.ready.is_set()}; worker_alive={worker.is_alive()}; "
+                    f"current_process={self.runtime.current_process!r}; target={target!r}")
+
         def work():
             try: results.append(self.gate(5 if cancel else 0.3))
-            except BaseException as error: errors.append(error)
+            except BaseException as error: errors.append("".join(traceback.format_exception(error)))
         worker = threading.Thread(target=work)
-        with self.double.hooks():
+        with self.double.hooks() as hooks:
+            if not cancel:
+                hooks.enter_context(patch.object(factory_container, "consume_output", consume_target))
+                hooks.enter_context(patch.object(self.runtime, "_finish_owned_client", finish_target))
             worker.start()
             try:
-                self.assertTrue(self.double.ready.wait(2))
+                self.assertTrue(self.double.ready.wait(2), diagnostic())
                 client = self.double.clients[-1]
                 if cancel:
                     # A stale identity has no authority over this preparation.
@@ -204,15 +265,24 @@ class PreparationTests(unittest.TestCase):
                     self.assertIsNone(client.poll())
                     self.assertTrue(self.runtime.cancel(self.runtime.container_cancel))
                 worker.join(0.8)
-                self.assertFalse(worker.is_alive(), "preparation client ignored cancellation/deadline")
-                self.assertIsNotNone(client.poll(), "client must be reaped, not just report a status")
+                self.assertFalse(worker.is_alive(), diagnostic())
+                # Check before fixture.close can kill or reap anything for us.
+                self.assertEqual(client.returncode, -signal.SIGKILL, diagnostic())
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(client.pid, os.WNOHANG)
+                self.assertFalse(errors, diagnostic())
+                self.assertEqual(len(results), 1, diagnostic())
+                self.assert_stopped_cleanup(results[0])
             finally:
                 self.double.close()
                 worker.join(3)
-        self.assertFalse(errors, errors)
         self.assertEqual(results[0]["status"], "CANCELLED" if cancel else "TIMEOUT")
-        self.assertIsNone(self.runtime.current_process)
-        self.assertFalse(self.double.resources)
+        if not cancel:
+            self.assertIs(target["process"], client)
+            self.assertAlmostEqual(target["cleanup_deadline"], started + 0.3)
+            self.assertGreater(target["cleanup_deadline"], target["work_deadline"])
+        self.assertEqual([p for p, _ in self.double.calls if p != "rm"],
+                         ["create"] if phase == "create" else ["create", "cp"])
         self.assertNotIn("run", [p for p, _ in self.double.calls])
 
     def test_create_client_is_stopped_on_cancel(self): self.blocked_client("create", True)
