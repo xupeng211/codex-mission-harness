@@ -1759,7 +1759,11 @@ class FootballPredictionAdapter:
         forbidden_side_effects = "NO" if local_verdict == "PASS" else "UNKNOWN"
         required_pr_governance = "UNKNOWN"
         if not use_project_policy:
-            argv += ["--selected-backend", "codex" if codex_receipt else "deepseek"]
+            # Reuse the bridge's canonical IDs; short receipt/lane keys are
+            # not accepted by the trusted project's CLI. Import lazily because
+            # factory_project also imports this adapter.
+            from .factory_project import BACKENDS
+            argv += ["--selected-backend", BACKENDS["codex" if codex_receipt else "deepseek"]]
         argv += ["--pr", str(pr_number), "--remote-ci-status", ci_status,
                 "--protected-invariants", protected_invariants,
                 "--forbidden-side-effects", forbidden_side_effects,

@@ -65,6 +65,46 @@ class PrepaidPreflightTests(unittest.TestCase):
         report = self.assert_zero_dispatch(self.factory())
         self.assertIn("independent_context", report["BLOCKERS_REMAINING"][0])
 
+    def single_config(self):
+        config = copy.deepcopy(self.config)
+        config["review_mode"] = "single_openai"
+        config["profiles"].pop("second_reviewer")
+        config["max_context_bytes"] = 10
+        return config
+
+    def test_single_skips_disabled_full_source_lane_but_reviews_and_reworks(self):
+        config = self.single_config()
+        self.assertTrue(config["independent_review_required"])
+        f = self.factory(config)
+        # Same baseline and limit as the dual blocker above. The disabled
+        # lane's capacity scanner must not even run, not merely hide its result.
+        with patch("harness.factory_preflight.text_capacity", side_effect=AssertionError("disabled lane scanned")):
+            report = f.run("feature")
+        self.assertEqual(report["DELIVERY_STATUS"], READY, report)
+        self.assertEqual(report["SECOND_REVIEW_STATUS"], "NOT_ENABLED")
+        self.assertEqual(report["BUDGET_USED"]["agent_runs"], 5)
+        self.assertEqual([call["role"] for call in f.runtime.calls],
+                         ["plan", "implement", "review", "rework", "review"])
+        self.assertEqual(f.db.execute("SELECT COUNT(*) FROM operations WHERE lane='second_reviewer'").fetchone()[0], 0)
+
+    def test_single_keeps_full_diff_limit_after_skipping_disabled_lane_capacity(self):
+        config = self.single_config()
+        config["max_review_bytes"] = 10
+        f = self.factory(config)
+        report = f.run("feature")
+        self.assertEqual(report["DELIVERY_STATUS"], "BLOCKED_SCOPE", report)
+        self.assertIn("nothing was truncated", report["BLOCKERS_REMAINING"][0])
+        self.assertEqual([call["role"] for call in f.runtime.calls], ["plan", "implement"])
+
+    def test_single_keeps_budget_limit_after_skipping_disabled_lane_capacity(self):
+        config = self.single_config()
+        config["budget"]["max_agent_runs"] = 3
+        f = self.factory(config)
+        report = f.run("feature")
+        self.assertEqual(report["DELIVERY_STATUS"], "BLOCKED_BUDGET", report)
+        self.assertLessEqual(report["BUDGET_USED"]["agent_runs"], 3)
+        self.assertNotIn("second_reviewer", [row[0] for row in f.db.execute("SELECT lane FROM operations")])
+
     def test_capacity_counts_utf8_regular_blobs_and_skips_binary_and_symlinks(self):
         (self.repo / "utf8.txt").write_text("中" * 10)
         (self.repo / "binary.bin").write_bytes(b"\0" * 1024)

@@ -13,6 +13,7 @@ import subprocess
 from pathlib import Path
 
 from .sandbox import SAFE_PATH
+from .factory_project import configured_review_lanes
 
 
 SCAN_BYTES = 64 * 1024 * 1024
@@ -360,7 +361,8 @@ def inspect_prepaid(spec, config):
                         raise ValueError("Controller PR body template is missing")
                 except ValueError as exc:
                     add("HARD_BLOCKER", "review_authorization", str(exc))
-    elif config["independent_review_required"] and not local_mode:
+    elif "second_reviewer" in configured_review_lanes(config) and not local_mode:
+        # Only this enabled lane serializes full-repository text at execution.
         try:
             capacity = text_capacity(repo, commit, config["max_context_bytes"])
             if capacity["text_bytes_lower_bound"] > capacity["limit_bytes"]:

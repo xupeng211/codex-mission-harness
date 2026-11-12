@@ -123,7 +123,7 @@ harness approve 任务编号 --action merge --head 交付显示的完整commit -
 
 `status` 和 `delivery` 显示执行次数、已观察的 token、未知 usage 及其永久保留额。金额没有真实遥测时明确为 `UNKNOWN`；不猜订阅价格，不把失败算成免费，不回填历史 UNKNOWN。
 
-第一次付费 dispatch 前，Factory 会记录 `PREPAID_PREFLIGHT`：只读取提交时的 baseline 和配置，不运行项目测试、Make、Docker 或 Provider 资格请求。独立审核的全库文本超过 `max_context_bytes`、缺少门禁可执行程序、明确依赖 Docker daemon 的门禁，以及 hosted workflow 不接受 Factory 候选分支 push 等已知问题标为 `HARD_BLOCKER`，以 `BLOCKED_PREFLIGHT` 停止，执行次数与 token 预留均为零。基础文本即使可读也不截断；扫描最多读取 64 MiB blob，有时间限制，不完整的扫描只提供下界。
+第一次付费 dispatch 前，Factory 会记录 `PREPAID_PREFLIGHT`：只读取提交时的 baseline 和配置，不运行项目测试、Make、Docker 或 Provider 资格请求。通用模式中，启用第二审核岗时才检查其全库文本是否超过 `max_context_bytes`；`single_openai` 不扫描未启用第二岗的容量，仍保留 OpenAI 独立审核、完整 diff 和预算门槛。该容量超限、缺少门禁可执行程序、明确依赖 Docker daemon 的门禁，以及 hosted workflow 不接受 Factory 候选分支 push 等已知问题标为 `HARD_BLOCKER`，以 `BLOCKED_PREFLIGHT` 停止，执行次数与 token 预留均为零。基础文本即使可读也不截断；扫描最多读取 64 MiB blob，有时间限制，不完整的扫描只提供下界。
 
 `WARNING` 表示当前 baseline 没发现该项明确障碍；`UNVERIFIED` 表示无法静态确定。`NO_KNOWN_HARD_BLOCKER` 不代表环境 READY 或交付 PASS。未来 diff 的 `max_review_bytes`、实施后的上下文、复杂 Make/CI 过滤、包和服务、远端权限以及项目自己的 receipt 合同仍需后续验证。YAML 使用 PyYAML 安全解析，重复键和无法理解的配置保持未验证；预检不执行仓库脚本，也不自动 fetch 缺失 Git objects。
 

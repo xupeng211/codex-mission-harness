@@ -4,6 +4,28 @@
 Owner 本轮禁止真实模型、业务开发、push、PR、Merge、部署；下文不构成执行批准。
 第二审代码、测试、分支和历史证据保留；目录清理、重装、DeepSeek/Antigravity 排障暂停。
 
+## 当前修复状态（F-01 / F-02）
+
+原完整候选 `499747673f244914694d39cb6640effd40e8b582` 已取得独立工程审核：
+COMPLETE / **FAIL**，存在 F-01/P1 最终门禁 backend 名称错误和 F-02/P2 通用单审误用
+第二岗容量限制。原报告 `build/single-openai-review-4997476/REVIEW.zh.md` 保持原样。
+旧版通过的测试没有覆盖真实最终参数解析，不能据此宣称单审交付已接通。
+
+本文件随两项窄修复更新：adapter 复用既有 BACKENDS 映射传 canonical ID；通用预检复用
+configured_review_lanes，只对启用的全仓文本第二岗检查容量。没有修改项目解析器、门禁
+返回逻辑、容量上限、independent_review_required、等级分类或业务试点语义。
+正式回归复用原 fake provider，实际运行 adapter 参数构造、项目 parser、scope、receipt 和
+policy；NORMAL/STRICT 正例、失败 CI 反例及默认双审均覆盖。通用单审与双审使用相同材料、
+相同容量上限，另验证完整 diff 和预算仍会阻断。
+
+准确修复 HEAD/tree、命令、结果及复审差异入口见
+`build/single-openai-f01-f02-repair-20261112/REPAIR.zh.md`。
+修复版本地 `make verify` 退出 0，1174 项 / 351.853 秒；相关套件 124 项、当前正式项目
+准确 Git 源码的追加验证 4 项均通过。日志中的进程/SQLite ResourceWarning 保留，未屏蔽。
+当前候选状态为 **实现者验证通过／待独立复审**；不是独立审核 PASS、真实 PR/CI 或正式交付。
+下一轮必须对包含本次修复的完整新 HEAD 独立复审，不能继续使用旧实现提交作为执行版本。
+下文业务、费用和启动步骤仍是待 Owner 批准提案，本轮只批准上述修复与离线验证。
+
 ## 项目和版本事实
 
 开始写入前核对：
@@ -56,7 +78,7 @@ JSON 状态为 REVIEW_MODE=single_openai / SECOND_REVIEW_STATUS=NOT_ENABLED，�
 原 task/path classifier 继续约束等级，NORMAL 不能伪装高风险路径，STRICT 不能掩盖
 CRITICAL 路径。CRITICAL 始终拒绝单审。试点仅允许精确 authorized_paths，不给目录通配授权。
 STRICT 保留实际 verify-strict 成功的发布门槛。本轮不修改 FootballPrediction 的审核权威。
-最终门禁通过 adapter 已有 selected-backend=codex 路径明确选择；双审继续无 override。
+最终门禁通过 adapter 已有 selected-backend=codex-cli 路径明确选择；双审继续无 override。
 
 开发与审核仍分别启动执行上下文；canonical reviewer 在原 detached/read-only 隔离现场，
 读取需求、完整 BASE→HEAD diff、scope 和必要源码，不消费 builder 的 PASS 或测试结论。
@@ -73,7 +95,9 @@ NO_VERDICT、旧 HEAD 均 UNKNOWN 且不重派；第二审显式派发被拒绝�
 原 STRICT/CRITICAL 与错误 NORMAL 路径的拒绝保持。
 
 真实 LocalRuntime 监督器、runner、validator 的集成只替换模型/认证为原 fake-backend，
-不调用真实模型。final consumer 的远端结果明确为 double，不构成真实 PR/CI 或正式审核。
+不调用真实模型。旧实现测试曾把 adapter.merge_ready 整体替换为 PASS，未覆盖参数/parser。
+本次回归执行真实 final consumer，只替换必要的认证和远端 PR/CI 事实；模拟结果
+不构成真实 PR/CI 或正式审核。
 既有固定合同回归需要 `a65464d1e5de498a072ed9a8fdf69ce46bcc04c5`：
 从正式仓库的本地 Git 对象生成 `build/footballprediction-contract-a65464` 只读测试依赖，
 它只供原测试的固定合同验证，不是当前 FootballPrediction 入口。
@@ -81,7 +105,8 @@ NO_VERDICT、旧 HEAD 均 UNKNOWN 且不重派；第二审显式派发被拒绝�
 测试自清理 fixture，跑同一单审 runner/validator/final bridge 和分类反例：2 项通过。
 
 最终本地提交及完整离线结果见本记录的“最终验收记录”。
-本轮是实现者检查，**没有独立审核结论**。下一次真实业务试跑不能替代 Harness 补丁的独立验收。
+原完整候选的独立审核已为 FAIL；本次修复只有实现者检查，**待新 HEAD 独立复审**。
+下一次真实业务试跑不能替代 Harness 补丁的独立验收。
 
 ## 下一次真实小任务提案
 
@@ -250,11 +275,12 @@ prepaid/container preflight、锁文件/QA 字节及临时服务绑定。没有�
 不能证明第二审可用、高风险任务可一律单审、任意业务自主交付、物理费用硬封顶或生产效果；
 未经 Owner 合并及 main Gate 不证明 DONE。第二审历史记录没有被覆盖成 PASS。
 
-## 最终验收记录
+## 原候选历史验收记录（不构成修复版独立验收）
 
 准确实现/测试/配置提交：`95c9c9c830e401675850845409c6529247ea139d`。
-下一次提案使用这一候选实现；必须先取得其独立验收，不能把该 SHA 当成已经批准运行。
-后续本记录的补充提交只修改本文件；源码/测试/配置与此实现提交一致：
+该实现后来在完整 HEAD `499747673f244914694d39cb6640effd40e8b582` 被独立审核判为 FAIL，
+不再作为下一次提案执行版本。以下是原实现当时的历史证据，不代表本次修复版源码/测试。
+当时至 4997476 的后续提交只修改本文件；原树为：
 
 ```text
 src tree    = 504c469ef068a7d92c444158f80a100f28690cfe
@@ -294,7 +320,7 @@ build/current-single-review-preflight.json
 
 INFERRED / 需 Owner 决定：URL 多余子路径应被拒绝，而不是受支持的比赛下级页面。
 
-UNKNOWN / NOT_RUN：Harness 补丁独立审核、真实模型访问/内部用量/金额、当前完整业务
+原交付当时 UNKNOWN / NOT_RUN：Harness 补丁独立审核（现已完成，旧 HEAD 为 FAIL）、真实模型访问/内部用量/金额、当前完整业务
 strict/pr profile、真实业务开发/返工、真实 PR required CI 和最终 merge-ready。
 本轮模型调用=0、push=NO、PR=NO、Merge=NO、deploy=NO；只读 GitHub main ref 查询不作为 CI 证据。
 没有重启 #1957 或其他 DONE 任务，没有合并第二审候选，也没有自动采纳本地修正。
