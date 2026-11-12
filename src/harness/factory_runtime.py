@@ -938,8 +938,10 @@ class LocalRuntime:
                 proc.wait()
             self.current_process = None
 
-    def project_policy(self, spec, cwd, paths):
-        return FootballPredictionContract().policy(spec, cwd, paths)
+    def project_policy(self, spec, cwd, paths, *, review_mode="dual"):
+        if review_mode == "dual":
+            return FootballPredictionContract().policy(spec, cwd, paths)
+        return FootballPredictionContract().policy(spec, cwd, paths, review_mode=review_mode)
 
     def project_review_admission(self, spec, cwd, target, limits):
         return FootballPredictionContract().review_admission(spec, cwd, target, limits)

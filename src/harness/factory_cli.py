@@ -48,6 +48,10 @@ def readable(result):
     lines = [f"任务：{result['MISSION']}", f"状态：{result['DELIVERY_STATUS']}",
              f"执行次数：{budget['agent_runs']}/{budget['limit']}；已观察 token：{budget['observed_tokens']}；未知 usage：{budget['unknown_usage_runs'] + budget['partial_usage_runs']}",
              f"未知 token 保留额：{budget['unknown_token_reservation']}；金额：{budget['money']}"]
+    if result.get("REVIEW_MODE") == "single_openai":
+        lines.append("审核：单审模式（OpenAI 独立审核）；第二审未启用")
+    elif result.get("REVIEW_MODE") == "dual":
+        lines.append("审核：双审模式；两岗审核均为必需")
     if route_line:
         lines.append(route_line.rstrip())
     if result['DELIVERY_STATUS'] == 'READY_FOR_USER_ACCEPTANCE':

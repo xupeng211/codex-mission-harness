@@ -42,16 +42,17 @@ class ProjectRuntime(AcceptanceRuntime):
         self.final_status = "PASS"
         self.final_calls = 0
 
-    def project_policy(self, spec, cwd, paths):
+    def project_policy(self, spec, cwd, paths, *, review_mode="dual"):
         scope = json.loads(approved_scope(spec)["content"])
         if set(paths) - set(scope["authorized_paths"]):
             raise ValueError("FIXTURE scope rejects path")
         workflow = scope["workflow_class"]
         return {"workflow_class": workflow,
-                "required_backends": ["claude-code-deepseek"] if workflow == "NORMAL" else
+                "required_backends": ["codex-cli"] if review_mode == "single_openai" else ["claude-code-deepseek"] if workflow == "NORMAL" else
                     ["codex-cli"] if workflow == "STRICT" else ["codex-cli", "claude-code-deepseek"],
                 "codex_model": "fixture-current-pin", "codex_effort": "medium",
-                "factory_required_backends": ["codex-cli", "claude-code-deepseek"], "factory_p3_blocks": True}
+                **({"single_review_eligible": workflow in {"NORMAL", "STRICT"}} if review_mode == "single_openai" else {}),
+                "factory_required_backends": ["codex-cli"] if review_mode == "single_openai" else ["codex-cli", "claude-code-deepseek"], "factory_p3_blocks": True}
 
     def prepare_project_review(self, spec, cwd, target, lane, timeout):
         return None  # Synthetic runtime; real LocalRuntime integration is tested separately.
@@ -139,6 +140,94 @@ class ProjectContractTests(unittest.TestCase):
         self.assertEqual(report["DELIVERY_STATUS"], OFFLINE_PASS, report)
         self.assertNotEqual(report["DELIVERY_STATUS"], READY)
         return report
+
+    def single_factory(self, name="single", workflow="NORMAL"):
+        config = copy.deepcopy(self.config)
+        config["review_mode"] = "single_openai"
+        config["profiles"].pop("second_reviewer")
+        self.scope["workflow_class"] = workflow
+        self.spec["approved_mission_scope"] = self.approval()
+        runtime = ProjectRuntime()
+        factory = Factory(self.root / name, config, runtime)
+        self.addCleanup(factory.close)
+        return factory, runtime
+
+    def test_single_review_rework_new_head_and_no_second_reservation(self):
+        factory, runtime = self.single_factory()
+        factory.submit(self.spec)
+        report = factory.run("feature")
+        self.assertEqual(report["DELIVERY_STATUS"], OFFLINE_PASS, report)
+        self.assertEqual(report["REVIEW_MODE"], "single_openai")
+        self.assertEqual(report["SECOND_REVIEW_STATUS"], "NOT_ENABLED")
+        from harness.factory_cli import readable
+        self.assertIn("单审模式（OpenAI 独立审核）；第二审未启用", readable(report))
+        self.assertEqual([r["lane"] for r in report["REVIEW_RESULT"]], ["reviewer"])
+        operations = list(factory.db.execute("SELECT * FROM operations"))
+        self.assertFalse(any(o["lane"] == "second_reviewer" for o in operations))
+        reviews = [json.loads(o["input"])["target"]["head"] for o in operations if o["stage"] == "review"]
+        self.assertEqual(len(reviews), 2)
+        self.assertNotEqual(reviews[0], reviews[1])
+        self.assertEqual(report["TARGET_HEAD"], reviews[-1])
+        repairs = [c for c in runtime.calls if c["role"] == "rework"]
+        self.assertEqual(len(repairs), 1)
+        self.assertEqual(repairs[0]["payload"]["feedback"][0]["department"], "reviewer")
+        self.assertEqual(len([o for o in operations if o["paid"]]), 5)
+        spec, cwd = factory.prepare("feature")
+        with self.assertRaisesRegex(FactoryBlocked, "not enabled"):
+            factory.project_review(spec, cwd, factory.target(spec, cwd), "second_reviewer")
+
+    def test_single_invalid_incomplete_stale_reviews_never_pass(self):
+        mutations = [lambda r: r.update(valid=False), lambda r: r.pop("findings"),
+                     lambda r: r.update(review_result="NO_VERDICT"),
+                     lambda r: r.update(reviewed_head_sha="b" * 40)]
+        for index, mutation in enumerate(mutations):
+            with self.subTest(index=index):
+                factory, runtime = self.single_factory(f"single-invalid-{index}")
+                runtime.mutate_receipt = lambda r, lane, m=mutation: m(r)
+                factory.submit(self.spec)
+                report = factory.run("feature")
+                self.assertEqual(report["DELIVERY_STATUS"], "UNKNOWN", report)
+                self.assertEqual(runtime.final_calls, 0)
+                calls = len(runtime.calls)
+                factory.run("feature")
+                self.assertEqual(len(runtime.calls), calls)
+                self.assertEqual(factory.db.execute("SELECT COUNT(*) FROM operations WHERE lane='second_reviewer'").fetchone()[0], 0)
+
+    def test_single_rejects_higher_risk_and_unknown_path_eligibility_before_model(self):
+        for index, workflow in enumerate(("CRITICAL", "NORMAL", "STRICT")):
+            factory, runtime = self.single_factory(f"single-risk-{index}", workflow)
+            if workflow != "CRITICAL":
+                original = runtime.project_policy
+                runtime.project_policy = lambda *a, **kw: {**original(*a, **kw), "single_review_eligible": False}
+            factory.submit(self.spec)
+            report = factory.run("feature")
+            self.assertNotEqual(report["DELIVERY_STATUS"], OFFLINE_PASS)
+            self.assertEqual(runtime.calls, [])
+
+    def test_review_mode_is_explicit_and_profiles_cannot_hide_second_lane(self):
+        config = copy.deepcopy(self.config)
+        config["review_mode"] = "single_openai"
+        with self.assertRaises(ValueError): validate_config(config)
+        config["profiles"].pop("second_reviewer")
+        self.assertEqual(validate_config(config)["review_mode"], "single_openai")
+        for mode in ("auto", "", False, "dual"):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                validate_config({**config, "review_mode": mode})
+
+    def test_single_preflight_does_not_require_disabled_provider_authorization(self):
+        from harness.factory_preflight import inspect_prepaid
+        config = copy.deepcopy(self.config)
+        config["simulation"] = False
+        spec = {**self.spec, "base": self.base, "pr_body_template": "Bounded offline fixture"}
+        dual = inspect_prepaid(spec, config)
+        self.assertTrue(any(f["check"] == "first_paid_execution" for f in dual["findings"]))
+        config["review_mode"] = "single_openai"
+        config["profiles"].pop("second_reviewer")
+        single = inspect_prepaid(spec, config)
+        self.assertFalse(any(f["check"] in {"first_paid_execution", "review_authorization"} for f in single["findings"]))
+        # Missing real validation/publication prerequisites still fail closed.
+        self.assertEqual(single["status"], "HARD_BLOCKER")
+        self.assertTrue(any(f["check"] == "project_container" for f in single["findings"]))
 
     def test_scope_materialized_only_in_candidate_and_bound_to_exact_head(self):
         before = {str(p.relative_to(self.repo)): p.read_bytes() for p in self.repo.rglob("*") if p.is_file()}
@@ -408,11 +497,14 @@ class ProjectContractTests(unittest.TestCase):
             "def validate_mission_scope(paths, scope):\n"
             " return ['rejected by fixture project policy'] if any(p not in scope.authorized_paths for p in paths) else []\n")
         (devops / "review_policy.py").write_text(
-            "def required_backends(workflow):\n"
+            "def required_backends(workflow, selected_backend=None):\n"
             " return ('claude-code-deepseek',) if workflow=='NORMAL' else ('codex-cli',) if workflow=='STRICT' else ('codex-cli','claude-code-deepseek')\n"
             "def load_active_backend_eligibility(path):\n"
             " return {'codex-cli':{'NORMAL','STRICT','CRITICAL'}, 'claude-code-deepseek':{'NORMAL','CRITICAL'}}\n")
         (devops / "codex_review_contract.py").write_text("REVIEW_MODEL_PINNED='fixture-current-pin'\nREVIEW_REASONING_EFFORT_PINNED='medium'\n")
+        (helpers / "strict_review_evidence.py").write_text(
+            "def _strict_classification_reasons(paths, task): return []\n"
+            "def _critical_classification_reasons(paths, task): return []\n")
         adapter = FootballPredictionAdapter()
         contract = FootballPredictionContract(adapter)
         with patch.object(adapter, "_trusted_base_checkout", return_value=trusted):

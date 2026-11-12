@@ -36,7 +36,8 @@ def facts(path):
 
 class DirectoryIdentityTests(unittest.TestCase):
     def setUp(self):
-        self.fixture = tempfile.TemporaryDirectory(prefix="cleanup-identity-")
+        # TaskTemp allocates in /tmp; replacement injection needs same-filesystem rename.
+        self.fixture = tempfile.TemporaryDirectory(prefix="cleanup-identity-", dir="/tmp")
         self.addCleanup(self.fixture.cleanup)
         self.root = Path(self.fixture.name)
 
@@ -50,10 +51,10 @@ class DirectoryIdentityTests(unittest.TestCase):
         def substitute(src_fd, src, dst_fd, dst):
             nonlocal substituted
             if src == source.name and not substituted:
-                substituted = True
                 source.rename(moved)
                 source.mkdir(mode=0o700)
                 (source / "marker").write_text("replacement-must-survive")
+                substituted = True
             return rename(src_fd, src, dst_fd, dst)
         try:
             with patch.object(temporary, "_rename_noreplace", side_effect=substitute):
@@ -180,8 +181,9 @@ class DirectoryIdentityTests(unittest.TestCase):
         def substitute(src_fd, src, dst_fd, dst):
             nonlocal substituted
             if src == path.name and not substituted:
-                substituted = True; path.rename(moved); path.mkdir(mode=0o700)
+                path.rename(moved); path.mkdir(mode=0o700)
                 (path / "marker").write_text("replacement")
+                substituted = True
             return rename(src_fd, src, dst_fd, dst)
         with patch("harness.factory_container.remove_owned", return_value=(True, None)), \
                 patch.object(temporary, "_rename_noreplace", side_effect=substitute):

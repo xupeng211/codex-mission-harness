@@ -13,6 +13,7 @@ import subprocess
 from pathlib import Path
 
 from .sandbox import SAFE_PATH
+from .factory_project import configured_review_lanes
 
 
 SCAN_BYTES = 64 * 1024 * 1024
@@ -327,6 +328,7 @@ def inspect_prepaid(spec, config):
         findings.append({"level": level, "check": check, "detail": detail, **values})
     if config.get("project_contract") == "footballprediction" and not local_mode:
         from .adapters import FootballPredictionAdapter
+        single = config.get("review_mode") == "single_openai"
         # Canonical tool-based review does not serialize the whole repository.
         # Check admission identity only; future diff and receipts remain unknown.
         for path in FootballPredictionAdapter.REVIEW_CONTRACT_PATHS:
@@ -339,7 +341,7 @@ def inspect_prepaid(spec, config):
         add("UNVERIFIED", "independent_context", "canonical reviewer reads exact diff and relevant source; full-repository prompt capacity is not the contract")
         if "trusted_validation" in config or "project_pr_ci" in config:
             add("UNVERIFIED", "project_final_gate", "canonical receipts and current exact PR/CI must pass before live readiness")
-            if not config["simulation"]:
+            if not config["simulation"] and not single:
                 add("HARD_BLOCKER", "first_paid_execution", "canonical DeepSeek outer operation may execute up to 64 backend calls; physical cost ceiling is unproven and first live paid execution remains blocked")
         else:
             if not config.get("project_delivery"):
@@ -347,18 +349,20 @@ def inspect_prepaid(spec, config):
             else:
                 add("UNVERIFIED", "project_final_gate", "Controller PR/CI bridge configured; remote permissions, PR checks and final gate remain unverified")
             if not config["simulation"]:
-                if not config.get("project_review_limits"):
+                if not single and not config.get("project_review_limits"):
                     add("HARD_BLOCKER", "first_paid_execution", "canonical DeepSeek outer operation may execute up to 64 backend calls; physical cost ceiling is unproven and first live paid execution remains blocked")
                 if not config.get("project_container"):
                     add("HARD_BLOCKER", "project_container", "Controller container executor policy missing; host fallback is forbidden")
                 from .factory_project import validate_review_limits
                 try:
-                    validate_review_limits(config.get("project_review_limits"))
+                    if not single:
+                        validate_review_limits(config.get("project_review_limits"))
                     if not spec.get("pr_body_template"):
                         raise ValueError("Controller PR body template is missing")
                 except ValueError as exc:
                     add("HARD_BLOCKER", "review_authorization", str(exc))
-    elif config["independent_review_required"] and not local_mode:
+    elif "second_reviewer" in configured_review_lanes(config) and not local_mode:
+        # Only this enabled lane serializes full-repository text at execution.
         try:
             capacity = text_capacity(repo, commit, config["max_context_bytes"])
             if capacity["text_bytes_lower_bound"] > capacity["limit_bytes"]:

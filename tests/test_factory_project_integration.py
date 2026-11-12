@@ -114,7 +114,7 @@ class CanonicalRuntimeIntegrationTests(unittest.TestCase):
             argv[script:script + 1] = [str(DRIVER), str(self.snapshot), mode, str(self.binary)]
         return self.original_popen(argv, *args, **kwargs)
 
-    def candidate(self, newline="\n"):
+    def candidate(self, newline="\n", changed_path="score.py"):
         content = (json.dumps(self.scope, indent=2) + "\n").replace("\n", newline)
         spec = {"version": 2, "mission_id": "feature", "repository": str(self.repo),
                 "base": self.base, "objective": "Offline integration probe",
@@ -124,7 +124,7 @@ class CanonicalRuntimeIntegrationTests(unittest.TestCase):
                     "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()}}
         self.f.submit(spec)
         spec, cwd = self.f.prepare("feature")
-        (cwd / "score.py").write_text("def score():\n    return 2\n")
+        (cwd / changed_path).write_text("def score():\n    return 2\n")
         target = self.f.checkpoint(spec, cwd)
         return spec, cwd, target
 
@@ -164,6 +164,112 @@ class CanonicalRuntimeIntegrationTests(unittest.TestCase):
         with self.assertRaises(FactoryBlocked):
             self.f.project_final_gate(spec, cwd, target, reviews)
         self.assertNotIn(self.f.row("feature")["status"], {"READY_FOR_USER_ACCEPTANCE", "MERGE_READY", "DONE"})
+
+    def test_single_real_runner_validator_and_final_consumer_without_deepseek(self):
+        self.single_final_consumer("STRICT")
+
+    def test_normal_single_real_final_consumer(self):
+        self.single_final_consumer("NORMAL")
+
+    def single_final_consumer(self, workflow):
+        config = copy.deepcopy(self.config)
+        config["review_mode"] = "single_openai"
+        config["profiles"].pop("second_reviewer")
+        config.pop("project_review_limits")
+        self.scope["workflow_class"] = workflow
+        changed_path = "score.py" if workflow == "STRICT" else "docs/offline_final_consumer.md"
+        self.scope["authorized_paths"] = [changed_path, self.path]
+        with patch.object(self.runtime, "profile_identity", return_value={"offline_test": True}):
+            self.f = Factory(self.root / "single-state", config, self.runtime)
+        self.addCleanup(self.f.close)
+        spec, cwd, target = self.candidate(changed_path=changed_path)
+        plan = self.runtime.project_review_admission(spec, cwd, target, None)
+        self.assertEqual(plan["second_reviewer"], "NOT_ENABLED")
+        self.assertNotIn("deepseek_backend_runs", plan)
+        review = self.review(spec, cwd, target, "reviewer")
+        self.assertEqual(review["status"], "PASS")
+        self.assertEqual([mode for mode, _ in self.starts], ["codex"])
+        self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM operations WHERE lane='second_reviewer'").fetchone()[0], 0)
+        with self.assertRaisesRegex(FactoryBlocked, "not enabled"):
+            self.review(spec, cwd, target, "second_reviewer")
+        gate, argv = self.real_final_consumer(spec, cwd, target, [review])
+        self.assertEqual(gate.status, "PASS")
+        self.assertEqual(argv[argv.index("--selected-backend") + 1], BACKENDS["codex"])
+        self.assertNotIn("--deepseek-receipt", argv)
+        # The real consumer must still reject failed required CI; the positive
+        # result above is only a fixture with simulated remote facts.
+        blocked, _ = self.real_final_consumer(spec, cwd, target, [review], remote_status="FAIL")
+        self.assertEqual(blocked.status, "BLOCKED_EXTERNAL")
+        self.assertEqual(blocked.data["merge_ready"], "NO")
+        self.assertEqual([mode for mode, _ in self.starts], ["codex"])
+        self.assertEqual(self.f.db.execute("SELECT COUNT(*) FROM operations WHERE lane='second_reviewer'").fetchone()[0], 0)
+
+    def real_final_consumer(self, spec, cwd, target, reviews, *, remote_status="PASS"):
+        # Reuse the independent audit's reproduction: real adapter argv, project
+        # parser, receipt classification, policy and local preflights. Only fake
+        # provider identity/auth and remote PR/CI facts are substituted.
+        from test_factory_preflight_inspection import publication_body
+        body = publication_body(self, target).replace("CRITICAL", self.scope["workflow_class"])
+        if len(reviews) == 1:
+            body = body.replace("codex-cli, claude-code-deepseek", "codex-cli")
+        contract = FootballPredictionContract()
+        contract.validate_pr_body(spec, cwd, target, body)
+        adapter = contract.adapter
+        original_call = adapter._call
+        final_argv = []
+
+        def call(argv, **kwargs):
+            argv = list(argv)
+            if "-c" in argv:
+                index = argv.index("-c") + 1
+                terminal = "raise SystemExit(m.main())"
+                if terminal in argv[index]:
+                    final_argv.append(list(argv))
+                    setup = ("from scripts.devops import codex_review_classification as cl; "
+                        + "cl.canonical_codex_binary=lambda:Path(" + repr(str(self.binary)) + "); "
+                        + "cl.canonical_reviewer_environment=lambda **kw:{'PATH':'/usr/bin:/bin'}; "
+                        + "m._remote_pr_check=lambda *a,**kw:(m.GateCheck('remote-required-ci',"
+                        + repr(remote_status) + ",'OFFLINE simulated remote facts'),{'verdict':"
+                        + repr(remote_status) + "}," + repr(body) + "); ")
+                    argv[index] = argv[index].replace(terminal, setup + terminal)
+            return original_call(argv, **kwargs)
+
+        facts = GateResult("PASS", data={"head": target["head"], "base": "main", "state": "OPEN",
+                                       "base_sha": target["base"], "body": body})
+        receipts = {LANES[review["lane"]]: review["canonical_receipt"] for review in reviews}
+        executions = {review["lane"]: review["canonical_execution"] for review in reviews}
+        with patch.object(adapter, "_pr_state", return_value=facts), patch.object(adapter, "_call", side_effect=call):
+            gate = contract.final_gate(spec, cwd, target, receipts,
+                context={"pr_number": 7, "pr_repo": "fixture/football", "pr_base_sha": target["base"], "ci_status": remote_status},
+                executions=executions)
+        self.assertEqual(len(final_argv), 1, gate)
+        return gate, final_argv[0]
+
+    def test_dual_real_final_consumer_keeps_project_policy(self):
+        spec, cwd, target = self.candidate()
+        reviews = [self.review(spec, cwd, target, lane) for lane in LANES]
+        gate, argv = self.real_final_consumer(spec, cwd, target, reviews)
+        self.assertEqual(gate.status, "PASS", gate)
+        self.assertNotIn("--selected-backend", argv)
+        self.assertIn("--receipt", argv)
+        self.assertIn("--deepseek-receipt", argv)
+
+    def test_single_canonical_classifier_rejects_declared_normal_high_risk_paths(self):
+        spec, cwd, target = self.candidate()
+        scope = copy.deepcopy(self.scope)
+        for workflow, high in (("NORMAL", "src/database/pilot.py"), ("NORMAL", "src/api/pilot.py"),
+                               ("STRICT", "database/migrations/pilot.sql")):
+            scope["workflow_class"] = workflow
+            scope["authorized_paths"] = [high, self.path]
+            content = json.dumps(scope) + "\n"
+            changed = {**spec, "approved_mission_scope": {**spec["approved_mission_scope"],
+                "content": content, "sha256": sha256(content.encode())}}
+            policy = FootballPredictionContract().policy(changed, cwd, [high, self.path], review_mode="single_openai")
+            self.assertFalse(policy["single_review_eligible"])
+            from harness.factory_project import review_lanes
+            with self.assertRaises(ValueError):
+                review_lanes({"review_mode": "single_openai", "project_policy": policy})
+        self.assertEqual(self.starts, [])
 
     def test_restarted_runtime_blocks_before_reservation_for_unfinished_validator(self):
         spec, cwd, target = self.candidate()
