@@ -267,7 +267,11 @@ class PreparationTests(unittest.TestCase):
                 worker.join(0.8)
                 self.assertFalse(worker.is_alive(), diagnostic())
                 # Check before fixture.close can kill or reap anything for us.
-                self.assertEqual(client.returncode, -signal.SIGKILL, diagnostic())
+                if cancel:
+                    # cancel sends SIGTERM; cleanup escalates only if still live.
+                    self.assertIn(client.returncode, (-signal.SIGTERM, -signal.SIGKILL), diagnostic())
+                else:
+                    self.assertEqual(client.returncode, -signal.SIGKILL, diagnostic())
                 with self.assertRaises(ChildProcessError):
                     os.waitpid(client.pid, os.WNOHANG)
                 self.assertFalse(errors, diagnostic())
