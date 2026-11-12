@@ -4,10 +4,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import threading
 import time
+import traceback
 import unittest
 from unittest.mock import Mock, patch
 
@@ -423,7 +425,9 @@ class ServiceDouble(InspectionDouble):
 
     def command(self, argv, *args, **kwargs):
         if argv[:2] == ["/usr/bin/docker", "inspect"]:
-            return subprocess.CompletedProcess(argv, 0, json.dumps(self.resources.get(argv[-1], {})).encode(), b"")
+            if argv[-1] not in self.resources:
+                return subprocess.CompletedProcess(argv, 1, b"", b"No such container")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.resources[argv[-1]]).encode(), b"")
         if argv[:2] == ["/usr/bin/docker", "ps"]:
             return subprocess.CompletedProcess(argv, 0, self.output(argv), b"")
         if argv[:2] == ["/usr/bin/docker", "logs"]:
@@ -502,48 +506,193 @@ class ServiceClientBoundaryTests(unittest.TestCase):
         self.assertTrue(all(p.poll() is not None for p in double.clients))
         self.assertIsNone(runtime.current_process)
 
-    def stopped_service(self, phase, cancel):
+    def service_fixture(self, phase=None):
         fx = gates.ControllerGatesTests()
         fx.setUp()
         self.addCleanup(fx.doCleanups)
         runtime = LocalRuntime()
-        old = runtime.begin_execution("old")
-        runtime.end_execution(old)
         double = ServiceDouble(fx, runtime, phase)
         self.addCleanup(double.close)
-        results, errors = [], []
+        return fx, runtime, double
+
+    def assert_service_stopped(self, fx, runtime, double, result, diagnostic):
+        for key in ("cleanup_confirmed", "dependencies_cleanup_confirmed", "preparation_cleanup_confirmed",
+                    "local_clients_stop_confirmed", "temporary_directory_cleanup_confirmed"):
+            self.assertTrue(result[key], diagnostic)
+        self.assertEqual(result["local_clients_stop_status"], "CONFIRMED", diagnostic)
+        self.assertTrue(result["services"]["postgres"]["cleanup_confirmed"], diagnostic)
+        self.assertTrue(result["preparation_clients"], diagnostic)
+        for client in result["preparation_clients"]:
+            self.assertTrue(client["confirmed"] and client["leader_reaped"], diagnostic)
+            # Only after the product claims reaping: this must find no child.
+            with self.assertRaises(ChildProcessError, msg=diagnostic):
+                os.waitpid(client["identity"]["pid"], os.WNOHANG)
+        lifecycle = fx.root / "service.container.json"
+        raw = lifecycle.read_bytes()
+        self.assertEqual(result["client_stop_evidence"],
+                         container.client_stop_evidence(fx.root / "service.raw", json.loads(raw), raw), diagnostic)
+        self.assertFalse(Path(result["temporary_directory_identity"]["path"]).exists(), diagnostic)
+        self.assertFalse(double.resources, diagnostic)
+        self.assertIsNone(runtime.current_process, diagnostic)
+        self.assertIsNone(runtime._preparation_client, diagnostic)
+        self.assertIsNone(runtime._active_execution, diagnostic)
+        self.assertTrue(all(p.returncode is not None for p in double.clients), diagnostic)
+        self.assertNotIn("run", [p for p, _ in double.calls], diagnostic)
+
+    def stopped_service(self, phase, cancel):
+        fx, runtime, double = self.service_fixture(phase)
+        old = runtime.begin_execution("old")
+        runtime.end_execution(old)
+        results, errors, target = [], [], {}
+        registered = threading.Event()
+        clock = double.clock
+        started = clock()
+        if not cancel:
+            # Logical time isolates target timing from real preparation latency.
+            # The three before-target cases below retain total-budget checks.
+            double.clock = lambda: started
+        consume, finish = container.consume_output, runtime._finish_owned_client
+
+        def consume_target(proc, output, event, deadline, **kwargs):
+            if double.blocked_clients and proc is double.blocked_clients[0]:
+                client = runtime._preparation_client
+                self.assertIs(runtime.current_process, proc)
+                self.assertIs(client["process"], proc)
+                self.assertIs(client["execution"], runtime._active_execution)
+                self.assertEqual(client["identity"]["pid"], proc.pid)
+                rows = [json.loads(line) for line in (fx.root / "service.container.clients.jsonl").read_text().splitlines()]
+                self.assertEqual(rows[-1]["event"], "started")
+                self.assertEqual(rows[-1]["identity"], client["identity"])
+                self.assertFalse(target, "target consumed twice")
+                target.update(process=proc, identity=client["identity"], work_deadline=deadline)
+                if not cancel:
+                    self.assertAlmostEqual(deadline, started + 0.7)
+                    resumed = clock()
+                    # Consume most of the ORIGINAL 0.8s, keeping its 0.1s
+                    # cleanup reserve. No new deadline or budget is issued.
+                    double.offset = deadline - started - 0.02
+                    double.clock = lambda: started + clock() - resumed
+                registered.set()
+            return consume(proc, output, event, deadline, **kwargs)
+
+        def finish_target(client, deadline):
+            if client["process"] is target.get("process"):
+                target["cleanup_deadline"] = deadline
+            return finish(client, deadline)
+
+        def diagnostic():
+            return (f"phase={phase!r}; cancel={cancel}; results={results!r}; errors={errors!r}; "
+                    f"calls={double.calls!r}; ready={double.service_ready.is_set()}; "
+                    f"registered={registered.is_set()}; worker_alive={worker.is_alive()}; target={target!r}; "
+                    f"clients={[(p.pid, p.returncode) for p in double.clients]!r}; resources={double.resources!r}; "
+                    f"current_process={runtime.current_process!r}; preparation_client={runtime._preparation_client!r}; "
+                    f"active_execution={runtime._active_execution!r}")
+
         def work():
             try:
                 results.append(runtime.container_gate(gates.CONTAINER, fx.spec, fx.cwd, fx.target,
                     ["make", "verify-pr"], fx.root / "service.raw", 4 if cancel else 0.8))
             except BaseException as error:
-                errors.append(error)
+                errors.append("".join(traceback.format_exception(error)))
         worker = threading.Thread(target=work)
-        with double.hooks():
+        with double.hooks() as hooks:
+            hooks.enter_context(patch.object(container, "consume_output", consume_target))
+            hooks.enter_context(patch.object(runtime, "_finish_owned_client", finish_target))
             worker.start()
             try:
-                self.assertTrue(double.service_ready.wait(2))
+                self.assertTrue(registered.wait(2), diagnostic())
+                self.assertTrue(double.service_ready.is_set(), diagnostic())
                 client = double.blocked_clients[0]
+                self.assertIs(target["process"], client, diagnostic())
                 if cancel:
-                    self.assertFalse(runtime.cancel(old))
-                    self.assertIsNone(client.poll())
-                    self.assertIs(runtime.current_process, client)
-                    self.assertTrue(runtime.cancel(runtime.container_cancel))
+                    self.assertFalse(runtime.cancel(old), diagnostic())
+                    self.assertFalse(runtime.container_cancel.is_set(), diagnostic())
+                    self.assertIsNone(client.returncode, diagnostic())
+                    self.assertIs(runtime.current_process, client, diagnostic())
+                    self.assertTrue(runtime.cancel(runtime.container_cancel), diagnostic())
                 worker.join(0.5 if cancel else 1.2)
-                self.assertFalse(worker.is_alive())
-                self.assertIsNotNone(client.poll())
+                self.assertFalse(worker.is_alive(), diagnostic())
+                # Before fixture.close can kill/reap anything for the product.
+                if cancel:
+                    self.assertIn(client.returncode, (-signal.SIGTERM, -signal.SIGKILL), diagnostic())
+                else:
+                    self.assertEqual(client.returncode, -signal.SIGKILL, diagnostic())
+                    self.assertAlmostEqual(target["cleanup_deadline"], started + 0.8, msg=diagnostic())
+                    self.assertGreater(target["cleanup_deadline"], target["work_deadline"], diagnostic())
+                self.assertFalse(errors, diagnostic())
+                self.assertEqual(len(results), 1, diagnostic())
+                self.assertEqual(results[0]["status"], "CANCELLED" if cancel else "TIMEOUT", diagnostic())
+                self.assert_service_stopped(fx, runtime, double, results[0], diagnostic())
+                stages = [p.removeprefix("postgres-") for p, _ in double.calls if p.startswith("postgres-")]
+                self.assertEqual(stages, ["start", "inspect", "health"][:["start", "inspect", "health"].index(phase) + 1], diagnostic())
             finally:
+                if worker.is_alive():
+                    runtime.cancel(runtime.container_cancel)
+                    worker.join(3)
                 double.close()
-                worker.join(3)
-        self.assertFalse(errors, errors)
-        self.assertEqual(results[0]["status"], "CANCELLED" if cancel else "TIMEOUT")
-        self.assertTrue(results[0]["services"]["postgres"]["cleanup_confirmed"])
-        self.assertFalse(double.resources)
-        self.assertIsNone(runtime.current_process)
-        self.assertTrue(all(p.poll() is not None for p in double.clients))
-        self.assertNotIn("run", [p for p, _ in double.calls], "validation cannot start after service preparation stops")
-        stages = [p.removeprefix("postgres-") for p, _ in double.calls if p.startswith("postgres-")]
-        self.assertEqual(stages, ["start", "inspect", "health"][:["start", "inspect", "health"].index(phase) + 1])
+
+    def test_service_deadline_before_each_target_prevents_dispatch(self):
+        from harness.factory_test_service import ProjectPostgres
+        for phase, command in (("start", "run"), ("inspect", "inspect"), ("health", "exec")):
+            with self.subTest(phase=phase):
+                fx, runtime, double = self.service_fixture(phase)
+                started = double.clock()
+                double.clock = lambda: started
+                original = ProjectPostgres.command
+                expired, cleanup = [], []
+
+                def command_before_deadline(service, args, **kwargs):
+                    if not kwargs.get("cleanup") and args[0] == command:
+                        self.assertTrue(service.attempted)
+                        self.assertAlmostEqual(service.deadline, started + 0.8)
+                        expired.append(phase)
+                        # In particular start is attempted, but NOT dispatched.
+                        double.offset = 1
+                    result = original(service, args, **kwargs)
+                    if kwargs.get("cleanup"):
+                        cleanup.append((args[0], result.returncode))
+                    return result
+
+                with double.hooks(), patch.object(ProjectPostgres, "command", command_before_deadline):
+                    try:
+                        result = runtime.container_gate(gates.CONTAINER, fx.spec, fx.cwd, fx.target,
+                            ["make", "verify-pr"], fx.root / "service.raw", 0.8)
+                        diagnostic = f"phase={phase}; expired={expired!r}; cleanup={cleanup!r}; result={result!r}; calls={double.calls!r}"
+                        self.assertEqual(expired, [phase], diagnostic)
+                        self.assertEqual(result["status"], "TIMEOUT", diagnostic)
+                        self.assertFalse(double.blocked_clients, diagnostic)
+                        self.assertFalse(double.service_ready.is_set(), diagnostic)
+                        stages = [p.removeprefix("postgres-") for p, _ in double.calls if p.startswith("postgres-")]
+                        self.assertEqual(stages, ["start", "inspect", "health"][:["start", "inspect", "health"].index(phase)], diagnostic)
+                        if phase == "start":
+                            self.assertEqual(cleanup, [("inspect", 1), ("ps", 0)], diagnostic)
+                            self.assertTrue(result["services"]["postgres"]["cleanup_absence_confirmed"], diagnostic)
+                            self.assertFalse(result["services"]["postgres"]["cleanup_ownership_confirmed"], diagnostic)
+                        self.assert_service_stopped(fx, runtime, double, result, diagnostic)
+                    finally:
+                        double.close()
+
+    def test_service_cleanup_rejects_existing_foreign_missing_or_invalid_labels(self):
+        from harness.factory_test_service import ProjectPostgres
+        fx, runtime, double = self.service_fixture()
+        with (fx.root / "cleanup.raw").open("wb") as log:
+            service = ProjectPostgres(gates.IMAGE, "cmh-validate-offline-postgres", fx.root,
+                fx.target, fx.spec["mission_id"], threading.Event(), double.clock() + 4, {}, log)
+            service.attempted = True
+            foreign = {**service.labels, "cmh.qa.owner": "another-task"}
+            missing = {key: value for key, value in service.labels.items() if key != "cmh.qa.head"}
+            for labels in (foreign, missing, []):
+                with self.subTest(labels=labels), double.hooks():
+                    double.resources[service.name] = labels
+                    inspected = double.command(["/usr/bin/docker", "inspect", service.name])
+                    self.assertEqual(inspected.returncode, 0)
+                    self.assertEqual(json.loads(inspected.stdout), labels)
+                    service.close()
+                    self.assertEqual(double.resources[service.name], labels)
+                    self.assertFalse(service.evidence["cleanup_confirmed"], service.evidence)
+                    self.assertFalse(service.evidence["cleanup_ownership_confirmed"], service.evidence)
+                    self.assertEqual(service.evidence["cleanup_error_type"], "RuntimeError")
+                    self.assertNotIn("rm", [p for p, _ in double.calls])
 
     def test_service_start_cancel(self): self.stopped_service("start", True)
     def test_service_inspection_cancel(self): self.stopped_service("inspect", True)
