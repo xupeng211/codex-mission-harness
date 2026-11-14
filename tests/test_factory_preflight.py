@@ -479,6 +479,108 @@ class PrepaidPreflightTests(unittest.TestCase):
         self.assertEqual(report["BUDGET_USED"]["unknown_token_reservation"], 240000)
         self.assertEqual(f.report("feature")["BUDGET_USED"], report["BUDGET_USED"])
 
+    def test_planner_receives_real_workspace_facts_and_required_contract(self):
+        self.spec.update(acceptance=["Preserve existing behavior"],
+                         constraints=["Never expand scope"], scope=["score.py"])
+        f = self.factory()
+        for remote in (False, True):
+            with self.subTest(has_remotes=remote):
+                mission = "remote-feature" if remote else "feature"
+                if remote:
+                    f.submit({**self.spec, "mission_id": mission})
+                spec, cwd = f.prepare(mission)
+                if remote:
+                    git(cwd, "remote", "add", "fixture", str(self.repo))
+                # A valid fixture plan stops at a product decision, allowing
+                # inspection of the original agent path without implementation.
+                result = {"output": {"plan": "offline inspection", "tasks": [], "acceptance": [],
+                                     "decisions_required": ["offline control"]},
+                          "usage": {"fixture_provider_calls": 0}}
+                with patch.object(f.runtime, "agent", return_value=result) as agent:
+                    self.assertEqual(f.run(mission)["DELIVERY_STATUS"], "WAITING_PRODUCT_DECISION")
+                payload = agent.call_args.args[3]
+                self.assertEqual(payload["workspace"], {
+                    "base": spec["base"], "dispatch_head": git(cwd, "rev-parse", "HEAD"),
+                    "branch": git(cwd, "rev-parse", "--abbrev-ref", "HEAD"),
+                    "has_remotes": remote})
+                for field in ("objective", "acceptance", "constraints", "scope"):
+                    self.assertEqual(payload[field], spec[field])
+                for rule in ("same version", "missing or changed", "nested rules", "authorization", "Batch independent"):
+                    self.assertIn(rule, payload["execution_guidance"])
+
+    def test_completed_plan_is_reused_after_checkpoint_changes_workspace_head(self):
+        f = self.factory()
+        spec, cwd = f.prepare("feature")
+        before = git(cwd, "rev-parse", "HEAD")
+        payload = {"objective": spec["objective"]}
+        result = f.agent(spec, cwd, "plan", 0, payload)
+        (cwd / "checkpoint.txt").write_text("offline checkpoint\n")
+        self.assertNotEqual(f.checkpoint(spec, cwd)["head"], before)
+        self.assertEqual(f.agent(spec, cwd, "plan", 0, payload), result)
+        self.assertEqual(len(f.runtime.calls), 1)
+        self.assertEqual(f.runtime.calls[0]["payload"]["workspace"]["dispatch_head"], before)
+
+    def test_new_planning_policy_cannot_recover_old_unknown_but_new_mission_can_coexist(self):
+        old_config = self.single_config()
+        old_config["budget"].update(max_agent_runs=5, max_run_tokens=120000, max_total_tokens=600000)
+        f = self.factory(old_config)
+        with patch.object(f.runtime, "agent", side_effect=RuntimeFailure(
+                "offline planning cutoff", {"input_tokens": 38268, "output_tokens": 347})):
+            report = f.run("feature")
+        self.assertEqual(report["DELIVERY_STATUS"], "BLOCKED_BUDGET")
+        self.assertEqual(report["BUDGET_USED"]["committed_tokens"], 158615)
+        snapshots = {table: [tuple(r) for r in f.db.execute(
+            f"SELECT * FROM {table} WHERE {'id' if table == 'missions' else 'mission'}=?", ("feature",))]
+            for table in ("missions", "operations", "events")}
+        evidence = {p: p.read_bytes() for p in (self.root / "state" / "evidence" / "feature").iterdir() if p.is_file()}
+        new_config = copy.deepcopy(f.config)
+        new_config["budget"]["max_plan_tokens"] = 96000
+        newer = Factory(self.root / "state", new_config, AcceptanceRuntime())
+        self.addCleanup(newer.close)
+        with self.assertRaisesRegex(ValueError, "immutable mission authority"):
+            newer.run("feature")
+        newer.submit({**self.spec, "mission_id": "independent-fixture"})
+        fresh = newer.run("independent-fixture")
+        self.assertEqual(fresh["DELIVERY_STATUS"], READY, fresh)
+        self.assertEqual(fresh["BUDGET_USED"]["agent_runs"], 5)
+        for value in (32000, 120000):
+            newer.config["budget"]["max_plan_tokens"] = value
+            with self.assertRaisesRegex(ValueError, "immutable mission authority"):
+                newer.run("independent-fixture")
+        newer.config["budget"]["max_plan_tokens"] = 96000
+        for table, rows in snapshots.items():
+            self.assertEqual([tuple(r) for r in f.db.execute(
+                f"SELECT * FROM {table} WHERE {'id' if table == 'missions' else 'mission'}=?", ("feature",))], rows)
+        self.assertEqual({p: p.read_bytes() for p in evidence}, evidence)
+        with self.assertRaisesRegex(FactoryBlocked, "unresolved operation"):
+            f.operation("feature", "new-fixture-key", "plan", "developer", {}, {}, True,
+                        lambda t: self.fail("UNKNOWN cannot replay"))
+        self.assertEqual(f.report("feature")["BUDGET_USED"]["unknown_token_reservation"], 120000)
+
+    def test_explicit_planning_cutoff_retains_telemetry_unknown_and_full_reservation(self):
+        self.config["budget"].update(max_plan_tokens=96000, max_run_tokens=120000, max_total_tokens=600000)
+        f = self.factory()
+        with patch.object(f.runtime, "agent", side_effect=RuntimeFailure(
+                "offline planning cutoff", {"input_tokens": 96000, "output_tokens": 1})) as agent:
+            report = f.run("feature")
+        self.assertEqual(report["DELIVERY_STATUS"], "BLOCKED_BUDGET")
+        self.assertEqual(agent.call_count, 1)
+        self.assertEqual(f.db.execute("SELECT status FROM operations").fetchone()[0], "UNKNOWN")
+        self.assertEqual(report["BUDGET_USED"]["observed_tokens"], 96001)
+        self.assertEqual(report["BUDGET_USED"]["unknown_token_reservation"], 120000)
+
+    def test_completed_planning_with_explicit_allowance_exceeds_legacy_threshold(self):
+        self.config["budget"].update(max_plan_tokens=96000, max_run_tokens=120000, max_total_tokens=600000)
+        f = self.factory()
+        result = {"output": {"plan": "offline plan", "tasks": [], "acceptance": [],
+                             "decisions_required": ["offline control"]},
+                  "usage": {"input_tokens": 38268, "output_tokens": 347}}
+        with patch.object(f.runtime, "agent", return_value=result):
+            report = f.run("feature")
+        self.assertEqual(report["DELIVERY_STATUS"], "WAITING_PRODUCT_DECISION")
+        self.assertEqual(report["BUDGET_USED"]["observed_tokens"], 38615)
+        self.assertEqual(report["BUDGET_USED"]["unknown_token_reservation"], 0)
+
 
 class DockerHelpBoundaryTests(unittest.TestCase):
     def test_client_help_and_container_help_across_direct_shell_and_make_gates(self):
@@ -565,6 +667,26 @@ class PlanningGuardTests(unittest.TestCase):
     def test_planning_limits_only_reduce_existing_authority(self):
         self.assertEqual(planning_limits({"max_run_tokens": 240000}, 900), {"max_tokens": 32000, "timeout_seconds": 120})
         self.assertEqual(planning_limits({"max_run_tokens": 100}, 3), {"max_tokens": 100, "timeout_seconds": 3})
+        self.assertEqual(planning_limits({"max_run_tokens": 120000, "max_plan_tokens": 96000}, 900),
+                         {"max_tokens": 96000, "timeout_seconds": 120})
+
+    def test_explicit_planning_budget_validation_and_legacy_config_compatibility(self):
+        config = fixture_config()
+        self.assertNotIn("max_plan_tokens", validate_config(config)["budget"])
+        config["budget"].update(max_run_tokens=120000, max_total_tokens=600000)
+        for value in (1, 96000, 120000):
+            with self.subTest(valid=value):
+                config["budget"]["max_plan_tokens"] = value
+                self.assertEqual(validate_config(config)["budget"]["max_plan_tokens"], value)
+        for value in (True, False, 0, -1, 96000.0, "96000", None, [], {}, 120001):
+            with self.subTest(invalid=value):
+                config["budget"]["max_plan_tokens"] = value
+                with self.assertRaises(ValueError):
+                    validate_config(config)
+        legacy = fixture_config()
+        legacy["budget"]["max_plan_tokens"] = 1
+        with self.assertRaisesRegex(ValueError, "max_run_tokens"):
+            validate_config(legacy)
 
     def test_runtime_applies_planning_limits_to_native_watchdog_and_proxy_observer(self):
         runtime = LocalRuntime()
@@ -579,6 +701,14 @@ class PlanningGuardTests(unittest.TestCase):
         self.assertEqual(args[-1], 32000)
         prompt = json.loads(server.execute.call_args.args[0])
         self.assertEqual(prompt["planning_resource_guard"]["physical_token_ceiling"], "NOT_GUARANTEED")
+        runtime.resource_policy.update(max_plan_tokens=96000)
+        with patch("harness.factory_runtime.FactoryAppServer", return_value=server) as constructor:
+            runtime.agent("plan", {}, Path("/fixture"), {"objective": "fixture"}, Path("/fixture.raw"), 900, [])
+        self.assertEqual(constructor.call_args.args[3], 120)
+        self.assertEqual(constructor.call_args.args[-1], 96000)
+        guard = json.loads(server.execute.call_args.args[0])["planning_resource_guard"]
+        self.assertEqual(guard["max_tokens"], 96000)
+        self.assertIn("cached input once", guard["instruction"])
         runtime.resource_policy = {"max_run_tokens": 12, "max_first_turn_tokens": 60000,
                                   "max_repair_incremental_tokens": 36000}
         with patch("harness.factory_runtime.FactoryAppServer", return_value=server) as constructor:

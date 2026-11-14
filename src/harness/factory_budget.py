@@ -21,7 +21,8 @@ ROUNDS = {"small": 3, "standard": 5, "large": 7}
 
 def planning_limits(budget, timeout):
     """Runtime restrictions, not a new authorization or a physical billing cap."""
-    return {"max_tokens": min(budget.get("max_run_tokens", 32000), 32000),
+    return {"max_tokens": min(budget.get("max_run_tokens", 32000),
+                              budget.get("max_plan_tokens", 32000)),
             "timeout_seconds": min(timeout, 120)}
 
 
