@@ -341,50 +341,113 @@ class RemainingPreparationTests(unittest.TestCase):
 
     def stopped_source_query(self, phase, cancel):
         clients, results, errors = [], [], []
+        target, progress = {}, {"stage": "preparation"}
         ready = threading.Event()
+        clock = self.double.clock
+        started = clock()
         original = self.double.popen
         def launch(argv, *args, **kwargs):
             if argv[-1] == phase and "-c" in argv and "from harness.factory_container import binding" in argv[4]:
                 proc = self.double.real_popen([sys.executable, "-B", "-c", "import time; time.sleep(30)"], **kwargs)
                 self.double.clients.append(proc)
                 clients.append(proc)
-                ready.set()
+                progress["stage"] = phase + " client created"
                 return proc
             return original(argv, *args, **kwargs)
         self.double.popen = launch
         # Retain a reference before patching the gate's query function.
         real_query = container.source_check
+        consume = container.consume_output
+        finish = self.runtime._finish_owned_client
         def selected_query(runtime, request, stage, log, event, deadline, **kwargs):
+            progress["stage"] = stage + " query"
             if stage == phase:
                 return real_query(runtime, request, stage, log, event, deadline, **kwargs)
             return gates.local_source_check(runtime, request, stage, log, event, deadline, **kwargs)
+        def consume_target(proc, output, event, deadline, **kwargs):
+            if clients and proc is clients[0]:
+                client = self.runtime._preparation_client
+                self.assertIs(self.runtime.current_process, proc)
+                self.assertIs(client["process"], proc)
+                self.assertIs(client["execution"], self.runtime._active_execution)
+                self.assertEqual(client["identity"]["pid"], proc.pid)
+                self.assertFalse(target, "target query consumed twice")
+                target.update(process=proc, work_deadline=deadline)
+                if not cancel:
+                    # Preparation has its own deadline tests. Exercise this
+                    # client's stop inside the ORIGINAL 0.8s gate budget,
+                    # retaining its 0.1s shutdown reserve, not a new deadline.
+                    self.assertAlmostEqual(deadline, started + 0.7)
+                    target["resumed"] = clock()
+                progress["stage"] = phase + " client consuming"
+                # Popen returns before runtime registration; signal only now.
+                ready.set()
+            return consume(proc, output, event, deadline, **kwargs)
+        def finish_target(client, deadline):
+            if client["process"] is target.get("process"):
+                progress["stage"] = phase + " client cleanup"
+                target["cleanup_deadline"] = deadline
+            return finish(client, deadline)
+        def diagnostic():
+            return (f"results={results!r}; errors={errors!r}; last_stage={progress['stage']}; "
+                    f"worker_alive={worker.is_alive()}; ready={ready.is_set()}; "
+                    f"clients={[(p.pid, p.returncode) for p in clients]!r}; "
+                    f"current_process={self.runtime.current_process!r}; target={target!r}")
         def work():
             try:
                 results.append(self.runtime.container_gate(gates.CONTAINER, self.fx.spec, self.fx.cwd,
                     self.fx.target, ["make", "verify-targeted"], self.fx.root / (phase + ".raw"), 4 if cancel else 0.8))
             except BaseException as error:
-                errors.append(error)
+                errors.append("".join(traceback.format_exception(error)))
         worker = threading.Thread(target=work)
-        with self.double.hooks(), patch("harness.factory_container.source_check", side_effect=selected_query):
+        if not cancel:
+            def query_clock():
+                # Only the gate worker uses test time. Event.wait, join and
+                # fixture cleanup in the main thread retain real time.
+                if threading.current_thread() is not worker:
+                    return clock()
+                if "resumed" not in target:
+                    return started
+                return target["work_deadline"] - 0.02 + clock() - target["resumed"]
+            self.double.clock = query_clock
+        with self.double.hooks() as hooks:
+            hooks.enter_context(patch.object(container, "source_check", side_effect=selected_query))
+            hooks.enter_context(patch.object(container, "consume_output", consume_target))
+            hooks.enter_context(patch.object(self.runtime, "_finish_owned_client", finish_target))
             worker.start()
             try:
-                self.assertTrue(ready.wait(2))
+                self.assertTrue(ready.wait(2), diagnostic())
                 if cancel:
                     self.assertIs(self.runtime.current_process, clients[0])
                     self.assertTrue(self.runtime.cancel(self.runtime.container_cancel))
                 worker.join(0.5 if cancel else 1.2)
-                self.assertFalse(worker.is_alive(), "source/Git/policy query ignored execution boundary")
-                self.assertIsNotNone(clients[0].poll())
+                self.assertFalse(worker.is_alive(), diagnostic())
+                # Assert production cleanup before fixture.close can help.
+                self.assertIsNotNone(clients[0].returncode, diagnostic())
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(clients[0].pid, os.WNOHANG)
+                self.assertFalse(errors, diagnostic())
+                self.assertEqual(len(results), 1, diagnostic())
+                result = results[0]
+                self.assertEqual(result["status"], "CANCELLED" if cancel else "TIMEOUT", diagnostic())
+                self.assertFalse(result["source_unchanged"])
+                self.assertFalse(self.double.resources)
+                self.assertIsNone(self.runtime.current_process)
+                self.assertIsNone(self.runtime._preparation_client)
+                self.assertIsNone(self.runtime._active_execution)
+                for key in ("cleanup_confirmed", "preparation_cleanup_confirmed",
+                            "local_clients_stop_confirmed", "temporary_directory_cleanup_confirmed"):
+                    self.assertTrue(result[key], diagnostic())
+                for client in result["preparation_clients"]:
+                    self.assertTrue(client["confirmed"] and client["leader_reaped"], diagnostic())
+                if phase != "final": self.assertNotIn("run", [p for p, _ in self.double.calls])
+                else: self.assertEqual(result["exit_code"], 0, "retain the already exited validation result")
+                if not cancel:
+                    self.assertAlmostEqual(target["cleanup_deadline"], started + 0.8)
+                    self.assertGreater(target["cleanup_deadline"], target["work_deadline"])
             finally:
                 self.double.close()
                 worker.join(3)
-        self.assertFalse(errors, errors)
-        self.assertEqual(results[0]["status"], "CANCELLED" if cancel else "TIMEOUT")
-        self.assertFalse(results[0]["source_unchanged"])
-        self.assertFalse(self.double.resources)
-        self.assertIsNone(self.runtime.current_process)
-        if phase != "final": self.assertNotIn("run", [p for p, _ in self.double.calls])
-        else: self.assertEqual(results[0]["exit_code"], 0, "retain the already exited validation result")
 
     def test_candidate_query_cancel(self): self.stopped_source_query("candidate", True)
     def test_candidate_query_deadline(self): self.stopped_source_query("candidate", False)
