@@ -61,6 +61,33 @@ Model/profile identity is lane-local. OpenAI uses official selected configuratio
 
 Operator authority fixes run budget, timeout, rework rounds, commands, capacity and independence at mission creation. It cannot increase on resume. SQLite transactionally reserves before dispatch. Failure/UNKNOWN consumes its run reservation. Completed accounting cannot be edited, deleted or refunded. Historical UNKNOWN is never backfilled from later requests.
 
+`budget.max_plan_tokens` optionally sets the planning observation threshold. Omission
+retains `min(max_run_tokens, 32000)` (32000 for legacy call-only budgets); an explicit
+value must be a positive integer, not a boolean, and requires an authorized
+`max_run_tokens` at least as large. It is part of the immutable mission policy:
+adding, removing or changing it cannot resume an old mission under new authority.
+For example, a newly authorized budget with `max_run_tokens: 120000` and
+`max_plan_tokens: 96000` uses 96000 for planning; this is an opt-in policy choice,
+not a new default or a promise that a real plan will complete. Runtime and retained
+result checks share `planning_limits`; planning remains bounded to 120 seconds
+and the remaining mission authority. Other stages and UNKNOWN reservations are
+unchanged. Token observations are cumulative input plus output, with cached input
+included once. Notifications may arrive after an overrun: neither this threshold,
+native rollout configuration nor logical reservations guarantee a physical token
+ceiling, internal request count, subscription usage or monetary limit.
+
+Planning receives Controller-observed BASE, dispatch HEAD, branch and whether the
+candidate actually has remotes. These dispatch facts do not invalidate a completed
+plan's cache key after a later implementation checkpoint; they are retained in
+the durable operation input and evidence envelope for the original dispatch.
+Reading guidance avoids
+reprinting instructions only when their automatic loading and same version are
+confirmed; missing/changed instructions, required workflow documents, applicable
+nested rules, scope, authorization and acceptance remain mandatory. It encourages
+batched independent reads and targeted excerpts without changing tool permissions
+or supplying the plan on the planner's behalf. Actual token savings remain unproven
+until a separately authorized real trial.
+
 Budget units are agent executions, not dollars or internal Codex model requests. Native subagent fan-out is disabled to avoid an unregistered execution tree; role/task threads still use the official runtime. Real money remains UNKNOWN; Provider account limits are necessary for a monetary ceiling. Fixture telemetry explicitly records zero real Provider calls and cannot become a formal receipt.
 
 Known completed results are reused after envelope and raw-file hash verification. A proven completed malformed review allows one separately charged validation attempt. Lost requests never automatically replay. Controller death with a reservation but no trustworthy completion is UNKNOWN. A published implementation receipt can recover its pending Git checkpoint without repeating that paid execution. A per-mission POSIX lock prevents concurrent controllers from racing source/dispatch. GNU `timeout` also bounds the App Server process independently of controller reads; controller death cannot leave an unlimited paid runtime.

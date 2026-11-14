@@ -804,7 +804,7 @@ class LocalRuntime:
             token_limit, timeout = limits["max_tokens"], limits["timeout_seconds"]
             payload = {**payload, "planning_resource_guard": {
                 **limits, "physical_token_ceiling": "NOT_GUARANTEED",
-                "instruction": "Use targeted searches and small excerpts. Do not dump the repository, generated bundles or unrelated documentation. Stop exploring once you can return a bounded actionable plan; if essential information is missing, state the unresolved decision. Do not repeat broad scans."}}
+                "instruction": "This is a cumulative input-plus-output observation threshold, including cached input once, not a physical token or monetary cap. Notifications may arrive after an overrun. Use targeted searches and necessary excerpts while preserving all required instructions, contracts and acceptance. Stop exploring once you can return a bounded actionable plan; if essential information is missing, state the unresolved decision. Do not repeat broad scans."}}
         protected = (cwd / payload["mission_scope_file"],) if payload.get("mission_scope_file") else ()
         binding = (json.dumps(profile, sort_keys=True), str(cwd.resolve()), tuple(map(str, denied_roots)))
         if reuse_session and self._single_server is not None:

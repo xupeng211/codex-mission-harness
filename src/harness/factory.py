@@ -162,7 +162,7 @@ def validate_config(raw: dict) -> dict:
         raise ValueError("trusted QA/PR CI and Controller execution policies cannot be mixed")
     budget = config.get("budget")
     budget_fields = {"max_agent_runs", "max_total_tokens", "max_run_tokens", "max_wall_seconds",
-                     "max_first_turn_tokens", "max_repair_incremental_tokens"}
+                     "max_first_turn_tokens", "max_repair_incremental_tokens", "max_plan_tokens"}
     if not isinstance(budget, dict) or "max_agent_runs" not in budget or set(budget) - budget_fields:
         raise ValueError("invalid mission resource authority; monetary usage remains UNKNOWN")
     if ("max_total_tokens" in budget) != ("max_run_tokens" in budget):
@@ -170,6 +170,10 @@ def validate_config(raw: dict) -> dict:
     for name, upper in (("max_total_tokens", 100_000_000), ("max_run_tokens", 2_000_000), ("max_wall_seconds", 86400)):
         if name in budget:
             bounded_int(budget[name], name, 1, upper)
+    if "max_plan_tokens" in budget:
+        bounded_int(budget["max_plan_tokens"], "max_plan_tokens", 1, 2_000_000)
+        if budget["max_plan_tokens"] > budget.get("max_run_tokens", 0):
+            raise ValueError("planning token authority exceeds authorized max_run_tokens")
     staged_fields = {"max_first_turn_tokens", "max_repair_incremental_tokens"}
     if bool(staged_fields & set(budget)) and not staged_fields <= set(budget):
         raise ValueError("first-turn and repair token authorities must be specified together")
@@ -811,6 +815,15 @@ class Factory:
                     "repository": spec["repository"], "base": spec["base"], "dispatch_head": git(cwd, "rev-parse", "HEAD"),
                     "scope": spec["scope"]}
         key = digest({"stage": stage, "round": round_, "profile": profile_identity, "payload": payload})
+        if stage == "plan":
+            # Dispatch facts are not part of the cache key: a checkpoint may
+            # advance HEAD before a completed plan is consumed on resume. They
+            # still belong in the durable input and evidence for this dispatch.
+            payload = {**payload, "workspace": {
+                "base": spec["base"], "dispatch_head": identity["dispatch_head"],
+                "branch": git(cwd, "rev-parse", "--abbrev-ref", "HEAD"),
+                "has_remotes": bool(git(cwd, "remote")),
+            }}
         call_payload = dict(payload)
         if "model_selection" in profile_identity and not self.config["simulation"]:
             call_payload["_authorized_route"] = profile_identity["route_identity"]
@@ -1843,6 +1856,14 @@ class Factory:
             elif row["status"] in ("UNKNOWN", "BLOCKED_BUDGET", "BLOCKED_SCOPE", "BLOCKED_LIMIT", "BLOCKED_VALIDATION"):
                 return self.report(mission)
             planning_payload = {"objective": spec["objective"], "acceptance": spec["acceptance"], "constraints": spec["constraints"],
+                                "execution_guidance": (
+                                    "Follow all applicable repository instructions, scope, authorization contracts and acceptance requirements. "
+                                    "Only instructions confirmed automatically loaded at the same version need not be printed in full again. "
+                                    "Read missing or changed instructions, required workflow documents and applicable nested rules. "
+                                    "Use the Controller workspace facts for BASE and dispatch identity; if has_remotes is false, "
+                                    "do not query origin/main or fetch. Batch independent reads where appropriate, "
+                                    "use targeted searches and necessary excerpts, and return the bounded plan once information is sufficient. "
+                                    "Never omit necessary context or requirements to save tokens."),
                                 "scope": spec["scope"], "instruction": "Act as technical lead. Understand the repository, plan a minimal complete solution and acceptance tests. Decide ordinary engineering questions yourself. Only unresolved major product ambiguity, safety, independence, budget or irreversible changes belong in decisions_required. Do not edit files. Return plan, bounded tasks, acceptance and decisions_required."}
             # Reconciliation may find an implementation awaiting its controller
             # checkpoint. A cached plan is read before touching that working tree.

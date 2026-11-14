@@ -216,6 +216,27 @@ class NativeProtocolTests(unittest.TestCase):
         self.assertEqual(repair["sampling_token_weight"], 1.0)
         self.assertEqual(repair["prefill_token_weight"], 1.0)
 
+    def test_explicit_planning_allowance_preserves_native_instructions_without_inference(self):
+        instructions = self.cwd / "AGENTS.md"
+        instructions.write_text("# Required policy\nPreserve scope, acceptance and independent review.\n")
+        limits = planning_limits({"max_run_tokens": 120000, "max_plan_tokens": 96000}, 900)
+        server = FactoryAppServer({"provider": "openai", "model": "offline-protocol-no-inference",
+            "codex_home": str(self.auth)}, self.cwd, self.root / "plan.raw",
+            limits["timeout_seconds"], [self.root / "state", self.source], True, False, limits["max_tokens"])
+        self.addCleanup(server.close)
+        server.start_or_resume(None, str(self.cwd))
+        effective = server._request("config/read", {"includeLayers": False})["config"]
+        self.assertEqual(effective["features"]["rollout_budget"]["limit_tokens"], 96000)
+        self.assertEqual(server.runtime_identity["native_runtime"]["execution_limits"],
+                         {"token_limit": 96000, "timeout_seconds": 120, "physical_token_ceiling": "NOT_GUARANTEED"})
+        started = next(e["result"] for e in server.events if "thread" in e.get("result", {}))
+        self.assertIn(str(instructions), started["instructionSources"])
+        params = server._thread_policy_params(str(self.cwd))
+        self.assertEqual(params["config"]["features"]["rollout_budget"]["limit_tokens"], 96000)
+        self.assertNotIn("baseInstructions", params)
+        self.assertNotIn("project_doc_max_bytes", params["config"])
+        self.assertFalse(any(e.get("method") == "turn/started" for e in server.events))
+
     def test_efficiency_guidance_preserves_native_repository_instruction_loading(self):
         instructions = self.cwd / "AGENTS.md"
         instructions.write_text("# Repository policy\nNever bypass regression tests or independent QA.\n")
