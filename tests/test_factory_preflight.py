@@ -12,11 +12,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from harness.factory import Factory, FactoryBlocked, READY, digest, git, validate_config
+from harness.factory import Factory, FactoryBlocked, READY, digest, encoded, git, validate_config
 from harness.factory_budget import planning_limits
 from harness.factory_fixture import AcceptanceRuntime, fixture_config
 from harness.factory_preflight import CONFIG_BYTES, MAKE_BYTES, committed_text, docker_gate, inspect_prepaid, make_docker_dependency, text_capacity, workflow_push
 from harness.factory_runtime import FactoryAppServer, LocalRuntime, RuntimeFailure
+
+
+LEGACY_PLAN_INSTRUCTION = "Act as technical lead. Understand the repository, plan a minimal complete solution and acceptance tests. Decide ordinary engineering questions yourself. Only unresolved major product ambiguity, safety, independence, budget or irreversible changes belong in decisions_required. Do not edit files. Return plan, bounded tasks, acceptance and decisions_required."
 
 
 class PrepaidPreflightTests(unittest.TestCase):
@@ -650,7 +653,7 @@ class PrepaidPreflightTests(unittest.TestCase):
             return digest({"stage": "plan", "round": 0, "profile": profile, "payload": value})
         self.assertEqual(key(payload), operation["key"])
         legacy = copy.deepcopy(payload)
-        legacy["instruction"] = "Act as technical lead. Understand the repository, plan a minimal complete solution and acceptance tests. Decide ordinary engineering questions yourself. Only unresolved major product ambiguity, safety, independence, budget or irreversible changes belong in decisions_required. Do not edit files. Return plan, bounded tasks, acceptance and decisions_required."
+        legacy["instruction"] = LEGACY_PLAN_INSTRUCTION
         self.assertNotEqual(key(legacy), operation["key"])
         before = {t: [tuple(r) for r in f.db.execute(f"SELECT * FROM {t}")]
                   for t in ("missions", "operations", "events", "approvals")}
@@ -659,10 +662,186 @@ class PrepaidPreflightTests(unittest.TestCase):
         with patch.object(f.runtime, "agent", side_effect=AssertionError("cached plan must not call transport")):
             self.assertEqual(f.agent(spec, cwd, "plan", 0, payload)["output"]["decisions_required"],
                              ["offline unresolved authority"])
-        # A changed prompt is a different operation, not a cache migration or
-        # replan authorization. Do not invoke the unmatched key in this test.
+        # Same-key reuse remains unchanged; the actual mismatching-key run
+        # paths are exercised separately below, without touching real state.
         self.assertEqual({t: [tuple(r) for r in f.db.execute(f"SELECT * FROM {t}")] for t in before}, before)
         self.assertEqual(Path(operation["evidence"]).read_bytes(), evidence)
+
+    def legacy_planner(self, factory):
+        """Publish an immutable old-prompt receipt through the real agent path."""
+        original = factory.agent
+        def agent(spec, cwd, stage, round_, payload):
+            if stage == "plan":
+                payload = {**payload, "instruction": LEGACY_PLAN_INSTRUCTION}
+            return original(spec, cwd, stage, round_, payload)
+        return patch.object(factory, "agent", side_effect=agent)
+
+    def planning_snapshot(self, factory, mission):
+        cwd = Path(factory.row(mission)["candidate"])
+        return {
+            "operations": [tuple(r) for r in factory.db.execute(
+                "SELECT * FROM operations WHERE mission=? ORDER BY id", (mission,))],
+            "reservations": [tuple(r) for r in factory.db.execute(
+                "SELECT * FROM events WHERE mission=? AND kind='reserved' ORDER BY sequence", (mission,))],
+            "evidence": {str(p): p.read_bytes() for p in (factory.root / "evidence" / mission).iterdir() if p.is_file()},
+            "candidate": {str(p.relative_to(cwd)): p.read_bytes() for p in cwd.rglob("*")
+                          if p.is_file() and ".git" not in p.relative_to(cwd).parts},
+            "head": git(cwd, "rev-parse", "HEAD"),
+            "dirty": git(cwd, "status", "--porcelain", "--untracked-files=all"),
+            "budget": factory.report(mission)["BUDGET_USED"],
+        }
+
+    def test_changed_plan_key_blocks_real_run_before_any_reservation_or_reimplementation(self):
+        for index, status in enumerate(("WAITING_PRODUCT_DECISION", "IMPLEMENT", "TEST", "CI", "REVIEW", "REWORK")):
+            with self.subTest(status=status):
+                mission = f"legacy-resume-{index}"
+                self.spec["mission_id"] = mission
+                config = self.single_config()
+                config["budget"].update(max_agent_runs=12, max_run_tokens=120000,
+                                        max_total_tokens=1440000, max_wall_seconds=7200)
+                f = self.factory(config)
+                if status == "WAITING_PRODUCT_DECISION":
+                    plan = {"output": {"plan": "Legacy bounded plan", "tasks": ["Implement with regressions"],
+                                       "acceptance": ["Preserve add"], "decisions_required": ["Owner decision"]},
+                            "usage": {"fixture_provider_calls": 0}}
+                    with self.legacy_planner(f), patch.object(f.runtime, "agent", return_value=plan):
+                        self.assertEqual(f.run(mission)["DELIVERY_STATUS"], status)
+                elif status == "IMPLEMENT":
+                    # Crash after COMPLETE implementation, before Git checkpoint.
+                    with self.legacy_planner(f), patch.object(f, "checkpoint", side_effect=KeyboardInterrupt), \
+                         self.assertRaises(KeyboardInterrupt):
+                        f.run(mission)
+                elif status in ("TEST", "CI"):
+                    original_gates = f.gates
+                    def gates(spec, cwd, target, kind, round_):
+                        if kind == ("checks" if status == "TEST" else "ci"):
+                            raise KeyboardInterrupt("offline controller interruption")
+                        return original_gates(spec, cwd, target, kind, round_)
+                    with self.legacy_planner(f), patch.object(f, "gates", side_effect=gates), \
+                         self.assertRaises(KeyboardInterrupt):
+                        f.run(mission)
+                elif status == "REVIEW":
+                    with self.legacy_planner(f), patch.object(f, "review", side_effect=KeyboardInterrupt), \
+                         self.assertRaises(KeyboardInterrupt):
+                        f.run(mission)
+                else:
+                    original_agent = f.agent
+                    def stop_rework(spec, cwd, stage, round_, payload):
+                        if stage == "rework":
+                            raise KeyboardInterrupt("before rework reservation")
+                        if stage == "plan":
+                            payload = {**payload, "instruction": LEGACY_PLAN_INSTRUCTION}
+                        return original_agent(spec, cwd, stage, round_, payload)
+                    with patch.object(f, "agent", side_effect=stop_rework), self.assertRaises(KeyboardInterrupt):
+                        f.run(mission)
+                self.assertEqual(f.row(mission)["status"], status)
+                old_plan = f.db.execute("SELECT * FROM operations WHERE mission=? AND stage='plan'", (mission,)).fetchone()
+                self.assertEqual(old_plan["status"], "COMPLETE")
+                self.assertEqual(json.loads(old_plan["input"])["instruction"], LEGACY_PLAN_INSTRUCTION)
+                self.assertEqual(f.uncertain_operations(mission), [])
+                before = self.planning_snapshot(f, mission)
+                self.assertLess(before["budget"]["agent_runs"], config["budget"]["max_agent_runs"])
+                self.assertLess(before["budget"]["committed_tokens"] + 120000, 1440000)
+                # Reopen from persisted fixture state; current prompt is now in use.
+                newer = Factory(f.root, f.config, AcceptanceRuntime())
+                self.addCleanup(newer.close)
+                with patch.object(newer.runtime, "agent") as model, patch.object(newer.runtime, "gate") as gate, \
+                     patch.object(newer, "checkpoint") as checkpoint, \
+                     patch.object(newer, "operation", wraps=newer.operation) as dispatch, \
+                     patch.object(newer, "verify_evidence", wraps=newer.verify_evidence) as verify:
+                    report = newer.run(mission)
+                    self.assertEqual(report["DELIVERY_STATUS"], "BLOCKED_LIMIT", report)
+                    self.assertIn("completed plan key differs", report["BLOCKERS_REMAINING"][0])
+                    self.assertEqual(dispatch.call_count, 1)
+                    self.assertEqual(dispatch.call_args.args[2], "plan")
+                    self.assertNotEqual(dispatch.call_args.args[1], old_plan["key"])
+                    verify.assert_called_once()
+                    self.assertEqual(verify.call_args.args[0]["id"], old_plan["id"])
+                    self.assertEqual(newer.run(mission)["DELIVERY_STATUS"], "BLOCKED_LIMIT")
+                    self.assertEqual(dispatch.call_count, 1)  # Stable stopped state.
+                    model.assert_not_called()
+                    gate.assert_not_called()
+                    checkpoint.assert_not_called()
+                self.assertEqual(self.planning_snapshot(newer, mission), before)
+
+    def test_planning_evidence_failure_blocks_changed_and_matching_keys(self):
+        cases = ("missing", "changed", "raw_missing", "misbound", "invalid_json", "same_key_misbound")
+        for index, damage in enumerate(cases):
+            with self.subTest(damage=damage):
+                mission = f"damaged-plan-{index}"
+                self.spec["mission_id"] = mission
+                f = self.factory(self.single_config())
+                result = {"output": {"plan": "Bounded plan", "tasks": ["Implement regression"],
+                                     "acceptance": ["Preserve add"], "decisions_required": ["Owner decision"]},
+                          "usage": {"fixture_provider_calls": 0}}
+                def encode(value):
+                    if isinstance(value, dict) and set(value) == {"operation", "identity", "input", "result"}:
+                        if damage in ("misbound", "same_key_misbound"):
+                            value = {**value, "operation": "another-operation"}
+                        elif damage == "invalid_json":
+                            return "not JSON"
+                    return encoded(value)
+                def publish(*args):
+                    args[4].write_text("offline fake transport response")
+                    return result
+                # Malformed/misbound receipts are published before COMPLETE,
+                # with correct hashes; no immutable operation is rewritten.
+                with patch("harness.factory.encoded", side_effect=encode), \
+                     patch.object(f.runtime, "agent", side_effect=publish):
+                    if damage == "same_key_misbound":
+                        f.run(mission)
+                    else:
+                        with self.legacy_planner(f):
+                            f.run(mission)
+                op = f.db.execute("SELECT * FROM operations WHERE mission=?", (mission,)).fetchone()
+                path = Path(op["evidence"])
+                if damage == "missing":
+                    path.unlink()
+                elif damage == "changed":
+                    path.chmod(0o600)
+                    path.write_text("changed fixture evidence")
+                elif damage == "raw_missing":
+                    raw = json.loads(op["result"])["raw_evidence"][0]["path"]
+                    Path(raw).unlink()
+                before = self.planning_snapshot(f, mission)
+                with patch.object(f.runtime, "agent") as model, patch.object(f.runtime, "gate") as gate:
+                    report = f.run(mission)
+                    self.assertEqual(report["DELIVERY_STATUS"], "UNKNOWN", report)
+                    reason = report["BLOCKERS_REMAINING"][0]
+                    self.assertIn("evidence", reason)
+                    if damage in ("misbound", "invalid_json", "same_key_misbound"):
+                        self.assertIn("binding", reason)
+                    self.assertEqual(f.run(mission)["DELIVERY_STATUS"], "UNKNOWN")
+                    model.assert_not_called()
+                    gate.assert_not_called()
+                self.assertEqual(self.planning_snapshot(f, mission), before)
+
+    def test_same_key_completed_plan_and_implementation_resume_normally(self):
+        f = self.factory(self.single_config())
+        with patch.object(f, "checkpoint", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            f.run("feature")
+        before = [tuple(r) for r in f.db.execute("SELECT * FROM operations ORDER BY id")]
+        self.assertEqual(len(before), 2)  # COMPLETE plan and implementation.
+        newer = Factory(f.root, f.config, AcceptanceRuntime())
+        self.addCleanup(newer.close)
+        with patch.object(newer, "verify_evidence", wraps=newer.verify_evidence) as verify:
+            self.assertEqual(newer.run("feature")["DELIVERY_STATUS"], READY)
+        self.assertTrue(verify.called)
+        self.assertEqual([call["role"] for call in newer.runtime.calls], ["review", "rework", "review"])
+        for old in before:
+            self.assertEqual(tuple(newer.db.execute("SELECT * FROM operations WHERE id=?", (old[0],)).fetchone()), old)
+
+    def test_ready_legacy_delivery_is_not_replanned_or_reimplemented(self):
+        f = self.factory(self.single_config())
+        with self.legacy_planner(f):
+            self.assertEqual(f.run("feature")["DELIVERY_STATUS"], READY)
+        before = self.planning_snapshot(f, "feature")
+        with patch.object(f.runtime, "agent") as model, patch.object(f.runtime, "gate") as gate:
+            self.assertEqual(f.run("feature")["DELIVERY_STATUS"], READY)
+            self.assertEqual(f.run("feature")["DELIVERY_STATUS"], READY)
+            model.assert_not_called()
+            gate.assert_not_called()
+        self.assertEqual(self.planning_snapshot(f, "feature"), before)
 
     def test_new_planning_policy_cannot_recover_old_unknown_but_new_mission_can_coexist(self):
         old_config = self.single_config()

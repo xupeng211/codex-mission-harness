@@ -795,6 +795,15 @@ class Factory:
         evidence = Path(operation["evidence"] or "")
         if not evidence.is_file() or evidence.is_symlink() or evidence.resolve() != evidence or hashlib.sha256(evidence.read_bytes()).hexdigest() != operation["evidence_hash"]:
             raise FactoryBlocked("UNKNOWN", "operation evidence is missing or changed")
+        if operation["stage"] == "plan":
+            try:
+                envelope = json.loads(evidence.read_bytes())
+                expected = {"operation": operation["id"], "identity": json.loads(operation["identity"]),
+                            "input": json.loads(operation["input"]), "result": json.loads(operation["result"])}
+                if envelope != expected:
+                    raise ValueError("planning envelope differs from its operation")
+            except (OSError, ValueError, TypeError) as error:
+                raise FactoryBlocked("UNKNOWN", "planning evidence binding is invalid") from error
         for raw in json.loads(operation["result"]).get("raw_evidence", []):
             path = Path(raw["path"])
             if not path.is_file() or path.is_symlink() or path.resolve() != path or hashlib.sha256(path.read_bytes()).hexdigest() != raw["sha256"]:
@@ -803,6 +812,18 @@ class Factory:
             path = Path(raw["path"])
             if not path.is_file() or path.is_symlink() or path.resolve() != path or hashlib.sha256(path.read_bytes()).hexdigest() != raw["sha256"]:
                 raise FactoryBlocked("UNKNOWN", "canonical project evidence is missing or changed")
+
+    def guard_plan_cache_miss(self, mission):
+        """Agent preparation hook: after cache/stop checks, before reservation."""
+        completed = self.db.execute(
+            "SELECT * FROM operations WHERE mission=? AND stage='plan' AND status='COMPLETE'",
+            (mission,)).fetchall()
+        for plan in completed:
+            self.verify_evidence(plan)
+        if completed:
+            # A changed prompt/profile is not authority to buy another plan
+            # or repeat implementation against the same candidate.
+            raise FactoryBlocked("BLOCKED_LIMIT", "completed plan key differs; no new paid planning or implementation authorized")
 
     def agent(self, spec, cwd, stage, round_, payload):
         candidate_stage.check_dispatch(self, spec["mission_id"], stage)
@@ -828,9 +849,10 @@ class Factory:
         if "model_selection" in profile_identity and not self.config["simulation"]:
             call_payload["_authorized_route"] = profile_identity["route_identity"]
         return self.operation(spec["mission_id"], key, stage, lane, identity, payload, True,
-                              lambda transcript: self.runtime.agent(stage, profile, cwd, call_payload, transcript,
-                                                                    self.operation_timeout(spec["mission_id"]),
-                                                                    [self.root, Path(spec["repository"])]))
+                              lambda transcript, prepared=None: self.runtime.agent(stage, profile, cwd, call_payload, transcript,
+                                                                                  self.operation_timeout(spec["mission_id"]),
+                                                                                  [self.root, Path(spec["repository"])]),
+                              prepare=(lambda: self.guard_plan_cache_miss(spec["mission_id"])) if stage == "plan" else None)
 
     def review_context(self, spec, cwd, target, lane):
         # Fresh, isolated repository for EACH lane. It has no prior findings,

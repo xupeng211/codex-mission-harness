@@ -128,12 +128,21 @@ unresolved facts are clear; planning does not execute tests or perform review.
 Compatibility: the operation key hashes the prompt before adding dispatch-only
 workspace facts. This instruction change therefore gives a different plan key
 from the previous prompt. An unchanged prompt still reuses its verified completed
-result after a checkpoint, but this patch does not migrate old receipts, rewrite
-plans or authorize a new paid plan. In particular, a previously paid
-`WAITING_PRODUCT_DECISION` task is not safe to resume merely because a changed
-prompt misses its cache: the existing path can admit a new operation if other
-guards permit. Do not use this patch to resume that task under its old approval.
-Old UNKNOWN protections remain unchanged. Any future execution needs consistent,
+result after a checkpoint. The real `Factory.agent` planning dispatch attaches
+an existing operation `prepare` hook: after cache, cancellation, uncertainty and
+preflight checks, a plan-key miss checks for COMPLETE plans in the same mission
+before any new reservation or transport. The generic low-level operation budget
+primitive is unchanged; it does not itself identify a real planner from a stage
+label alone. Historical envelope/raw hashes and envelope-to-operation binding
+must verify; missing, changed or misbound planning evidence stops as UNKNOWN.
+With valid historical evidence, a different plan key stops as BLOCKED_LIMIT,
+including WAITING_PRODUCT_DECISION and intermediate implementation/test/review
+resumes. A repeated run remains stopped; it cannot buy a new plan or repeat
+implementation by missing the cache. Matching-key plans retain verified reuse,
+and already READY deliveries retain their existing exact-evidence checks.
+This patch does not migrate receipts, rewrite plans, change old accounting or
+provide paid replanning/recovery authority. Old UNKNOWN/RUNNING, cancellation
+and budget protections remain. Any future execution needs consistent,
 explicitly authorized frozen inputs and a separately decided compatibility path;
 this patch supplies no recovery mechanism or new spending authority. Offline
 fixtures prove transport/evidence/dispatch and rejection behavior, not future
