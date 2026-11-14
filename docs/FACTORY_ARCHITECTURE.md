@@ -88,6 +88,57 @@ batched independent reads and targeted excerpts without changing tool permission
 or supplying the plan on the planner's behalf. Actual token savings remain unproven
 until a separately authorized real trial.
 
+### Planning handoff contract
+
+Keep preparation status and execution authority distinct in the existing mission
+`constraints`. Before freezing a future execution input, the Controller must
+verify the real Owner source and its exact versions, scope, budget and window,
+then replace preparation-only/pending wording with a consistent statement of
+those verified facts. Do not append an approval claim while leaving contradictory
+pending wording elsewhere. If an approval binds input hashes, the final execution
+bytes and hashes need to be covered by that approval; do not rewrite already
+frozen inputs. An external record that the planner cannot read is not a substitute
+for these input facts. This is a Controller preparation responsibility: Factory
+passes constraints through and binds them in the operation input/evidence, but
+does not authenticate human approval or interpret a new generic approval schema.
+The prompt never grants approval. Missing or conflicting authority remains a
+genuine `decisions_required` blocker, not something to infer from user tone.
+
+The PLAN session is intentionally read-only and receives no writable temporary
+workspace. Later implementation uses separate sessions; the existing runtime
+allocates and checks authorized candidate writes and private temporary resources
+for those writable sessions. PLAN's current permissions alone are not evidence
+of a Builder defect. This explains the role boundary, not a claim that the future
+Builder environment has already passed. Concrete permission conflicts or missing
+prerequisites must still be reported. No permissions, TaskTemp or sandbox rules
+change as part of this handoff contract.
+
+The four-field `PLAN_SCHEMA` is unchanged. `tasks` is a machine dispatch list:
+each entry becomes one separately charged implementation assignment, including
+its corresponding product regression tests. It is not the complete delivery
+workflow. Harness validation, independent review, Controller checkpoints and
+PR/release work do not belong in that list; describe the verification route in
+`plan`/`acceptance` instead. Task count may vary by project and must fit remaining
+implementation plus configured review operations. Existing malformed-plan,
+nonempty-decision and over-budget checks still stop before implementation; no
+decision or returned task is silently removed or compacted. Return the complete
+plan once locations, requirements, authority, bounded work, verification and real
+unresolved facts are clear; planning does not execute tests or perform review.
+
+Compatibility: the operation key hashes the prompt before adding dispatch-only
+workspace facts. This instruction change therefore gives a different plan key
+from the previous prompt. An unchanged prompt still reuses its verified completed
+result after a checkpoint, but this patch does not migrate old receipts, rewrite
+plans or authorize a new paid plan. In particular, a previously paid
+`WAITING_PRODUCT_DECISION` task is not safe to resume merely because a changed
+prompt misses its cache: the existing path can admit a new operation if other
+guards permit. Do not use this patch to resume that task under its old approval.
+Old UNKNOWN protections remain unchanged. Any future execution needs consistent,
+explicitly authorized frozen inputs and a separately decided compatibility path;
+this patch supplies no recovery mechanism or new spending authority. Offline
+fixtures prove transport/evidence/dispatch and rejection behavior, not future
+model understanding, planning success or business delivery.
+
 Budget units are agent executions, not dollars or internal Codex model requests. Native subagent fan-out is disabled to avoid an unregistered execution tree; role/task threads still use the official runtime. Real money remains UNKNOWN; Provider account limits are necessary for a monetary ceiling. Fixture telemetry explicitly records zero real Provider calls and cannot become a formal receipt.
 
 Known completed results are reused after envelope and raw-file hash verification. A proven completed malformed review allows one separately charged validation attempt. Lost requests never automatically replay. Controller death with a reservation but no trustworthy completion is UNKNOWN. A published implementation receipt can recover its pending Git checkpoint without repeating that paid execution. A per-mission POSIX lock prevents concurrent controllers from racing source/dispatch. GNU `timeout` also bounds the App Server process independently of controller reads; controller death cannot leave an unlimited paid runtime.

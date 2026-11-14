@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from harness.factory import Factory, FactoryBlocked, READY, git, validate_config
+from harness.factory import Factory, FactoryBlocked, READY, digest, git, validate_config
 from harness.factory_budget import planning_limits
 from harness.factory_fixture import AcceptanceRuntime, fixture_config
 from harness.factory_preflight import CONFIG_BYTES, MAKE_BYTES, committed_text, docker_gate, inspect_prepaid, make_docker_dependency, text_capacity, workflow_push
@@ -527,6 +527,143 @@ class PrepaidPreflightTests(unittest.TestCase):
         self.assertEqual(json.loads(operation["input"])["workspace"]["dispatch_head"], before)
         self.assertEqual(json.loads(Path(operation["evidence"]).read_text())["input"], json.loads(operation["input"]))
 
+    def test_authority_constraints_reach_planner_and_evidence_without_becoming_an_approval(self):
+        base = git(self.repo, "rev-parse", "HEAD")
+        # These are synthetic Controller statements, not authenticated approval.
+        constraints = (
+            "Preparation only; execution approval and window are pending.",
+            f"Controller verified fixture-owner-message for BASE {base}, scope score.py, "
+            "budget 5 runs/600000 tokens/7200 seconds, window fixture-start..fixture-end. "
+            "This supersedes the preparation-only status for this future frozen input.",
+        )
+        for index, authority in enumerate(constraints):
+            with self.subTest(authority=authority):
+                self.spec.update(mission_id=f"authority-{index}", base=base, scope=["score.py"],
+                                 constraints=[authority])
+                f = self.factory(self.single_config())
+                # A real unresolved issue must stop even with an explicit
+                # execution statement. No prompt can erase model decisions.
+                decision = "Approval pending" if index == 0 else "Observed scope conflict needs Owner decision"
+                output = {"plan": "Inspect the bounded change", "tasks": ["Implement regression"],
+                          "acceptance": ["Preserve add"], "decisions_required": [decision]}
+                runtime = LocalRuntime()
+                runtime.resource_policy = f.config["budget"]
+                server = Mock(proc=None)
+                server.execute.return_value = {"output": output, "usage": {"fixture_provider_calls": 0}}
+                # Exercise the real adapter serialization, with a fake server;
+                # no AppServer process, authentication or Provider call occurs.
+                with patch("harness.factory_runtime.FactoryAppServer", return_value=server), \
+                     patch.object(f.runtime, "agent", side_effect=runtime.agent) as agent:
+                    report = f.run(self.spec["mission_id"])
+                self.assertEqual(report["DELIVERY_STATUS"], "WAITING_PRODUCT_DECISION")
+                self.assertIn(decision, report["BLOCKERS_REMAINING"][0])
+                self.assertEqual(agent.call_count, 1)
+                self.assertEqual(agent.call_args.args[0], "plan")
+                payload = agent.call_args.args[3]
+                self.assertEqual(payload["constraints"], [authority])
+                wire = json.loads(server.execute.call_args.args[0])
+                self.assertEqual({k: wire[k] for k in payload}, payload)
+                self.assertEqual(set(wire) - set(payload), {"planning_resource_guard"})
+                for contract in ("Controller before freezing", "Factory does not authenticate",
+                                 "PLAN session is intentionally read-only", "Each tasks entry",
+                                 "not a list of delivery stages", "configured independent reviews"):
+                    self.assertIn(contract, payload["instruction"])
+                operation = f.db.execute("SELECT * FROM operations WHERE mission=?",
+                                         (self.spec["mission_id"],)).fetchone()
+                self.assertEqual(json.loads(operation["input"]), payload)
+                envelope = json.loads(Path(operation["evidence"]).read_text())
+                self.assertEqual(envelope["input"], payload)
+                self.assertEqual(envelope["result"]["output"], output)
+                self.assertEqual(report["BUDGET_USED"]["agent_runs"], 1)
+
+    def test_planned_implementation_assignments_are_dispatched_and_charged_separately(self):
+        config = self.single_config()
+        config["budget"].update(max_agent_runs=6, max_run_tokens=120000, max_total_tokens=720000)
+        self.spec["constraints"] = ["Controller verified fixture authorization for this bounded execution."]
+        f = self.factory(config)
+        original = f.runtime.agent
+        tasks = ["Implement source with product regression coverage", "Extend boundary regressions"]
+        def agent(role, *args):
+            result = original(role, *args)
+            if role == "plan":
+                result["output"]["tasks"] = tasks
+            return result
+        with patch.object(f.runtime, "agent", side_effect=agent):
+            report = f.run("feature")
+        self.assertEqual(report["DELIVERY_STATUS"], READY, report)
+        implementations = [c["payload"] for c in f.runtime.calls if c["role"] == "implement"]
+        self.assertEqual([p["current_task"] for p in implementations], tasks)
+        self.assertEqual([p["task_index"] for p in implementations], [0, 1])
+        self.assertTrue(all(p["plan"]["tasks"] == tasks for p in implementations))
+        self.assertEqual([c["role"] for c in f.runtime.calls],
+                         ["plan", "implement", "implement", "review", "rework", "review"])
+        self.assertEqual(f.runtime.calls[0]["payload"]["constraints"], self.spec["constraints"])
+        self.assertEqual(report["BUDGET_USED"]["agent_runs"], 6)
+        self.assertEqual(report["TEST_RESULT"], "PASS")
+
+    def test_unconsumable_plans_stop_without_rewriting_or_dispatching_implementation(self):
+        cases = (
+            ({"plan": "bounded", "tasks": [], "acceptance": [], "decisions_required": []}, "UNKNOWN"),
+            ({"plan": "", "tasks": ["implement"], "acceptance": [], "decisions_required": []}, "UNKNOWN"),
+            ({"plan": "bounded", "tasks": [None], "acceptance": [], "decisions_required": []}, "UNKNOWN"),
+            ({"plan": "bounded", "tasks": ["implement"] * 9, "acceptance": [], "decisions_required": []}, "UNKNOWN"),
+            # Like the real six-entry output, this cannot fit four remaining
+            # operations plus independent review. Do not compact it silently.
+            ({"plan": "bounded", "tasks": [f"assignment {n}" for n in range(6)],
+              "acceptance": ["preserve behavior"], "decisions_required": []}, "BLOCKED_BUDGET"),
+        )
+        for index, (output, status) in enumerate(cases):
+            with self.subTest(output=output):
+                self.spec["mission_id"] = f"bad-plan-{index}"
+                config = self.single_config()
+                config["budget"].update(max_agent_runs=5, max_run_tokens=120000, max_total_tokens=600000)
+                f = self.factory(config)
+                with patch.object(f.runtime, "agent", return_value={
+                        "output": output, "usage": {"fixture_provider_calls": 0}}) as agent:
+                    report = f.run(self.spec["mission_id"])
+                self.assertEqual(report["DELIVERY_STATUS"], status, report)
+                self.assertEqual(agent.call_count, 1)
+                operation = f.db.execute("SELECT * FROM operations WHERE mission=?",
+                                         (self.spec["mission_id"],)).fetchone()
+                self.assertEqual(json.loads(operation["result"])["output"], output)
+                before = tuple(operation)
+                with patch.object(f.runtime, "agent", side_effect=AssertionError("no rejected-plan replay")):
+                    self.assertEqual(f.run(self.spec["mission_id"])["DELIVERY_STATUS"], status)
+                self.assertEqual(tuple(f.db.execute("SELECT * FROM operations WHERE mission=?",
+                                                   (self.spec["mission_id"],)).fetchone()), before)
+                self.assertEqual(report["BUDGET_USED"]["agent_runs"], 1)
+
+    def test_handoff_prompt_changes_plan_key_without_migrating_completed_plan(self):
+        f = self.factory(self.single_config())
+        original = f.runtime.agent
+        def stop(role, *args):
+            result = original(role, *args)
+            result["output"]["decisions_required"] = ["offline unresolved authority"]
+            return result
+        with patch.object(f.runtime, "agent", side_effect=stop):
+            self.assertEqual(f.run("feature")["DELIVERY_STATUS"], "WAITING_PRODUCT_DECISION")
+        operation = f.db.execute("SELECT * FROM operations").fetchone()
+        payload = json.loads(operation["input"])
+        payload.pop("workspace")
+        profile = f.profile_identities["developer"]
+        def key(value):
+            return digest({"stage": "plan", "round": 0, "profile": profile, "payload": value})
+        self.assertEqual(key(payload), operation["key"])
+        legacy = copy.deepcopy(payload)
+        legacy["instruction"] = "Act as technical lead. Understand the repository, plan a minimal complete solution and acceptance tests. Decide ordinary engineering questions yourself. Only unresolved major product ambiguity, safety, independence, budget or irreversible changes belong in decisions_required. Do not edit files. Return plan, bounded tasks, acceptance and decisions_required."
+        self.assertNotEqual(key(legacy), operation["key"])
+        before = {t: [tuple(r) for r in f.db.execute(f"SELECT * FROM {t}")]
+                  for t in ("missions", "operations", "events", "approvals")}
+        evidence = Path(operation["evidence"]).read_bytes()
+        spec, cwd = f.prepare("feature")
+        with patch.object(f.runtime, "agent", side_effect=AssertionError("cached plan must not call transport")):
+            self.assertEqual(f.agent(spec, cwd, "plan", 0, payload)["output"]["decisions_required"],
+                             ["offline unresolved authority"])
+        # A changed prompt is a different operation, not a cache migration or
+        # replan authorization. Do not invoke the unmatched key in this test.
+        self.assertEqual({t: [tuple(r) for r in f.db.execute(f"SELECT * FROM {t}")] for t in before}, before)
+        self.assertEqual(Path(operation["evidence"]).read_bytes(), evidence)
+
     def test_new_planning_policy_cannot_recover_old_unknown_but_new_mission_can_coexist(self):
         old_config = self.single_config()
         old_config["budget"].update(max_agent_runs=5, max_run_tokens=120000, max_total_tokens=600000)
@@ -722,6 +859,23 @@ class PlanningGuardTests(unittest.TestCase):
             runtime.agent("implement", {}, Path("/fixture"), {}, Path("/fixture.raw"), 9, [])
         self.assertEqual(constructor.call_args.args[3], 9)
         self.assertEqual(constructor.call_args.args[-1], 12)
+
+    def test_plan_read_only_is_separate_from_later_implementation_and_review_sessions(self):
+        runtime = LocalRuntime()
+        runtime.resource_policy = {"max_run_tokens": 120000, "max_plan_tokens": 96000}
+        servers = [Mock(proc=None) for _ in range(3)]
+        for server in servers:
+            server.execute.return_value = {"output": {}}
+        with patch("harness.factory_runtime.FactoryAppServer", side_effect=servers) as constructor:
+            for role in ("plan", "implement", "review"):
+                runtime.agent(role, {}, Path("/fixture"), {}, Path(f"/fixture-{role}.raw"), 900, [])
+        calls = [c.args for c in constructor.call_args_list]
+        self.assertEqual([(c[5], c[6]) for c in calls], [(True, False), (False, False), (True, True)])
+        self.assertEqual([(c[3], c[7]) for c in calls], [(120, 96000), (900, 120000), (900, 120000)])
+        for server in servers:
+            server.execute.assert_called_once()
+            server.close.assert_called_once()
+        self.assertIsNone(runtime._single_server)
 
     def test_foreign_thread_telemetry_cannot_charge_or_interrupt_active_turn(self):
         server = FactoryAppServer.__new__(FactoryAppServer)

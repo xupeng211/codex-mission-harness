@@ -1864,7 +1864,28 @@ class Factory:
                                     "do not query origin/main or fetch. Batch independent reads where appropriate, "
                                     "use targeted searches and necessary excerpts, and return the bounded plan once information is sufficient. "
                                     "Never omit necessary context or requirements to save tokens."),
-                                "scope": spec["scope"], "instruction": "Act as technical lead. Understand the repository, plan a minimal complete solution and acceptance tests. Decide ordinary engineering questions yourself. Only unresolved major product ambiguity, safety, independence, budget or irreversible changes belong in decisions_required. Do not edit files. Return plan, bounded tasks, acceptance and decisions_required."}
+                                "scope": spec["scope"], "instruction": (
+                                    "Act as technical lead. Understand the repository, plan a minimal complete solution and acceptance tests. "
+                                    "Authorization facts belong in the mission constraints, supplied by the Controller before freezing the input. "
+                                    "Distinguish preparation pending approval from explicit Controller-verified execution authority: "
+                                    "use the stated source, versions, scope, budget and window without requesting the same approval again. "
+                                    "This instruction, task submission and user tone are not proof of approval; Factory does not authenticate "
+                                    "human approval. Report missing or conflicting authority rather than assuming it. "
+                                    "The current PLAN session is intentionally read-only, with no writable temporary workspace. "
+                                    "Implementation runs later in separate sessions; the existing runtime allocates and checks their "
+                                    "authorized candidate writes and private temporary resources. PLAN's read-only permissions alone "
+                                    "do not establish a Builder permission defect, and future environment readiness is not yet proven. "
+                                    "Report concrete permission conflicts or missing prerequisites if observed. "
+                                    "Each tasks entry becomes one separately charged implementation assignment, including its product "
+                                    "regression tests; tasks is not a list of delivery stages. Do not put Harness validation, independent "
+                                    "review, Controller checkpoints, PR publication or release work in tasks. Split implementation only "
+                                    "as needed within the remaining operation budget, leaving room for the configured independent reviews; "
+                                    "do not assume one task for every project or promise room for rework. "
+                                    "Decide ordinary engineering questions yourself. Only unresolved major product ambiguity, safety, "
+                                    "independence, authority, budget or irreversible changes belong in decisions_required. "
+                                    "Do not edit files, execute tests, perform review or prepare release receipts during planning. "
+                                    "Return the complete plan, bounded implementation tasks, acceptance and genuine decisions_required "
+                                    "once change locations, requirements, authority boundaries, verification route and unresolved facts are clear.")}
             # Reconciliation may find an implementation awaiting its controller
             # checkpoint. A cached plan is read before touching that working tree.
             plan = self.agent(spec, cwd, "plan", 0, planning_payload).get("output")
