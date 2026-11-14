@@ -815,15 +815,16 @@ class Factory:
                     "repository": spec["repository"], "base": spec["base"], "dispatch_head": git(cwd, "rev-parse", "HEAD"),
                     "scope": spec["scope"]}
         key = digest({"stage": stage, "round": round_, "profile": profile_identity, "payload": payload})
-        call_payload = dict(payload)
         if stage == "plan":
             # Dispatch facts are not part of the cache key: a checkpoint may
-            # advance HEAD before a completed plan is consumed on resume.
-            call_payload["workspace"] = {
+            # advance HEAD before a completed plan is consumed on resume. They
+            # still belong in the durable input and evidence for this dispatch.
+            payload = {**payload, "workspace": {
                 "base": spec["base"], "dispatch_head": identity["dispatch_head"],
                 "branch": git(cwd, "rev-parse", "--abbrev-ref", "HEAD"),
                 "has_remotes": bool(git(cwd, "remote")),
-            }
+            }}
+        call_payload = dict(payload)
         if "model_selection" in profile_identity and not self.config["simulation"]:
             call_payload["_authorized_route"] = profile_identity["route_identity"]
         return self.operation(spec["mission_id"], key, stage, lane, identity, payload, True,

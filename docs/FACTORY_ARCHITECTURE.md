@@ -78,7 +78,9 @@ ceiling, internal request count, subscription usage or monetary limit.
 
 Planning receives Controller-observed BASE, dispatch HEAD, branch and whether the
 candidate actually has remotes. These dispatch facts do not invalidate a completed
-plan's cache key after a later implementation checkpoint. Reading guidance avoids
+plan's cache key after a later implementation checkpoint; they are retained in
+the durable operation input and evidence envelope for the original dispatch.
+Reading guidance avoids
 reprinting instructions only when their automatic loading and same version are
 confirmed; missing/changed instructions, required workflow documents, applicable
 nested rules, scope, authorization and acceptance remain mandatory. It encourages

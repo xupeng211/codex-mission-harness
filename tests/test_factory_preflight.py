@@ -507,6 +507,10 @@ class PrepaidPreflightTests(unittest.TestCase):
                     self.assertEqual(payload[field], spec[field])
                 for rule in ("same version", "missing or changed", "nested rules", "authorization", "Batch independent"):
                     self.assertIn(rule, payload["execution_guidance"])
+                operation = f.db.execute("SELECT * FROM operations WHERE mission=?", (mission,)).fetchone()
+                self.assertEqual(json.loads(operation["input"]), payload)
+                evidence = json.loads(Path(operation["evidence"]).read_text())
+                self.assertEqual(evidence["input"], payload)
 
     def test_completed_plan_is_reused_after_checkpoint_changes_workspace_head(self):
         f = self.factory()
@@ -519,6 +523,9 @@ class PrepaidPreflightTests(unittest.TestCase):
         self.assertEqual(f.agent(spec, cwd, "plan", 0, payload), result)
         self.assertEqual(len(f.runtime.calls), 1)
         self.assertEqual(f.runtime.calls[0]["payload"]["workspace"]["dispatch_head"], before)
+        operation = f.db.execute("SELECT * FROM operations").fetchone()
+        self.assertEqual(json.loads(operation["input"])["workspace"]["dispatch_head"], before)
+        self.assertEqual(json.loads(Path(operation["evidence"]).read_text())["input"], json.loads(operation["input"]))
 
     def test_new_planning_policy_cannot_recover_old_unknown_but_new_mission_can_coexist(self):
         old_config = self.single_config()
