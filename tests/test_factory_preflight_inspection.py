@@ -255,6 +255,44 @@ class InitialInspectionTests(unittest.TestCase):
         self.assertIsNone(self.runtime.current_process)
         self.assertFalse(self.double.resources)
 
+    def cancel_timeout_diagnostics(self, worker, client, timing):
+        """Best-effort, non-atomic observations; never poll/reap or take ownership locks."""
+        slot = self.runtime._preparation_client
+        cleanup = self.runtime._preparation_cleanups[-1:]
+        record = {
+            "capture_started": time.monotonic(), "timing": timing, "non_atomic": True,
+            "cancel_event_set": self.runtime.container_cancel.is_set(),
+            "current_process_pid": getattr(self.runtime.current_process, "pid", None),
+            "active_execution_matches_event": self.runtime._active_execution is self.runtime.container_cancel,
+            "preparation_slot_present": slot is not None,
+            "registered_identity": dict(slot["identity"]) if slot and slot.get("identity") else "UNKNOWN",
+            "cancel_error": slot.get("cancel_error", "UNKNOWN") if slot else "UNKNOWN",
+            "client_pid": client.pid, "cached_returncode": client.returncode,
+            "cleanup": {key: cleanup[0].get(key, "UNKNOWN") for key in (
+                "identity", "confirmed", "leader_reaped", "exit_code", "diagnostics_complete", "signal"
+            )} if cleanup else "UNKNOWN",
+            "worker_ident": worker.ident, "worker_stack": [],
+        }
+        try:
+            # This reader only opens /proc/<pid>/stat and stats its directory.
+            record["client_kernel_identity"] = self.runtime._client_process_identity(client.pid)
+        except Exception as error:
+            record["client_kernel_identity"] = {"status": "UNKNOWN", "error_type": type(error).__name__}
+        frame = sys._current_frames().get(worker.ident)
+        record["worker_frame_status"] = "PRESENT" if frame is not None else "UNKNOWN"
+        try:
+            for _ in range(32):
+                if frame is None:
+                    break
+                record["worker_stack"].append({"file": frame.f_code.co_filename,
+                    "function": frame.f_code.co_name, "line": frame.f_lineno})
+                frame = frame.f_back
+            record["worker_stack_complete"] = frame is None
+        finally:
+            del frame
+        record["capture_finished"] = time.monotonic()
+        print("CANCEL_TIMEOUT_DIAGNOSTICS " + json.dumps(record, sort_keys=True), file=sys.stderr, flush=True)
+
     def test_two_slow_inspections_share_total_deadline_and_elapsed(self):
         started = time.monotonic()
         with self.double.hooks(): result = self.gate(1)
@@ -280,9 +318,31 @@ class InitialInspectionTests(unittest.TestCase):
                 self.assertFalse(self.runtime.cancel(self.old_execution))
                 self.assertIsNone(client.poll(), "old execution cannot kill this client")
                 self.assertIs(self.runtime.current_process, client, "initial client must be tracked")
-                self.assertTrue(self.runtime.cancel(self.runtime.container_cancel))
+                cancel_started = time.monotonic()
+                cancel_accepted = self.runtime.cancel(self.runtime.container_cancel)
+                cancel_returned = time.monotonic()
+                self.assertTrue(cancel_accepted)
+                wait_started = time.monotonic()
                 worker.join(0.4)
-                self.assertFalse(worker.is_alive(), "initial check ignored cancellation")
+                wait_finished = time.monotonic()
+                try:
+                    self.assertFalse(worker.is_alive(), "initial check ignored cancellation")
+                except AssertionError:
+                    # Record before fixture close(), preserving this exact failed assertion
+                    # even if the worker returns while diagnostics are being collected.
+                    try:
+                        self.cancel_timeout_diagnostics(worker, client, {
+                            "cancel_started": cancel_started, "cancel_returned": cancel_returned,
+                            "cancel_accepted": cancel_accepted, "wait_started": wait_started,
+                            "wait_finished": wait_finished, "wait_seconds": wait_finished - wait_started,
+                        })
+                    except BaseException as error:
+                        try:
+                            print("CANCEL_TIMEOUT_DIAGNOSTICS UNKNOWN " + type(error).__name__,
+                                  file=sys.stderr, flush=True)
+                        except BaseException:
+                            pass
+                    raise
                 self.assertIsNotNone(client.poll())
             finally:
                 self.double.close()
