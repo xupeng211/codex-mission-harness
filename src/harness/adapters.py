@@ -1587,6 +1587,15 @@ class FootballPredictionAdapter:
             raise ValueError("origin does not identify one GitHub repository")
         return f"{owner}/{name}"
 
+    @staticmethod
+    def _validated_repository(repository: str) -> str:
+        """Accept one GitHub slug, never a URL, path or Git configuration."""
+        if (not isinstance(repository, str)
+                or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None
+                or any(part in {".", ".."} for part in repository.split("/"))):
+            raise ValueError("invalid trusted GitHub repository identity")
+        return repository
+
     def ci(self, worktree: str, head: str, pr_number: int | None = None,
            pr_repo: str | None = None, base_sha: str | None = None,
            pr_base_sha: str | None = None) -> GateResult:
@@ -1638,6 +1647,7 @@ class FootballPredictionAdapter:
             result = self._call(
                 ["python3", "-I", "-B", "-c", code, str(trusted), worktree, str(pr_number)],
                 cwd=str(trusted), env={"GH_REPO": pr_repo, "GH_HOST": "github.com", "PYTHONDONTWRITEBYTECODE": "1"},
+                repository=pr_repo,
             )
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
             return GateResult("BLOCKED_EXTERNAL", f"trusted PR readiness unavailable: {exc}")
@@ -1769,7 +1779,8 @@ class FootballPredictionAdapter:
                 "--forbidden-side-effects", forbidden_side_effects,
                 "--required-pr-governance", required_pr_governance, "--json"]
         result = self._call(argv, cwd=worktree, env={"GH_HOST": "github.com", "GH_REPO": pr_repo,
-                                                        "PYTHONDONTWRITEBYTECODE": "1"})
+                                                        "PYTHONDONTWRITEBYTECODE": "1"},
+                            repository=pr_repo)
         try:
             data = self._json_document_prefix(result.stdout)
         except json.JSONDecodeError:
@@ -1779,6 +1790,12 @@ class FootballPredictionAdapter:
         return GateResult("BLOCKED_EXTERNAL", result.stderr.strip() or "canonical agent-merge-ready rejected merge", data=data)
 
     def _pr_state(self, worktree: str, pr_number: int, pr_repo: str) -> GateResult:
+        try:
+            pr_repo = self._validated_repository(pr_repo)
+        except ValueError as exc:
+            return GateResult("BLOCKED_EXTERNAL", str(exc))
+        if type(pr_number) is not int or pr_number <= 0:
+            return GateResult("BLOCKED_EXTERNAL", "invalid durable PR number")
         try:
             raw = json.loads(self._run(self._gh("api", f"repos/{pr_repo}/pulls/{pr_number}"), cwd=worktree))
         except (KeyError, json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
@@ -1794,6 +1811,11 @@ class FootballPredictionAdapter:
                 or re.fullmatch(r"[0-9a-fA-F]{40}", str(base.get("sha", ""))) is None
                 or not isinstance(base.get("ref"), str)):
             return GateResult("BLOCKED_EXTERNAL", "GitHub PR lookup returned malformed or mismatched identity")
+        # The API endpoint already binds the repository. Reject contradictory
+        # repository metadata as well when it is present in the response.
+        if "repo" in base and (not isinstance(base["repo"], dict)
+                or str(base["repo"].get("full_name", "")).lower() != pr_repo.lower()):
+            return GateResult("BLOCKED_EXTERNAL", "GitHub PR repository identity mismatch")
         return GateResult("PASS", f"{pr_repo} PR #{pr_number}", data={"repo": pr_repo, "raw": raw,
             "head": str(head.get("sha", "")).lower(),
             "base": str(base.get("ref", "")),
@@ -1956,12 +1978,23 @@ class FootballPredictionAdapter:
         return GateResult("BLOCKED_EXTERNAL", "Production Gate returned an invalid verdict", data=data)
 
     @classmethod
-    def _call(cls, argv, cwd=None, env=None, inherit_environment=True):
+    def _call(cls, argv, cwd=None, env=None, inherit_environment=True, *, repository=None):
         try:
             trusted_argv = cls._trusted_command_argv(argv)
             child_env = cls._trusted_subprocess_environment(
                 env=env, inherit_environment=inherit_environment,
             )
+            if repository is not None:
+                # Only the two canonical delivery gates supply the repository
+                # from their verified PR context. Rebuild exactly one locator
+                # AFTER sanitization; arbitrary GIT_CONFIG_* remain forbidden.
+                repository = cls._validated_repository(repository)
+                child_env.update({
+                    "GH_REPO": repository,
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "remote.origin.url",
+                    "GIT_CONFIG_VALUE_0": f"https://github.com/{repository}.git",
+                })
             return subprocess.run(trusted_argv, cwd=cwd, env=child_env, text=True,
                                   capture_output=True, check=False, timeout=60)
         except subprocess.TimeoutExpired as exc:
