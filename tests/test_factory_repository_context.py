@@ -9,8 +9,8 @@ import copy
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -165,22 +165,53 @@ sys.exit({code!r} if identity_ok else 2)
             self.assertEqual(self.ci().status, "BLOCKED_EXTERNAL")
         self.assert_context(self.calls[0][1])
 
+    def test_environment_probes_fall_back_from_untrusted_running_python(self):
+        trusted = self.adapter._trusted_system_executable("python3")
+        directory = self.root / "runner-python"
+        directory.mkdir(mode=0o700)
+        executable = directory / "python3"
+        shutil.copyfile(trusted, executable)
+        # Exercise real validation, without changing any host interpreter or
+        # bypassing the executable/ancestor checks used by production calls.
+        for file_mode, directory_mode, reason in (
+                (0o775, 0o700, "unsafe ownership or permissions"),
+                (0o755, 0o777, "unsafe parent directory")):
+            executable.chmod(file_mode)
+            directory.chmod(directory_mode)
+            with self.subTest(reason=reason):
+                denied = self.adapter._call([str(executable), "--version"])
+                self.assertEqual(denied.returncode, 127, denied.stderr)
+                self.assertEqual(denied.stdout, "")
+                self.assertIn(reason, denied.stderr)
+                with patch("harness.adapters.sys.executable", str(executable)):
+                    self.assertEqual(self.adapter._trusted_python_interpreter(), trusted)
+                    for name in (
+                            "test_explicit_environment_cannot_override_trusted_repository",
+                            "test_other_commands_keep_original_isolation"):
+                        with self.subTest(probe=name):
+                            getattr(self, name)()
+
     def test_explicit_environment_cannot_override_trusted_repository(self):
         code = "import json,os; print(json.dumps(dict(os.environ)))"
         with patch.dict(os.environ, {}, clear=True):
-            result = self.adapter._call([sys.executable, "-I", "-c", code],
+            result = self.adapter._call(
+                [self.adapter._trusted_python_interpreter(), "-I", "-c", code],
                 repository=self.REPO, env={"GH_REPO": "attacker/other",
                     "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.sshCommand",
                     "GIT_CONFIG_VALUE_0": "evil", "GIT_DIR": "/evil"})
-        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 0,
+                         f"argv={result.args!r}; stdout={result.stdout!r}; stderr={result.stderr!r}")
         self.assert_context({"identity_ok": True, "env": json.loads(result.stdout)})
 
     def test_other_commands_keep_original_isolation(self):
         with patch.dict(os.environ, {"GIT_CONFIG_COUNT": "1", "GIT_DIR": "/evil",
                 "GIT_CONFIG_KEY_0": "remote.origin.url", "GIT_CONFIG_VALUE_0": "evil"},
                 clear=True):
-            result = self.adapter._call([sys.executable, "-I", "-c",
+            result = self.adapter._call(
+                [self.adapter._trusted_python_interpreter(), "-I", "-c",
                 "import json,os; print(json.dumps(dict(os.environ)))"])
+        self.assertEqual(result.returncode, 0,
+                         f"argv={result.args!r}; stdout={result.stdout!r}; stderr={result.stderr!r}")
         env = json.loads(result.stdout)
         self.assertEqual(env["GIT_CONFIG_COUNT"], "0")
         self.assertNotIn("GIT_CONFIG_KEY_0", env)
