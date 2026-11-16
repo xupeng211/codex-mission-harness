@@ -1416,19 +1416,134 @@ class Factory:
             results.append({**result, "evidence_key": key, "department": "hosted_ci"})
         return results
 
-    def verify_temporary_cleanup(self, mission):
-        """Read only: every allocation needs its original, bound cleanup proof."""
+    def active_temporary_allocation(self, mission, operation, identity, read):
+        """Report-only, pending assessment; never a stop/cleanup proof or replay permit.
+
+        The kernel lock owner, original operation and private allocation must agree.
+        Once present, the supervisor journal additionally binds this execution. A
+        constructor/close handoff may be incomplete, but cannot establish readiness.
+        """
+        from .appserver_process import process_identity
+        execution = self.db.execute("SELECT payload,at FROM events WHERE mission=? AND kind='controller_execution' "
+                                    "ORDER BY sequence DESC LIMIT 1", (mission,)).fetchone()
+        if execution is None or operation["started"] < execution["at"]:
+            raise ValueError("temporary allocation belongs to no current controller execution")
+        execution = json.loads(execution["payload"])
+        lock = self.root / "control" / f"{mission}.lock"
+        info = lock.lstat()
+        if not stat.S_ISREG(info.st_mode) or lock.is_symlink() or info.st_uid != os.getuid():
+            raise ValueError("active controller lock identity differs")
+        device = f"{os.major(info.st_dev):02x}:{os.minor(info.st_dev):02x}:{info.st_ino}"
+        with open("/proc/locks", "rb") as stream:
+            locks = stream.read(1024 * 1024 + 1)
+        if len(locks) > 1024 * 1024:
+            raise ValueError("active controller locks exceed inspection capacity")
+        owners = [int(v[4]) for line in locks.decode().splitlines() if
+                  len(v := line.split()) == 8 and v[1:4] == ["FLOCK", "ADVISORY", "WRITE"]
+                  and v[5] == device and v[6:] == ["0", "EOF"]]
+        if len(owners) != 1:
+            raise ValueError("temporary allocation has no live mission controller lock")
+        controller = process_identity(owners[0])
+        if (controller["uid"] != os.getuid() or controller["state"] in ("Z", "X")
+                or any(controller[k] != v for k, v in execution["controller"].items() if k != "state")
+                or execution["lock"] != {"device": info.st_dev, "inode": info.st_ino}):
+            raise ValueError("active mission controller identity is unavailable")
+        spec = json.loads(self.row(mission)["spec"])
+        original = json.loads(operation["identity"])
+        if (operation["mission"] != mission or operation["lane"] != "developer"
+                or operation["stage"] not in ("implement", "rework") or not operation["paid"]
+                or (operation["status"] == "RUNNING") != (operation["ended"] is None)
+                or any(original.get(k) != v for k, v in {
+                    "stage": operation["stage"], "repository": spec["repository"],
+                    "base": spec["base"], "scope": spec["scope"], "engine": "codex-app-server"}.items())):
+            raise ValueError("active temporary operation binding differs")
+        transcript = self.root / "evidence" / mission / (operation["id"] + ".raw")
+        journal = transcript.with_suffix(".process.jsonl")
+        if identity is None:
+            if (operation["status"] != "RUNNING" or operation["result"] is not None
+                    or operation["evidence"] is not None or journal.exists() or journal.is_symlink()):
+                raise ValueError("temporary allocation record is incomplete outside startup")
+            return {"operation": operation["id"], "status": "PENDING", "phase": "STARTING"}
+        rows = []
+        if journal.exists() or journal.is_symlink():
+            data = read(journal, None)
+            # One bounded snapshot can end during an append. Validate every
+            # complete row; an unfinished tail supplies no additional proof.
+            rows = [json.loads(line) for line in data.splitlines(keepends=True) if line.endswith(b"\n")]
+            if data and not rows:
+                raise ValueError("active temporary journal has no complete binding")
+        if rows:
+            binding, supervisor = rows[0]["binding"], rows[0]["supervisor"]
+            events = [v.get("event") for v in rows]
+            if (events not in (["allocated"], ["allocated", "started"], ["allocated", "started", "stopped"])
+                    or any(v.get("binding") != binding or v.get("supervisor") != supervisor for v in rows)
+                    or rows[0]["at"] < operation["started"]
+                    or binding.get("worktree") != identity["worktree"]
+                    or binding.get("permission_profile") != identity["permission_profile"]
+                    or binding.get("temporary_workspace") != identity or binding.get("operation") != str(transcript)
+                    or binding.get("context", {}) != {"mission_id": mission, "runtime_execution": execution["runtime_execution"]}
+                    or any(not isinstance(v, str) or re.fullmatch(r"[0-9a-f]{32}", v) is None
+                           for v in (binding.get("execution_id"), binding.get("context", {}).get("runtime_execution")))
+                    or supervisor.get("ppid") != controller["pid"] or supervisor.get("uid") != controller["uid"]
+                    or supervisor.get("pid") != supervisor.get("pgid") or supervisor.get("pid") != supervisor.get("sid")):
+                raise ValueError("active temporary execution/resource binding differs")
+            native = (json.loads(operation["result"] or "{}").get("runtime_identity") or {}).get("native_runtime", {})
+            if native and (native.get("temporary_workspace") != identity
+                           or native.get("process_ownership") != {"binding": binding, "supervisor": supervisor}):
+                raise ValueError("active temporary original execution differs")
+            if events[-1] == "stopped":
+                stop = rows[-1]["result"]
+                if (stop.get("confirmed") is not True or stop.get("proof") != "ECHILD"
+                        or stop.get("binding") != binding
+                        or stop.get("supervisor") != {k:v for k,v in supervisor.items() if k != "state"}):
+                    raise ValueError("active temporary execution stop is unconfirmed")
+            else:
+                actual = process_identity(supervisor["pid"])
+                if actual["state"] in ("Z", "X") or any(actual[k] != v for k, v in supervisor.items() if k != "state"):
+                    raise ValueError("active temporary supervisor identity changed")
+        elif operation["status"] != "RUNNING" or operation["result"] is not None or operation["evidence"] is not None:
+            raise ValueError("temporary final operation lacks original execution journal")
+        path = Path(identity["path"])
+        if path.exists() or path.is_symlink():
+            actual = path.lstat()
+            if (path.is_symlink() or path.resolve(strict=True) != path or not stat.S_ISDIR(actual.st_mode)
+                    or (actual.st_dev, actual.st_ino, actual.st_uid, oct(stat.S_IMODE(actual.st_mode))) !=
+                       (identity["device"], identity["inode"], identity["uid"], identity["mode"])):
+                raise ValueError("active temporary directory identity changed")
+        elif not rows or rows[-1]["event"] != "stopped":
+            raise ValueError("active temporary directory disappeared before confirmed stop")
+        receipt = transcript.with_suffix(".temp.cleanup.jsonl")
+        if receipt.exists() or receipt.is_symlink():
+            if not rows or rows[-1]["event"] != "stopped":
+                raise ValueError("active temporary cleanup precedes confirmed execution stop")
+            data = read(receipt, None)
+            for line in data.splitlines(keepends=True):
+                if not line.endswith(b"\n"):
+                    break  # In-progress receipt write is still only PENDING.
+                entry = json.loads(line)
+                if (entry.get("cleanup_confirmed") is not True or entry.get("identity") != identity
+                        or entry.get("process_stop") != rows[-1]["result"]):
+                    raise ValueError("active temporary cleanup is unconfirmed or foreign")
+        # This is intentionally PENDING even after ECHILD: immutable final
+        # operation/receipt binding is still required after the controller exits.
+        return {"operation": operation["id"], "status": "PENDING",
+                "phase": "FINALIZING" if rows and rows[-1]["event"] == "stopped" else
+                         "EXECUTING" if len(rows) == 2 else "STARTING"}
+
+    def verify_temporary_cleanup(self, mission, *, allow_active=False):
+        """Strict by default; public reports may describe bound active work as pending."""
         try:
             candidate = self.row(mission)["candidate"]
             root = self.root / "evidence" / mission
             allocations, proofs, native_identities, process_owners = {}, [], [], {}
+            pending, operations = {}, {}
             def read(path, expected_hash):
                 info = path.lstat()
                 if (path.is_symlink() or path.resolve(strict=True) != path or not stat.S_ISREG(info.st_mode)
                         or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077 or info.st_size > 65536):
                     raise ValueError("untrusted temporary cleanup evidence")
                 data = path.read_bytes()
-                if hashlib.sha256(data).hexdigest() != expected_hash:
+                if expected_hash is not None and hashlib.sha256(data).hexdigest() != expected_hash:
                     raise ValueError("temporary cleanup evidence hash changed")
                 return data
             for operation in self.db.execute("SELECT * FROM operations WHERE mission=?", (mission,)):
@@ -1445,21 +1560,32 @@ class Factory:
                             raise ValueError("temporary allocation execution ownership changed")
                         process_owners[native["path"]] = native_runtime["process_ownership"]
                 if entries or allocation.exists() or allocation.is_symlink():
-                    if len(entries) != 1 or operation["lane"] != "developer":
+                    unfinished = (allow_active and operation["status"] == "RUNNING"
+                                  and operation["result"] is None and operation["evidence"] is None)
+                    if (not unfinished and len(entries) != 1) or operation["lane"] != "developer":
                         raise ValueError("temporary allocation lacks original operation binding")
-                    self.verify_evidence(operation)
-                    original = json.loads(Path(operation["evidence"]).read_bytes())
-                    if original != {"operation": operation["id"], "identity": json.loads(operation["identity"]),
-                                    "input": json.loads(operation["input"]), "result": result}:
-                        raise ValueError("temporary allocation differs from immutable operation evidence")
-                    identity = json.loads(read(allocation, entries[0]["sha256"]))
+                    if not unfinished:
+                        self.verify_evidence(operation)
+                        original = json.loads(Path(operation["evidence"]).read_bytes())
+                        if original != {"operation": operation["id"], "identity": json.loads(operation["identity"]),
+                                        "input": json.loads(operation["input"]), "result": result}:
+                            raise ValueError("temporary allocation differs from immutable operation evidence")
+                    data = read(allocation, None if unfinished else entries[0]["sha256"])
+                    if unfinished and not data.endswith(b"\n"):
+                        pending[operation["id"]] = self.active_temporary_allocation(mission, operation, None, read)
+                        continue  # An in-progress constructor write is not an allocation/cleanup proof.
+                    identity = json.loads(data)
                     if (not isinstance(identity, dict) or identity.get("worktree") != candidate
                             or Path(identity["path"]).parent != Path("/tmp")
                             or identity.get("uid") != os.getuid() or identity.get("mode") != "0o700"
                             or any(type(identity.get(k)) is not int for k in ("device", "inode"))
                             or not isinstance(identity.get("permission_profile"), str)):
                         raise ValueError("temporary allocation candidate/directory identity differs")
-                    allocations[operation["id"]] = (identity, entries[0])
+                    reference = {"path": str(allocation), "sha256": hashlib.sha256(data).hexdigest()}
+                    allocations[operation["id"]] = (identity, reference)
+                    operations[operation["id"]] = operation
+                    if unfinished:
+                        pending[operation["id"]] = self.active_temporary_allocation(mission, operation, identity, read)
                     receipt = allocation.with_suffix(".cleanup.jsonl")
                     proofs.extend((operation["id"], v, None) for v in raw if v["path"] == str(receipt))
             for event in self.db.execute("SELECT payload FROM events WHERE mission=? AND kind='agent_temporary_cleanup' ORDER BY sequence", (mission,)):
@@ -1498,8 +1624,14 @@ class Factory:
                 if event is not None and any(event.get(k) != rows[-1].get(k) for k in ("identity", "cleanup_confirmed", "at")):
                     raise ValueError("temporary cleanup event differs from original receipt")
                 covered.add(source)
-            if covered != set(allocations) or any(v not in [a[0] for a in allocations.values()] for v in native_identities):
+            for source in set(allocations) - covered:
+                if allow_active:
+                    pending[source] = self.active_temporary_allocation(mission, operations[source], allocations[source][0], read)
+                else:
+                    raise ValueError("temporary allocation has no confirmed cleanup proof")
+            if any(v not in [a[0] for a in allocations.values()] for v in native_identities):
                 raise ValueError("temporary allocation has no confirmed cleanup proof")
+            return list(pending.values())
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
             raise FactoryBlocked("UNKNOWN", "temporary cleanup evidence invalid: " + str(error)) from error
 
@@ -1550,13 +1682,21 @@ class Factory:
             raise FactoryBlocked("UNKNOWN", "container local clients not confirmed stopped: " + str(error)) from error
 
     def report(self, mission):
-        temporary_error = None
-        try:
-            self.verify_temporary_cleanup(mission)
-            self.verify_container_client_stops(mission)
-        except FactoryBlocked as error:
-            temporary_error = error.reason
-        report = self._report(mission, temporary_error)
+        temporary_error, pending = None, []
+        # SQLite settlement and filesystem receipts are not one transaction.
+        # Re-read once on rejection, without waiting, adopting resources or writing state.
+        for _ in range(2):
+            mission_row = self.row(mission)
+            try:
+                pending = self.verify_temporary_cleanup(mission, allow_active=True)
+                self.verify_container_client_stops(mission)
+                temporary_error = None
+                break
+            except FactoryBlocked as error:
+                temporary_error = error.reason
+        report = self._report(mission, temporary_error, pending, mission_row=mission_row)
+        report["TEMPORARY_CLEANUP"] = {"status": "INVALID" if temporary_error else "PENDING" if pending else "VERIFIED",
+                                       "operations": pending}
         if "model_routing" in self.config:
             from .factory_routing import observation
             event = self.db.execute("SELECT payload FROM events WHERE mission=? AND kind='submitted'", (mission,)).fetchone()
@@ -1565,11 +1705,16 @@ class Factory:
             report["MODEL_ROUTING"] = observation(decision, operations)
         return report
 
-    def _report(self, mission, temporary_error=None):
+    def _report(self, mission, temporary_error=None, temporary_pending=None, *, mission_row=None):
         from .factory_remote import project_branch
-        row = self.row(mission)
+        # Do not promote a later terminal status using an earlier cleanup snapshot.
+        row = self.row(mission) if mission_row is None else mission_row
         if temporary_error is not None:
             row = {**dict(row), "status": "UNKNOWN", "reason": temporary_error}
+        elif temporary_pending:
+            pending_statuses = (READY, OFFLINE_PASS, candidate_stage.LOCAL_READY, "CANCELLED")
+            row = {**dict(row), "status": "RUNNING" if row["status"] in pending_statuses else row["status"],
+                   "reason": "temporary cleanup verification pending for active mission controller"}
         operations = self.db.execute("SELECT * FROM operations WHERE mission=? ORDER BY started", (mission,)).fetchall()
         events = self.db.execute("SELECT kind,payload FROM events WHERE mission=? ORDER BY sequence", (mission,)).fetchall()
         spec = json.loads(row["spec"])
@@ -1734,6 +1879,14 @@ class Factory:
             watcher.start()
             cleanup = None
             try:
+                if execution is not None:
+                    from .appserver_process import process_identity
+                    info = os.fstat(stream.fileno())
+                    self.event(mission, "controller_execution", {
+                        "controller": process_identity(os.getpid()),
+                        "runtime_execution": getattr(self.runtime, "_execution_id", None),
+                        "lock": {"device": info.st_dev, "inode": info.st_ino}})
+                    self.db.commit()
                 result = self._run(mission)
             finally:
                 stopped.set()
