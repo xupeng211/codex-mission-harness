@@ -194,3 +194,12 @@ HEAD `a65464d1e5de498a072ed9a8fdf69ce46bcc04c5`，tree
 不需要新增私有仓库 token；若访问条件变化，应报告前置阻断，不自动扩大权限或改用最新版本。
 这些测试执行原合同的离线规则并明确替换外部 I/O，不运行项目真实严格门禁或业务任务。
 Native Codex / 平台条件限定的可选测试仍单独报告 skip，不能替代必需的合同测试。
+
+## License
+
+Unless otherwise noted, this project is licensed under the [Apache License 2.0](LICENSE).
+
+The vendored OpenAI Codex review rubric retains its upstream attribution and
+[license](src/harness/vendor/codex/LICENSE), [NOTICE](src/harness/vendor/codex/NOTICE),
+and [source provenance](src/harness/vendor/codex/provenance.json).
+Third-party material remains subject to its existing notices and license terms.
