@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from harness.appserver_process import AppServerProcess
 from harness.factory import Factory, git
+from harness.factory_candidate import BILLING, LOCAL_READY
 from harness.factory_fixture import AcceptanceRuntime, fixture_config
 from harness.task_temp import TaskTemp
 
@@ -88,6 +89,19 @@ class ControlledRuntime(AcceptanceRuntime):
         self.release.set()
 
 
+class LocalCandidateRuntime(ControlledRuntime):
+    """Keep the real fixture session open after local completion has reported."""
+    def agent(self, role, profile, cwd, payload, transcript, timeout, denied_roots):
+        result = super().agent(role, profile, cwd, payload, transcript, timeout, denied_roots)
+        result.update(thread_id="fixture-local-thread", usage={"total": {
+            "inputTokens": len(self.calls), "outputTokens": 0, "totalTokens": len(self.calls)}})
+        return result
+
+    def close_session(self):
+        self.pause("before-close")
+        return super().close_session()
+
+
 @unittest.skipUnless(sys.platform == "linux" and hasattr(os, "pidfd_open"), "Linux process ownership required")
 class ActiveTempStatusTests(unittest.TestCase):
     def setUp(self):
@@ -106,8 +120,8 @@ class ActiveTempStatusTests(unittest.TestCase):
         self.factory.submit({"version": 2, "mission_id": "active-temp", "repository": str(self.repo),
                              "objective": "Offline fixture average", "scope": ["score.py", "tests/test_score.py"]})
 
-    def start(self, phase="started", immediate=False):
-        self.runtime = ControlledRuntime(phase, immediate)
+    def start(self, phase="started", immediate=False, *, runtime=None):
+        self.runtime = runtime or ControlledRuntime(phase, immediate)
         self.result, self.errors = [], []
         def work():
             factory = Factory(self.factory.root, self.config, self.runtime)
@@ -121,6 +135,36 @@ class ActiveTempStatusTests(unittest.TestCase):
         self.worker.start()
         self.addCleanup(self.finish)
         self.assertTrue(self.runtime.reached.wait(10), self.errors)
+
+    def start_local_candidate(self, phase="before-close"):
+        self.factory.close()
+        self.config = fixture_config()
+        self.config["budget"] = {"max_agent_runs": 2, "max_run_tokens": 36000,
+                                 "max_first_turn_tokens": 60000, "max_repair_incremental_tokens": 36000,
+                                 "max_total_tokens": 96000, "max_wall_seconds": 300}
+        self.factory = Factory(self.root / "local-state", self.config, AcceptanceRuntime())
+        self.addCleanup(self.factory.close)
+        spec = {"version": 2, "mission_id": "active-temp", "repository": str(self.repo),
+                "base": git(self.repo, "rev-parse", "HEAD"), "objective": "Offline fixture average",
+                "scope": ["score.py", "tests/test_score.py"],
+                "acceptance": ["Preserve add and empty/fractional averages"],
+                "delivery_mode": "local_candidate"}
+        spec["local_candidate_authorization"] = {
+            "approval_id": "OFFLINE-FIXTURE-ONLY", "mission_id": spec["mission_id"],
+            "repository": spec["repository"], "base": spec["base"],
+            "worktree": str(self.factory.root / "candidates/active-temp"),
+            "allowed_paths": spec["scope"], "acceptance": spec["acceptance"],
+            "executor_identity": self.factory.profile_identities["developer"],
+            **{key: self.factory.config[key] for key in
+               ("checks", "ci", "budget", "max_rounds", "timeout_seconds", "simulation")},
+            "billing": BILLING, "remote_write": "FORBIDDEN", "formal_review": "NOT_AUTHORIZED",
+            "executor_permissions": "ISOLATED_CANDIDATE_ONLY_NO_NETWORK",
+            "expires_at": "2099-01-01T00:00:00+00:00"}
+        self.factory.submit(spec)
+        self.start(runtime=LocalCandidateRuntime(phase))
+        self.assertEqual(self.factory.row("active-temp")["status"], LOCAL_READY)
+        self.assertEqual(self.factory.db.execute(
+            "SELECT COUNT(*) FROM events WHERE kind='local_candidate'").fetchone()[0], 1)
 
     def finish(self):
         self.runtime.release.set()
@@ -182,6 +226,88 @@ class ActiveTempStatusTests(unittest.TestCase):
         report = self.report()
         self.assertEqual(report["DELIVERY_STATUS"], "READY_FOR_USER_ACCEPTANCE")
         self.assertEqual(report["TEMPORARY_CLEANUP"]["status"], "VERIFIED")
+
+    def assert_local_not_ready(self, report):
+        self.assertFalse(report["LOCAL_CANDIDATE_READY"])
+        self.assertNotEqual(report["DELIVERY_STATUS"], LOCAL_READY)
+        self.assertFalse(report["READY_FOR_MERGE"])
+        self.assertFalse(report["READY_FOR_PRODUCTION"])
+
+    def test_local_completion_is_pending_until_session_stop_and_cleanup(self):
+        self.start_local_candidate()
+        self.assertIsNone(self.runtime.owner.stopped)
+        self.assertTrue(self.runtime.temp.path.exists())
+        report = self.report()
+        self.assertEqual(report["TEMPORARY_CLEANUP"]["status"], "PENDING")
+        self.assert_local_not_ready(report)
+        self.assertEqual(report["DELIVERY_STATUS"], "RUNNING")
+        self.assertEqual(report["SCOPE_RESULT"], "UNKNOWN")
+        self.assertEqual(report["TEST_RESULT"], "UNKNOWN")
+        for results in report["TRUSTED_QA_RESULT"].values():
+            self.assertTrue(results)
+            self.assertTrue(all(result["status"] == "PASS" for result in results))
+        self.finish()
+        final = self.result[0]  # Actual Factory.run() report, after its finally.
+        self.assertEqual(final["DELIVERY_STATUS"], LOCAL_READY)
+        self.assertTrue(final["LOCAL_CANDIDATE_READY"])
+        self.assertEqual(final["TEMPORARY_CLEANUP"]["status"], "VERIFIED")
+        self.assertEqual(self.report(), final)
+        self.assertFalse(final["READY_FOR_MERGE"])
+        self.assertFalse(final["READY_FOR_PRODUCTION"])
+
+    def test_local_pending_does_not_hide_foreign_execution_binding(self):
+        self.start_local_candidate()
+        journal = self.runtime.owner.record
+        original = journal.read_bytes()
+        rows = [json.loads(line) for line in original.splitlines()]
+        for row in rows:
+            row["binding"]["context"]["mission_id"] = "foreign"
+        journal.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        try:
+            report = self.report()
+            self.assertEqual(report["TEMPORARY_CLEANUP"]["status"], "INVALID")
+            self.assertEqual(report["DELIVERY_STATUS"], "UNKNOWN")
+            self.assert_local_not_ready(report)
+        finally:
+            journal.write_bytes(original)
+
+    def test_local_unconfirmed_stop_cannot_release_readiness(self):
+        self.start_local_candidate("stopped")
+        journal = self.runtime.owner.record
+        original = journal.read_bytes()
+        rows = [json.loads(line) for line in original.splitlines()]
+        rows[-1]["result"]["confirmed"] = False
+        journal.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        try:
+            report = self.report()
+            self.assertEqual(report["TEMPORARY_CLEANUP"]["status"], "INVALID")
+            self.assertEqual(report["DELIVERY_STATUS"], "UNKNOWN")
+            self.assert_local_not_ready(report)
+        finally:
+            journal.write_bytes(original)
+
+    def test_local_finished_missing_or_damaged_cleanup_blocks_readiness(self):
+        self.start_local_candidate()
+        self.finish()
+        self.assertTrue(self.report()["LOCAL_CANDIDATE_READY"])
+        receipt = self.runtime.temp.cleanup_log
+        original = receipt.read_bytes()
+        mode = receipt.stat().st_mode & 0o777
+        for damage in (None, original + b" "):
+            with self.subTest(missing=damage is None):
+                if damage is None:
+                    receipt.unlink()
+                else:
+                    receipt.write_bytes(damage)
+                try:
+                    report = self.report()
+                    self.assertEqual(report["TEMPORARY_CLEANUP"]["status"], "INVALID")
+                    self.assertEqual(report["DELIVERY_STATUS"], "UNKNOWN")
+                    self.assert_local_not_ready(report)
+                finally:
+                    receipt.write_bytes(original)
+                    receipt.chmod(mode)
+        self.assertTrue(self.report()["LOCAL_CANDIDATE_READY"])
 
     def test_cancelled_stopped_and_cleaned_report_keeps_cancelled(self):
         self.start()

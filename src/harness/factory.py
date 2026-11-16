@@ -1712,7 +1712,8 @@ class Factory:
         if temporary_error is not None:
             row = {**dict(row), "status": "UNKNOWN", "reason": temporary_error}
         elif temporary_pending:
-            row = {**dict(row), "status": "RUNNING" if row["status"] in (READY, OFFLINE_PASS, "CANCELLED") else row["status"],
+            pending_statuses = (READY, OFFLINE_PASS, candidate_stage.LOCAL_READY, "CANCELLED")
+            row = {**dict(row), "status": "RUNNING" if row["status"] in pending_statuses else row["status"],
                    "reason": "temporary cleanup verification pending for active mission controller"}
         operations = self.db.execute("SELECT * FROM operations WHERE mission=? ORDER BY started", (mission,)).fetchall()
         events = self.db.execute("SELECT kind,payload FROM events WHERE mission=? ORDER BY sequence", (mission,)).fetchall()
