@@ -91,7 +91,7 @@ class QAFeedbackTests(unittest.TestCase):
         self.assertTrue(all("diagnostics" not in v for v in self.captured[0]["feedback"]))
 
     def test_invalid_original_stops_before_rework_dispatch(self):
-        for mode in ("missing", "corrupt", "oversized", "no-transcript", "envelope"):
+        for mode in ("missing", "corrupt", "oversized", "empty", "no-transcript", "envelope"):
             with self.subTest(mode=mode):
                 case = QAFeedbackTests()
                 case.setUp()
@@ -100,7 +100,7 @@ class QAFeedbackTests(unittest.TestCase):
                     def gate(command, cwd, target, transcript, timeout):
                         if not case.f.row("feature")["round"]:
                             if mode != "no-transcript":
-                                transcript.write_text("x" * 16385 if mode == "oversized"
+                                transcript.write_text("x" * 16385 if mode == "oversized" else "" if mode == "empty"
                                                       else SAMPLE["diagnostic_output"])
                             return {"status": "FAIL", "exit_code": 1}
                         return case.original_gate(command, cwd, target, transcript, timeout)
