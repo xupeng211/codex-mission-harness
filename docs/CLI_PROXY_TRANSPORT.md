@@ -27,6 +27,8 @@ are admitted. Each policy keeps the exact local ID it was provisioned with.
 | v8.0.15 | OCI index | `sha256:ebc2ffc189cf241ff589cd9237c63ca9feba3c9b87fe6213ab9a0b642df132ae` |
 | v8.0.15 | linux/amd64 manifest | `sha256:e248cd0dc9d54a7709ed23276842f627da32e43010c6226ca51b6f4b59173771` |
 | v8.0.15 | linux/amd64 config | `sha256:9e2be6a609ef43f243b433543b705d1ddcce10c2a840f745848c10e02468ab53` |
+| v8.0.15 | linux/arm64 manifest | `sha256:327cc3c3acc4cceafe8350f94f30fd0329131d71866f8b83b440213b019f6b09` |
+| v8.0.15 | linux/arm64 config | `sha256:c088c22d25aceb212e0713c907d25991dbdcc7ba8be3bff3644121f20e74e4c4` |
 | v8.0.77 | OCI index | `sha256:2acf44fbadf9933a04e971048b4c2ddd184ce6e3ea08fc2dc25354f3a365f5ab` |
 | v8.0.77 | linux/amd64 manifest | `sha256:61451a1fce07e70fb86bc52939b3b99bcb0d4c98a94483bb880017d2937f5e1e` |
 | v8.0.77 | linux/amd64 config | `sha256:8712adc77fc26b5062667e2e9bc023ea4be2651faab46b10d32e43ac6b40508d` |
@@ -39,14 +41,23 @@ Existing v8.0.15 policies keep their original layout.
 The original interactive instance can keep its configuration. A Factory-only copy
 uses zero credential/stream bootstrap retries, a single credential per request,
 disabled WebSockets/model aliases/steering, read-only configuration and credential
-mounts, and a loopback-only published port. Only those binds and the provisioner's
-optional `/tmp` tmpfs are accepted.
+mounts, and a loopback-only published port. The two bind mounts must have private
+propagation and either exclude submounts or force recursive read-only access.
+The optional `/tmp` tmpfs is limited to 32 MiB with `noexec,nosuid,nodev`.
+An existing container whose mount metadata cannot prove these properties needs
+to be reprovisioned before starting a new run.
 
 For v8.0.77, provisioning copies an access-token snapshot with a known expiry
-and leaves refresh material out. The running relay stops on snapshot drift,
-expiry or a proxy 401, including an authentication failure carried in a stream.
-Reprovision a fresh out-of-band snapshot and authorize a new run to recover.
-The stopped run is never refreshed, replayed or switched to another account.
+and leaves refresh material out. It writes a private `transport.json` with a
+`snapshot_id` derived from the exact credential bytes and the private
+management key. Include that transport object in the approved private Factory
+config for a fixed developer profile or model-pool entry. Factory retains the
+approved route in the immutable submission event and checks it before a new
+dispatch, after opening the relay and before forwarding. Keep the snapshot
+identifier, private transport and build evidence that contains it out of public
+logs and artifacts. The relay stops on snapshot drift, expiry or a proxy 401,
+including a recognized stream authentication failure. Reprovision a fresh
+out-of-band snapshot and authorize a new run to recover.
 
 Use an owner-controlled mode-0600 input auth file in a private directory. If the
 existing proxy auth directory is writable by other users, first make a private
@@ -62,7 +73,8 @@ python3 scripts/configure_factory_proxy.py \
 ```
 
 This performs no model inference. It creates private key files and a safe
-`policy.json`, and reports only configuration/runtime identity. Do not upload the
+`policy.json`, and reports the configuration/runtime identity with the
+snapshot identifier omitted. Do not upload the
 configuration/key/auth files as CI artifacts. The policy directory must remain
 outside the candidate repository. No secret is passed through Docker/Codex argv.
 
@@ -98,6 +110,8 @@ Do not change/resume/refund a historical UNKNOWN mission to switch routes.
 `harness setup` also accepts `--transport cli_proxy --model ... --proxy-endpoint ...
 --proxy-policy-file ...`; it keeps the reviewer official. Model and endpoint are
 mandatory explicit choices. Only `http://127.0.0.1:PORT/v1` is currently supported.
+For v8.0.77, bind the private transport emitted by provisioning directly in the
+approved Factory config.
 
 ## Evidence, isolation and accounting
 
@@ -157,6 +171,9 @@ Factory READY. Unknown/truncated reviews remain in their new ledger without
 automatic retries. Native offline tests cover official transport, proxy selection,
 credential isolation and no-fallback; HTTP contract tests cover bounded attempts,
 identity mismatches, partial usage, unknown reservations and immutable receipts.
+The qualification helper shown above accepts the legacy transport fields.
+Upstream HTTP 307/308 behavior remains a separate verification requirement for
+v8.0.77. The observer's redirect guard covers the hop to the local proxy.
 
 ## Task-level model pool
 

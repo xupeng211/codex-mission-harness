@@ -15,8 +15,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from harness.factory_proxy import (
-    LEGACY_PROXY_IMAGE, PROXY_V8_0_77_IMAGES, SUPPORTED_PROXY_RELEASES, ProxyPolicy,
-    private_file, verify_snapshot_expiry,
+    LEGACY_PROXY_IMAGE, PROXY_TMPFS_OPTIONS, PROXY_V8_0_77_IMAGES, SUPPORTED_PROXY_RELEASES, ProxyPolicy,
+    private_file, snapshot_identity, verify_snapshot_expiry,
 )
 
 
@@ -92,7 +92,8 @@ def main():
     key_path = root / "proxy-key"
     management_path = root / "management-key"
     write(config_path, json.dumps(managed_config(key, management_key, args.network_proxy, source["Image"]), indent=2)+"\n")
-    write(auth_path, json.dumps(selected)+"\n")
+    auth_text = json.dumps(selected, ensure_ascii=True) + "\n"
+    write(auth_path, auth_text)
     write(key_path, key+"\n")
     write(management_path, management_key+"\n")
     endpoint = f"http://127.0.0.1:{args.port}/v1"
@@ -102,11 +103,13 @@ def main():
     write(root / "policy.json", json.dumps(policy, indent=2)+"\n")
     # No credential in args or env; secret files are never copied to artifacts.
     subprocess.run(["docker", "run", "-d", "--name", args.name, "--read-only", "--network", args.network,
-                    "--tmpfs", "/tmp:rw,noexec,nosuid,size=32m", "-p", f"127.0.0.1:{args.port}:8317",
-                    "--mount", f"type=bind,src={config_path},dst=/CLIProxyAPI/config.yaml,readonly",
-                    "--mount", f"type=bind,src={auth_dir},dst=/factory-auth,readonly",
+                    "--tmpfs", f"/tmp:{PROXY_TMPFS_OPTIONS}", "-p", f"127.0.0.1:{args.port}:8317",
+                    "--mount", f"type=bind,src={config_path},dst=/CLIProxyAPI/config.yaml,readonly,bind-propagation=rprivate,bind-recursive=disabled",
+                    "--mount", f"type=bind,src={auth_dir},dst=/factory-auth,readonly,bind-propagation=rprivate,bind-recursive=disabled",
                     source["Image"], "/CLIProxyAPI/CLIProxyAPI", "-config", "/CLIProxyAPI/config.yaml", "-local-model"], check=True, capture_output=True)
     transport = {"type": "cli_proxy", "endpoint": endpoint, "configured_provider": "cli_proxy_api", "policy_file": str(root / "policy.json")}
+    if source["Image"] in PROXY_V8_0_77_IMAGES:
+        transport["snapshot_id"] = snapshot_identity(management_key, auth_text.encode("ascii"))
     for attempt in range(20):
         try:
             result = ProxyPolicy(transport)
@@ -115,7 +118,11 @@ def main():
             if attempt == 19:
                 raise RuntimeError("dedicated proxy did not become ready; no inference dispatched") from None
             time.sleep(.25)
-    print(json.dumps({"transport": transport, "runtime": result.identity, "model_inference_calls": 0,
+    if result.uses_snapshot:
+        write(root / "transport.json", json.dumps(transport, indent=2) + "\n")
+        transport = {"private_transport_file": str(root / "transport.json")}
+    runtime = {key: value for key, value in result.identity.items() if key != "snapshot_id"}
+    print(json.dumps({"transport": transport, "runtime": runtime, "model_inference_calls": 0,
                       "note": "Developer/planner only; proxy OpenAI reviewer is not qualified"}, indent=2))
 
 

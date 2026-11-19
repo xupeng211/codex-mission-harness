@@ -3,6 +3,7 @@ import base64
 import copy
 import http.server
 import hashlib
+import io
 import json
 import shutil
 import subprocess
@@ -11,17 +12,20 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from harness.factory import Factory, FactoryBlocked, validate_config
+from harness.factory import Factory, FactoryBlocked, git, validate_config
+from harness.factory_cli import main as factory_cli
 from harness.factory_fixture import AcceptanceRuntime, fixture_config
 from harness.factory_proxy import (
-    LEGACY_PROXY_IMAGE, LEGACY_PROXY_IMAGES, PROXY_V8_0_77_IMAGE, PROXY_V8_0_77_IMAGES,
-    SNAPSHOT_REJECTED, ProxyPolicy, ProxyRelay, validate_transport, verify_snapshot_expiry,
+    LEGACY_PROXY_IMAGE, LEGACY_PROXY_IMAGES, PROXY_TMPFS_OPTIONS, PROXY_V8_0_77_IMAGE, PROXY_V8_0_77_IMAGES,
+    SNAPSHOT_REJECTED, ProxyPolicy, ProxyRelay, snapshot_identity, validate_transport, verify_snapshot_expiry,
 )
-from harness.factory_runtime import FactoryAppServer, RuntimeFailure
+from harness.factory_runtime import FactoryAppServer, LocalRuntime, RuntimeFailure
 from scripts.configure_factory_proxy import managed_config, managed_credential, verify_release
+from test_factory_routing import pool
 
 
 class ProxyContracts(unittest.TestCase):
@@ -57,12 +61,13 @@ class ProxyContracts(unittest.TestCase):
                 if fixture.mode == "unauthorized":
                     self.send_error(401, fixture.key)
                     return
-                if fixture.mode == "stream_unauthorized":
+                if fixture.mode in {"stream_unauthorized", "stream_status_401"}:
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.end_headers()
                     failed = {"type": "response.failed", "response": {
-                        "error": {"code": "invalid_api_key", "message": fixture.key},
+                        "error": {**({"code": 401} if fixture.mode == "stream_status_401"
+                                     else {"code": "invalid_api_key"}), "message": fixture.key},
                     }}
                     self.wfile.write(b"data: " + json.dumps(failed).encode() + b"\n\n")
                     return
@@ -107,11 +112,17 @@ class ProxyContracts(unittest.TestCase):
                    "config_file": str(self.config_path), "auth_file": str(self.auth), "credential_file": str(self.root/"key"), "management_token_file": str(self.root/"management")}))
         self.transport = {"type": "cli_proxy", "endpoint": self.endpoint, "configured_provider": "cli_proxy_api", "policy_file": str(self.policy_file)}
         self.profile = {"provider": "openai", "model": "fixture-model", "transport": self.transport}
+        mounts = {"/CLIProxyAPI/config.yaml": str(self.config_path), "/factory-auth": str(auth_dir)}
         self.container = {"Id": "runtime-fixture", "Image": self.image, "State": {"Running": True},
-                          "Config": {"Entrypoint": None, "Cmd": ["/CLIProxyAPI/CLIProxyAPI", "-config", "/CLIProxyAPI/config.yaml", "-local-model"]},
-                          "HostConfig": {"ReadonlyRootfs": True, "PortBindings": {"8317/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(self.upstream.server_port)}]}},
-                          "Mounts": [{"Type": "bind", "Destination": "/CLIProxyAPI/config.yaml", "Source": str(self.config_path), "RW": False},
-                                     {"Type": "bind", "Destination": "/factory-auth", "Source": str(auth_dir), "RW": False}]}
+                          "Config": {"Entrypoint": None, "WorkingDir": "/CLIProxyAPI",
+                                     "Cmd": ["/CLIProxyAPI/CLIProxyAPI", "-config", "/CLIProxyAPI/config.yaml", "-local-model"]},
+                          "HostConfig": {"ReadonlyRootfs": True,
+                                         "PortBindings": {"8317/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(self.upstream.server_port)}]},
+                                         "Mounts": [{"Type": "bind", "Target": target, "Source": source, "ReadOnly": True,
+                                                     "BindOptions": {"NonRecursive": True, "Propagation": "rprivate"}}
+                                                    for target, source in mounts.items()]},
+                          "Mounts": [{"Type": "bind", "Destination": target, "Source": source, "RW": False,
+                                      "Propagation": "rprivate"} for target, source in mounts.items()]}
         self.inspect = patch("harness.factory_proxy.docker_json", return_value=[self.container])
         self.inspect.start()
         self.addCleanup(self.inspect.stop)
@@ -135,7 +146,14 @@ class ProxyContracts(unittest.TestCase):
         auth = json.loads(self.auth.read_text())
         auth["expired"] = "2100-01-01T00:00:00Z"
         self.write(self.auth, json.dumps(auth))
+        if image in PROXY_V8_0_77_IMAGES:
+            self.pin_snapshot()
+        else:
+            self.transport.pop("snapshot_id", None)
         return config
+
+    def pin_snapshot(self):
+        self.transport["snapshot_id"] = snapshot_identity(self.management_key, self.auth.read_bytes())
 
     def post(self, relay, model="fixture-model"):
         request = urllib.request.Request(relay.base_url+"/responses", data=json.dumps({"model": model, "stream": True}).encode(),
@@ -235,7 +253,10 @@ class ProxyContracts(unittest.TestCase):
     def test_only_the_expected_mounts_and_tmpfs_are_accepted(self):
         self.use_image(PROXY_V8_0_77_IMAGE)
         self.container["HostConfig"]["Tmpfs"] = {"/tmp": "rw,noexec,nosuid,size=32m"}
+        ProxyPolicy(self.transport)
         self.container["Mounts"].append({"Type": "tmpfs", "Destination": "/tmp", "RW": True})
+        ProxyPolicy(self.transport)
+        self.container["HostConfig"]["Tmpfs"]["/tmp"] = PROXY_TMPFS_OPTIONS
         ProxyPolicy(self.transport)
         for mount_type, path in (
             ("volume", "/CLIProxyAPI"),
@@ -252,6 +273,46 @@ class ProxyContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unexpected mount"):
             ProxyPolicy(self.transport)
 
+    def test_rejects_unproven_mount_metadata(self):
+        self.use_image(PROXY_V8_0_77_IMAGE)
+        baseline = copy.deepcopy(self.container)
+        host = self.container["HostConfig"]
+        for mutate in (
+            lambda: host.update(Mounts=[]),
+            lambda: host.update(Binds=["/fixture:/factory-auth:rw"]),
+            lambda: host.update(VolumesFrom=["other"]),
+            lambda: host["Mounts"].append({"Type": "tmpfs", "Target": "/factory-auth"}),
+            lambda: host["Mounts"][1].update(ReadOnly=False),
+            lambda: host["Mounts"][1]["BindOptions"].update(ReadOnlyNonRecursive=True),
+            lambda: host["Mounts"][1]["BindOptions"].update(NonRecursive=False),
+            lambda: host["Mounts"][1]["BindOptions"].update(ReadOnlyForceRecursive=True),
+            lambda: host["Mounts"][1]["BindOptions"].update(Propagation="rshared"),
+            lambda: self.container["Mounts"][1].update(Propagation="rslave"),
+            lambda: self.container["Config"].update(WorkingDir="/tmp"),
+            *(lambda option=option: host.update(Tmpfs={"/tmp": PROXY_TMPFS_OPTIONS + "," + option})
+              for option in ("exec", "suid", "dev", "size=64m")),
+        ):
+            mutate()
+            with self.assertRaisesRegex(ValueError, "mount|working directory"):
+                ProxyPolicy(self.transport)
+            self.container.update(copy.deepcopy(baseline))
+            host = self.container["HostConfig"]
+        host["Mounts"][1]["BindOptions"] = {"ReadOnlyForceRecursive": True, "Propagation": "rprivate"}
+        ProxyPolicy(self.transport)
+
+    def test_snapshot_pin_is_required_and_changes_with_exact_bytes(self):
+        self.use_image(PROXY_V8_0_77_IMAGE)
+        approved = dict(self.transport)
+        ProxyPolicy(approved)
+        self.transport.pop("snapshot_id")
+        with self.assertRaisesRegex(ValueError, "SNAPSHOT_AUTHORIZATION_REQUIRED"):
+            ProxyPolicy(self.transport)
+        self.write(self.auth, self.auth.read_text() + "\n")
+        with self.assertRaisesRegex(ValueError, "SNAPSHOT_CHANGED"):
+            ProxyPolicy(approved)
+        self.pin_snapshot()
+        ProxyPolicy(self.transport)
+
     def test_v8_0_77_provisions_no_refresh_material_and_rejects_expired_or_unknown_expiry(self):
         source = {"type": "codex", "access_token": "offline-token", "refresh_token": "legacy-refresh",
                   "siwc": {"refresh_token": "nested-refresh"}, "expired": "2100-01-01T00:00:00Z"}
@@ -264,6 +325,7 @@ class ProxyContracts(unittest.TestCase):
         self.use_image(PROXY_V8_0_77_IMAGE)
         for key in ("refresh_token", "refreshToken", "siwc"):
             self.write(self.auth, json.dumps({**snapshot, key: source["refresh_token"]}))
+            self.pin_snapshot()
             with self.assertRaisesRegex(ValueError, "credential aliases"):
                 ProxyPolicy(self.transport)
         for values, reason in (
@@ -299,9 +361,181 @@ class ProxyContracts(unittest.TestCase):
         self.assertEqual(self.requests, [])
         self.assertIn("CLI_PROXY_SNAPSHOT_CHANGED", relay.receipt()["stop_reason"])
 
+    def task_config(self, routed):
+        config = fixture_config()
+        config.update(simulation=False, review_mode="single_openai",
+                      budget={"max_agent_runs": 5, "max_run_tokens": 100, "max_total_tokens": 500})
+        config["profiles"]["developer"] = copy.deepcopy(self.profile)
+        config["profiles"].pop("second_reviewer")
+        if routed:
+            config["model_routing"] = pool()
+            for entry in config["model_routing"]["models"]:
+                entry["transport"] = dict(self.transport)
+        return config
+
+    def replace_snapshot(self, account_changed):
+        auth = json.loads(self.auth.read_text())
+        auth["access_token"] = "replacement-fixture-token"
+        if account_changed:
+            auth["account_id"] = "replacement-fixture-account"
+        self.write(self.auth, json.dumps(auth))
+
+    def test_task_dispatch_binds_the_exact_snapshot_across_sqlite_reopen(self):
+        self.use_image(PROXY_V8_0_77_IMAGE)
+        source = self.root / "source"
+        source.mkdir()
+        git(source, "init", "-q")
+        git(source, "-c", "user.name=Fixture", "-c", "user.email=f@localhost", "commit",
+            "--allow-empty", "-qm", "baseline")
+        auth = json.loads(self.auth.read_text())
+        auth["account_id"] = "approved-fixture-account"
+        original = json.dumps(auth)
+
+        def open_factory(name, config):
+            runtime = LocalRuntime()
+            live_identity = runtime.profile_identity
+            # Developer policy and task routing are real. The reviewer lane
+            # is unused here and never reads a real Codex home.
+            runtime.profile_identity = lambda profile: (
+                live_identity(profile) if profile.get("transport", {}).get("type") == "cli_proxy"
+                else {"configured": profile})
+            return Factory(self.root / name, config, runtime)
+
+        def appserver(profile, cwd, transcript, timeout, denied_roots, readonly, review, token_limit, **_):
+            # Substitute the native model process only. Loopback uses the
+            # production relay and its real pre-forward Docker policy check.
+            relay = ProxyRelay(profile, transcript, timeout, token_limit)
+            server = Mock(_proxy_relay=relay, _task_temp=None, runtime_identity=None)
+            server.usage_telemetry.return_value = None
+            server.close.side_effect = relay.close
+
+            def execute(prompt, schema, **_):
+                self.assertNotIn("snapshot_id", prompt)
+                if scenario == "after_relay":
+                    self.replace_snapshot(False)
+                body = self.post(relay, profile["model"])
+                relay.collect_telemetry()
+                if not body:
+                    self.assertIn("SNAPSHOT_CHANGED", relay.receipt()["stop_reason"])
+                    raise RuntimeFailure("synthetic turn stopped")
+                route = {**relay.policy.transport, "route_type": "cli_proxy",
+                         "auth_source": relay.policy.policy["credential_file"],
+                         "requested_model": profile["model"], "runtime": relay.policy.identity}
+                return {"summary": "offline", "usage": relay.usage(), "usage_complete": True,
+                        "output": {"plan": "synthetic control", "tasks": [], "acceptance": [],
+                                   "decisions_required": ["fixture ends after PLAN"]},
+                        "runtime_identity": {"route_identity": route, "reported_model": profile["model"]}}
+
+            server.execute.side_effect = execute
+            return server
+
+        for routed in (False, True):
+            for scenario in ("unchanged", "different_account", "same_account", "during_construction", "after_relay"):
+                with self.subTest(routed=routed, scenario=scenario):
+                    state = f"state-{routed}-{scenario}"
+                    self.write(self.auth, original)
+                    self.pin_snapshot()
+                    config = self.task_config(routed)
+                    before = len(self.requests)
+                    mission = {"version": 2, "mission_id": "snapshot-task", "repository": str(source),
+                               "objective": "synthetic snapshot contract"}
+
+                    def construct(*args, **kwargs):
+                        if scenario == "during_construction":
+                            self.replace_snapshot(False)
+                        return appserver(*args, **kwargs)
+
+                    with patch("harness.factory_runtime.AppServerCodex._trusted_executable",
+                               return_value=Path("/usr/bin/true")), patch(
+                            "harness.factory_preflight.inspect_prepaid", return_value={"findings": []}), patch(
+                            "harness.factory_runtime.FactoryAppServer", side_effect=construct) as server:
+                        first = open_factory(state, config)
+                        try:
+                            first.submit(mission)
+                            spec = json.loads(first.row("snapshot-task")["spec"])
+                            if scenario in {"different_account", "same_account"}:
+                                self.replace_snapshot(scenario == "different_account")
+                                with self.assertRaisesRegex(ValueError, "SNAPSHOT_CHANGED"):
+                                    first.submit({**mission, "mission_id": "another-task"})
+                        finally:
+                            first.close()
+                        reopened = open_factory(state, config)
+                        try:
+                            if scenario == "unchanged":
+                                result = reopened.agent(spec, source, "implement", 1, {})
+                                self.assertEqual(result["summary"], "offline")
+                                private_evidence = {"executor_identity": reopened.submitted_executor("snapshot-task")}
+                                with patch.object(reopened, "_report", return_value={
+                                        "LOCAL_CANDIDATE_EVIDENCE": private_evidence}):
+                                    report = reopened.report("snapshot-task")
+                                self.assertNotIn(self.transport["snapshot_id"], json.dumps(report))
+                                self.assertIn(self.transport["snapshot_id"], json.dumps(private_evidence))
+                                self.replace_snapshot(False)
+                                self.assertEqual(reopened.agent(spec, source, "implement", 1, {}), result)
+                                self.assertEqual(server.call_count, 1)
+                            else:
+                                with self.assertRaisesRegex(FactoryBlocked, "SNAPSHOT_CHANGED"):
+                                    reopened.agent(spec, source, "implement", 1, {})
+                                rows = reopened.db.execute("SELECT status FROM operations").fetchall()
+                                if scenario in {"different_account", "same_account"}:
+                                    server.assert_not_called()
+                                    self.assertEqual(rows, [])
+                                else:
+                                    self.assertEqual([row["status"] for row in rows], ["UNKNOWN"])
+                        finally:
+                            reopened.close()
+                        self.assertEqual(len(self.requests) - before, int(scenario == "unchanged"))
+                        if scenario in {"unchanged", "same_account", "different_account"}:
+                            # Updating the config to match replacement bytes does
+                            # not modify the submitted snapshot authorization.
+                            self.pin_snapshot()
+                            rebound = self.task_config(routed)
+                            reopened = open_factory(state, rebound)
+                            try:
+                                with self.assertRaisesRegex(ValueError, "route changed|immutable mission authority"):
+                                    reopened.agent(spec, source, "implement", 2, {})
+                            finally:
+                                reopened.close()
+                            self.assertEqual(len(self.requests) - before, int(scenario == "unchanged"))
+
+        for scenario, expected, forwarded in (
+            ("cli_control", "WAITING_PRODUCT_DECISION", 1),
+            ("cli_swapped", "BLOCKED_LOCAL_AUTHORITY", 0),
+        ):
+            with self.subTest(scenario=scenario):
+                self.write(self.auth, original)
+                self.pin_snapshot()
+                config = self.task_config(False)
+                config_path = self.root / "cli-config.json"
+                self.write(config_path, json.dumps(config))
+                mission_path = self.root / "cli-mission.json"
+                self.write(mission_path, json.dumps(mission))
+                name = scenario
+                before = len(self.requests)
+                with patch("harness.factory_runtime.AppServerCodex._trusted_executable",
+                           return_value=Path("/usr/bin/true")), patch(
+                        "harness.factory_preflight.inspect_prepaid", return_value={"findings": []}), patch(
+                        "harness.factory_runtime.FactoryAppServer", side_effect=appserver), patch(
+                        "harness.factory_cli.Factory", side_effect=lambda _root, cfg, **_: open_factory(name, cfg)):
+                    first = open_factory(name, config)
+                    try:
+                        first.submit(mission)
+                    finally:
+                        first.close()
+                    if scenario == "cli_swapped":
+                        self.replace_snapshot(True)
+                    with redirect_stdout(io.StringIO()) as report, redirect_stderr(io.StringIO()):
+                        with self.assertRaises(SystemExit) as stopped:
+                            factory_cli(["factory-run", str(mission_path), "--config", str(config_path),
+                                         "--state-dir", str(self.root / name), "--json"])
+                    self.assertEqual(stopped.exception.code, 1)
+                    self.assertEqual(json.loads(report.getvalue())["DELIVERY_STATUS"], expected)
+                    self.assertNotIn(self.transport["snapshot_id"], report.getvalue())
+                    self.assertEqual(len(self.requests) - before, forwarded)
+
     def test_v8_0_77_unauthorized_latches_transport_without_replay_or_error_body(self):
         self.use_image(PROXY_V8_0_77_IMAGE)
-        for mode, status in (("unauthorized", 401), ("stream_unauthorized", 200)):
+        for mode, status in (("unauthorized", 401), ("stream_unauthorized", 200), ("stream_status_401", 200)):
             self.mode = mode
             with self.subTest(mode=mode):
                 relay = ProxyRelay(self.profile, self.root / (mode + ".raw"), 5)

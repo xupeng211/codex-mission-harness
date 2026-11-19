@@ -8,8 +8,9 @@ this adapter deliberately does not qualify it as an OpenAI review lane.
 from __future__ import annotations
 
 import base64
-import hashlib
 import fcntl
+import hashlib
+import hmac
 import http.server
 import json
 import os
@@ -36,6 +37,8 @@ LEGACY_PROXY_IMAGES = (
     LEGACY_PROXY_IMAGE,  # Published multi-platform index.
     "sha256:e248cd0dc9d54a7709ed23276842f627da32e43010c6226ca51b6f4b59173771",  # amd64 manifest
     "sha256:9e2be6a609ef43f243b433543b705d1ddcce10c2a840f745848c10e02468ab53",  # amd64 config
+    "sha256:327cc3c3acc4cceafe8350f94f30fd0329131d71866f8b83b440213b019f6b09",  # arm64 manifest
+    "sha256:c088c22d25aceb212e0713c907d25991dbdcc7ba8be3bff3644121f20e74e4c4",  # arm64 config
 )
 PROXY_V8_0_77_IMAGES = (
     "sha256:2acf44fbadf9933a04e971048b4c2ddd184ce6e3ea08fc2dc25354f3a365f5ab",  # index
@@ -49,10 +52,17 @@ SUPPORTED_PROXY_RELEASES = {
 SNAPSHOT_REJECTED = (
     "CLI_PROXY_SNAPSHOT_REJECTED: access-token snapshot rejected; reprovision before a new run"
 )
+SNAPSHOT_CHANGED = "CLI_PROXY_SNAPSHOT_CHANGED: new run authorization required"
+PROXY_TMPFS_OPTIONS = "rw,noexec,nosuid,nodev,size=32m"
 
 
 class ProxySnapshotError(ValueError):
     """Safe stop reason for an unusable access-token-only snapshot."""
+
+
+def snapshot_identity(management_key, auth_bytes):
+    return hmac.new(management_key.encode(), b"cmh-cli-proxy-snapshot/v1\0" + auth_bytes,
+                    hashlib.sha256).hexdigest()
 
 
 def verify_snapshot_expiry(auth):
@@ -101,6 +111,15 @@ def private_file(path):
     return path
 
 
+def read_snapshot(path):
+    path = private_file(path)
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError("proxy snapshot must be owner-owned mode 0600")
+        return stream.read()
+
+
 def validate_transport(profile, reviewer=False):
     transport = profile.get("transport", {"type": "official"})
     if not isinstance(transport, dict) or transport.get("type") not in ("official", "cli_proxy"):
@@ -109,8 +128,13 @@ def validate_transport(profile, reviewer=False):
         if set(transport) != {"type"}:
             raise ValueError("official transport does not accept proxy fields")
         return transport
-    if set(transport) != {"type", "endpoint", "configured_provider", "policy_file"}:
+    fields = {"type", "endpoint", "configured_provider", "policy_file"}
+    if set(transport) not in (fields, fields | {"snapshot_id"}):
         raise ValueError("cli_proxy requires endpoint, configured_provider and policy_file")
+    if "snapshot_id" in transport and (
+            not isinstance(transport["snapshot_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", transport["snapshot_id"])):
+        raise ValueError("invalid approved proxy snapshot identity")
     if reviewer:
         raise ValueError("CLI_PROXY_OPENAI_REVIEWER_NOT_QUALIFIED: upstream identity is proxy-attested only")
     if profile.get("provider") != "openai" or not profile.get("model") or profile.get("codex_profile"):
@@ -161,7 +185,8 @@ class ProxyPolicy:
         self.key = read_private_token(Path(self.policy["credential_file"]))
         self.management_key = read_private_token(Path(self.policy["management_token_file"]))
         self.uses_snapshot = self.policy["image"] in PROXY_V8_0_77_IMAGES
-        self._auth_snapshot = Path(self.policy["auth_file"]).read_bytes() if self.uses_snapshot else None
+        if self.uses_snapshot != ("snapshot_id" in transport):
+            raise ProxySnapshotError("CLI_PROXY_SNAPSHOT_AUTHORIZATION_REQUIRED: bind the snapshot to a new run")
         self.identity = self.verify()
 
     def management(self, path):
@@ -180,9 +205,12 @@ class ProxyPolicy:
         for key in ("config_file", "auth_file", "credential_file", "management_token_file"):
             private_file(p[key])
         config = json.loads(Path(p["config_file"]).read_text())
-        auth_bytes = Path(p["auth_file"]).read_bytes()
-        auth = json.loads(auth_bytes)
         modern_layout = self.uses_snapshot
+        auth_bytes = read_snapshot(p["auth_file"]) if modern_layout else Path(p["auth_file"]).read_bytes()
+        if modern_layout and not hmac.compare_digest(snapshot_identity(self.management_key, auth_bytes),
+                                                     self.transport["snapshot_id"]):
+            raise ProxySnapshotError(SNAPSHOT_CHANGED)
+        auth = json.loads(auth_bytes)
         # A closed schema prevents hidden YAML aliases, provider mappings,
         # payload rewrites, plugin routing and per-credential retry overrides.
         config_keys = {"config-version", "server", "management", "access", "routing", "requests", "oauth", "upstream", "observability"}
@@ -217,8 +245,6 @@ class ProxyPolicy:
         if (set(auth) - auth_keys
                 or type(auth.get("request_retry")) is not int or auth["request_retry"] != 0 or auth.get("websockets") is not False):
             raise ValueError("credential aliases, route overrides and replay are forbidden")
-        if modern_layout and auth_bytes != self._auth_snapshot:
-            raise ProxySnapshotError("CLI_PROXY_SNAPSHOT_CHANGED: new run authorization required")
         if any(auth.get(k) for k in ("base_url", "proxy_url", "proxy-url", "models", "prefix", "headers", "request_retry", "request-retry", "websockets")):
             raise ValueError("proxy credential contains route/retry overrides")
         if config["server"] != {"host": "", "port": 8317, "tls": {"enable": False}}:
@@ -238,28 +264,56 @@ class ProxyPolicy:
                 or container["HostConfig"].get("Privileged", False)
                 or any(v.split("=", 1)[0] not in ("PATH", "TZ") for v in container["Config"].get("Env", []))):
             raise ValueError("proxy endpoint/runtime identity differs from pinned policy")
-        mount_list = container["Mounts"]
-        binds = [m for m in mount_list if m["Type"] == "bind"]
-        mounts = {m["Destination"]: m for m in binds}
-        # The provisioner needs only its two read-only binds and an optional /tmp.
-        extra = [m for m in mount_list if m["Type"] != "bind"]
-        tmpfs = container["HostConfig"].get("Tmpfs") or {}
-        if (set(tmpfs) - {"/tmp"} or len(extra) > 1
-                or any(m["Type"] != "tmpfs" or m["Destination"] != "/tmp" for m in extra)):
-            raise ValueError("managed proxy has an unexpected mount")
         expected = {"/CLIProxyAPI/config.yaml": p["config_file"], "/factory-auth": str(Path(p["auth_file"]).parent)}
-        if (len(binds) != len(expected) or set(mounts) != set(expected)
-                or any(mounts[d]["Source"] != s or mounts[d]["RW"] for d,s in expected.items())):
-            raise ValueError("managed proxy config and credential mounts must be pinned read-only")
+        verify_proxy_mounts(container, expected)
         if list(Path(p["auth_file"]).parent.iterdir()) != [Path(p["auth_file"])]:
             raise ValueError("managed proxy requires exactly one credential file")
         if self.management("request-retry") != {"request-retry": 0} or self.management("max-retry-credentials") != {"max-retry-credentials": 1}:
             raise ValueError("running proxy retry policy differs from configuration")
         if modern_layout:
+            # Re-read after management I/O so a change during verification cannot pass.
+            if read_snapshot(p["auth_file"]) != auth_bytes:
+                raise ProxySnapshotError(SNAPSHOT_CHANGED)
             verify_snapshot_expiry(auth)
         return {"container_id": container["Id"], "image": p["image"], "config_sha256": digest({**config, "access": {"credential": "PRESENT"}, "management": {"credential": "PRESENT"}}),
+                **({"snapshot_id": self.transport["snapshot_id"]} if modern_layout else {}),
                 "credential_class": "codex", "upstream_attestation": "NOT_PROVABLE",
                 "retry_policy": {"request_retries": 0, "bootstrap_retries": 0, "max_credentials": 1, "websockets": False}}
+
+
+def verify_proxy_mounts(container, expected):
+    host = container["HostConfig"]
+    declared = host.get("Mounts") or []
+    discovered = container["Mounts"]
+    tmpfs = host.get("Tmpfs") or {}
+    permitted_tmpfs = ({}, {"/tmp": PROXY_TMPFS_OPTIONS},
+                       {"/tmp": "rw,noexec,nosuid,size=32m"})  # Moby adds nodev by default.
+    if (tmpfs not in permitted_tmpfs or host.get("Binds") or host.get("VolumesFrom")
+            or container["Config"].get("WorkingDir") != "/CLIProxyAPI"):
+        raise ValueError("managed proxy has an unexpected mount or working directory")
+
+    # Only structured binds with explicit submount exclusion or forced recursive RO
+    # prove the requested read-only boundary. RW:false alone is insufficient.
+    if len(declared) != len(expected) or {m.get("Target") for m in declared} != set(expected):
+        raise ValueError("managed proxy has unexpected structured mounts")
+    for mount in declared:
+        options = mount.get("BindOptions") or {}
+        non_recursive = options.get("NonRecursive") is True
+        force_read_only = options.get("ReadOnlyForceRecursive") is True
+        if (mount.get("Type") != "bind" or mount.get("Source") != expected[mount["Target"]]
+                or mount.get("ReadOnly") is not True or options.get("Propagation") != "rprivate"
+                or options.get("ReadOnlyNonRecursive") or options.get("CreateMountpoint")
+                or non_recursive == force_read_only):
+            raise ValueError("managed proxy config and credential mounts must be pinned read-only")
+
+    binds = [m for m in discovered if m["Type"] == "bind"]
+    extra = [m for m in discovered if m["Type"] != "bind"]
+    if len(extra) > 1 or any(m["Type"] != "tmpfs" or m["Destination"] not in tmpfs for m in extra):
+        raise ValueError("managed proxy has an unexpected mount")
+    if (len(binds) != len(expected) or {m["Destination"] for m in binds} != set(expected)
+            or any(m["Source"] != expected[m["Destination"]] or m["RW"] is not False
+                   or m.get("Propagation") != "rprivate" for m in binds)):
+        raise ValueError("managed proxy config and credential mounts must be pinned read-only")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -375,7 +429,8 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
             error = value.get("error") or response.get("error")
             if self.policy.uses_snapshot and isinstance(error, dict) and (
                 error.get("type") == "authentication_error"
-                or error.get("code") in ("invalid_api_key", "unauthorized", "upstream_authentication_required")
+                or error.get("code") in (401, "invalid_api_key", "unauthorized", "upstream_authentication_required")
+                or error.get("status") == 401
             ):
                 raise ProxySnapshotError(SNAPSHOT_REJECTED)
             raise ValueError("proxy generation failed or incomplete")
