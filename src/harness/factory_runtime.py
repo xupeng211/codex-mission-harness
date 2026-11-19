@@ -587,7 +587,8 @@ class FactoryAppServer(AppServerCodex):
             self.runtime_identity["physical_accounting"] = receipt
             self.runtime_identity["reported_model"] = self.MODEL if receipt["usage_complete"] else None
             if not receipt["usage_complete"]:
-                raise RuntimeFailure("explicit proxy result/usage identity is uncertain; no replay", self.usage, self.runtime_identity)
+                raise RuntimeFailure(receipt.get("stop_reason", "explicit proxy result/usage identity is uncertain; no replay"),
+                                     self.usage, self.runtime_identity)
         return {"output": json.loads(text[-1]), "usage": self.usage,
                 "thread_id": thread_id if return_thread else None, "turn_id": turn_id,
                 "turn_completion": completed, "usage_complete": True,
@@ -882,7 +883,8 @@ class LocalRuntime:
                     server.runtime_identity["physical_accounting"] = server._proxy_relay.receipt()
                 # Never include upstream error bodies, credentials or transport
                 # exception reprs in a receipt for a proxy failure.
-                raise RuntimeFailure("explicit CLI proxy run failed; no retry or fallback", server.usage, server.runtime_identity,
+                reason = server._proxy_relay.stop_reason or "explicit CLI proxy run failed; no retry or fallback"
+                raise RuntimeFailure(reason, server.usage, server.runtime_identity,
                                      usage_telemetry=server.usage_telemetry()) from exc
             raise RuntimeFailure(str(exc), server.usage, server.runtime_identity,
                                  usage_complete=getattr(server, "_usage_complete", False),

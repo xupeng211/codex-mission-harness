@@ -1,4 +1,5 @@
 """Transport contracts exercised against real local HTTP, with no paid calls."""
+import base64
 import copy
 import http.server
 import hashlib
@@ -16,10 +17,11 @@ from unittest.mock import patch
 from harness.factory import Factory, FactoryBlocked, validate_config
 from harness.factory_fixture import AcceptanceRuntime, fixture_config
 from harness.factory_proxy import (
-    LEGACY_PROXY_IMAGE, PROXY_V8_0_77_IMAGE, ProxyPolicy, ProxyRelay, validate_transport,
+    LEGACY_PROXY_IMAGE, LEGACY_PROXY_IMAGES, PROXY_V8_0_77_IMAGE, PROXY_V8_0_77_IMAGES,
+    SNAPSHOT_REJECTED, ProxyPolicy, ProxyRelay, validate_transport, verify_snapshot_expiry,
 )
 from harness.factory_runtime import FactoryAppServer, RuntimeFailure
-from scripts.configure_factory_proxy import managed_config, verify_release
+from scripts.configure_factory_proxy import managed_config, managed_credential, verify_release
 
 
 class ProxyContracts(unittest.TestCase):
@@ -51,6 +53,18 @@ class ProxyContracts(unittest.TestCase):
                 fixture.requests.append({"body": body, "auth": self.headers.get("Authorization")})
                 if fixture.mode == "http_error":
                     self.send_error(500, fixture.key)
+                    return
+                if fixture.mode == "unauthorized":
+                    self.send_error(401, fixture.key)
+                    return
+                if fixture.mode == "stream_unauthorized":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.end_headers()
+                    failed = {"type": "response.failed", "response": {
+                        "error": {"code": "invalid_api_key", "message": fixture.key},
+                    }}
+                    self.wfile.write(b"data: " + json.dumps(failed).encode() + b"\n\n")
                     return
                 if fixture.mode == "redirect":
                     self.send_response(307)
@@ -112,6 +126,17 @@ class ProxyContracts(unittest.TestCase):
         self.addCleanup(relay.close)
         return relay
 
+    def use_image(self, image):
+        policy = json.loads(self.policy_file.read_text())
+        policy["image"] = self.container["Image"] = image
+        self.write(self.policy_file, json.dumps(policy))
+        config = managed_config(self.key, self.management_key, "http://127.0.0.1:7897", image)
+        self.write(self.config_path, json.dumps(config))
+        auth = json.loads(self.auth.read_text())
+        auth["expired"] = "2100-01-01T00:00:00Z"
+        self.write(self.auth, json.dumps(auth))
+        return config
+
     def post(self, relay, model="fixture-model"):
         request = urllib.request.Request(relay.base_url+"/responses", data=json.dumps({"model": model, "stream": True}).encode(),
                                          headers={"Authorization": "Bearer "+relay.nonce})
@@ -160,8 +185,12 @@ class ProxyContracts(unittest.TestCase):
     def test_provisioning_requires_matching_release_and_image(self):
         legacy = "CLIProxyAPI Version: v8.0.15, Commit: a4acc9f, BuiltAt: fixture"
         modern = "CLIProxyAPI Version: v8.0.77, Commit: a5e8f69e, BuiltAt: fixture"
-        verify_release(LEGACY_PROXY_IMAGE, legacy)
-        verify_release(PROXY_V8_0_77_IMAGE, modern)
+        for release_images, banner in ((LEGACY_PROXY_IMAGES, legacy), (PROXY_V8_0_77_IMAGES, modern)):
+            for image in release_images:
+                with self.subTest(image=image):
+                    verify_release(image, banner)
+                    self.use_image(image)
+                    self.assertEqual(ProxyPolicy(self.transport).identity["image"], image)
         for image, banner in (
             (LEGACY_PROXY_IMAGE, modern),
             (PROXY_V8_0_77_IMAGE, legacy),
@@ -173,12 +202,7 @@ class ProxyContracts(unittest.TestCase):
                 verify_release(image, banner)
 
     def test_v8_0_77_policy_checks_layout_and_isolation(self):
-        policy = json.loads(self.policy_file.read_text())
-        policy["image"] = self.container["Image"] = PROXY_V8_0_77_IMAGE
-        self.write(self.policy_file, json.dumps(policy))
-        config = managed_config(self.key, self.management_key, "http://127.0.0.1:7897",
-                                image=PROXY_V8_0_77_IMAGE)
-        self.write(self.config_path, json.dumps(config))
+        config = self.use_image(PROXY_V8_0_77_IMAGE)
         self.assertEqual(config["multimedia"], {"disable-image-generation": True})
         self.assertEqual(config["observability"]["logs"]["request-log"], False)
         self.assertEqual(ProxyPolicy(self.transport).identity["image"], PROXY_V8_0_77_IMAGE)
@@ -202,10 +226,113 @@ class ProxyContracts(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "mounts must be pinned read-only"):
                     ProxyPolicy(self.transport)
                 mount["RW"] = False
+        policy = json.loads(self.policy_file.read_text())
         policy["image"] = self.container["Image"] = "sha256:" + "f" * 64
         self.write(self.policy_file, json.dumps(policy))
         with self.assertRaisesRegex(ValueError, "not a supported release"):
             ProxyPolicy(self.transport)
+
+    def test_only_the_expected_mounts_and_tmpfs_are_accepted(self):
+        self.use_image(PROXY_V8_0_77_IMAGE)
+        self.container["HostConfig"]["Tmpfs"] = {"/tmp": "rw,noexec,nosuid,size=32m"}
+        self.container["Mounts"].append({"Type": "tmpfs", "Destination": "/tmp", "RW": True})
+        ProxyPolicy(self.transport)
+        for mount_type, path in (
+            ("volume", "/CLIProxyAPI"),
+            ("volume", "/factory-auth/logs"),
+            ("tmpfs", "/factory-auth"),
+            ("bind", "/CLIProxyAPI/CLIProxyAPI"),
+        ):
+            with self.subTest(mount_type=mount_type, path=path):
+                self.container["Mounts"].append({"Type": mount_type, "Destination": path, "RW": True})
+                with self.assertRaisesRegex(ValueError, "mount"):
+                    ProxyPolicy(self.transport)
+                self.container["Mounts"].pop()
+        self.container["HostConfig"]["Tmpfs"]["/CLIProxyAPI"] = "rw"
+        with self.assertRaisesRegex(ValueError, "unexpected mount"):
+            ProxyPolicy(self.transport)
+
+    def test_v8_0_77_provisions_no_refresh_material_and_rejects_expired_or_unknown_expiry(self):
+        source = {"type": "codex", "access_token": "offline-token", "refresh_token": "legacy-refresh",
+                  "siwc": {"refresh_token": "nested-refresh"}, "expired": "2100-01-01T00:00:00Z"}
+        self.assertEqual(managed_credential(source, LEGACY_PROXY_IMAGE)["refresh_token"], "legacy-refresh")
+        snapshot = managed_credential(source, PROXY_V8_0_77_IMAGE)
+        self.assertEqual(snapshot["access_token"], source["access_token"])
+        self.assertNotIn("refresh_token", snapshot)
+        self.assertNotIn("siwc", snapshot)
+        self.assertEqual(source["refresh_token"], "legacy-refresh")
+        self.use_image(PROXY_V8_0_77_IMAGE)
+        for key in ("refresh_token", "refreshToken", "siwc"):
+            self.write(self.auth, json.dumps({**snapshot, key: source["refresh_token"]}))
+            with self.assertRaisesRegex(ValueError, "credential aliases"):
+                ProxyPolicy(self.transport)
+        for values, reason in (
+            ({"access_token": "opaque"}, "EXPIRY_UNKNOWN"),
+            ({"access_token": "opaque", "expired": "2100-01-01"}, "EXPIRY_UNKNOWN"),
+            ({"access_token": "opaque", "expired": "2000-01-01T00:00:00Z"}, "SNAPSHOT_EXPIRED"),
+        ):
+            with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason):
+                managed_credential(values, PROXY_V8_0_77_IMAGE)
+        exp = base64.urlsafe_b64encode(b'{"exp":1}').decode().rstrip("=")
+        with self.assertRaisesRegex(ValueError, "SNAPSHOT_EXPIRED"):
+            verify_snapshot_expiry({**snapshot, "access_token": f"header.{exp}.signature"})
+
+    def test_v8_0_77_expiry_is_rechecked_before_forwarding(self):
+        self.use_image(PROXY_V8_0_77_IMAGE)
+        relay = self.relay()
+        with patch("harness.factory_proxy.time.time", return_value=4102444800):
+            self.post(relay)
+        self.post(relay)
+        self.assertEqual(self.requests, [])
+        self.assertIn("CLI_PROXY_SNAPSHOT_EXPIRED", relay.receipt()["stop_reason"])
+        self.assertEqual(relay.receipt()["physical_attempts"], [])
+        with self.assertRaisesRegex(ValueError, "SNAPSHOT_EXPIRED"):
+            relay.start_turn(self.root / "another.raw", 5, None)
+
+    def test_v8_0_77_snapshot_cannot_be_replaced_mid_session(self):
+        self.use_image(PROXY_V8_0_77_IMAGE)
+        relay = self.relay()
+        auth = json.loads(self.auth.read_text())
+        auth["access_token"] = "offline-replacement"
+        self.write(self.auth, json.dumps(auth))
+        self.post(relay)
+        self.assertEqual(self.requests, [])
+        self.assertIn("CLI_PROXY_SNAPSHOT_CHANGED", relay.receipt()["stop_reason"])
+
+    def test_v8_0_77_unauthorized_latches_transport_without_replay_or_error_body(self):
+        self.use_image(PROXY_V8_0_77_IMAGE)
+        for mode, status in (("unauthorized", 401), ("stream_unauthorized", 200)):
+            self.mode = mode
+            with self.subTest(mode=mode):
+                relay = ProxyRelay(self.profile, self.root / (mode + ".raw"), 5)
+                try:
+                    before = len(self.requests)
+                    body = self.post(relay)
+                    self.post(relay)
+                    receipt = relay.receipt()
+                    self.assertEqual(len(self.requests) - before, 1)
+                    self.assertEqual(receipt["stop_reason"], SNAPSHOT_REJECTED)
+                    self.assertEqual(receipt["physical_attempts"][0]["proxy_http_status"], status)
+                    self.assertEqual(receipt["physical_attempts"][0]["status"], "UNKNOWN")
+                    self.assertFalse(receipt["usage_complete"])
+                    with self.assertRaisesRegex(ValueError, "SNAPSHOT_REJECTED"):
+                        relay.start_turn(self.root / "another.raw", 5, None)
+                    self.assertNotIn(self.key, relay.evidence.read_text())
+                    self.assertNotIn(self.key.encode(), body)
+                finally:
+                    relay.close()
+
+    def test_v8_0_77_management_401_is_not_attributed_to_the_access_token(self):
+        self.use_image(PROXY_V8_0_77_IMAGE)
+        relay = self.relay()
+        url = self.endpoint.removesuffix("/v1") + "/v0/management/request-retry"
+        error = urllib.error.HTTPError(url, 401, "fixture management rejection", {}, None)
+        with patch.object(ProxyPolicy, "management", side_effect=error):
+            self.post(relay)
+        self.post(relay)
+        self.assertTrue(relay.failed)
+        self.assertNotIn("stop_reason", relay.receipt())
+        self.assertEqual(self.requests, [])
 
     def test_success_records_physical_requests_actual_model_and_redacted_correlated_telemetry(self):
         relay = self.relay()

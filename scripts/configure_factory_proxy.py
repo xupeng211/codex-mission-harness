@@ -15,7 +15,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from harness.factory_proxy import (
-    LEGACY_PROXY_IMAGE, PROXY_V8_0_77_IMAGE, SUPPORTED_PROXY_RELEASES, ProxyPolicy, private_file,
+    LEGACY_PROXY_IMAGE, PROXY_V8_0_77_IMAGES, SUPPORTED_PROXY_RELEASES, ProxyPolicy,
+    private_file, verify_snapshot_expiry,
 )
 
 
@@ -29,12 +30,23 @@ def managed_config(key, management_key, network_proxy, image=LEGACY_PROXY_IMAGE)
             "oauth": {"auth-dir": "/factory-auth"},
             "upstream": {"codex": {"response-steering": False, "stream-bootstrap-buffering": False}},
             "observability": {"logging": {"debug": False, "request-log": False, "logging-to-file": False}, "usage": {"usage-statistics-enabled": True, "redis-usage-queue-retention-seconds": 3600}}}
-    if image == PROXY_V8_0_77_IMAGE:
+    if image in PROXY_V8_0_77_IMAGES:
         config["multimedia"] = {
             "disable-image-generation": config["requests"].pop("disable-image-generation"),
         }
         config["observability"]["logs"] = config["observability"].pop("logging")
     return config
+
+
+def managed_credential(auth, image):
+    fields = {"type", "access_token", "id_token", "account_id", "email", "expired", "last_refresh"}
+    if image not in PROXY_V8_0_77_IMAGES:
+        fields.add("refresh_token")
+    selected = {key: auth[key] for key in fields if key in auth}
+    selected.update(request_retry=0, websockets=False)
+    if image in PROXY_V8_0_77_IMAGES:
+        verify_snapshot_expiry(selected)
+    return selected
 
 
 def verify_release(image, banner):
@@ -67,15 +79,13 @@ def main():
     version = subprocess.run(["docker", "exec", args.source_container, "/CLIProxyAPI/CLIProxyAPI", "--help"], capture_output=True, text=True, timeout=10)
     try:
         verify_release(source["Image"], version.stdout + version.stderr)
+        selected = managed_credential(auth, source["Image"])
     except ValueError as exc:
         parser.error(str(exc))
     root = args.directory.absolute()
     root.mkdir(mode=0o700, parents=True, exist_ok=False)
     auth_dir = root / "auth"
     auth_dir.mkdir(mode=0o700)
-    # Copy only authentication fields, not arbitrary provider/routing overrides.
-    selected = {k: v for k,v in auth.items() if k in {"type", "access_token", "refresh_token", "id_token", "account_id", "email", "expired", "last_refresh"}}
-    selected.update(request_retry=0, websockets=False)
     key, management_key = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
     config_path = root / "config.json"
     auth_path = auth_dir / "codex.json"

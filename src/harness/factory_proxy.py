@@ -7,6 +7,7 @@ this adapter deliberately does not qualify it as an OpenAI review lane.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import fcntl
 import http.server
@@ -21,6 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from .codex import AppServerCodex
@@ -30,10 +32,57 @@ from .factory_budget import tokens
 
 LEGACY_PROXY_IMAGE = "sha256:ebc2ffc189cf241ff589cd9237c63ca9feba3c9b87fe6213ab9a0b642df132ae"
 PROXY_V8_0_77_IMAGE = "sha256:61451a1fce07e70fb86bc52939b3b99bcb0d4c98a94483bb880017d2937f5e1e"
+LEGACY_PROXY_IMAGES = (
+    LEGACY_PROXY_IMAGE,  # Published multi-platform index.
+    "sha256:e248cd0dc9d54a7709ed23276842f627da32e43010c6226ca51b6f4b59173771",  # amd64 manifest
+    "sha256:9e2be6a609ef43f243b433543b705d1ddcce10c2a840f745848c10e02468ab53",  # amd64 config
+)
+PROXY_V8_0_77_IMAGES = (
+    "sha256:2acf44fbadf9933a04e971048b4c2ddd184ce6e3ea08fc2dc25354f3a365f5ab",  # index
+    PROXY_V8_0_77_IMAGE,  # amd64 manifest
+    "sha256:8712adc77fc26b5062667e2e9bc023ea4be2651faab46b10d32e43ac6b40508d",  # amd64 config
+)
 SUPPORTED_PROXY_RELEASES = {
-    LEGACY_PROXY_IMAGE: ("v8.0.15", "a4acc9f752bd46571f737a10c04bf413656ab06b"),
-    PROXY_V8_0_77_IMAGE: ("v8.0.77", "a5e8f69e56309e1ef6d6872e667da81fdfbce2ce"),
+    **dict.fromkeys(LEGACY_PROXY_IMAGES, ("v8.0.15", "a4acc9f752bd46571f737a10c04bf413656ab06b")),
+    **dict.fromkeys(PROXY_V8_0_77_IMAGES, ("v8.0.77", "a5e8f69e56309e1ef6d6872e667da81fdfbce2ce")),
 }
+SNAPSHOT_REJECTED = (
+    "CLI_PROXY_SNAPSHOT_REJECTED: access-token snapshot rejected; reprovision before a new run"
+)
+
+
+class ProxySnapshotError(ValueError):
+    """Safe stop reason for an unusable access-token-only snapshot."""
+
+
+def verify_snapshot_expiry(auth):
+    """Use available expiry bounds for stopping, never for authenticating the token."""
+    token = auth.get("access_token")
+    if not isinstance(token, str) or not token.strip():
+        raise ProxySnapshotError("CLI_PROXY_SNAPSHOT_EXPIRY_UNKNOWN: invalid snapshot access token")
+    deadlines = []
+    expiry = auth.get("expired")
+    if expiry:
+        try:
+            expiry = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+            if expiry.tzinfo is None:
+                raise ValueError("timezone required")
+            deadlines.append(expiry.timestamp())
+        except (AttributeError, ValueError, OverflowError, OSError):
+            raise ProxySnapshotError("CLI_PROXY_SNAPSHOT_EXPIRY_UNKNOWN: invalid snapshot expiry") from None
+    parts = token.split(".")
+    if len(parts) == 3:
+        payload = parts[1]
+        try:
+            claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        except (ValueError, UnicodeError):
+            claims = {}
+        if isinstance(claims, dict) and type(claims.get("exp")) is int:
+            deadlines.append(claims["exp"])
+    if not deadlines:
+        raise ProxySnapshotError("CLI_PROXY_SNAPSHOT_EXPIRY_UNKNOWN: use a snapshot with a known expiry")
+    if min(deadlines) <= time.time():
+        raise ProxySnapshotError("CLI_PROXY_SNAPSHOT_EXPIRED: reprovision before a new run")
 
 
 def digest(value):
@@ -111,6 +160,8 @@ class ProxyPolicy:
                 raise ValueError("all proxy authentication sources must stay inside the private policy directory")
         self.key = read_private_token(Path(self.policy["credential_file"]))
         self.management_key = read_private_token(Path(self.policy["management_token_file"]))
+        self.uses_snapshot = self.policy["image"] in PROXY_V8_0_77_IMAGES
+        self._auth_snapshot = Path(self.policy["auth_file"]).read_bytes() if self.uses_snapshot else None
         self.identity = self.verify()
 
     def management(self, path):
@@ -129,8 +180,9 @@ class ProxyPolicy:
         for key in ("config_file", "auth_file", "credential_file", "management_token_file"):
             private_file(p[key])
         config = json.loads(Path(p["config_file"]).read_text())
-        auth = json.loads(Path(p["auth_file"]).read_text())
-        modern_layout = p["image"] == PROXY_V8_0_77_IMAGE
+        auth_bytes = Path(p["auth_file"]).read_bytes()
+        auth = json.loads(auth_bytes)
+        modern_layout = self.uses_snapshot
         # A closed schema prevents hidden YAML aliases, provider mappings,
         # payload rewrites, plugin routing and per-credential retry overrides.
         config_keys = {"config-version", "server", "management", "access", "routing", "requests", "oauth", "upstream", "observability"}
@@ -158,9 +210,15 @@ class ProxyPolicy:
             raise ValueError("managed proxy authentication source differs")
         if auth.get("type") != "codex" or auth.get("disabled") is True or not auth.get("access_token"):
             raise ValueError("managed proxy requires one active Codex credential")
-        if (set(auth) - {"type", "access_token", "refresh_token", "id_token", "account_id", "email", "expired", "last_refresh", "request_retry", "websockets"}
+        auth_keys = {"type", "access_token", "id_token", "account_id", "email", "expired",
+                     "last_refresh", "request_retry", "websockets"}
+        if not modern_layout:
+            auth_keys.add("refresh_token")
+        if (set(auth) - auth_keys
                 or type(auth.get("request_retry")) is not int or auth["request_retry"] != 0 or auth.get("websockets") is not False):
             raise ValueError("credential aliases, route overrides and replay are forbidden")
+        if modern_layout and auth_bytes != self._auth_snapshot:
+            raise ProxySnapshotError("CLI_PROXY_SNAPSHOT_CHANGED: new run authorization required")
         if any(auth.get(k) for k in ("base_url", "proxy_url", "proxy-url", "models", "prefix", "headers", "request_retry", "request-retry", "websockets")):
             raise ValueError("proxy credential contains route/retry overrides")
         if config["server"] != {"host": "", "port": 8317, "tls": {"enable": False}}:
@@ -180,14 +238,25 @@ class ProxyPolicy:
                 or container["HostConfig"].get("Privileged", False)
                 or any(v.split("=", 1)[0] not in ("PATH", "TZ") for v in container["Config"].get("Env", []))):
             raise ValueError("proxy endpoint/runtime identity differs from pinned policy")
-        mounts = {m["Destination"]: m for m in container["Mounts"] if m["Type"] == "bind"}
+        mount_list = container["Mounts"]
+        binds = [m for m in mount_list if m["Type"] == "bind"]
+        mounts = {m["Destination"]: m for m in binds}
+        # The provisioner needs only its two read-only binds and an optional /tmp.
+        extra = [m for m in mount_list if m["Type"] != "bind"]
+        tmpfs = container["HostConfig"].get("Tmpfs") or {}
+        if (set(tmpfs) - {"/tmp"} or len(extra) > 1
+                or any(m["Type"] != "tmpfs" or m["Destination"] != "/tmp" for m in extra)):
+            raise ValueError("managed proxy has an unexpected mount")
         expected = {"/CLIProxyAPI/config.yaml": p["config_file"], "/factory-auth": str(Path(p["auth_file"]).parent)}
-        if set(mounts) != set(expected) or any(mounts[d]["Source"] != s or mounts[d]["RW"] for d,s in expected.items()):
+        if (len(binds) != len(expected) or set(mounts) != set(expected)
+                or any(mounts[d]["Source"] != s or mounts[d]["RW"] for d,s in expected.items())):
             raise ValueError("managed proxy config and credential mounts must be pinned read-only")
         if list(Path(p["auth_file"]).parent.iterdir()) != [Path(p["auth_file"])]:
             raise ValueError("managed proxy requires exactly one credential file")
         if self.management("request-retry") != {"request-retry": 0} or self.management("max-retry-credentials") != {"max-retry-credentials": 1}:
             raise ValueError("running proxy retry policy differs from configuration")
+        if modern_layout:
+            verify_snapshot_expiry(auth)
         return {"container_id": container["Id"], "image": p["image"], "config_sha256": digest({**config, "access": {"credential": "PRESENT"}, "management": {"credential": "PRESENT"}}),
                 "credential_class": "codex", "upstream_attestation": "NOT_PROVABLE",
                 "retry_policy": {"request_retries": 0, "bootstrap_retries": 0, "max_credentials": 1, "websockets": False}}
@@ -223,6 +292,7 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
         self.token_baseline = 0
         self.records = []
         self.failed = False
+        self.stop_reason = None
         self.accepting = True
         self.lock = threading.RLock()
         self.evidence = transcript.with_suffix(".proxy.jsonl")
@@ -246,6 +316,8 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
         """Rotate immutable operation evidence while retaining thread totals."""
         with self.lock:
             if self.failed:
+                if self.stop_reason:
+                    raise ProxySnapshotError(self.stop_reason)
                 raise ValueError("uncertain proxy session cannot start a repair")
             evidence = transcript.with_suffix(".proxy.jsonl")
             evidence.touch(mode=0o600, exist_ok=False)
@@ -300,6 +372,12 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
         if terminal == "response.completed" or response.get("status") == "completed":
             record["status"] = "COMPLETE"
         if terminal in ("response.failed", "response.incomplete", "error"):
+            error = value.get("error") or response.get("error")
+            if self.policy.uses_snapshot and isinstance(error, dict) and (
+                error.get("type") == "authentication_error"
+                or error.get("code") in ("invalid_api_key", "unauthorized", "upstream_authentication_required")
+            ):
+                raise ProxySnapshotError(SNAPSHOT_REJECTED)
             raise ValueError("proxy generation failed or incomplete")
 
     def forward(self, handler):
@@ -373,13 +451,22 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                     raise ValueError("proxy policy changed during dispatch")
             except Exception as exc:
                 if isinstance(exc, urllib.error.HTTPError):
+                    if (self.policy.uses_snapshot and exc.code == 401
+                            and exc.url == self.endpoint + "/responses"):
+                        self.stop_reason = SNAPSHOT_REJECTED
+                        if record is not None:
+                            record["proxy_http_status"] = 401
                     exc.close()  # Do not let GC log upstream reason/error bodies.
+                if isinstance(exc, ProxySnapshotError):
+                    self.stop_reason = str(exc)
                 self.failed = True
                 if record is not None:
                     record["status"] = "UNKNOWN"
                     record["physical_attempt_count"] = "UNKNOWN"
+                    if self.stop_reason:
+                        record["stop_reason"] = self.stop_reason
                 if not sent_headers:
-                    handler.send_error(502, "Explicit proxy route failed; no retry or fallback")
+                    handler.send_error(502, self.stop_reason or "Explicit proxy route failed; no retry or fallback")
             finally:
                 handler.close_connection = True
                 if record is not None:
@@ -388,6 +475,7 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
     def receipt(self):
         with self.lock:
             return {"logical_run_id": self.evidence.stem, "physical_attempts": list(self.records),
+                    **({"stop_reason": self.stop_reason} if self.stop_reason else {}),
                     "physical_attempt_limit_per_http_request": 1,
                     "physical_attempt_count": sum(r["physical_attempt_count"] for r in self.records) if self.records and not self.failed and all(type(r["physical_attempt_count"]) is int for r in self.records) else "UNKNOWN",
                     "usage_complete": bool(self.records) and not self.failed and all(r["status"] == "COMPLETE" and len(r.get("proxy_telemetry", [])) == 1 for r in self.records),
