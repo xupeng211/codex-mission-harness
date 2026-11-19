@@ -15,9 +15,11 @@ from unittest.mock import patch
 
 from harness.factory import Factory, FactoryBlocked, validate_config
 from harness.factory_fixture import AcceptanceRuntime, fixture_config
-from harness.factory_proxy import ProxyPolicy, ProxyRelay, validate_transport
+from harness.factory_proxy import (
+    LEGACY_PROXY_IMAGE, PROXY_V8_0_77_IMAGE, ProxyPolicy, ProxyRelay, validate_transport,
+)
 from harness.factory_runtime import FactoryAppServer, RuntimeFailure
-from scripts.configure_factory_proxy import managed_config
+from scripts.configure_factory_proxy import managed_config, verify_release
 
 
 class ProxyContracts(unittest.TestCase):
@@ -86,7 +88,7 @@ class ProxyContracts(unittest.TestCase):
         for name, value in (("key", self.key), ("management", self.management_key)):
             self.write(self.root/name, value)
         self.policy_file = self.root / "policy.json"
-        self.image = "sha256:"+"a"*64
+        self.image = LEGACY_PROXY_IMAGE
         self.write(self.policy_file, json.dumps({"version": 1, "container": "fixture-container", "image": self.image, "endpoint": self.endpoint,
                    "config_file": str(self.config_path), "auth_file": str(self.auth), "credential_file": str(self.root/"key"), "management_token_file": str(self.root/"management")}))
         self.transport = {"type": "cli_proxy", "endpoint": self.endpoint, "configured_provider": "cli_proxy_api", "policy_file": str(self.policy_file)}
@@ -153,6 +155,56 @@ class ProxyContracts(unittest.TestCase):
         (self.auth.parent/"extra.json").unlink()
         self.container["Image"] = "different-image"
         with self.assertRaisesRegex(ValueError, "runtime identity"):
+            ProxyPolicy(self.transport)
+
+    def test_provisioning_requires_matching_release_and_image(self):
+        legacy = "CLIProxyAPI Version: v8.0.15, Commit: a4acc9f, BuiltAt: fixture"
+        modern = "CLIProxyAPI Version: v8.0.77, Commit: a5e8f69e, BuiltAt: fixture"
+        verify_release(LEGACY_PROXY_IMAGE, legacy)
+        verify_release(PROXY_V8_0_77_IMAGE, modern)
+        for image, banner in (
+            (LEGACY_PROXY_IMAGE, modern),
+            (PROXY_V8_0_77_IMAGE, legacy),
+            (PROXY_V8_0_77_IMAGE, modern.replace("v8.0.77", "v8.0.78")),
+            (PROXY_V8_0_77_IMAGE, modern.replace("a5e8f69e", "a5e8f69f")),
+            ("sha256:" + "f" * 64, modern),
+        ):
+            with self.subTest(image=image, banner=banner), self.assertRaises(ValueError):
+                verify_release(image, banner)
+
+    def test_v8_0_77_policy_checks_layout_and_isolation(self):
+        policy = json.loads(self.policy_file.read_text())
+        policy["image"] = self.container["Image"] = PROXY_V8_0_77_IMAGE
+        self.write(self.policy_file, json.dumps(policy))
+        config = managed_config(self.key, self.management_key, "http://127.0.0.1:7897",
+                                image=PROXY_V8_0_77_IMAGE)
+        self.write(self.config_path, json.dumps(config))
+        self.assertEqual(config["multimedia"], {"disable-image-generation": True})
+        self.assertEqual(config["observability"]["logs"]["request-log"], False)
+        self.assertEqual(ProxyPolicy(self.transport).identity["image"], PROXY_V8_0_77_IMAGE)
+        for invalid in (self.config, {**config, "multimedia": {}},
+                        {**config, "observability": self.config["observability"]}):
+            self.write(self.config_path, json.dumps(invalid))
+            with self.assertRaises(ValueError):
+                ProxyPolicy(self.transport)
+        self.write(self.config_path, json.dumps(config))
+        with patch.object(ProxyPolicy, "management", return_value={"request-retry": 1}):
+            with self.assertRaisesRegex(ValueError, "running proxy retry policy"):
+                ProxyPolicy(self.transport)
+        extra = self.auth.parent / "other.json"
+        self.write(extra, "{}")
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            ProxyPolicy(self.transport)
+        extra.unlink()
+        for mount in self.container["Mounts"]:
+            with self.subTest(mount=mount["Destination"]):
+                mount["RW"] = True
+                with self.assertRaisesRegex(ValueError, "mounts must be pinned read-only"):
+                    ProxyPolicy(self.transport)
+                mount["RW"] = False
+        policy["image"] = self.container["Image"] = "sha256:" + "f" * 64
+        self.write(self.policy_file, json.dumps(policy))
+        with self.assertRaisesRegex(ValueError, "not a supported release"):
             ProxyPolicy(self.transport)
 
     def test_success_records_physical_requests_actual_model_and_redacted_correlated_telemetry(self):

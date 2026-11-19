@@ -28,6 +28,14 @@ from .model_registry import read_private_token
 from .factory_budget import tokens
 
 
+LEGACY_PROXY_IMAGE = "sha256:ebc2ffc189cf241ff589cd9237c63ca9feba3c9b87fe6213ab9a0b642df132ae"
+PROXY_V8_0_77_IMAGE = "sha256:61451a1fce07e70fb86bc52939b3b99bcb0d4c98a94483bb880017d2937f5e1e"
+SUPPORTED_PROXY_RELEASES = {
+    LEGACY_PROXY_IMAGE: ("v8.0.15", "a4acc9f752bd46571f737a10c04bf413656ab06b"),
+    PROXY_V8_0_77_IMAGE: ("v8.0.77", "a5e8f69e56309e1ef6d6872e667da81fdfbce2ce"),
+}
+
+
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -93,6 +101,8 @@ class ProxyPolicy:
             raise ValueError("invalid managed proxy policy")
         if not isinstance(self.policy["image"], str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", self.policy["image"]):
             raise ValueError("managed proxy image must be pinned by content digest")
+        if self.policy["image"] not in SUPPORTED_PROXY_RELEASES:
+            raise ValueError("managed proxy image is not a supported release")
         if self.policy["endpoint"] != transport["endpoint"]:
             raise ValueError("proxy endpoint differs from managed policy")
         for key in ("config_file", "auth_file", "credential_file", "management_token_file"):
@@ -120,16 +130,26 @@ class ProxyPolicy:
             private_file(p[key])
         config = json.loads(Path(p["config_file"]).read_text())
         auth = json.loads(Path(p["auth_file"]).read_text())
+        modern_layout = p["image"] == PROXY_V8_0_77_IMAGE
         # A closed schema prevents hidden YAML aliases, provider mappings,
         # payload rewrites, plugin routing and per-credential retry overrides.
-        if set(config) != {"config-version", "server", "management", "access", "routing", "requests", "oauth", "upstream", "observability"}:
+        config_keys = {"config-version", "server", "management", "access", "routing", "requests", "oauth", "upstream", "observability"}
+        if modern_layout:
+            config_keys.add("multimedia")
+        if set(config) != config_keys:
             raise ValueError("managed proxy config contains unsupported routing controls")
         if config["config-version"] != 8 or config["routing"] != {"strategy": "fill-first", "retry": {"request-retry": 0, "max-retry-credentials": 1, "max-retry-interval": 0}}:
             raise ValueError("managed proxy retries must be zero and credential attempts bounded to one")
         request_config = config["requests"]
-        if (set(request_config) != {"proxy-url", "passthrough-headers", "streaming", "disable-image-generation"}
+        request_keys = {"proxy-url", "passthrough-headers", "streaming"}
+        if not modern_layout:
+            request_keys.add("disable-image-generation")
+        image_generation = config["multimedia"] if modern_layout else request_config
+        if (set(request_config) != request_keys
                 or request_config["streaming"] != {"bootstrap-retries": 0, "keepalive-seconds": 0}
-                or request_config["disable-image-generation"] is not True
+                or not isinstance(image_generation, dict)
+                or image_generation.get("disable-image-generation") is not True
+                or (modern_layout and set(image_generation) != {"disable-image-generation"})
                 or request_config["passthrough-headers"] is not True):
             raise ValueError("managed proxy streaming retries/tools are not bounded")
         if config["oauth"] != {"auth-dir": "/factory-auth"} or config["upstream"] != {"codex": {"response-steering": False, "stream-bootstrap-buffering": False}}:
@@ -147,7 +167,8 @@ class ProxyPolicy:
             raise ValueError("unsupported managed proxy server config")
         if config["management"] != {"allow-remote": True, "secret-key": self.management_key, "disable-control-panel": True}:
             raise ValueError("unsupported managed proxy management config")
-        if config["observability"] != {"logging": {"debug": False, "request-log": False, "logging-to-file": False}, "usage": {"usage-statistics-enabled": True, "redis-usage-queue-retention-seconds": 3600}}:
+        logging_key = "logs" if modern_layout else "logging"
+        if config["observability"] != {logging_key: {"debug": False, "request-log": False, "logging-to-file": False}, "usage": {"usage-statistics-enabled": True, "redis-usage-queue-retention-seconds": 3600}}:
             raise ValueError("managed proxy must disable secret-bearing request logs and enable telemetry")
         container = docker_json("inspect", p["container"])[0]
         port = str(urllib.parse.urlsplit(p["endpoint"]).port)

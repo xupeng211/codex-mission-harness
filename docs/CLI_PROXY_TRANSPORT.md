@@ -16,8 +16,20 @@ The historical official-route receipts remain intact.
 
 ## Configure a bounded dedicated instance
 
-The supported policy is a local Docker CLIProxyAPI **v8.0.15 / a4acc9f** instance,
-pinned by image digest, with exactly one existing active Codex OAuth credential.
+The supported policy is a local Docker CLIProxyAPI instance with one active Codex
+OAuth credential. The provisioner checks the version banner against the commit
+paired with the local Docker image ID. The runtime accepts only these image IDs:
+
+| Release | Commit | Docker image ID |
+| --- | --- | --- |
+| v8.0.15 | `a4acc9f752bd46571f737a10c04bf413656ab06b` | `sha256:ebc2ffc189cf241ff589cd9237c63ca9feba3c9b87fe6213ab9a0b642df132ae` |
+| v8.0.77 (linux/amd64) | `a5e8f69e56309e1ef6d6872e667da81fdfbce2ce` | `sha256:61451a1fce07e70fb86bc52939b3b99bcb0d4c98a94483bb880017d2937f5e1e` |
+
+The published linux/amd64 manifest for v8.0.77 is
+`docker.io/eceasy/cli-proxy-api@sha256:61451a1fce07e70fb86bc52939b3b99bcb0d4c98a94483bb880017d2937f5e1e`.
+For this image the generated config uses `multimedia.disable-image-generation`
+and `observability.logs`. Existing v8.0.15 policies use their original layout.
+
 The original interactive instance can keep its configuration. A Factory-only copy
 uses zero credential/stream bootstrap retries, a single credential per request,
 disabled WebSockets/model aliases/steering, read-only configuration and credential
