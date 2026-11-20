@@ -180,7 +180,10 @@ def main():
     config = validate_config(json.loads(args.config.read_text()))
     mission = json.loads(args.mission.read_text())
     profile, decision = select(config["model_routing"], mission.get("model_routing"))
-    print(json.dumps({"profile": profile, "selection": decision, "model_inference_calls": 0,
+    public_profile = {**profile, "transport": {
+        key: value for key, value in profile["transport"].items() if key != "snapshot_id"
+    }}
+    print(json.dumps({"profile": public_profile, "selection": decision, "model_inference_calls": 0,
                       "route_access": "NOT_VERIFIED", "REAL_PROXY_MODEL_DISPATCH_VERIFIED": "NO"}, indent=2))
 
 

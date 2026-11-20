@@ -144,13 +144,21 @@ class SelectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config_path, mission_path = root/"config.json", root/"mission.json"
-            config_path.write_text(json.dumps({**fixture_config(), "model_routing": pool()}))
+            model_pool = pool()
+            snapshot_id = "b" * 64
+            for entry in model_pool["models"]:
+                entry["transport"]["snapshot_id"] = snapshot_id
+            config_path.write_text(json.dumps({**fixture_config(), "model_routing": model_pool}))
             mission_path.write_text(json.dumps({"model_routing": {"category": "docs", "complexity": "low", "risk": "low"}}))
             output = io.StringIO()
             with patch("sys.argv", ["preview", "--config", str(config_path), "--mission", str(mission_path)]), patch("sys.stdout", output), patch("socket.socket.connect", side_effect=AssertionError("network forbidden")):
                 preview()
             result = json.loads(output.getvalue())
             self.assertEqual(result["selection"]["selected_tier"], "economy")
+            self.assertNotIn(snapshot_id, output.getvalue())
+            self.assertNotIn("snapshot_id", result["profile"]["transport"])
+            self.assertEqual(select(model_pool, {"category": "docs", "complexity": "low", "risk": "low"})[0]
+                             ["transport"]["snapshot_id"], snapshot_id)
             self.assertEqual(result["model_inference_calls"], 0)
             self.assertEqual(result["REAL_PROXY_MODEL_DISPATCH_VERIFIED"], "NO")
 

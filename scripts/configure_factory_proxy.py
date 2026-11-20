@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from harness.factory_proxy import (
-    LEGACY_PROXY_IMAGE, PROXY_TMPFS_OPTIONS, PROXY_V8_0_77_IMAGES, SUPPORTED_PROXY_RELEASES, ProxyPolicy,
+    FACTORY_SNAPSHOT_IMAGE, LEGACY_PROXY_IMAGE, PROXY_TMPFS_OPTIONS, SNAPSHOT_IMAGES, SUPPORTED_PROXY_RELEASES, ProxyPolicy,
     private_file, snapshot_identity, verify_snapshot_expiry,
 )
 
@@ -30,7 +30,7 @@ def managed_config(key, management_key, network_proxy, image=LEGACY_PROXY_IMAGE)
             "oauth": {"auth-dir": "/factory-auth"},
             "upstream": {"codex": {"response-steering": False, "stream-bootstrap-buffering": False}},
             "observability": {"logging": {"debug": False, "request-log": False, "logging-to-file": False}, "usage": {"usage-statistics-enabled": True, "redis-usage-queue-retention-seconds": 3600}}}
-    if image in PROXY_V8_0_77_IMAGES:
+    if image in SNAPSHOT_IMAGES:
         config["multimedia"] = {
             "disable-image-generation": config["requests"].pop("disable-image-generation"),
         }
@@ -40,11 +40,11 @@ def managed_config(key, management_key, network_proxy, image=LEGACY_PROXY_IMAGE)
 
 def managed_credential(auth, image):
     fields = {"type", "access_token", "id_token", "account_id", "email", "expired", "last_refresh"}
-    if image not in PROXY_V8_0_77_IMAGES:
+    if image not in SNAPSHOT_IMAGES:
         fields.add("refresh_token")
     selected = {key: auth[key] for key in fields if key in auth}
     selected.update(request_retry=0, websockets=False)
-    if image in PROXY_V8_0_77_IMAGES:
+    if image in SNAPSHOT_IMAGES:
         verify_snapshot_expiry(selected)
     return selected
 
@@ -102,14 +102,18 @@ def main():
               "credential_file": str(key_path), "management_token_file": str(management_path)}
     write(root / "policy.json", json.dumps(policy, indent=2)+"\n")
     # No credential in args or env; secret files are never copied to artifacts.
+    command = ["/CLIProxyAPI/CLIProxyAPI", "-config", "/CLIProxyAPI/config.yaml", "-local-model"]
+    if source["Image"] == FACTORY_SNAPSHOT_IMAGE:
+        command.append("-factory-snapshot")
     subprocess.run(["docker", "run", "-d", "--name", args.name, "--read-only", "--network", args.network,
                     "--tmpfs", f"/tmp:{PROXY_TMPFS_OPTIONS}", "-p", f"127.0.0.1:{args.port}:8317",
                     "--mount", f"type=bind,src={config_path},dst=/CLIProxyAPI/config.yaml,readonly,bind-propagation=rprivate,bind-recursive=disabled",
                     "--mount", f"type=bind,src={auth_dir},dst=/factory-auth,readonly,bind-propagation=rprivate,bind-recursive=disabled",
-                    source["Image"], "/CLIProxyAPI/CLIProxyAPI", "-config", "/CLIProxyAPI/config.yaml", "-local-model"], check=True, capture_output=True)
+                    source["Image"], *command], check=True, capture_output=True)
     transport = {"type": "cli_proxy", "endpoint": endpoint, "configured_provider": "cli_proxy_api", "policy_file": str(root / "policy.json")}
-    if source["Image"] in PROXY_V8_0_77_IMAGES:
-        transport["snapshot_id"] = snapshot_identity(management_key, auth_text.encode("ascii"))
+    if source["Image"] in SNAPSHOT_IMAGES:
+        snapshot_key = key if source["Image"] == FACTORY_SNAPSHOT_IMAGE else management_key
+        transport["snapshot_id"] = snapshot_identity(snapshot_key, auth_text.encode("ascii"))
     for attempt in range(20):
         try:
             result = ProxyPolicy(transport)

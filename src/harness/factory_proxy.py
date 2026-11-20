@@ -45,7 +45,11 @@ PROXY_V8_0_77_IMAGES = (
     PROXY_V8_0_77_IMAGE,  # amd64 manifest
     "sha256:8712adc77fc26b5062667e2e9bc023ea4be2651faab46b10d32e43ac6b40508d",  # amd64 config
 )
+# Exact linux/amd64 image manifest, paired with its patched source commit.
+FACTORY_SNAPSHOT_IMAGE = "sha256:09689cab6ecdd59f6d3b65a0e583d43f12b60c53bd3b797aee986ee29e97ebef"
+SNAPSHOT_IMAGES = (*PROXY_V8_0_77_IMAGES, FACTORY_SNAPSHOT_IMAGE)
 SUPPORTED_PROXY_RELEASES = {
+    FACTORY_SNAPSHOT_IMAGE: ("v8.0.77", "fe147c8d508c544efafc7289b1be51bb36deb2c4"),
     **dict.fromkeys(LEGACY_PROXY_IMAGES, ("v8.0.15", "a4acc9f752bd46571f737a10c04bf413656ab06b")),
     **dict.fromkeys(PROXY_V8_0_77_IMAGES, ("v8.0.77", "a5e8f69e56309e1ef6d6872e667da81fdfbce2ce")),
 }
@@ -60,8 +64,8 @@ class ProxySnapshotError(ValueError):
     """Safe stop reason for an unusable access-token-only snapshot."""
 
 
-def snapshot_identity(management_key, auth_bytes):
-    return hmac.new(management_key.encode(), b"cmh-cli-proxy-snapshot/v1\0" + auth_bytes,
+def snapshot_identity(key, auth_bytes):
+    return hmac.new(key.encode(), b"cmh-cli-proxy-snapshot/v1\0" + auth_bytes,
                     hashlib.sha256).hexdigest()
 
 
@@ -184,7 +188,9 @@ class ProxyPolicy:
                 raise ValueError("all proxy authentication sources must stay inside the private policy directory")
         self.key = read_private_token(Path(self.policy["credential_file"]))
         self.management_key = read_private_token(Path(self.policy["management_token_file"]))
-        self.uses_snapshot = self.policy["image"] in PROXY_V8_0_77_IMAGES
+        self.frozen_snapshot = self.policy["image"] == FACTORY_SNAPSHOT_IMAGE
+        self.uses_snapshot = self.policy["image"] in SNAPSHOT_IMAGES
+        self.snapshot_key = self.key if self.frozen_snapshot else self.management_key
         if self.uses_snapshot != ("snapshot_id" in transport):
             raise ProxySnapshotError("CLI_PROXY_SNAPSHOT_AUTHORIZATION_REQUIRED: bind the snapshot to a new run")
         self.identity = self.verify()
@@ -207,7 +213,7 @@ class ProxyPolicy:
         config = json.loads(Path(p["config_file"]).read_text())
         modern_layout = self.uses_snapshot
         auth_bytes = read_snapshot(p["auth_file"]) if modern_layout else Path(p["auth_file"]).read_bytes()
-        if modern_layout and not hmac.compare_digest(snapshot_identity(self.management_key, auth_bytes),
+        if modern_layout and not hmac.compare_digest(snapshot_identity(self.snapshot_key, auth_bytes),
                                                      self.transport["snapshot_id"]):
             raise ProxySnapshotError(SNAPSHOT_CHANGED)
         auth = json.loads(auth_bytes)
@@ -256,8 +262,13 @@ class ProxyPolicy:
             raise ValueError("managed proxy must disable secret-bearing request logs and enable telemetry")
         container = docker_json("inspect", p["container"])[0]
         port = str(urllib.parse.urlsplit(p["endpoint"]).port)
+        command = ["/CLIProxyAPI/CLIProxyAPI", "-config", "/CLIProxyAPI/config.yaml", "-local-model"]
+        if self.frozen_snapshot:
+            command.append("-factory-snapshot")
+            if Path(p["auth_file"]).name != "codex.json":
+                raise ValueError("dedicated proxy requires the canonical snapshot filename")
         if (not container["State"]["Running"] or container["Image"] != p["image"]
-                or container["Config"]["Cmd"] != ["/CLIProxyAPI/CLIProxyAPI", "-config", "/CLIProxyAPI/config.yaml", "-local-model"]
+                or container["Config"]["Cmd"] != command
                 or container["Config"].get("Entrypoint")
                 or container["HostConfig"]["PortBindings"] != {"8317/tcp": [{"HostIp": "127.0.0.1", "HostPort": port}]}
                 or not container["HostConfig"]["ReadonlyRootfs"]
@@ -466,9 +477,11 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                           "physical_attempt_limit": 1, "physical_attempt_count": "UNKNOWN", "money": "UNKNOWN"}
                 self.records.append(record)
                 self.persist(record)
-                req = urllib.request.Request(self.endpoint+"/responses", data=body,
-                      headers={"Authorization": "Bearer "+self.policy.key, "Content-Type": "application/json",
-                               "Session_id": record["http_request_id"]})
+                headers = {"Authorization": "Bearer "+self.policy.key, "Content-Type": "application/json",
+                           "Session_id": record["http_request_id"]}
+                if self.policy.frozen_snapshot:
+                    headers["X-Cmh-Credential-Snapshot"] = self.policy.transport["snapshot_id"]
+                req = urllib.request.Request(self.endpoint+"/responses", data=body, headers=headers)
                 remaining = self.deadline-time.monotonic()
                 if remaining <= 0:
                     raise ValueError("proxy run deadline exhausted")
@@ -506,6 +519,12 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                     raise ValueError("proxy policy changed during dispatch")
             except Exception as exc:
                 if isinstance(exc, urllib.error.HTTPError):
+                    if (self.policy.frozen_snapshot and exc.code == 409
+                            and exc.url == self.endpoint + "/responses"
+                            and exc.headers.get("X-Cmh-Snapshot-Status") == "mismatch"):
+                        self.stop_reason = SNAPSHOT_CHANGED
+                        if record is not None:
+                            record["proxy_http_status"] = 409
                     if (self.policy.uses_snapshot and exc.code == 401
                             and exc.url == self.endpoint + "/responses"):
                         self.stop_reason = SNAPSHOT_REJECTED

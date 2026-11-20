@@ -20,8 +20,8 @@ from harness.factory import Factory, FactoryBlocked, git, validate_config
 from harness.factory_cli import main as factory_cli
 from harness.factory_fixture import AcceptanceRuntime, fixture_config
 from harness.factory_proxy import (
-    LEGACY_PROXY_IMAGE, LEGACY_PROXY_IMAGES, PROXY_TMPFS_OPTIONS, PROXY_V8_0_77_IMAGE, PROXY_V8_0_77_IMAGES,
-    SNAPSHOT_REJECTED, ProxyPolicy, ProxyRelay, snapshot_identity, validate_transport, verify_snapshot_expiry,
+    FACTORY_SNAPSHOT_IMAGE, LEGACY_PROXY_IMAGE, LEGACY_PROXY_IMAGES, PROXY_TMPFS_OPTIONS, PROXY_V8_0_77_IMAGE, PROXY_V8_0_77_IMAGES,
+    SNAPSHOT_IMAGES, SNAPSHOT_REJECTED, SUPPORTED_PROXY_RELEASES, ProxyPolicy, ProxyRelay, snapshot_identity, validate_transport, verify_snapshot_expiry,
 )
 from harness.factory_runtime import FactoryAppServer, LocalRuntime, RuntimeFailure
 from scripts.configure_factory_proxy import managed_config, managed_credential, verify_release
@@ -139,21 +139,27 @@ class ProxyContracts(unittest.TestCase):
 
     def use_image(self, image):
         policy = json.loads(self.policy_file.read_text())
-        policy["image"] = self.container["Image"] = image
+        policy["image"] = self.container["Image"] = self.image = image
         self.write(self.policy_file, json.dumps(policy))
         config = managed_config(self.key, self.management_key, "http://127.0.0.1:7897", image)
         self.write(self.config_path, json.dumps(config))
         auth = json.loads(self.auth.read_text())
         auth["expired"] = "2100-01-01T00:00:00Z"
         self.write(self.auth, json.dumps(auth))
-        if image in PROXY_V8_0_77_IMAGES:
+        command = self.container["Config"]["Cmd"]
+        if command[-1] == "-factory-snapshot":
+            command.pop()
+        if image == FACTORY_SNAPSHOT_IMAGE:
+            command.append("-factory-snapshot")
+        if image in SNAPSHOT_IMAGES:
             self.pin_snapshot()
         else:
             self.transport.pop("snapshot_id", None)
         return config
 
     def pin_snapshot(self):
-        self.transport["snapshot_id"] = snapshot_identity(self.management_key, self.auth.read_bytes())
+        snapshot_key = self.key if self.image == FACTORY_SNAPSHOT_IMAGE else self.management_key
+        self.transport["snapshot_id"] = snapshot_identity(snapshot_key, self.auth.read_bytes())
 
     def post(self, relay, model="fixture-model"):
         request = urllib.request.Request(relay.base_url+"/responses", data=json.dumps({"model": model, "stream": True}).encode(),
@@ -218,6 +224,21 @@ class ProxyContracts(unittest.TestCase):
         ):
             with self.subTest(image=image, banner=banner), self.assertRaises(ValueError):
                 verify_release(image, banner)
+
+    def test_derived_image_requires_its_commit_command_and_snapshot_key(self):
+        self.use_image(FACTORY_SNAPSHOT_IMAGE)
+        version, commit = SUPPORTED_PROXY_RELEASES[FACTORY_SNAPSHOT_IMAGE]
+        verify_release(FACTORY_SNAPSHOT_IMAGE, f"CLIProxyAPI Version: {version}, Commit: {commit}, BuiltAt: fixture")
+        with self.assertRaises(ValueError):
+            verify_release(FACTORY_SNAPSHOT_IMAGE, f"CLIProxyAPI Version: {version}, Commit: a5e8f69e, BuiltAt: fixture")
+        self.assertTrue(ProxyPolicy(self.transport).frozen_snapshot)
+        self.container["Config"]["Cmd"].pop()
+        with self.assertRaisesRegex(ValueError, "runtime identity"):
+            ProxyPolicy(self.transport)
+        self.container["Config"]["Cmd"].append("-factory-snapshot")
+        self.transport["snapshot_id"] = snapshot_identity(self.management_key, self.auth.read_bytes())
+        with self.assertRaisesRegex(ValueError, "SNAPSHOT_CHANGED"):
+            ProxyPolicy(self.transport)
 
     def test_v8_0_77_policy_checks_layout_and_isolation(self):
         config = self.use_image(PROXY_V8_0_77_IMAGE)
