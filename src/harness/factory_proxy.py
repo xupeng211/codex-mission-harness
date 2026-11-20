@@ -47,6 +47,7 @@ PROXY_V8_0_77_IMAGES = (
 )
 # Exact linux/amd64 image manifest, paired with its patched source commit.
 FACTORY_SNAPSHOT_IMAGE = "sha256:09689cab6ecdd59f6d3b65a0e583d43f12b60c53bd3b797aee986ee29e97ebef"
+FACTORY_SNAPSHOT_MODEL = "gpt-6.2-sol"
 SNAPSHOT_IMAGES = (*PROXY_V8_0_77_IMAGES, FACTORY_SNAPSHOT_IMAGE)
 SUPPORTED_PROXY_RELEASES = {
     FACTORY_SNAPSHOT_IMAGE: ("v8.0.77", "fe147c8d508c544efafc7289b1be51bb36deb2c4"),
@@ -57,6 +58,9 @@ SNAPSHOT_REJECTED = (
     "CLI_PROXY_SNAPSHOT_REJECTED: access-token snapshot rejected; reprovision before a new run"
 )
 SNAPSHOT_CHANGED = "CLI_PROXY_SNAPSHOT_CHANGED: new run authorization required"
+DEDICATED_IMAGE_REQUIRED = (
+    "CLI_PROXY_DEDICATED_IMAGE_REQUIRED: gpt-6.2-sol requires the verified Factory proxy image"
+)
 PROXY_TMPFS_OPTIONS = "rw,noexec,nosuid,nodev,size=32m"
 
 
@@ -170,14 +174,19 @@ def docker_json(*args):
 class ProxyPolicy:
     """Bind endpoint to the running, pinned, read-only single-credential instance."""
 
-    def __init__(self, transport):
+    def __init__(self, transport, *, model=None):
         self.transport = transport
+        self.dedicated_model = (
+            isinstance(model, str)
+            and model.strip().lower().rsplit("(", 1)[0].strip() == FACTORY_SNAPSHOT_MODEL
+        )
         self.path = private_file(transport["policy_file"])
         self.policy = json.loads(self.path.read_text())
         if set(self.policy) != {"version", "container", "image", "endpoint", "config_file", "auth_file", "credential_file", "management_token_file"} or self.policy["version"] != 1:
             raise ValueError("invalid managed proxy policy")
         if not isinstance(self.policy["image"], str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", self.policy["image"]):
             raise ValueError("managed proxy image must be pinned by content digest")
+        self.require_dedicated_image(self.policy["image"])
         if self.policy["image"] not in SUPPORTED_PROXY_RELEASES:
             raise ValueError("managed proxy image is not a supported release")
         if self.policy["endpoint"] != transport["endpoint"]:
@@ -194,6 +203,10 @@ class ProxyPolicy:
         if self.uses_snapshot != ("snapshot_id" in transport):
             raise ProxySnapshotError("CLI_PROXY_SNAPSHOT_AUTHORIZATION_REQUIRED: bind the snapshot to a new run")
         self.identity = self.verify()
+
+    def require_dedicated_image(self, image):
+        if self.dedicated_model and image != FACTORY_SNAPSHOT_IMAGE:
+            raise ProxySnapshotError(DEDICATED_IMAGE_REQUIRED)
 
     def management(self, path):
         base = self.transport["endpoint"].removesuffix("/v1")
@@ -261,6 +274,7 @@ class ProxyPolicy:
         if config["observability"] != {logging_key: {"debug": False, "request-log": False, "logging-to-file": False}, "usage": {"usage-statistics-enabled": True, "redis-usage-queue-retention-seconds": 3600}}:
             raise ValueError("managed proxy must disable secret-bearing request logs and enable telemetry")
         container = docker_json("inspect", p["container"])[0]
+        self.require_dedicated_image(container.get("Image"))
         port = str(urllib.parse.urlsplit(p["endpoint"]).port)
         command = ["/CLIProxyAPI/CLIProxyAPI", "-config", "/CLIProxyAPI/config.yaml", "-local-model"]
         if self.frozen_snapshot:
@@ -341,8 +355,8 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
 """
 
     def __init__(self, profile, transcript, timeout, token_limit=None):
-        self.profile = profile
-        self.policy = ProxyPolicy(validate_transport(profile))
+        self.model = profile["model"]
+        self.policy = ProxyPolicy(validate_transport(profile), model=self.model)
         self.lease = (self.policy.path.parent / "factory-run.lock").open("a")
         try:
             fcntl.flock(self.lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -429,7 +443,7 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
         model = response.get("model")
         if model:
             record["reported_model"] = model
-            if model != self.profile["model"]:
+            if model != self.model:
                 raise ValueError("proxy reported a different model")
         if response.get("id"):
             record["response_id"] = response["id"]
@@ -465,7 +479,7 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                     raise ValueError("invalid request size")
                 body = handler.rfile.read(size)
                 request = json.loads(body)
-                if request.get("model") != self.profile["model"]:
+                if request.get("model") != self.model:
                     raise ValueError("proxy requested a different model")
                 current = self.policy.verify()
                 if current != self.policy.identity:
@@ -512,9 +526,9 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                         handler.wfile.write(data)
                 if record["status"] != "COMPLETE" or record.get("reported_model") != request["model"] or not record.get("response_id") or tokens(record["usage"]) is None:
                     raise ValueError("proxy completion/model/usage unproven")
-                # A completed response proves one generation in this bounded
-                # policy. On failures it could be zero or one; never guess.
-                record["physical_attempt_count"] = 1
+                # The dedicated route settles the count only after the queue is correlated.
+                if not self.policy.dedicated_model:
+                    record["physical_attempt_count"] = 1
                 if self.policy.verify() != self.policy.identity:
                     raise ValueError("proxy policy changed during dispatch")
             except Exception as exc:
@@ -598,6 +612,14 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                     self.persist(matched)
                 if any(len(r.get("proxy_telemetry", [])) != 1 for r in self.records):
                     self.failed = True
+                if self.policy.dedicated_model:
+                    for record in self.records:
+                        if record["status"] == "COMPLETE" and record["physical_attempt_count"] == "UNKNOWN":
+                            if self.failed:
+                                record["status"] = "UNKNOWN"
+                            else:
+                                record["physical_attempt_count"] = 1
+                            self.persist(record)
             except Exception:
                 self.failed = True
                 raise ValueError("proxy telemetry unproven; no retry or fallback") from None

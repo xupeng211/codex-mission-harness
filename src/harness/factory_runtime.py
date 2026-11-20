@@ -744,7 +744,7 @@ class LocalRuntime:
         if profile["provider"] == "openai":
             transport = validate_transport(profile)
             if transport["type"] == "cli_proxy":
-                policy = ProxyPolicy(transport)
+                policy = ProxyPolicy(transport, model=profile["model"])
                 route = {**transport, "route_type": "cli_proxy", "auth_source": policy.policy["credential_file"], "requested_model": profile["model"], "runtime": policy.identity}
                 identity["route_identity"] = route
                 identity["qualification_identity"] = route_digest(route)

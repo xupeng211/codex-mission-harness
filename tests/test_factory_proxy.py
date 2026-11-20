@@ -240,6 +240,76 @@ class ProxyContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "SNAPSHOT_CHANGED"):
             ProxyPolicy(self.transport)
 
+    def test_gpt62_rejects_stock_image_before_proxy_access(self):
+        for image in (*PROXY_V8_0_77_IMAGES, LEGACY_PROXY_IMAGE):
+            self.use_image(image)
+            for model in ("gpt-6.2-sol", "GPT-6.2-SOL(high)"):
+                profile = {**self.profile, "model": model}
+                with self.subTest(image=image, model=model), patch(
+                        "harness.factory_proxy.docker_json") as inspect, patch.object(
+                        ProxyPolicy, "management") as management:
+                    with self.assertRaisesRegex(ValueError, "DEDICATED_IMAGE_REQUIRED"):
+                        LocalRuntime().profile_identity(profile)
+                    with self.assertRaisesRegex(ValueError, "DEDICATED_IMAGE_REQUIRED"):
+                        ProxyRelay(profile, self.root / "blocked.raw", 5)
+                    inspect.assert_not_called()
+                    management.assert_not_called()
+                    self.assertEqual(self.requests, [])
+                    self.assertFalse((self.root / "blocked.proxy.jsonl").exists())
+
+    def test_gpt62_stops_if_running_image_changes_before_forward(self):
+        self.use_image(FACTORY_SNAPSHOT_IMAGE)
+        self.profile["model"] = "gpt-6.2-sol"
+        relay = self.relay()
+        with patch.object(ProxyPolicy, "management") as management:
+            self.container["Image"] = PROXY_V8_0_77_IMAGE
+            self.assertFalse(self.post(relay, self.profile["model"]))
+            management.assert_not_called()
+        receipt = relay.receipt()
+        self.assertIn("DEDICATED_IMAGE_REQUIRED", receipt["stop_reason"])
+        self.assertEqual(self.requests, [])
+        self.assertEqual(receipt["physical_attempts"], [])
+        self.assertEqual(receipt["physical_attempt_count"], "UNKNOWN")
+        self.assertFalse(receipt["usage_complete"])
+
+    def test_gpt62_derived_image_requires_correlated_evidence_to_settle(self):
+        self.use_image(FACTORY_SNAPSHOT_IMAGE)
+        self.profile["model"] = "gpt-6.2-sol"
+        for scenario in ("correlated", "missing", "duplicate"):
+            transcript = self.root / (scenario + ".raw")
+            with self.subTest(scenario=scenario), patch(
+                    "harness.factory_runtime.AppServerCodex._trusted_executable",
+                    return_value=Path("/usr/bin/true")):
+                identity = LocalRuntime().profile_identity(self.profile)
+                self.assertEqual(identity["route_identity"]["runtime"]["image"], FACTORY_SNAPSHOT_IMAGE)
+                relay = ProxyRelay(self.profile, transcript, 5)
+                before = len(self.requests)
+                try:
+                    self.assertTrue(self.post(relay, self.profile["model"]))
+                    pending = relay.receipt()
+                    self.assertEqual(pending["physical_attempt_count"], "UNKNOWN")
+                    self.assertEqual(pending["physical_attempts"][0]["physical_attempt_count"], "UNKNOWN")
+                    self.assertFalse(pending["usage_complete"])
+
+                    if scenario == "missing":
+                        self.telemetry.clear()
+                    if scenario == "duplicate":
+                        self.telemetry.append(self.telemetry[0].copy())
+                    relay.collect_telemetry()
+
+                    complete = scenario == "correlated"
+                    result = relay.receipt()
+                    self.assertEqual(result["physical_attempt_count"], 1 if complete else "UNKNOWN")
+                    self.assertEqual(result["usage_complete"], complete)
+                    self.assertEqual(relay.usage()["total_tokens"], 13)
+                    self.assertEqual(result["money"], "UNKNOWN")
+                    durable = json.loads(relay.evidence.read_text().splitlines()[-1])
+                    self.assertEqual(durable["status"], "COMPLETE" if complete else "UNKNOWN")
+                    self.assertEqual(durable["physical_attempt_count"], 1 if complete else "UNKNOWN")
+                    self.assertEqual(len(self.requests) - before, 1)
+                finally:
+                    relay.close()
+
     def test_v8_0_77_policy_checks_layout_and_isolation(self):
         config = self.use_image(PROXY_V8_0_77_IMAGE)
         self.assertEqual(config["multimedia"], {"disable-image-generation": True})

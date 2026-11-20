@@ -59,6 +59,12 @@ logs and artifacts. The relay stops on snapshot drift, expiry or a proxy 401,
 including a recognized stream authentication failure. Reprovision a fresh
 out-of-band snapshot and authorize a new run to recover.
 
+A `cli_proxy` profile for `gpt-6.2-sol` requires the verified Factory image
+manifest `sha256:09689cab6ecdd59f6d3b65a0e583d43f12b60c53bd3b797aee986ee29e97ebef`.
+Factory checks both the declared policy image and the actual running container
+before forwarding. The request count stays unknown until response evidence
+matches the proxy usage queue.
+
 Use an owner-controlled mode-0600 input auth file in a private directory. If the
 existing proxy auth directory is writable by other users, first make a private
 copy; do not change the interactive proxy's credential or put the copy in Git.
