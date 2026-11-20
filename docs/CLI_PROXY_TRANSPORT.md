@@ -64,9 +64,11 @@ A `cli_proxy` profile for `gpt-6.2-sol` requires the verified Factory image
 manifest `sha256:09689cab6ecdd59f6d3b65a0e583d43f12b60c53bd3b797aee986ee29e97ebef`.
 Factory checks both the declared policy image and the actual running container
 before forwarding. For completed requests, Factory polls the usage queue for
-up to two seconds within the existing turn deadline. This uses only management
-reads. A unique match confirms the request count. Missing, duplicate or
-mismatched evidence keeps the count `UNKNOWN`.
+up to two seconds within the existing turn deadline. Each management query
+uses that same cutoff from connection through the complete HTTP response and
+closes the connection on timeout. A unique match confirms the request count.
+Evidence that arrives after the cutoff, is missing, is duplicated or does not
+match keeps the count `UNKNOWN`.
 
 Use an owner-controlled mode-0600 input auth file in a private directory. If the
 existing proxy auth directory is writable by other users, first make a private

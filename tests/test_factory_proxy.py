@@ -5,6 +5,7 @@ import http.server
 import hashlib
 import io
 import json
+import select
 import shutil
 import subprocess
 import tempfile
@@ -40,6 +41,7 @@ class ProxyContracts(unittest.TestCase):
         self.telemetry = []
         self.queue_reads = 0
         self.empty_queue_reads = 0
+        self.queue_response = None
         self.mode = "complete"
         fixture = self
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -57,6 +59,9 @@ class ProxyContracts(unittest.TestCase):
                         value = []
                     else:
                         value, fixture.telemetry = fixture.telemetry, []
+                    if fixture.queue_response:
+                        fixture.queue_response(self, json.dumps(value).encode())
+                        return
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(json.dumps(value).encode())
@@ -325,9 +330,9 @@ class ProxyContracts(unittest.TestCase):
                         expected_reads = 2 if scenario in ("late", "missing") else 1
                         self.assertEqual(self.queue_reads - reads, expected_reads)
                         self.assertEqual(management.call_count, expected_reads)
-                        for attempt, call in enumerate(management.call_args_list):
+                        for call in management.call_args_list:
                             self.assertEqual(call.args, ("usage-queue?count=256",))
-                            self.assertAlmostEqual(call.kwargs["timeout"], 0.075 - attempt * 0.05)
+                            self.assertEqual(call.kwargs, {"deadline": cutoff})
                         self.assertLessEqual(now[0], cutoff)
                         if scenario == "missing":
                             self.assertEqual(now[0], cutoff)
@@ -347,6 +352,63 @@ class ProxyContracts(unittest.TestCase):
                     self.assertEqual(durable["physical_attempt_count"], 1 if complete else "UNKNOWN")
                     self.assertEqual(len(self.requests) - before, 1)
                 finally:
+                    relay.close()
+
+    def test_gpt62_usage_query_enforces_deadline_through_headers_and_body(self):
+        self.use_image(FACTORY_SNAPSHOT_IMAGE)
+        self.profile["model"] = "gpt-6.2-sol"
+        for stage in ("headers", "body", "timely"):
+            with self.subTest(stage=stage):
+                peer_closed = threading.Event()
+                fragments = 1 if stage == "timely" else 16
+
+                def respond(handler, payload):
+                    if stage == "headers":
+                        handler.wfile.write(b"HTTP/1.0 200 OK\r\nX-Fixture: drip")
+                        tail = f"\r\nContent-Length: {len(payload)}\r\n\r\n".encode() + payload
+                    else:
+                        handler.send_response(200)
+                        handler.send_header("Content-Length", str(fragments + len(payload)))
+                        handler.end_headers()
+                        tail = payload
+                    try:
+                        for _ in range(fragments):
+                            readable, _, _ = select.select([handler.connection], [], [], 0.04)
+                            if readable and not handler.connection.recv(1):
+                                peer_closed.set()
+                                return
+                            handler.wfile.write(b" ")
+                        handler.wfile.write(tail)
+                    except (BrokenPipeError, ConnectionResetError):
+                        peer_closed.set()
+
+                relay = ProxyRelay(self.profile, self.root / f"{stage}.raw", 5)
+                reads, posts = self.queue_reads, len(self.requests)
+                self.queue_response = respond
+                try:
+                    self.assertTrue(self.post(relay, self.profile["model"]))
+                    started = time.monotonic()
+                    relay.collect_telemetry(deadline=started + 0.25)
+                    elapsed = time.monotonic() - started
+                    receipt = relay.receipt()
+                    durable = json.loads(relay.evidence.read_text().splitlines()[-1])
+                    if stage == "timely":
+                        self.assertLess(elapsed, 0.25)
+                        self.assertTrue(receipt["usage_complete"])
+                        self.assertEqual(durable["physical_attempt_count"], 1)
+                    else:
+                        self.assertLess(elapsed, 0.4)
+                        self.assertTrue(peer_closed.wait(0.2), "management connection still open")
+                        self.assertFalse(receipt["usage_complete"])
+                        self.assertEqual(durable["status"], "UNKNOWN")
+                        self.assertEqual(durable["physical_attempt_count"], "UNKNOWN")
+                        self.assertNotIn("proxy_telemetry", durable)
+                    self.assertEqual(relay.usage()["total_tokens"], 13)
+                    relay.collect_telemetry()
+                    self.assertEqual(self.queue_reads - reads, 1)
+                    self.assertEqual(len(self.requests) - posts, 1)
+                finally:
+                    self.queue_response = None
                     relay.close()
 
     def test_gpt62_settled_history_is_unchanged_by_late_duplicate(self):

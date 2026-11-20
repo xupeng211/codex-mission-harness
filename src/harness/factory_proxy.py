@@ -11,11 +11,13 @@ import base64
 import fcntl
 import hashlib
 import hmac
+import http.client
 import http.server
 import json
 import os
 import re
 import secrets
+import socket
 import stat
 import threading
 import time
@@ -23,6 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
@@ -64,10 +67,37 @@ DEDICATED_IMAGE_REQUIRED = (
 PROXY_TMPFS_OPTIONS = "rw,noexec,nosuid,nodev,size=32m"
 PROXY_USAGE_WAIT_SECONDS = 2
 PROXY_USAGE_POLL_SECONDS = 0.05
+MANAGEMENT_RESPONSE_LIMIT = 2 * 1024 * 1024
 
 
 class ProxySnapshotError(ValueError):
     """Safe stop reason for an unusable access-token-only snapshot."""
+
+
+class _DeadlineSocket(socket.socket):
+    def __init__(self, deadline):
+        super().__init__(socket.AF_INET, socket.SOCK_STREAM)
+        self.deadline = deadline
+
+    def _set_deadline_timeout(self):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("proxy usage query deadline expired")
+        self.settimeout(remaining)
+
+    def connect(self, address):
+        self._set_deadline_timeout()
+        return super().connect(address)
+
+    def sendall(self, data, flags=0):
+        self._set_deadline_timeout()
+        return super().sendall(data, flags)
+
+    def recv_into(self, buffer, nbytes=0, flags=0):
+        # The HTTP parser's buffered socket file calls this for every raw read,
+        # including status lines, headers and chunked response bodies.
+        self._set_deadline_timeout()
+        return super().recv_into(buffer, nbytes, flags)
 
 
 def snapshot_identity(key, auth_bytes):
@@ -210,16 +240,37 @@ class ProxyPolicy:
         if self.dedicated_model and image != FACTORY_SNAPSHOT_IMAGE:
             raise ProxySnapshotError(DEDICATED_IMAGE_REQUIRED)
 
-    def management(self, path, *, timeout=5):
-        base = self.transport["endpoint"].removesuffix("/v1")
-        request = urllib.request.Request(base+"/v0/management/"+path,
-                                         headers={"Authorization": "Bearer "+self.management_key})
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-        with opener.open(request, timeout=timeout) as response:
-            data = response.read(2*1024*1024+1)
-        if len(data) > 2*1024*1024:
+    def management(self, path, *, deadline=None):
+        target = "/v0/management/" + path
+        headers = {"Authorization": "Bearer " + self.management_key}
+        if deadline is None:
+            base = self.transport["endpoint"].removesuffix("/v1")
+            request = urllib.request.Request(base + target, headers=headers)
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+            with opener.open(request, timeout=5) as response:
+                data = response.read(MANAGEMENT_RESPONSE_LIMIT + 1)
+        else:
+            data = self._read_management_before_deadline(target, headers, deadline)
+        if len(data) > MANAGEMENT_RESPONSE_LIMIT:
             raise ValueError("proxy management response limit exceeded")
         return json.loads(data)
+
+    def _read_management_before_deadline(self, target, headers, deadline):
+        port = urllib.parse.urlsplit(self.transport["endpoint"]).port
+        with (
+            _DeadlineSocket(deadline) as sock,
+            closing(http.client.HTTPConnection("127.0.0.1", port)) as connection,
+        ):
+            sock.connect(("127.0.0.1", port))
+            connection.sock = sock
+            connection.request("GET", target, headers={**headers, "Connection": "close"})
+            with connection.getresponse() as response:
+                if not 200 <= response.status < 300:
+                    raise ValueError("proxy management request failed")
+                data = response.read(MANAGEMENT_RESPONSE_LIMIT + 1)
+                if response.length and len(data) <= MANAGEMENT_RESPONSE_LIMIT:
+                    raise ValueError("incomplete proxy management response")
+                return data
 
     def verify(self):
         p = self.policy
@@ -583,10 +634,12 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
             if cutoff is None:
                 rows = self.policy.management(path)
             else:
-                remaining = cutoff - time.monotonic()
-                if remaining <= 0:
+                if time.monotonic() >= cutoff:
                     return
-                rows = self.policy.management(path, timeout=remaining)
+                try:
+                    rows = self.policy.management(path, deadline=cutoff)
+                except TimeoutError:
+                    return
                 if time.monotonic() >= cutoff:
                     return
             if not isinstance(rows, list):
