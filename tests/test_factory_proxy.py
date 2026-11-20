@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -37,6 +38,8 @@ class ProxyContracts(unittest.TestCase):
         self.management_key = "not-a-real-management-credential-sentinel"
         self.requests = []
         self.telemetry = []
+        self.queue_reads = 0
+        self.empty_queue_reads = 0
         self.mode = "complete"
         fixture = self
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -48,7 +51,12 @@ class ProxyContracts(unittest.TestCase):
                 elif self.path.endswith("max-retry-credentials"):
                     value = {"max-retry-credentials": 1}
                 else:
-                    value, fixture.telemetry = fixture.telemetry, []
+                    fixture.queue_reads += 1
+                    if fixture.empty_queue_reads:
+                        fixture.empty_queue_reads -= 1
+                        value = []
+                    else:
+                        value, fixture.telemetry = fixture.telemetry, []
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(json.dumps(value).encode())
@@ -275,7 +283,7 @@ class ProxyContracts(unittest.TestCase):
     def test_gpt62_derived_image_requires_correlated_evidence_to_settle(self):
         self.use_image(FACTORY_SNAPSHOT_IMAGE)
         self.profile["model"] = "gpt-6.2-sol"
-        for scenario in ("correlated", "missing", "duplicate"):
+        for scenario in ("correlated", "late", "missing", "duplicate", "mismatched"):
             transcript = self.root / (scenario + ".raw")
             with self.subTest(scenario=scenario), patch(
                     "harness.factory_runtime.AppServerCodex._trusted_executable",
@@ -291,13 +299,44 @@ class ProxyContracts(unittest.TestCase):
                     self.assertEqual(pending["physical_attempts"][0]["physical_attempt_count"], "UNKNOWN")
                     self.assertFalse(pending["usage_complete"])
 
-                    if scenario == "missing":
+                    arrived = self.telemetry[0].copy()
+                    if scenario == "late":
+                        self.empty_queue_reads = 1
+                    elif scenario == "missing":
                         self.telemetry.clear()
-                    if scenario == "duplicate":
-                        self.telemetry.append(self.telemetry[0].copy())
-                    relay.collect_telemetry()
+                    elif scenario == "duplicate":
+                        self.telemetry.append(arrived)
+                    elif scenario == "mismatched":
+                        self.telemetry[0]["response_model"] = "other-model"
 
-                    complete = scenario == "correlated"
+                    reads = self.queue_reads
+                    started = time.monotonic()
+                    now = [started]
+                    cutoff = started + 0.075
+
+                    def advance(seconds):
+                        now[0] += seconds
+
+                    with patch("harness.factory_proxy.time") as clock, patch.object(
+                            relay.policy, "management", wraps=relay.policy.management) as management:
+                        clock.monotonic.side_effect = lambda: now[0]
+                        clock.sleep.side_effect = advance
+                        relay.collect_telemetry(deadline=cutoff)
+                        expected_reads = 2 if scenario in ("late", "missing") else 1
+                        self.assertEqual(self.queue_reads - reads, expected_reads)
+                        self.assertEqual(management.call_count, expected_reads)
+                        for attempt, call in enumerate(management.call_args_list):
+                            self.assertEqual(call.args, ("usage-queue?count=256",))
+                            self.assertAlmostEqual(call.kwargs["timeout"], 0.075 - attempt * 0.05)
+                        self.assertLessEqual(now[0], cutoff)
+                        if scenario == "missing":
+                            self.assertEqual(now[0], cutoff)
+                            self.telemetry.append(arrived)
+                            relay.collect_telemetry()
+                            self.assertEqual(management.call_count, expected_reads)
+                            self.telemetry.clear()
+
+                    complete = scenario in ("correlated", "late")
                     result = relay.receipt()
                     self.assertEqual(result["physical_attempt_count"], 1 if complete else "UNKNOWN")
                     self.assertEqual(result["usage_complete"], complete)
@@ -309,6 +348,28 @@ class ProxyContracts(unittest.TestCase):
                     self.assertEqual(len(self.requests) - before, 1)
                 finally:
                     relay.close()
+
+    def test_gpt62_settled_history_is_unchanged_by_late_duplicate(self):
+        self.use_image(FACTORY_SNAPSHOT_IMAGE)
+        self.profile["model"] = "gpt-6.2-sol"
+        relay = self.relay()
+        self.assertTrue(self.post(relay, self.profile["model"]))
+        previous = self.telemetry[0].copy()
+        relay.collect_telemetry()
+        self.assertTrue(relay.receipt()["usage_complete"])
+        saved = relay.evidence.read_bytes()
+        first = copy.deepcopy(relay.records[0])
+
+        relay.start_turn(self.root / "next.raw", 5, None)
+        self.assertTrue(self.post(relay, self.profile["model"]))
+        self.telemetry.insert(0, previous)
+        relay.collect_telemetry()
+
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(relay.receipt()["physical_attempt_count"], "UNKNOWN")
+        self.assertFalse(relay.receipt()["usage_complete"])
+        self.assertEqual(relay.records[0], first)
+        self.assertEqual((self.root / "run.proxy.jsonl").read_bytes(), saved)
 
     def test_v8_0_77_policy_checks_layout_and_isolation(self):
         config = self.use_image(PROXY_V8_0_77_IMAGE)
@@ -838,6 +899,7 @@ class ProxyContracts(unittest.TestCase):
         server.usage, server.events, server.runtime_identity = None, [], {}
         server._proxy_relay, server._policy_cwd = relay, str(self.root)
         server._reuse_session, server.token_limit = True, 1000
+        server._end_time = relay.deadline
         server.MODEL, server.REASONING_EFFORT = "fixture-model", None
         turn = [0]
         def request(method, params):

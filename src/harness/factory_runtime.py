@@ -581,7 +581,7 @@ class FactoryAppServer(AppServerCodex):
             raise RuntimeError("completed Codex turn has no structured final result")
         receipt = None
         if getattr(self, "_proxy_relay", None):
-            self._proxy_relay.collect_telemetry()
+            self._proxy_relay.collect_telemetry(deadline=self._deadline())
             receipt = self._proxy_relay.receipt()
             self.usage = self._proxy_relay.usage()
             self.runtime_identity["physical_accounting"] = receipt
@@ -875,7 +875,7 @@ class LocalRuntime:
         except Exception as exc:
             if server._proxy_relay:
                 try:
-                    server._proxy_relay.collect_telemetry()
+                    server._proxy_relay.collect_telemetry(deadline=server._deadline())
                 except Exception:
                     pass  # Unknown telemetry cannot settle the reservation.
                 server.usage = server._proxy_relay.usage()

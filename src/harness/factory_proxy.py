@@ -62,6 +62,8 @@ DEDICATED_IMAGE_REQUIRED = (
     "CLI_PROXY_DEDICATED_IMAGE_REQUIRED: gpt-6.2-sol requires the verified Factory proxy image"
 )
 PROXY_TMPFS_OPTIONS = "rw,noexec,nosuid,nodev,size=32m"
+PROXY_USAGE_WAIT_SECONDS = 2
+PROXY_USAGE_POLL_SECONDS = 0.05
 
 
 class ProxySnapshotError(ValueError):
@@ -208,12 +210,12 @@ class ProxyPolicy:
         if self.dedicated_model and image != FACTORY_SNAPSHOT_IMAGE:
             raise ProxySnapshotError(DEDICATED_IMAGE_REQUIRED)
 
-    def management(self, path):
+    def management(self, path, *, timeout=5):
         base = self.transport["endpoint"].removesuffix("/v1")
         request = urllib.request.Request(base+"/v0/management/"+path,
                                          headers={"Authorization": "Bearer "+self.management_key})
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-        with opener.open(request, timeout=5) as response:
+        with opener.open(request, timeout=timeout) as response:
             data = response.read(2*1024*1024+1)
         if len(data) > 2*1024*1024:
             raise ValueError("proxy management response limit exceeded")
@@ -570,7 +572,36 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                     "upstream_provider_identity": "NOT_PROVABLE", "upstream_model_identity": "NOT_PROVABLE",
                     "money": "UNKNOWN"}
 
-    def collect_telemetry(self):
+    def _usage_rows(self, records, deadline):
+        path = "usage-queue?count=256"
+        cutoff = None
+        if self.policy.dedicated_model:
+            cutoff = min(self.deadline, time.monotonic() + PROXY_USAGE_WAIT_SECONDS)
+            if deadline is not None:
+                cutoff = min(cutoff, deadline)
+        while True:
+            if cutoff is None:
+                rows = self.policy.management(path)
+            else:
+                remaining = cutoff - time.monotonic()
+                if remaining <= 0:
+                    return
+                rows = self.policy.management(path, timeout=remaining)
+                if time.monotonic() >= cutoff:
+                    return
+            if not isinstance(rows, list):
+                raise ValueError("proxy usage telemetry is unavailable")
+            yield from rows
+            if cutoff is None or self.failed or any(r["status"] != "COMPLETE" for r in records):
+                return
+            if all(r.get("proxy_telemetry") for r in records):
+                return
+            remaining = cutoff - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(PROXY_USAGE_POLL_SECONDS, remaining))
+
+    def collect_telemetry(self, *, deadline=None):
         """Consume only the dedicated pool's queue, persisting an allowlist.
 
         Raw queue entries include API keys, account details and error bodies;
@@ -579,17 +610,22 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
         A missing entry remains unknown, not evidence of zero physical attempts.
         """
         with self.lock:
+            if self.policy.dedicated_model and not self.accepting:
+                return
             self.accepting = False  # Only the next authorized turn can reopen dispatch.
+            records = self.records
+            if self.policy.dedicated_model:
+                # Earlier settled requests keep their original evidence.
+                records = [r for r in records if r["physical_attempt_count"] == "UNKNOWN"]
+                if not records:
+                    return
             try:
-                rows = self.policy.management("usage-queue?count=256")
-                if not isinstance(rows, list):
-                    raise ValueError("proxy usage telemetry is unavailable")
                 fields = ("provider", "executor_type", "model", "response_model", "request_id", "execution_id", "trace_id", "session_id", "auth_type", "failed")
-                for row in rows:
+                for row in self._usage_rows(records, deadline):
                     if not isinstance(row, dict):
                         self.failed = True
                         continue
-                    matched = next((r for r in self.records if r["http_request_id"] == row.get("session_id")), None)
+                    matched = next((r for r in records if r["http_request_id"] == row.get("session_id")), None)
                     if matched is None:
                         # A dedicated route must have no unattributed requests.
                         self.failed = True
@@ -610,10 +646,10 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                         matched["status"] = "UNKNOWN"
                         matched["physical_attempt_count"] = "UNKNOWN"
                     self.persist(matched)
-                if any(len(r.get("proxy_telemetry", [])) != 1 for r in self.records):
+                if any(len(r.get("proxy_telemetry", [])) != 1 for r in records):
                     self.failed = True
                 if self.policy.dedicated_model:
-                    for record in self.records:
+                    for record in records:
                         if record["status"] == "COMPLETE" and record["physical_attempt_count"] == "UNKNOWN":
                             if self.failed:
                                 record["status"] = "UNKNOWN"
