@@ -68,7 +68,7 @@ def setup(config_path, repository, token_file, size, codex_home=None, model=None
         from .factory_proxy import validate_transport, ProxyPolicy
         developer["transport"].update(endpoint=proxy_endpoint, configured_provider=proxy_provider,
                                       policy_file=str(proxy_policy_file) if proxy_policy_file else "")
-        ProxyPolicy(validate_transport(developer))
+        ProxyPolicy(validate_transport(developer), model=developer["model"])
     elif proxy_endpoint or proxy_policy_file:
         raise ValueError("proxy options require explicit --transport cli_proxy")
     config = validate_config({"version": 1, "repository": str(repo), "budget": PRESETS[size],

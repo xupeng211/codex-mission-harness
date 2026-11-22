@@ -16,13 +16,59 @@ The historical official-route receipts remain intact.
 
 ## Configure a bounded dedicated instance
 
-The supported policy is a local Docker CLIProxyAPI **v8.0.15 / a4acc9f** instance,
-pinned by image digest, with exactly one existing active Codex OAuth credential.
+The supported policy is a local Docker CLIProxyAPI instance with one active Codex
+OAuth credential. The provisioner checks the version banner against the commit
+paired with the local Docker image ID. Docker can report an OCI index, platform
+manifest or config digest as the local ID. Only the following known equivalents
+are admitted. Each policy keeps the exact local ID it was provisioned with.
+
+| Release | Identity | Digest |
+| --- | --- | --- |
+| v8.0.15 | OCI index | `sha256:ebc2ffc189cf241ff589cd9237c63ca9feba3c9b87fe6213ab9a0b642df132ae` |
+| v8.0.15 | linux/amd64 manifest | `sha256:e248cd0dc9d54a7709ed23276842f627da32e43010c6226ca51b6f4b59173771` |
+| v8.0.15 | linux/amd64 config | `sha256:9e2be6a609ef43f243b433543b705d1ddcce10c2a840f745848c10e02468ab53` |
+| v8.0.15 | linux/arm64 manifest | `sha256:327cc3c3acc4cceafe8350f94f30fd0329131d71866f8b83b440213b019f6b09` |
+| v8.0.15 | linux/arm64 config | `sha256:c088c22d25aceb212e0713c907d25991dbdcc7ba8be3bff3644121f20e74e4c4` |
+| v8.0.77 | OCI index | `sha256:2acf44fbadf9933a04e971048b4c2ddd184ce6e3ea08fc2dc25354f3a365f5ab` |
+| v8.0.77 | linux/amd64 manifest | `sha256:61451a1fce07e70fb86bc52939b3b99bcb0d4c98a94483bb880017d2937f5e1e` |
+| v8.0.77 | linux/amd64 config | `sha256:8712adc77fc26b5062667e2e9bc023ea4be2651faab46b10d32e43ac6b40508d` |
+
+The pinned commits are `a4acc9f752bd46571f737a10c04bf413656ab06b` for v8.0.15
+and `a5e8f69e56309e1ef6d6872e667da81fdfbce2ce` for v8.0.77. The v8.0.77
+config uses `multimedia.disable-image-generation` and `observability.logs`.
+Existing v8.0.15 policies keep their original layout.
+
 The original interactive instance can keep its configuration. A Factory-only copy
 uses zero credential/stream bootstrap retries, a single credential per request,
 disabled WebSockets/model aliases/steering, read-only configuration and credential
-mounts, and a loopback-only published port. Its read-only credential snapshot must
-be reprovisioned when expired; failure never rotates to another account.
+mounts, and a loopback-only published port. The two bind mounts must have private
+propagation and either exclude submounts or force recursive read-only access.
+The optional `/tmp` tmpfs is limited to 32 MiB with `noexec,nosuid,nodev`.
+An existing container whose mount metadata cannot prove these properties needs
+to be reprovisioned before starting a new run.
+
+For v8.0.77, provisioning copies an access-token snapshot with a known expiry
+and leaves refresh material out. It writes a private `transport.json` with a
+`snapshot_id` derived from the exact credential bytes. The original v8.0.77
+image uses the private management key. The derived Factory image uses the
+private proxy access key. Include that transport object in the approved
+private Factory config for a fixed developer profile or model-pool entry.
+Factory retains the approved route in the immutable submission event and
+checks it before a new dispatch, after opening the relay and before forwarding. Keep the snapshot
+identifier, private transport and build evidence that contains it out of public
+logs and artifacts. The relay stops on snapshot drift, expiry or a proxy 401,
+including a recognized stream authentication failure. Reprovision a fresh
+out-of-band snapshot and authorize a new run to recover.
+
+A `cli_proxy` profile for `gpt-6.2-sol` requires the verified Factory image
+manifest `sha256:09689cab6ecdd59f6d3b65a0e583d43f12b60c53bd3b797aee986ee29e97ebef`.
+Factory checks both the declared policy image and the actual running container
+before forwarding. For completed requests, Factory polls the usage queue for
+up to two seconds within the existing turn deadline. Each management query
+uses that same cutoff from connection through the complete HTTP response and
+closes the connection on timeout. A unique match confirms the request count.
+Evidence that arrives after the cutoff, is missing, is duplicated or does not
+match keeps the count `UNKNOWN`.
 
 Use an owner-controlled mode-0600 input auth file in a private directory. If the
 existing proxy auth directory is writable by other users, first make a private
@@ -38,7 +84,8 @@ python3 scripts/configure_factory_proxy.py \
 ```
 
 This performs no model inference. It creates private key files and a safe
-`policy.json`, and reports only configuration/runtime identity. Do not upload the
+`policy.json`, and reports the configuration/runtime identity with the
+snapshot identifier omitted. Do not upload the
 configuration/key/auth files as CI artifacts. The policy directory must remain
 outside the candidate repository. No secret is passed through Docker/Codex argv.
 
@@ -74,6 +121,8 @@ Do not change/resume/refund a historical UNKNOWN mission to switch routes.
 `harness setup` also accepts `--transport cli_proxy --model ... --proxy-endpoint ...
 --proxy-policy-file ...`; it keeps the reviewer official. Model and endpoint are
 mandatory explicit choices. Only `http://127.0.0.1:PORT/v1` is currently supported.
+For v8.0.77, bind the private transport emitted by provisioning directly in the
+approved Factory config.
 
 ## Evidence, isolation and accounting
 
@@ -133,6 +182,9 @@ Factory READY. Unknown/truncated reviews remain in their new ledger without
 automatic retries. Native offline tests cover official transport, proxy selection,
 credential isolation and no-fallback; HTTP contract tests cover bounded attempts,
 identity mismatches, partial usage, unknown reservations and immutable receipts.
+The qualification helper shown above accepts the legacy transport fields.
+Upstream HTTP 307/308 behavior remains a separate verification requirement for
+v8.0.77. The observer's redirect guard covers the hop to the local proxy.
 
 ## Task-level model pool
 

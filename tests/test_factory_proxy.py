@@ -1,23 +1,33 @@
 """Transport contracts exercised against real local HTTP, with no paid calls."""
+import base64
 import copy
 import http.server
 import hashlib
+import io
 import json
+import select
 import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from harness.factory import Factory, FactoryBlocked, validate_config
+from harness.factory import Factory, FactoryBlocked, git, validate_config
+from harness.factory_cli import main as factory_cli
 from harness.factory_fixture import AcceptanceRuntime, fixture_config
-from harness.factory_proxy import ProxyPolicy, ProxyRelay, validate_transport
-from harness.factory_runtime import FactoryAppServer, RuntimeFailure
-from scripts.configure_factory_proxy import managed_config
+from harness.factory_proxy import (
+    FACTORY_SNAPSHOT_IMAGE, LEGACY_PROXY_IMAGE, LEGACY_PROXY_IMAGES, PROXY_TMPFS_OPTIONS, PROXY_V8_0_77_IMAGE, PROXY_V8_0_77_IMAGES,
+    SNAPSHOT_IMAGES, SNAPSHOT_REJECTED, SUPPORTED_PROXY_RELEASES, ProxyPolicy, ProxyRelay, snapshot_identity, validate_transport, verify_snapshot_expiry,
+)
+from harness.factory_runtime import FactoryAppServer, LocalRuntime, RuntimeFailure
+from scripts.configure_factory_proxy import managed_config, managed_credential, verify_release
+from test_factory_routing import pool
 
 
 class ProxyContracts(unittest.TestCase):
@@ -29,6 +39,9 @@ class ProxyContracts(unittest.TestCase):
         self.management_key = "not-a-real-management-credential-sentinel"
         self.requests = []
         self.telemetry = []
+        self.queue_reads = 0
+        self.empty_queue_reads = 0
+        self.queue_response = None
         self.mode = "complete"
         fixture = self
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -40,7 +53,15 @@ class ProxyContracts(unittest.TestCase):
                 elif self.path.endswith("max-retry-credentials"):
                     value = {"max-retry-credentials": 1}
                 else:
-                    value, fixture.telemetry = fixture.telemetry, []
+                    fixture.queue_reads += 1
+                    if fixture.empty_queue_reads:
+                        fixture.empty_queue_reads -= 1
+                        value = []
+                    else:
+                        value, fixture.telemetry = fixture.telemetry, []
+                    if fixture.queue_response:
+                        fixture.queue_response(self, json.dumps(value).encode())
+                        return
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(json.dumps(value).encode())
@@ -49,6 +70,19 @@ class ProxyContracts(unittest.TestCase):
                 fixture.requests.append({"body": body, "auth": self.headers.get("Authorization")})
                 if fixture.mode == "http_error":
                     self.send_error(500, fixture.key)
+                    return
+                if fixture.mode == "unauthorized":
+                    self.send_error(401, fixture.key)
+                    return
+                if fixture.mode in {"stream_unauthorized", "stream_status_401"}:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.end_headers()
+                    failed = {"type": "response.failed", "response": {
+                        "error": {**({"code": 401} if fixture.mode == "stream_status_401"
+                                     else {"code": "invalid_api_key"}), "message": fixture.key},
+                    }}
+                    self.wfile.write(b"data: " + json.dumps(failed).encode() + b"\n\n")
                     return
                 if fixture.mode == "redirect":
                     self.send_response(307)
@@ -86,16 +120,22 @@ class ProxyContracts(unittest.TestCase):
         for name, value in (("key", self.key), ("management", self.management_key)):
             self.write(self.root/name, value)
         self.policy_file = self.root / "policy.json"
-        self.image = "sha256:"+"a"*64
+        self.image = LEGACY_PROXY_IMAGE
         self.write(self.policy_file, json.dumps({"version": 1, "container": "fixture-container", "image": self.image, "endpoint": self.endpoint,
                    "config_file": str(self.config_path), "auth_file": str(self.auth), "credential_file": str(self.root/"key"), "management_token_file": str(self.root/"management")}))
         self.transport = {"type": "cli_proxy", "endpoint": self.endpoint, "configured_provider": "cli_proxy_api", "policy_file": str(self.policy_file)}
         self.profile = {"provider": "openai", "model": "fixture-model", "transport": self.transport}
+        mounts = {"/CLIProxyAPI/config.yaml": str(self.config_path), "/factory-auth": str(auth_dir)}
         self.container = {"Id": "runtime-fixture", "Image": self.image, "State": {"Running": True},
-                          "Config": {"Entrypoint": None, "Cmd": ["/CLIProxyAPI/CLIProxyAPI", "-config", "/CLIProxyAPI/config.yaml", "-local-model"]},
-                          "HostConfig": {"ReadonlyRootfs": True, "PortBindings": {"8317/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(self.upstream.server_port)}]}},
-                          "Mounts": [{"Type": "bind", "Destination": "/CLIProxyAPI/config.yaml", "Source": str(self.config_path), "RW": False},
-                                     {"Type": "bind", "Destination": "/factory-auth", "Source": str(auth_dir), "RW": False}]}
+                          "Config": {"Entrypoint": None, "WorkingDir": "/CLIProxyAPI",
+                                     "Cmd": ["/CLIProxyAPI/CLIProxyAPI", "-config", "/CLIProxyAPI/config.yaml", "-local-model"]},
+                          "HostConfig": {"ReadonlyRootfs": True,
+                                         "PortBindings": {"8317/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(self.upstream.server_port)}]},
+                                         "Mounts": [{"Type": "bind", "Target": target, "Source": source, "ReadOnly": True,
+                                                     "BindOptions": {"NonRecursive": True, "Propagation": "rprivate"}}
+                                                    for target, source in mounts.items()]},
+                          "Mounts": [{"Type": "bind", "Destination": target, "Source": source, "RW": False,
+                                      "Propagation": "rprivate"} for target, source in mounts.items()]}
         self.inspect = patch("harness.factory_proxy.docker_json", return_value=[self.container])
         self.inspect.start()
         self.addCleanup(self.inspect.stop)
@@ -109,6 +149,30 @@ class ProxyContracts(unittest.TestCase):
         relay = ProxyRelay(self.profile, self.root / "run.raw", 5)
         self.addCleanup(relay.close)
         return relay
+
+    def use_image(self, image):
+        policy = json.loads(self.policy_file.read_text())
+        policy["image"] = self.container["Image"] = self.image = image
+        self.write(self.policy_file, json.dumps(policy))
+        config = managed_config(self.key, self.management_key, "http://127.0.0.1:7897", image)
+        self.write(self.config_path, json.dumps(config))
+        auth = json.loads(self.auth.read_text())
+        auth["expired"] = "2100-01-01T00:00:00Z"
+        self.write(self.auth, json.dumps(auth))
+        command = self.container["Config"]["Cmd"]
+        if command[-1] == "-factory-snapshot":
+            command.pop()
+        if image == FACTORY_SNAPSHOT_IMAGE:
+            command.append("-factory-snapshot")
+        if image in SNAPSHOT_IMAGES:
+            self.pin_snapshot()
+        else:
+            self.transport.pop("snapshot_id", None)
+        return config
+
+    def pin_snapshot(self):
+        snapshot_key = self.key if self.image == FACTORY_SNAPSHOT_IMAGE else self.management_key
+        self.transport["snapshot_id"] = snapshot_identity(snapshot_key, self.auth.read_bytes())
 
     def post(self, relay, model="fixture-model"):
         request = urllib.request.Request(relay.base_url+"/responses", data=json.dumps({"model": model, "stream": True}).encode(),
@@ -154,6 +218,569 @@ class ProxyContracts(unittest.TestCase):
         self.container["Image"] = "different-image"
         with self.assertRaisesRegex(ValueError, "runtime identity"):
             ProxyPolicy(self.transport)
+
+    def test_provisioning_requires_matching_release_and_image(self):
+        legacy = "CLIProxyAPI Version: v8.0.15, Commit: a4acc9f, BuiltAt: fixture"
+        modern = "CLIProxyAPI Version: v8.0.77, Commit: a5e8f69e, BuiltAt: fixture"
+        for release_images, banner in ((LEGACY_PROXY_IMAGES, legacy), (PROXY_V8_0_77_IMAGES, modern)):
+            for image in release_images:
+                with self.subTest(image=image):
+                    verify_release(image, banner)
+                    self.use_image(image)
+                    self.assertEqual(ProxyPolicy(self.transport).identity["image"], image)
+        for image, banner in (
+            (LEGACY_PROXY_IMAGE, modern),
+            (PROXY_V8_0_77_IMAGE, legacy),
+            (PROXY_V8_0_77_IMAGE, modern.replace("v8.0.77", "v8.0.78")),
+            (PROXY_V8_0_77_IMAGE, modern.replace("a5e8f69e", "a5e8f69f")),
+            ("sha256:" + "f" * 64, modern),
+        ):
+            with self.subTest(image=image, banner=banner), self.assertRaises(ValueError):
+                verify_release(image, banner)
+
+    def test_derived_image_requires_its_commit_command_and_snapshot_key(self):
+        self.use_image(FACTORY_SNAPSHOT_IMAGE)
+        version, commit = SUPPORTED_PROXY_RELEASES[FACTORY_SNAPSHOT_IMAGE]
+        verify_release(FACTORY_SNAPSHOT_IMAGE, f"CLIProxyAPI Version: {version}, Commit: {commit}, BuiltAt: fixture")
+        with self.assertRaises(ValueError):
+            verify_release(FACTORY_SNAPSHOT_IMAGE, f"CLIProxyAPI Version: {version}, Commit: a5e8f69e, BuiltAt: fixture")
+        self.assertTrue(ProxyPolicy(self.transport).frozen_snapshot)
+        self.container["Config"]["Cmd"].pop()
+        with self.assertRaisesRegex(ValueError, "runtime identity"):
+            ProxyPolicy(self.transport)
+        self.container["Config"]["Cmd"].append("-factory-snapshot")
+        self.transport["snapshot_id"] = snapshot_identity(self.management_key, self.auth.read_bytes())
+        with self.assertRaisesRegex(ValueError, "SNAPSHOT_CHANGED"):
+            ProxyPolicy(self.transport)
+
+    def test_gpt62_rejects_stock_image_before_proxy_access(self):
+        for image in (*PROXY_V8_0_77_IMAGES, LEGACY_PROXY_IMAGE):
+            self.use_image(image)
+            for model in ("gpt-6.2-sol", "GPT-6.2-SOL(high)"):
+                profile = {**self.profile, "model": model}
+                with self.subTest(image=image, model=model), patch(
+                        "harness.factory_proxy.docker_json") as inspect, patch.object(
+                        ProxyPolicy, "management") as management:
+                    with self.assertRaisesRegex(ValueError, "DEDICATED_IMAGE_REQUIRED"):
+                        LocalRuntime().profile_identity(profile)
+                    with self.assertRaisesRegex(ValueError, "DEDICATED_IMAGE_REQUIRED"):
+                        ProxyRelay(profile, self.root / "blocked.raw", 5)
+                    inspect.assert_not_called()
+                    management.assert_not_called()
+                    self.assertEqual(self.requests, [])
+                    self.assertFalse((self.root / "blocked.proxy.jsonl").exists())
+
+    def test_gpt62_stops_if_running_image_changes_before_forward(self):
+        self.use_image(FACTORY_SNAPSHOT_IMAGE)
+        self.profile["model"] = "gpt-6.2-sol"
+        relay = self.relay()
+        with patch.object(ProxyPolicy, "management") as management:
+            self.container["Image"] = PROXY_V8_0_77_IMAGE
+            self.assertFalse(self.post(relay, self.profile["model"]))
+            management.assert_not_called()
+        receipt = relay.receipt()
+        self.assertIn("DEDICATED_IMAGE_REQUIRED", receipt["stop_reason"])
+        self.assertEqual(self.requests, [])
+        self.assertEqual(receipt["physical_attempts"], [])
+        self.assertEqual(receipt["physical_attempt_count"], "UNKNOWN")
+        self.assertFalse(receipt["usage_complete"])
+
+    def test_gpt62_derived_image_requires_correlated_evidence_to_settle(self):
+        self.use_image(FACTORY_SNAPSHOT_IMAGE)
+        self.profile["model"] = "gpt-6.2-sol"
+        for scenario in ("correlated", "late", "missing", "duplicate", "mismatched"):
+            transcript = self.root / (scenario + ".raw")
+            with self.subTest(scenario=scenario), patch(
+                    "harness.factory_runtime.AppServerCodex._trusted_executable",
+                    return_value=Path("/usr/bin/true")):
+                identity = LocalRuntime().profile_identity(self.profile)
+                self.assertEqual(identity["route_identity"]["runtime"]["image"], FACTORY_SNAPSHOT_IMAGE)
+                relay = ProxyRelay(self.profile, transcript, 5)
+                before = len(self.requests)
+                try:
+                    self.assertTrue(self.post(relay, self.profile["model"]))
+                    pending = relay.receipt()
+                    self.assertEqual(pending["physical_attempt_count"], "UNKNOWN")
+                    self.assertEqual(pending["physical_attempts"][0]["physical_attempt_count"], "UNKNOWN")
+                    self.assertFalse(pending["usage_complete"])
+
+                    arrived = self.telemetry[0].copy()
+                    if scenario == "late":
+                        self.empty_queue_reads = 1
+                    elif scenario == "missing":
+                        self.telemetry.clear()
+                    elif scenario == "duplicate":
+                        self.telemetry.append(arrived)
+                    elif scenario == "mismatched":
+                        self.telemetry[0]["response_model"] = "other-model"
+
+                    reads = self.queue_reads
+                    started = time.monotonic()
+                    now = [started]
+                    cutoff = started + 0.075
+
+                    def advance(seconds):
+                        now[0] += seconds
+
+                    with patch("harness.factory_proxy.time") as clock, patch.object(
+                            relay.policy, "management", wraps=relay.policy.management) as management:
+                        clock.monotonic.side_effect = lambda: now[0]
+                        clock.sleep.side_effect = advance
+                        relay.collect_telemetry(deadline=cutoff)
+                        expected_reads = 2 if scenario in ("late", "missing") else 1
+                        self.assertEqual(self.queue_reads - reads, expected_reads)
+                        self.assertEqual(management.call_count, expected_reads)
+                        for call in management.call_args_list:
+                            self.assertEqual(call.args, ("usage-queue?count=256",))
+                            self.assertEqual(call.kwargs, {"deadline": cutoff})
+                        self.assertLessEqual(now[0], cutoff)
+                        if scenario == "missing":
+                            self.assertEqual(now[0], cutoff)
+                            self.telemetry.append(arrived)
+                            relay.collect_telemetry()
+                            self.assertEqual(management.call_count, expected_reads)
+                            self.telemetry.clear()
+
+                    complete = scenario in ("correlated", "late")
+                    result = relay.receipt()
+                    self.assertEqual(result["physical_attempt_count"], 1 if complete else "UNKNOWN")
+                    self.assertEqual(result["usage_complete"], complete)
+                    self.assertEqual(relay.usage()["total_tokens"], 13)
+                    self.assertEqual(result["money"], "UNKNOWN")
+                    durable = json.loads(relay.evidence.read_text().splitlines()[-1])
+                    self.assertEqual(durable["status"], "COMPLETE" if complete else "UNKNOWN")
+                    self.assertEqual(durable["physical_attempt_count"], 1 if complete else "UNKNOWN")
+                    self.assertEqual(len(self.requests) - before, 1)
+                finally:
+                    relay.close()
+
+    def test_gpt62_usage_query_enforces_deadline_through_headers_and_body(self):
+        self.use_image(FACTORY_SNAPSHOT_IMAGE)
+        self.profile["model"] = "gpt-6.2-sol"
+        for stage in ("headers", "body", "timely"):
+            with self.subTest(stage=stage):
+                peer_closed = threading.Event()
+                fragments = 1 if stage == "timely" else 16
+
+                def respond(handler, payload):
+                    if stage == "headers":
+                        handler.wfile.write(b"HTTP/1.0 200 OK\r\nX-Fixture: drip")
+                        tail = f"\r\nContent-Length: {len(payload)}\r\n\r\n".encode() + payload
+                    else:
+                        handler.send_response(200)
+                        handler.send_header("Content-Length", str(fragments + len(payload)))
+                        handler.end_headers()
+                        tail = payload
+                    try:
+                        for _ in range(fragments):
+                            readable, _, _ = select.select([handler.connection], [], [], 0.04)
+                            if readable and not handler.connection.recv(1):
+                                peer_closed.set()
+                                return
+                            handler.wfile.write(b" ")
+                        handler.wfile.write(tail)
+                    except (BrokenPipeError, ConnectionResetError):
+                        peer_closed.set()
+
+                relay = ProxyRelay(self.profile, self.root / f"{stage}.raw", 5)
+                reads, posts = self.queue_reads, len(self.requests)
+                self.queue_response = respond
+                try:
+                    self.assertTrue(self.post(relay, self.profile["model"]))
+                    started = time.monotonic()
+                    relay.collect_telemetry(deadline=started + 0.25)
+                    elapsed = time.monotonic() - started
+                    receipt = relay.receipt()
+                    durable = json.loads(relay.evidence.read_text().splitlines()[-1])
+                    if stage == "timely":
+                        self.assertLess(elapsed, 0.25)
+                        self.assertTrue(receipt["usage_complete"])
+                        self.assertEqual(durable["physical_attempt_count"], 1)
+                    else:
+                        self.assertLess(elapsed, 0.4)
+                        self.assertTrue(peer_closed.wait(0.2), "management connection still open")
+                        self.assertFalse(receipt["usage_complete"])
+                        self.assertEqual(durable["status"], "UNKNOWN")
+                        self.assertEqual(durable["physical_attempt_count"], "UNKNOWN")
+                        self.assertNotIn("proxy_telemetry", durable)
+                    self.assertEqual(relay.usage()["total_tokens"], 13)
+                    relay.collect_telemetry()
+                    self.assertEqual(self.queue_reads - reads, 1)
+                    self.assertEqual(len(self.requests) - posts, 1)
+                finally:
+                    self.queue_response = None
+                    relay.close()
+
+    def test_gpt62_settled_history_is_unchanged_by_late_duplicate(self):
+        self.use_image(FACTORY_SNAPSHOT_IMAGE)
+        self.profile["model"] = "gpt-6.2-sol"
+        relay = self.relay()
+        self.assertTrue(self.post(relay, self.profile["model"]))
+        previous = self.telemetry[0].copy()
+        relay.collect_telemetry()
+        self.assertTrue(relay.receipt()["usage_complete"])
+        saved = relay.evidence.read_bytes()
+        first = copy.deepcopy(relay.records[0])
+
+        relay.start_turn(self.root / "next.raw", 5, None)
+        self.assertTrue(self.post(relay, self.profile["model"]))
+        self.telemetry.insert(0, previous)
+        relay.collect_telemetry()
+
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(relay.receipt()["physical_attempt_count"], "UNKNOWN")
+        self.assertFalse(relay.receipt()["usage_complete"])
+        self.assertEqual(relay.records[0], first)
+        self.assertEqual((self.root / "run.proxy.jsonl").read_bytes(), saved)
+
+    def test_v8_0_77_policy_checks_layout_and_isolation(self):
+        config = self.use_image(PROXY_V8_0_77_IMAGE)
+        self.assertEqual(config["multimedia"], {"disable-image-generation": True})
+        self.assertEqual(config["observability"]["logs"]["request-log"], False)
+        self.assertEqual(ProxyPolicy(self.transport).identity["image"], PROXY_V8_0_77_IMAGE)
+        for invalid in (self.config, {**config, "multimedia": {}},
+                        {**config, "observability": self.config["observability"]}):
+            self.write(self.config_path, json.dumps(invalid))
+            with self.assertRaises(ValueError):
+                ProxyPolicy(self.transport)
+        self.write(self.config_path, json.dumps(config))
+        with patch.object(ProxyPolicy, "management", return_value={"request-retry": 1}):
+            with self.assertRaisesRegex(ValueError, "running proxy retry policy"):
+                ProxyPolicy(self.transport)
+        extra = self.auth.parent / "other.json"
+        self.write(extra, "{}")
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            ProxyPolicy(self.transport)
+        extra.unlink()
+        for mount in self.container["Mounts"]:
+            with self.subTest(mount=mount["Destination"]):
+                mount["RW"] = True
+                with self.assertRaisesRegex(ValueError, "mounts must be pinned read-only"):
+                    ProxyPolicy(self.transport)
+                mount["RW"] = False
+        policy = json.loads(self.policy_file.read_text())
+        policy["image"] = self.container["Image"] = "sha256:" + "f" * 64
+        self.write(self.policy_file, json.dumps(policy))
+        with self.assertRaisesRegex(ValueError, "not a supported release"):
+            ProxyPolicy(self.transport)
+
+    def test_only_the_expected_mounts_and_tmpfs_are_accepted(self):
+        self.use_image(PROXY_V8_0_77_IMAGE)
+        self.container["HostConfig"]["Tmpfs"] = {"/tmp": "rw,noexec,nosuid,size=32m"}
+        ProxyPolicy(self.transport)
+        self.container["Mounts"].append({"Type": "tmpfs", "Destination": "/tmp", "RW": True})
+        ProxyPolicy(self.transport)
+        self.container["HostConfig"]["Tmpfs"]["/tmp"] = PROXY_TMPFS_OPTIONS
+        ProxyPolicy(self.transport)
+        for mount_type, path in (
+            ("volume", "/CLIProxyAPI"),
+            ("volume", "/factory-auth/logs"),
+            ("tmpfs", "/factory-auth"),
+            ("bind", "/CLIProxyAPI/CLIProxyAPI"),
+        ):
+            with self.subTest(mount_type=mount_type, path=path):
+                self.container["Mounts"].append({"Type": mount_type, "Destination": path, "RW": True})
+                with self.assertRaisesRegex(ValueError, "mount"):
+                    ProxyPolicy(self.transport)
+                self.container["Mounts"].pop()
+        self.container["HostConfig"]["Tmpfs"]["/CLIProxyAPI"] = "rw"
+        with self.assertRaisesRegex(ValueError, "unexpected mount"):
+            ProxyPolicy(self.transport)
+
+    def test_rejects_unproven_mount_metadata(self):
+        self.use_image(PROXY_V8_0_77_IMAGE)
+        baseline = copy.deepcopy(self.container)
+        host = self.container["HostConfig"]
+        for mutate in (
+            lambda: host.update(Mounts=[]),
+            lambda: host.update(Binds=["/fixture:/factory-auth:rw"]),
+            lambda: host.update(VolumesFrom=["other"]),
+            lambda: host["Mounts"].append({"Type": "tmpfs", "Target": "/factory-auth"}),
+            lambda: host["Mounts"][1].update(ReadOnly=False),
+            lambda: host["Mounts"][1]["BindOptions"].update(ReadOnlyNonRecursive=True),
+            lambda: host["Mounts"][1]["BindOptions"].update(NonRecursive=False),
+            lambda: host["Mounts"][1]["BindOptions"].update(ReadOnlyForceRecursive=True),
+            lambda: host["Mounts"][1]["BindOptions"].update(Propagation="rshared"),
+            lambda: self.container["Mounts"][1].update(Propagation="rslave"),
+            lambda: self.container["Config"].update(WorkingDir="/tmp"),
+            *(lambda option=option: host.update(Tmpfs={"/tmp": PROXY_TMPFS_OPTIONS + "," + option})
+              for option in ("exec", "suid", "dev", "size=64m")),
+        ):
+            mutate()
+            with self.assertRaisesRegex(ValueError, "mount|working directory"):
+                ProxyPolicy(self.transport)
+            self.container.update(copy.deepcopy(baseline))
+            host = self.container["HostConfig"]
+        host["Mounts"][1]["BindOptions"] = {"ReadOnlyForceRecursive": True, "Propagation": "rprivate"}
+        ProxyPolicy(self.transport)
+
+    def test_snapshot_pin_is_required_and_changes_with_exact_bytes(self):
+        self.use_image(PROXY_V8_0_77_IMAGE)
+        approved = dict(self.transport)
+        ProxyPolicy(approved)
+        self.transport.pop("snapshot_id")
+        with self.assertRaisesRegex(ValueError, "SNAPSHOT_AUTHORIZATION_REQUIRED"):
+            ProxyPolicy(self.transport)
+        self.write(self.auth, self.auth.read_text() + "\n")
+        with self.assertRaisesRegex(ValueError, "SNAPSHOT_CHANGED"):
+            ProxyPolicy(approved)
+        self.pin_snapshot()
+        ProxyPolicy(self.transport)
+
+    def test_v8_0_77_provisions_no_refresh_material_and_rejects_expired_or_unknown_expiry(self):
+        source = {"type": "codex", "access_token": "offline-token", "refresh_token": "legacy-refresh",
+                  "siwc": {"refresh_token": "nested-refresh"}, "expired": "2100-01-01T00:00:00Z"}
+        self.assertEqual(managed_credential(source, LEGACY_PROXY_IMAGE)["refresh_token"], "legacy-refresh")
+        snapshot = managed_credential(source, PROXY_V8_0_77_IMAGE)
+        self.assertEqual(snapshot["access_token"], source["access_token"])
+        self.assertNotIn("refresh_token", snapshot)
+        self.assertNotIn("siwc", snapshot)
+        self.assertEqual(source["refresh_token"], "legacy-refresh")
+        self.use_image(PROXY_V8_0_77_IMAGE)
+        for key in ("refresh_token", "refreshToken", "siwc"):
+            self.write(self.auth, json.dumps({**snapshot, key: source["refresh_token"]}))
+            self.pin_snapshot()
+            with self.assertRaisesRegex(ValueError, "credential aliases"):
+                ProxyPolicy(self.transport)
+        for values, reason in (
+            ({"access_token": "opaque"}, "EXPIRY_UNKNOWN"),
+            ({"access_token": "opaque", "expired": "2100-01-01"}, "EXPIRY_UNKNOWN"),
+            ({"access_token": "opaque", "expired": "2000-01-01T00:00:00Z"}, "SNAPSHOT_EXPIRED"),
+        ):
+            with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason):
+                managed_credential(values, PROXY_V8_0_77_IMAGE)
+        exp = base64.urlsafe_b64encode(b'{"exp":1}').decode().rstrip("=")
+        with self.assertRaisesRegex(ValueError, "SNAPSHOT_EXPIRED"):
+            verify_snapshot_expiry({**snapshot, "access_token": f"header.{exp}.signature"})
+
+    def test_v8_0_77_expiry_is_rechecked_before_forwarding(self):
+        self.use_image(PROXY_V8_0_77_IMAGE)
+        relay = self.relay()
+        with patch("harness.factory_proxy.time.time", return_value=4102444800):
+            self.post(relay)
+        self.post(relay)
+        self.assertEqual(self.requests, [])
+        self.assertIn("CLI_PROXY_SNAPSHOT_EXPIRED", relay.receipt()["stop_reason"])
+        self.assertEqual(relay.receipt()["physical_attempts"], [])
+        with self.assertRaisesRegex(ValueError, "SNAPSHOT_EXPIRED"):
+            relay.start_turn(self.root / "another.raw", 5, None)
+
+    def test_v8_0_77_snapshot_cannot_be_replaced_mid_session(self):
+        self.use_image(PROXY_V8_0_77_IMAGE)
+        relay = self.relay()
+        auth = json.loads(self.auth.read_text())
+        auth["access_token"] = "offline-replacement"
+        self.write(self.auth, json.dumps(auth))
+        self.post(relay)
+        self.assertEqual(self.requests, [])
+        self.assertIn("CLI_PROXY_SNAPSHOT_CHANGED", relay.receipt()["stop_reason"])
+
+    def task_config(self, routed):
+        config = fixture_config()
+        config.update(simulation=False, review_mode="single_openai",
+                      budget={"max_agent_runs": 5, "max_run_tokens": 100, "max_total_tokens": 500})
+        config["profiles"]["developer"] = copy.deepcopy(self.profile)
+        config["profiles"].pop("second_reviewer")
+        if routed:
+            config["model_routing"] = pool()
+            for entry in config["model_routing"]["models"]:
+                entry["transport"] = dict(self.transport)
+        return config
+
+    def replace_snapshot(self, account_changed):
+        auth = json.loads(self.auth.read_text())
+        auth["access_token"] = "replacement-fixture-token"
+        if account_changed:
+            auth["account_id"] = "replacement-fixture-account"
+        self.write(self.auth, json.dumps(auth))
+
+    def test_task_dispatch_binds_the_exact_snapshot_across_sqlite_reopen(self):
+        self.use_image(PROXY_V8_0_77_IMAGE)
+        source = self.root / "source"
+        source.mkdir()
+        git(source, "init", "-q")
+        git(source, "-c", "user.name=Fixture", "-c", "user.email=f@localhost", "commit",
+            "--allow-empty", "-qm", "baseline")
+        auth = json.loads(self.auth.read_text())
+        auth["account_id"] = "approved-fixture-account"
+        original = json.dumps(auth)
+
+        def open_factory(name, config):
+            runtime = LocalRuntime()
+            live_identity = runtime.profile_identity
+            # Developer policy and task routing are real. The reviewer lane
+            # is unused here and never reads a real Codex home.
+            runtime.profile_identity = lambda profile: (
+                live_identity(profile) if profile.get("transport", {}).get("type") == "cli_proxy"
+                else {"configured": profile})
+            return Factory(self.root / name, config, runtime)
+
+        def appserver(profile, cwd, transcript, timeout, denied_roots, readonly, review, token_limit, **_):
+            # Substitute the native model process only. Loopback uses the
+            # production relay and its real pre-forward Docker policy check.
+            relay = ProxyRelay(profile, transcript, timeout, token_limit)
+            server = Mock(_proxy_relay=relay, _task_temp=None, runtime_identity=None)
+            server.usage_telemetry.return_value = None
+            server.close.side_effect = relay.close
+
+            def execute(prompt, schema, **_):
+                self.assertNotIn("snapshot_id", prompt)
+                if scenario == "after_relay":
+                    self.replace_snapshot(False)
+                body = self.post(relay, profile["model"])
+                relay.collect_telemetry()
+                if not body:
+                    self.assertIn("SNAPSHOT_CHANGED", relay.receipt()["stop_reason"])
+                    raise RuntimeFailure("synthetic turn stopped")
+                route = {**relay.policy.transport, "route_type": "cli_proxy",
+                         "auth_source": relay.policy.policy["credential_file"],
+                         "requested_model": profile["model"], "runtime": relay.policy.identity}
+                return {"summary": "offline", "usage": relay.usage(), "usage_complete": True,
+                        "output": {"plan": "synthetic control", "tasks": [], "acceptance": [],
+                                   "decisions_required": ["fixture ends after PLAN"]},
+                        "runtime_identity": {"route_identity": route, "reported_model": profile["model"]}}
+
+            server.execute.side_effect = execute
+            return server
+
+        for routed in (False, True):
+            for scenario in ("unchanged", "different_account", "same_account", "during_construction", "after_relay"):
+                with self.subTest(routed=routed, scenario=scenario):
+                    state = f"state-{routed}-{scenario}"
+                    self.write(self.auth, original)
+                    self.pin_snapshot()
+                    config = self.task_config(routed)
+                    before = len(self.requests)
+                    mission = {"version": 2, "mission_id": "snapshot-task", "repository": str(source),
+                               "objective": "synthetic snapshot contract"}
+
+                    def construct(*args, **kwargs):
+                        if scenario == "during_construction":
+                            self.replace_snapshot(False)
+                        return appserver(*args, **kwargs)
+
+                    with patch("harness.factory_runtime.AppServerCodex._trusted_executable",
+                               return_value=Path("/usr/bin/true")), patch(
+                            "harness.factory_preflight.inspect_prepaid", return_value={"findings": []}), patch(
+                            "harness.factory_runtime.FactoryAppServer", side_effect=construct) as server:
+                        first = open_factory(state, config)
+                        try:
+                            first.submit(mission)
+                            spec = json.loads(first.row("snapshot-task")["spec"])
+                            if scenario in {"different_account", "same_account"}:
+                                self.replace_snapshot(scenario == "different_account")
+                                with self.assertRaisesRegex(ValueError, "SNAPSHOT_CHANGED"):
+                                    first.submit({**mission, "mission_id": "another-task"})
+                        finally:
+                            first.close()
+                        reopened = open_factory(state, config)
+                        try:
+                            if scenario == "unchanged":
+                                result = reopened.agent(spec, source, "implement", 1, {})
+                                self.assertEqual(result["summary"], "offline")
+                                private_evidence = {"executor_identity": reopened.submitted_executor("snapshot-task")}
+                                with patch.object(reopened, "_report", return_value={
+                                        "LOCAL_CANDIDATE_EVIDENCE": private_evidence}):
+                                    report = reopened.report("snapshot-task")
+                                self.assertNotIn(self.transport["snapshot_id"], json.dumps(report))
+                                self.assertIn(self.transport["snapshot_id"], json.dumps(private_evidence))
+                                self.replace_snapshot(False)
+                                self.assertEqual(reopened.agent(spec, source, "implement", 1, {}), result)
+                                self.assertEqual(server.call_count, 1)
+                            else:
+                                with self.assertRaisesRegex(FactoryBlocked, "SNAPSHOT_CHANGED"):
+                                    reopened.agent(spec, source, "implement", 1, {})
+                                rows = reopened.db.execute("SELECT status FROM operations").fetchall()
+                                if scenario in {"different_account", "same_account"}:
+                                    server.assert_not_called()
+                                    self.assertEqual(rows, [])
+                                else:
+                                    self.assertEqual([row["status"] for row in rows], ["UNKNOWN"])
+                        finally:
+                            reopened.close()
+                        self.assertEqual(len(self.requests) - before, int(scenario == "unchanged"))
+                        if scenario in {"unchanged", "same_account", "different_account"}:
+                            # Updating the config to match replacement bytes does
+                            # not modify the submitted snapshot authorization.
+                            self.pin_snapshot()
+                            rebound = self.task_config(routed)
+                            reopened = open_factory(state, rebound)
+                            try:
+                                with self.assertRaisesRegex(ValueError, "route changed|immutable mission authority"):
+                                    reopened.agent(spec, source, "implement", 2, {})
+                            finally:
+                                reopened.close()
+                            self.assertEqual(len(self.requests) - before, int(scenario == "unchanged"))
+
+        for scenario, expected, forwarded in (
+            ("cli_control", "WAITING_PRODUCT_DECISION", 1),
+            ("cli_swapped", "BLOCKED_LOCAL_AUTHORITY", 0),
+        ):
+            with self.subTest(scenario=scenario):
+                self.write(self.auth, original)
+                self.pin_snapshot()
+                config = self.task_config(False)
+                config_path = self.root / "cli-config.json"
+                self.write(config_path, json.dumps(config))
+                mission_path = self.root / "cli-mission.json"
+                self.write(mission_path, json.dumps(mission))
+                name = scenario
+                before = len(self.requests)
+                with patch("harness.factory_runtime.AppServerCodex._trusted_executable",
+                           return_value=Path("/usr/bin/true")), patch(
+                        "harness.factory_preflight.inspect_prepaid", return_value={"findings": []}), patch(
+                        "harness.factory_runtime.FactoryAppServer", side_effect=appserver), patch(
+                        "harness.factory_cli.Factory", side_effect=lambda _root, cfg, **_: open_factory(name, cfg)):
+                    first = open_factory(name, config)
+                    try:
+                        first.submit(mission)
+                    finally:
+                        first.close()
+                    if scenario == "cli_swapped":
+                        self.replace_snapshot(True)
+                    with redirect_stdout(io.StringIO()) as report, redirect_stderr(io.StringIO()):
+                        with self.assertRaises(SystemExit) as stopped:
+                            factory_cli(["factory-run", str(mission_path), "--config", str(config_path),
+                                         "--state-dir", str(self.root / name), "--json"])
+                    self.assertEqual(stopped.exception.code, 1)
+                    self.assertEqual(json.loads(report.getvalue())["DELIVERY_STATUS"], expected)
+                    self.assertNotIn(self.transport["snapshot_id"], report.getvalue())
+                    self.assertEqual(len(self.requests) - before, forwarded)
+
+    def test_v8_0_77_unauthorized_latches_transport_without_replay_or_error_body(self):
+        self.use_image(PROXY_V8_0_77_IMAGE)
+        for mode, status in (("unauthorized", 401), ("stream_unauthorized", 200), ("stream_status_401", 200)):
+            self.mode = mode
+            with self.subTest(mode=mode):
+                relay = ProxyRelay(self.profile, self.root / (mode + ".raw"), 5)
+                try:
+                    before = len(self.requests)
+                    body = self.post(relay)
+                    self.post(relay)
+                    receipt = relay.receipt()
+                    self.assertEqual(len(self.requests) - before, 1)
+                    self.assertEqual(receipt["stop_reason"], SNAPSHOT_REJECTED)
+                    self.assertEqual(receipt["physical_attempts"][0]["proxy_http_status"], status)
+                    self.assertEqual(receipt["physical_attempts"][0]["status"], "UNKNOWN")
+                    self.assertFalse(receipt["usage_complete"])
+                    with self.assertRaisesRegex(ValueError, "SNAPSHOT_REJECTED"):
+                        relay.start_turn(self.root / "another.raw", 5, None)
+                    self.assertNotIn(self.key, relay.evidence.read_text())
+                    self.assertNotIn(self.key.encode(), body)
+                finally:
+                    relay.close()
+
+    def test_v8_0_77_management_401_is_not_attributed_to_the_access_token(self):
+        self.use_image(PROXY_V8_0_77_IMAGE)
+        relay = self.relay()
+        url = self.endpoint.removesuffix("/v1") + "/v0/management/request-retry"
+        error = urllib.error.HTTPError(url, 401, "fixture management rejection", {}, None)
+        with patch.object(ProxyPolicy, "management", side_effect=error):
+            self.post(relay)
+        self.post(relay)
+        self.assertTrue(relay.failed)
+        self.assertNotIn("stop_reason", relay.receipt())
+        self.assertEqual(self.requests, [])
 
     def test_success_records_physical_requests_actual_model_and_redacted_correlated_telemetry(self):
         relay = self.relay()
@@ -334,6 +961,7 @@ class ProxyContracts(unittest.TestCase):
         server.usage, server.events, server.runtime_identity = None, [], {}
         server._proxy_relay, server._policy_cwd = relay, str(self.root)
         server._reuse_session, server.token_limit = True, 1000
+        server._end_time = relay.deadline
         server.MODEL, server.REASONING_EFFORT = "fixture-model", None
         turn = [0]
         def request(method, params):

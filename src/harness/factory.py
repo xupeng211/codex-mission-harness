@@ -32,6 +32,18 @@ from . import factory_candidate as candidate_stage
 READY = "READY_FOR_USER_ACCEPTANCE"
 
 
+def snapshot_profile(profile):
+    return "snapshot_id" in profile.get("transport", {})
+
+
+def omit_snapshot_ids(value):
+    if isinstance(value, dict):
+        return {key: omit_snapshot_ids(item) for key, item in value.items() if key != "snapshot_id"}
+    if isinstance(value, list):
+        return [omit_snapshot_ids(item) for item in value]
+    return value
+
+
 class FactoryBlocked(RuntimeError):
     def __init__(self, status, reason):
         self.status, self.reason = status, reason
@@ -369,7 +381,8 @@ class Factory:
         self.project = self.config.get("project_contract") == PROJECT
         self.profile_identities = {lane: self.runtime.profile_identity(profile) if hasattr(self.runtime, "profile_identity") else {"configured": profile, "fixture": True}
                                    for lane, profile in self.config["profiles"].items()
-                                   if (not self.project or lane == "developer") and not (lane == "developer" and "model_routing" in self.config)}
+                                   if (not self.project or lane == "developer")
+                                   and not (lane == "developer" and ("model_routing" in self.config or snapshot_profile(profile)))}
         self._routing_identities = {}
         requested_root = Path(root).absolute()
         metadata = [parent / ".git" for parent in (requested_root, *requested_root.parents)]
@@ -441,23 +454,48 @@ class Factory:
             raise ValueError("operator policy/budget differs from the immutable mission authority")
         return row
 
+    def submitted_executor(self, mission):
+        submitted = self.db.execute("SELECT payload FROM events WHERE mission=? AND kind='submitted'",
+                                    (mission,)).fetchone()
+        return json.loads(submitted[0]).get("routing_executor") if submitted else None
+
     def developer_binding(self, spec):
         """Resolve once per identity; the submitted route cannot change on resume."""
         if "model_routing" not in self.config:
             if "model_routing" in spec:
                 raise ValueError("task routing requires an explicit operator model pool")
-            return self.config["profiles"]["developer"], self.profile_identities["developer"]
+            profile = self.config["profiles"]["developer"]
+            submitted = self.submitted_executor(spec["mission_id"])
+            if submitted is not None:
+                if not snapshot_profile(profile) or submitted.get("configured") != profile:
+                    raise ValueError("bound task route changed; new task authorization required")
+                # Use the immutable identity for cache lookup even if the
+                # snapshot has expired. New dispatches reverify the live route.
+                return profile, submitted
+            if snapshot_profile(profile):
+                if self.db.execute("SELECT 1 FROM missions WHERE id=?", (spec["mission_id"],)).fetchone():
+                    raise ValueError("existing task has no snapshot authorization")
+                return profile, self.runtime.profile_identity(profile)
+            return profile, self.profile_identities["developer"]
         from .factory_routing import select
         profile, decision = select(self.config["model_routing"], spec.get("model_routing"))
+        submitted = self.submitted_executor(spec["mission_id"])
+        existing = self.db.execute("SELECT 1 FROM missions WHERE id=?", (spec["mission_id"],)).fetchone()
+        if snapshot_profile(profile) and submitted:
+            if submitted.get("configured") != profile or submitted.get("model_selection") != decision:
+                raise ValueError("bound task route changed; new task authorization required")
+            return profile, submitted
+        if snapshot_profile(profile):
+            if existing:
+                raise ValueError("existing task has no snapshot authorization")
+            return profile, {**self.runtime.profile_identity(profile), "model_selection": decision}
         key = digest({"profile": profile, "selection": decision})
         if key not in self._routing_identities:
             identity = (self.runtime.profile_identity(profile) if hasattr(self.runtime, "profile_identity")
                         else {"configured": profile, "fixture": True})
             self._routing_identities[key] = {**identity, "model_selection": decision}
         identity = self._routing_identities[key]
-        submitted = self.db.execute("SELECT payload FROM events WHERE mission=? AND kind='submitted'",
-                                    (spec["mission_id"],)).fetchone()
-        if submitted and json.loads(submitted[0]).get("routing_executor") != identity:
+        if existing and submitted != identity:
             raise ValueError("bound task route changed; new task authorization required")
         return profile, identity
 
@@ -473,7 +511,7 @@ class Factory:
 
     def submit(self, raw):
         spec = validate_mission(raw)
-        _, executor = self.developer_binding(spec)
+        developer, executor = self.developer_binding(spec)
         if candidate_stage.requested(spec):
             candidate_stage.authorize(spec, self.config)
         if self.project:
@@ -509,7 +547,8 @@ class Factory:
         self.db.execute("INSERT INTO missions(id,spec,policy,status,candidate) VALUES(?,?,?,?,?)",
                         (mission, encoded(spec), encoded(policy_identity(self.config)), "CREATED", str(candidate)))
         self.event(mission, "submitted", {"spec": spec, "profiles": self.config["profiles"],
-                   **({"routing_executor": executor} if "model_routing" in self.config else {})})
+                   **({"routing_executor": executor} if "model_routing" in self.config
+                      or snapshot_profile(developer) else {})})
         self.db.commit()
         return mission
 
@@ -667,6 +706,20 @@ class Factory:
         # Trusted local preparation is not a paid dispatch. Keep it after the
         # cache/uncertainty guards and outside the reservation transaction.
         prepared = prepare() if prepare is not None else None
+        if paid and lane == "developer" and not self.config["simulation"]:
+            submitted = self.submitted_executor(mission)
+            if (snapshot_profile((submitted or {}).get("configured", {}))
+                    or ("model_routing" not in self.config
+                        and snapshot_profile(self.config["profiles"]["developer"]))):
+                spec = json.loads(self.row(mission)["spec"])
+                try:
+                    profile, authorized = self.developer_binding(spec)
+                    expected_profile = {key: value for key, value in authorized.items() if key != "model_selection"}
+                    if (submitted != authorized or identity.get("profile") != authorized
+                            or self.runtime.profile_identity(profile) != expected_profile):
+                        raise ValueError("dispatch differs from the bound snapshot route")
+                except (OSError, RuntimeError, ValueError) as exc:
+                    raise FactoryBlocked("BLOCKED_LOCAL_AUTHORITY", str(exc)) from exc
         operation_id = uuid.uuid4().hex
         evidence_dir = private_dir(self.root / "evidence" / mission)
         evidence = evidence_dir / f"{operation_id}.json"
@@ -854,7 +907,7 @@ class Factory:
                 "has_remotes": bool(git(cwd, "remote")),
             }}
         call_payload = dict(payload)
-        if "model_selection" in profile_identity and not self.config["simulation"]:
+        if not self.config["simulation"] and ("model_selection" in profile_identity or snapshot_profile(profile)):
             call_payload["_authorized_route"] = profile_identity["route_identity"]
         return self.operation(spec["mission_id"], key, stage, lane, identity, payload, True,
                               lambda transcript, prepared=None: self.runtime.agent(stage, profile, cwd, call_payload, transcript,
@@ -1712,6 +1765,10 @@ class Factory:
             decision = json.loads(event[0])["routing_executor"]["model_selection"]
             operations = self.db.execute("SELECT * FROM operations WHERE mission=? ORDER BY started", (mission,)).fetchall()
             report["MODEL_ROUTING"] = observation(decision, operations)
+        candidate = report.get("LOCAL_CANDIDATE_EVIDENCE", {})
+        if snapshot_profile(candidate.get("executor_identity", {}).get("configured", {})):
+            # Verify against the full private record, then mask the public copy.
+            return omit_snapshot_ids(report)
         return report
 
     def _report(self, mission, temporary_error=None, temporary_pending=None, *, mission_row=None):
@@ -2364,7 +2421,7 @@ class Factory:
         def invoke(transcript):
             call_payload = {**payload, "_thread_id": thread_id, "_return_thread": True,
                             "_reuse_session": True, "_operation_token_limit": token_limit}
-            if "model_selection" in profile_identity and not self.config["simulation"]:
+            if not self.config["simulation"] and ("model_selection" in profile_identity or snapshot_profile(profile)):
                 call_payload["_authorized_route"] = profile_identity["route_identity"]
             if self.project:
                 approval = approved_scope(spec)

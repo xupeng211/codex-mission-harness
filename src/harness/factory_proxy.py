@@ -7,13 +7,17 @@ this adapter deliberately does not qualify it as an OpenAI review lane.
 """
 from __future__ import annotations
 
-import hashlib
+import base64
 import fcntl
+import hashlib
+import hmac
+import http.client
 import http.server
 import json
 import os
 import re
 import secrets
+import socket
 import stat
 import threading
 import time
@@ -21,11 +25,114 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 
 from .codex import AppServerCodex
 from .model_registry import read_private_token
 from .factory_budget import tokens
+
+
+LEGACY_PROXY_IMAGE = "sha256:ebc2ffc189cf241ff589cd9237c63ca9feba3c9b87fe6213ab9a0b642df132ae"
+PROXY_V8_0_77_IMAGE = "sha256:61451a1fce07e70fb86bc52939b3b99bcb0d4c98a94483bb880017d2937f5e1e"
+LEGACY_PROXY_IMAGES = (
+    LEGACY_PROXY_IMAGE,  # Published multi-platform index.
+    "sha256:e248cd0dc9d54a7709ed23276842f627da32e43010c6226ca51b6f4b59173771",  # amd64 manifest
+    "sha256:9e2be6a609ef43f243b433543b705d1ddcce10c2a840f745848c10e02468ab53",  # amd64 config
+    "sha256:327cc3c3acc4cceafe8350f94f30fd0329131d71866f8b83b440213b019f6b09",  # arm64 manifest
+    "sha256:c088c22d25aceb212e0713c907d25991dbdcc7ba8be3bff3644121f20e74e4c4",  # arm64 config
+)
+PROXY_V8_0_77_IMAGES = (
+    "sha256:2acf44fbadf9933a04e971048b4c2ddd184ce6e3ea08fc2dc25354f3a365f5ab",  # index
+    PROXY_V8_0_77_IMAGE,  # amd64 manifest
+    "sha256:8712adc77fc26b5062667e2e9bc023ea4be2651faab46b10d32e43ac6b40508d",  # amd64 config
+)
+# Exact linux/amd64 image manifest, paired with its patched source commit.
+FACTORY_SNAPSHOT_IMAGE = "sha256:09689cab6ecdd59f6d3b65a0e583d43f12b60c53bd3b797aee986ee29e97ebef"
+FACTORY_SNAPSHOT_MODEL = "gpt-6.2-sol"
+SNAPSHOT_IMAGES = (*PROXY_V8_0_77_IMAGES, FACTORY_SNAPSHOT_IMAGE)
+SUPPORTED_PROXY_RELEASES = {
+    FACTORY_SNAPSHOT_IMAGE: ("v8.0.77", "fe147c8d508c544efafc7289b1be51bb36deb2c4"),
+    **dict.fromkeys(LEGACY_PROXY_IMAGES, ("v8.0.15", "a4acc9f752bd46571f737a10c04bf413656ab06b")),
+    **dict.fromkeys(PROXY_V8_0_77_IMAGES, ("v8.0.77", "a5e8f69e56309e1ef6d6872e667da81fdfbce2ce")),
+}
+SNAPSHOT_REJECTED = (
+    "CLI_PROXY_SNAPSHOT_REJECTED: access-token snapshot rejected; reprovision before a new run"
+)
+SNAPSHOT_CHANGED = "CLI_PROXY_SNAPSHOT_CHANGED: new run authorization required"
+DEDICATED_IMAGE_REQUIRED = (
+    "CLI_PROXY_DEDICATED_IMAGE_REQUIRED: gpt-6.2-sol requires the verified Factory proxy image"
+)
+PROXY_TMPFS_OPTIONS = "rw,noexec,nosuid,nodev,size=32m"
+PROXY_USAGE_WAIT_SECONDS = 2
+PROXY_USAGE_POLL_SECONDS = 0.05
+MANAGEMENT_RESPONSE_LIMIT = 2 * 1024 * 1024
+
+
+class ProxySnapshotError(ValueError):
+    """Safe stop reason for an unusable access-token-only snapshot."""
+
+
+class _DeadlineSocket(socket.socket):
+    def __init__(self, deadline):
+        super().__init__(socket.AF_INET, socket.SOCK_STREAM)
+        self.deadline = deadline
+
+    def _set_deadline_timeout(self):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("proxy usage query deadline expired")
+        self.settimeout(remaining)
+
+    def connect(self, address):
+        self._set_deadline_timeout()
+        return super().connect(address)
+
+    def sendall(self, data, flags=0):
+        self._set_deadline_timeout()
+        return super().sendall(data, flags)
+
+    def recv_into(self, buffer, nbytes=0, flags=0):
+        # The HTTP parser's buffered socket file calls this for every raw read,
+        # including status lines, headers and chunked response bodies.
+        self._set_deadline_timeout()
+        return super().recv_into(buffer, nbytes, flags)
+
+
+def snapshot_identity(key, auth_bytes):
+    return hmac.new(key.encode(), b"cmh-cli-proxy-snapshot/v1\0" + auth_bytes,
+                    hashlib.sha256).hexdigest()
+
+
+def verify_snapshot_expiry(auth):
+    """Use available expiry bounds for stopping, never for authenticating the token."""
+    token = auth.get("access_token")
+    if not isinstance(token, str) or not token.strip():
+        raise ProxySnapshotError("CLI_PROXY_SNAPSHOT_EXPIRY_UNKNOWN: invalid snapshot access token")
+    deadlines = []
+    expiry = auth.get("expired")
+    if expiry:
+        try:
+            expiry = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+            if expiry.tzinfo is None:
+                raise ValueError("timezone required")
+            deadlines.append(expiry.timestamp())
+        except (AttributeError, ValueError, OverflowError, OSError):
+            raise ProxySnapshotError("CLI_PROXY_SNAPSHOT_EXPIRY_UNKNOWN: invalid snapshot expiry") from None
+    parts = token.split(".")
+    if len(parts) == 3:
+        payload = parts[1]
+        try:
+            claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        except (ValueError, UnicodeError):
+            claims = {}
+        if isinstance(claims, dict) and type(claims.get("exp")) is int:
+            deadlines.append(claims["exp"])
+    if not deadlines:
+        raise ProxySnapshotError("CLI_PROXY_SNAPSHOT_EXPIRY_UNKNOWN: use a snapshot with a known expiry")
+    if min(deadlines) <= time.time():
+        raise ProxySnapshotError("CLI_PROXY_SNAPSHOT_EXPIRED: reprovision before a new run")
 
 
 def digest(value):
@@ -44,6 +151,15 @@ def private_file(path):
     return path
 
 
+def read_snapshot(path):
+    path = private_file(path)
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError("proxy snapshot must be owner-owned mode 0600")
+        return stream.read()
+
+
 def validate_transport(profile, reviewer=False):
     transport = profile.get("transport", {"type": "official"})
     if not isinstance(transport, dict) or transport.get("type") not in ("official", "cli_proxy"):
@@ -52,8 +168,13 @@ def validate_transport(profile, reviewer=False):
         if set(transport) != {"type"}:
             raise ValueError("official transport does not accept proxy fields")
         return transport
-    if set(transport) != {"type", "endpoint", "configured_provider", "policy_file"}:
+    fields = {"type", "endpoint", "configured_provider", "policy_file"}
+    if set(transport) not in (fields, fields | {"snapshot_id"}):
         raise ValueError("cli_proxy requires endpoint, configured_provider and policy_file")
+    if "snapshot_id" in transport and (
+            not isinstance(transport["snapshot_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", transport["snapshot_id"])):
+        raise ValueError("invalid approved proxy snapshot identity")
     if reviewer:
         raise ValueError("CLI_PROXY_OPENAI_REVIEWER_NOT_QUALIFIED: upstream identity is proxy-attested only")
     if profile.get("provider") != "openai" or not profile.get("model") or profile.get("codex_profile"):
@@ -85,14 +206,21 @@ def docker_json(*args):
 class ProxyPolicy:
     """Bind endpoint to the running, pinned, read-only single-credential instance."""
 
-    def __init__(self, transport):
+    def __init__(self, transport, *, model=None):
         self.transport = transport
+        self.dedicated_model = (
+            isinstance(model, str)
+            and model.strip().lower().rsplit("(", 1)[0].strip() == FACTORY_SNAPSHOT_MODEL
+        )
         self.path = private_file(transport["policy_file"])
         self.policy = json.loads(self.path.read_text())
         if set(self.policy) != {"version", "container", "image", "endpoint", "config_file", "auth_file", "credential_file", "management_token_file"} or self.policy["version"] != 1:
             raise ValueError("invalid managed proxy policy")
         if not isinstance(self.policy["image"], str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", self.policy["image"]):
             raise ValueError("managed proxy image must be pinned by content digest")
+        self.require_dedicated_image(self.policy["image"])
+        if self.policy["image"] not in SUPPORTED_PROXY_RELEASES:
+            raise ValueError("managed proxy image is not a supported release")
         if self.policy["endpoint"] != transport["endpoint"]:
             raise ValueError("proxy endpoint differs from managed policy")
         for key in ("config_file", "auth_file", "credential_file", "management_token_file"):
@@ -101,35 +229,79 @@ class ProxyPolicy:
                 raise ValueError("all proxy authentication sources must stay inside the private policy directory")
         self.key = read_private_token(Path(self.policy["credential_file"]))
         self.management_key = read_private_token(Path(self.policy["management_token_file"]))
+        self.frozen_snapshot = self.policy["image"] == FACTORY_SNAPSHOT_IMAGE
+        self.uses_snapshot = self.policy["image"] in SNAPSHOT_IMAGES
+        self.snapshot_key = self.key if self.frozen_snapshot else self.management_key
+        if self.uses_snapshot != ("snapshot_id" in transport):
+            raise ProxySnapshotError("CLI_PROXY_SNAPSHOT_AUTHORIZATION_REQUIRED: bind the snapshot to a new run")
         self.identity = self.verify()
 
-    def management(self, path):
-        base = self.transport["endpoint"].removesuffix("/v1")
-        request = urllib.request.Request(base+"/v0/management/"+path,
-                                         headers={"Authorization": "Bearer "+self.management_key})
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-        with opener.open(request, timeout=5) as response:
-            data = response.read(2*1024*1024+1)
-        if len(data) > 2*1024*1024:
+    def require_dedicated_image(self, image):
+        if self.dedicated_model and image != FACTORY_SNAPSHOT_IMAGE:
+            raise ProxySnapshotError(DEDICATED_IMAGE_REQUIRED)
+
+    def management(self, path, *, deadline=None):
+        target = "/v0/management/" + path
+        headers = {"Authorization": "Bearer " + self.management_key}
+        if deadline is None:
+            base = self.transport["endpoint"].removesuffix("/v1")
+            request = urllib.request.Request(base + target, headers=headers)
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+            with opener.open(request, timeout=5) as response:
+                data = response.read(MANAGEMENT_RESPONSE_LIMIT + 1)
+        else:
+            data = self._read_management_before_deadline(target, headers, deadline)
+        if len(data) > MANAGEMENT_RESPONSE_LIMIT:
             raise ValueError("proxy management response limit exceeded")
         return json.loads(data)
+
+    def _read_management_before_deadline(self, target, headers, deadline):
+        port = urllib.parse.urlsplit(self.transport["endpoint"]).port
+        with (
+            _DeadlineSocket(deadline) as sock,
+            closing(http.client.HTTPConnection("127.0.0.1", port)) as connection,
+        ):
+            sock.connect(("127.0.0.1", port))
+            connection.sock = sock
+            connection.request("GET", target, headers={**headers, "Connection": "close"})
+            with connection.getresponse() as response:
+                if not 200 <= response.status < 300:
+                    raise ValueError("proxy management request failed")
+                data = response.read(MANAGEMENT_RESPONSE_LIMIT + 1)
+                if response.length and len(data) <= MANAGEMENT_RESPONSE_LIMIT:
+                    raise ValueError("incomplete proxy management response")
+                return data
 
     def verify(self):
         p = self.policy
         for key in ("config_file", "auth_file", "credential_file", "management_token_file"):
             private_file(p[key])
         config = json.loads(Path(p["config_file"]).read_text())
-        auth = json.loads(Path(p["auth_file"]).read_text())
+        modern_layout = self.uses_snapshot
+        auth_bytes = read_snapshot(p["auth_file"]) if modern_layout else Path(p["auth_file"]).read_bytes()
+        if modern_layout and not hmac.compare_digest(snapshot_identity(self.snapshot_key, auth_bytes),
+                                                     self.transport["snapshot_id"]):
+            raise ProxySnapshotError(SNAPSHOT_CHANGED)
+        auth = json.loads(auth_bytes)
         # A closed schema prevents hidden YAML aliases, provider mappings,
         # payload rewrites, plugin routing and per-credential retry overrides.
-        if set(config) != {"config-version", "server", "management", "access", "routing", "requests", "oauth", "upstream", "observability"}:
+        config_keys = {"config-version", "server", "management", "access", "routing", "requests", "oauth", "upstream", "observability"}
+        if modern_layout:
+            config_keys.add("multimedia")
+        if set(config) != config_keys:
             raise ValueError("managed proxy config contains unsupported routing controls")
         if config["config-version"] != 8 or config["routing"] != {"strategy": "fill-first", "retry": {"request-retry": 0, "max-retry-credentials": 1, "max-retry-interval": 0}}:
             raise ValueError("managed proxy retries must be zero and credential attempts bounded to one")
         request_config = config["requests"]
-        if (set(request_config) != {"proxy-url", "passthrough-headers", "streaming", "disable-image-generation"}
+        request_keys = {"proxy-url", "passthrough-headers", "streaming"}
+        if not modern_layout:
+            request_keys.add("disable-image-generation")
+        image_generation = config["multimedia"] if modern_layout else request_config
+        if (set(request_config) != request_keys
                 or request_config["streaming"] != {"bootstrap-retries": 0, "keepalive-seconds": 0}
-                or request_config["disable-image-generation"] is not True
+                or not isinstance(image_generation, dict)
+                or image_generation.get("disable-image-generation") is not True
+                or (modern_layout and set(image_generation) != {"disable-image-generation"})
                 or request_config["passthrough-headers"] is not True):
             raise ValueError("managed proxy streaming retries/tools are not bounded")
         if config["oauth"] != {"auth-dir": "/factory-auth"} or config["upstream"] != {"codex": {"response-steering": False, "stream-bootstrap-buffering": False}}:
@@ -138,7 +310,11 @@ class ProxyPolicy:
             raise ValueError("managed proxy authentication source differs")
         if auth.get("type") != "codex" or auth.get("disabled") is True or not auth.get("access_token"):
             raise ValueError("managed proxy requires one active Codex credential")
-        if (set(auth) - {"type", "access_token", "refresh_token", "id_token", "account_id", "email", "expired", "last_refresh", "request_retry", "websockets"}
+        auth_keys = {"type", "access_token", "id_token", "account_id", "email", "expired",
+                     "last_refresh", "request_retry", "websockets"}
+        if not modern_layout:
+            auth_keys.add("refresh_token")
+        if (set(auth) - auth_keys
                 or type(auth.get("request_retry")) is not int or auth["request_retry"] != 0 or auth.get("websockets") is not False):
             raise ValueError("credential aliases, route overrides and replay are forbidden")
         if any(auth.get(k) for k in ("base_url", "proxy_url", "proxy-url", "models", "prefix", "headers", "request_retry", "request-retry", "websockets")):
@@ -147,29 +323,75 @@ class ProxyPolicy:
             raise ValueError("unsupported managed proxy server config")
         if config["management"] != {"allow-remote": True, "secret-key": self.management_key, "disable-control-panel": True}:
             raise ValueError("unsupported managed proxy management config")
-        if config["observability"] != {"logging": {"debug": False, "request-log": False, "logging-to-file": False}, "usage": {"usage-statistics-enabled": True, "redis-usage-queue-retention-seconds": 3600}}:
+        logging_key = "logs" if modern_layout else "logging"
+        if config["observability"] != {logging_key: {"debug": False, "request-log": False, "logging-to-file": False}, "usage": {"usage-statistics-enabled": True, "redis-usage-queue-retention-seconds": 3600}}:
             raise ValueError("managed proxy must disable secret-bearing request logs and enable telemetry")
         container = docker_json("inspect", p["container"])[0]
+        self.require_dedicated_image(container.get("Image"))
         port = str(urllib.parse.urlsplit(p["endpoint"]).port)
+        command = ["/CLIProxyAPI/CLIProxyAPI", "-config", "/CLIProxyAPI/config.yaml", "-local-model"]
+        if self.frozen_snapshot:
+            command.append("-factory-snapshot")
+            if Path(p["auth_file"]).name != "codex.json":
+                raise ValueError("dedicated proxy requires the canonical snapshot filename")
         if (not container["State"]["Running"] or container["Image"] != p["image"]
-                or container["Config"]["Cmd"] != ["/CLIProxyAPI/CLIProxyAPI", "-config", "/CLIProxyAPI/config.yaml", "-local-model"]
+                or container["Config"]["Cmd"] != command
                 or container["Config"].get("Entrypoint")
                 or container["HostConfig"]["PortBindings"] != {"8317/tcp": [{"HostIp": "127.0.0.1", "HostPort": port}]}
                 or not container["HostConfig"]["ReadonlyRootfs"]
                 or container["HostConfig"].get("Privileged", False)
                 or any(v.split("=", 1)[0] not in ("PATH", "TZ") for v in container["Config"].get("Env", []))):
             raise ValueError("proxy endpoint/runtime identity differs from pinned policy")
-        mounts = {m["Destination"]: m for m in container["Mounts"] if m["Type"] == "bind"}
         expected = {"/CLIProxyAPI/config.yaml": p["config_file"], "/factory-auth": str(Path(p["auth_file"]).parent)}
-        if set(mounts) != set(expected) or any(mounts[d]["Source"] != s or mounts[d]["RW"] for d,s in expected.items()):
-            raise ValueError("managed proxy config and credential mounts must be pinned read-only")
+        verify_proxy_mounts(container, expected)
         if list(Path(p["auth_file"]).parent.iterdir()) != [Path(p["auth_file"])]:
             raise ValueError("managed proxy requires exactly one credential file")
         if self.management("request-retry") != {"request-retry": 0} or self.management("max-retry-credentials") != {"max-retry-credentials": 1}:
             raise ValueError("running proxy retry policy differs from configuration")
+        if modern_layout:
+            # Re-read after management I/O so a change during verification cannot pass.
+            if read_snapshot(p["auth_file"]) != auth_bytes:
+                raise ProxySnapshotError(SNAPSHOT_CHANGED)
+            verify_snapshot_expiry(auth)
         return {"container_id": container["Id"], "image": p["image"], "config_sha256": digest({**config, "access": {"credential": "PRESENT"}, "management": {"credential": "PRESENT"}}),
+                **({"snapshot_id": self.transport["snapshot_id"]} if modern_layout else {}),
                 "credential_class": "codex", "upstream_attestation": "NOT_PROVABLE",
                 "retry_policy": {"request_retries": 0, "bootstrap_retries": 0, "max_credentials": 1, "websockets": False}}
+
+
+def verify_proxy_mounts(container, expected):
+    host = container["HostConfig"]
+    declared = host.get("Mounts") or []
+    discovered = container["Mounts"]
+    tmpfs = host.get("Tmpfs") or {}
+    permitted_tmpfs = ({}, {"/tmp": PROXY_TMPFS_OPTIONS},
+                       {"/tmp": "rw,noexec,nosuid,size=32m"})  # Moby adds nodev by default.
+    if (tmpfs not in permitted_tmpfs or host.get("Binds") or host.get("VolumesFrom")
+            or container["Config"].get("WorkingDir") != "/CLIProxyAPI"):
+        raise ValueError("managed proxy has an unexpected mount or working directory")
+
+    # Only structured binds with explicit submount exclusion or forced recursive RO
+    # prove the requested read-only boundary. RW:false alone is insufficient.
+    if len(declared) != len(expected) or {m.get("Target") for m in declared} != set(expected):
+        raise ValueError("managed proxy has unexpected structured mounts")
+    for mount in declared:
+        options = mount.get("BindOptions") or {}
+        non_recursive = options.get("NonRecursive") is True
+        force_read_only = options.get("ReadOnlyForceRecursive") is True
+        if (mount.get("Type") != "bind" or mount.get("Source") != expected[mount["Target"]]
+                or mount.get("ReadOnly") is not True or options.get("Propagation") != "rprivate"
+                or options.get("ReadOnlyNonRecursive") or options.get("CreateMountpoint")
+                or non_recursive == force_read_only):
+            raise ValueError("managed proxy config and credential mounts must be pinned read-only")
+
+    binds = [m for m in discovered if m["Type"] == "bind"]
+    extra = [m for m in discovered if m["Type"] != "bind"]
+    if len(extra) > 1 or any(m["Type"] != "tmpfs" or m["Destination"] not in tmpfs for m in extra):
+        raise ValueError("managed proxy has an unexpected mount")
+    if (len(binds) != len(expected) or {m["Destination"] for m in binds} != set(expected)
+            or any(m["Source"] != expected[m["Destination"]] or m["RW"] is not False
+                   or m.get("Propagation") != "rprivate" for m in binds)):
+        raise ValueError("managed proxy config and credential mounts must be pinned read-only")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -186,8 +408,8 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
 """
 
     def __init__(self, profile, transcript, timeout, token_limit=None):
-        self.profile = profile
-        self.policy = ProxyPolicy(validate_transport(profile))
+        self.model = profile["model"]
+        self.policy = ProxyPolicy(validate_transport(profile), model=self.model)
         self.lease = (self.policy.path.parent / "factory-run.lock").open("a")
         try:
             fcntl.flock(self.lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -202,6 +424,7 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
         self.token_baseline = 0
         self.records = []
         self.failed = False
+        self.stop_reason = None
         self.accepting = True
         self.lock = threading.RLock()
         self.evidence = transcript.with_suffix(".proxy.jsonl")
@@ -225,6 +448,8 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
         """Rotate immutable operation evidence while retaining thread totals."""
         with self.lock:
             if self.failed:
+                if self.stop_reason:
+                    raise ProxySnapshotError(self.stop_reason)
                 raise ValueError("uncertain proxy session cannot start a repair")
             evidence = transcript.with_suffix(".proxy.jsonl")
             evidence.touch(mode=0o600, exist_ok=False)
@@ -271,7 +496,7 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
         model = response.get("model")
         if model:
             record["reported_model"] = model
-            if model != self.profile["model"]:
+            if model != self.model:
                 raise ValueError("proxy reported a different model")
         if response.get("id"):
             record["response_id"] = response["id"]
@@ -279,6 +504,13 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
         if terminal == "response.completed" or response.get("status") == "completed":
             record["status"] = "COMPLETE"
         if terminal in ("response.failed", "response.incomplete", "error"):
+            error = value.get("error") or response.get("error")
+            if self.policy.uses_snapshot and isinstance(error, dict) and (
+                error.get("type") == "authentication_error"
+                or error.get("code") in (401, "invalid_api_key", "unauthorized", "upstream_authentication_required")
+                or error.get("status") == 401
+            ):
+                raise ProxySnapshotError(SNAPSHOT_REJECTED)
             raise ValueError("proxy generation failed or incomplete")
 
     def forward(self, handler):
@@ -300,7 +532,7 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                     raise ValueError("invalid request size")
                 body = handler.rfile.read(size)
                 request = json.loads(body)
-                if request.get("model") != self.profile["model"]:
+                if request.get("model") != self.model:
                     raise ValueError("proxy requested a different model")
                 current = self.policy.verify()
                 if current != self.policy.identity:
@@ -312,9 +544,11 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                           "physical_attempt_limit": 1, "physical_attempt_count": "UNKNOWN", "money": "UNKNOWN"}
                 self.records.append(record)
                 self.persist(record)
-                req = urllib.request.Request(self.endpoint+"/responses", data=body,
-                      headers={"Authorization": "Bearer "+self.policy.key, "Content-Type": "application/json",
-                               "Session_id": record["http_request_id"]})
+                headers = {"Authorization": "Bearer "+self.policy.key, "Content-Type": "application/json",
+                           "Session_id": record["http_request_id"]}
+                if self.policy.frozen_snapshot:
+                    headers["X-Cmh-Credential-Snapshot"] = self.policy.transport["snapshot_id"]
+                req = urllib.request.Request(self.endpoint+"/responses", data=body, headers=headers)
                 remaining = self.deadline-time.monotonic()
                 if remaining <= 0:
                     raise ValueError("proxy run deadline exhausted")
@@ -345,20 +579,35 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                         handler.wfile.write(data)
                 if record["status"] != "COMPLETE" or record.get("reported_model") != request["model"] or not record.get("response_id") or tokens(record["usage"]) is None:
                     raise ValueError("proxy completion/model/usage unproven")
-                # A completed response proves one generation in this bounded
-                # policy. On failures it could be zero or one; never guess.
-                record["physical_attempt_count"] = 1
+                # The dedicated route settles the count only after the queue is correlated.
+                if not self.policy.dedicated_model:
+                    record["physical_attempt_count"] = 1
                 if self.policy.verify() != self.policy.identity:
                     raise ValueError("proxy policy changed during dispatch")
             except Exception as exc:
                 if isinstance(exc, urllib.error.HTTPError):
+                    if (self.policy.frozen_snapshot and exc.code == 409
+                            and exc.url == self.endpoint + "/responses"
+                            and exc.headers.get("X-Cmh-Snapshot-Status") == "mismatch"):
+                        self.stop_reason = SNAPSHOT_CHANGED
+                        if record is not None:
+                            record["proxy_http_status"] = 409
+                    if (self.policy.uses_snapshot and exc.code == 401
+                            and exc.url == self.endpoint + "/responses"):
+                        self.stop_reason = SNAPSHOT_REJECTED
+                        if record is not None:
+                            record["proxy_http_status"] = 401
                     exc.close()  # Do not let GC log upstream reason/error bodies.
+                if isinstance(exc, ProxySnapshotError):
+                    self.stop_reason = str(exc)
                 self.failed = True
                 if record is not None:
                     record["status"] = "UNKNOWN"
                     record["physical_attempt_count"] = "UNKNOWN"
+                    if self.stop_reason:
+                        record["stop_reason"] = self.stop_reason
                 if not sent_headers:
-                    handler.send_error(502, "Explicit proxy route failed; no retry or fallback")
+                    handler.send_error(502, self.stop_reason or "Explicit proxy route failed; no retry or fallback")
             finally:
                 handler.close_connection = True
                 if record is not None:
@@ -367,13 +616,45 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
     def receipt(self):
         with self.lock:
             return {"logical_run_id": self.evidence.stem, "physical_attempts": list(self.records),
+                    **({"stop_reason": self.stop_reason} if self.stop_reason else {}),
                     "physical_attempt_limit_per_http_request": 1,
                     "physical_attempt_count": sum(r["physical_attempt_count"] for r in self.records) if self.records and not self.failed and all(type(r["physical_attempt_count"]) is int for r in self.records) else "UNKNOWN",
                     "usage_complete": bool(self.records) and not self.failed and all(r["status"] == "COMPLETE" and len(r.get("proxy_telemetry", [])) == 1 for r in self.records),
                     "upstream_provider_identity": "NOT_PROVABLE", "upstream_model_identity": "NOT_PROVABLE",
                     "money": "UNKNOWN"}
 
-    def collect_telemetry(self):
+    def _usage_rows(self, records, deadline):
+        path = "usage-queue?count=256"
+        cutoff = None
+        if self.policy.dedicated_model:
+            cutoff = min(self.deadline, time.monotonic() + PROXY_USAGE_WAIT_SECONDS)
+            if deadline is not None:
+                cutoff = min(cutoff, deadline)
+        while True:
+            if cutoff is None:
+                rows = self.policy.management(path)
+            else:
+                if time.monotonic() >= cutoff:
+                    return
+                try:
+                    rows = self.policy.management(path, deadline=cutoff)
+                except TimeoutError:
+                    return
+                if time.monotonic() >= cutoff:
+                    return
+            if not isinstance(rows, list):
+                raise ValueError("proxy usage telemetry is unavailable")
+            yield from rows
+            if cutoff is None or self.failed or any(r["status"] != "COMPLETE" for r in records):
+                return
+            if all(r.get("proxy_telemetry") for r in records):
+                return
+            remaining = cutoff - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(PROXY_USAGE_POLL_SECONDS, remaining))
+
+    def collect_telemetry(self, *, deadline=None):
         """Consume only the dedicated pool's queue, persisting an allowlist.
 
         Raw queue entries include API keys, account details and error bodies;
@@ -382,17 +663,22 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
         A missing entry remains unknown, not evidence of zero physical attempts.
         """
         with self.lock:
+            if self.policy.dedicated_model and not self.accepting:
+                return
             self.accepting = False  # Only the next authorized turn can reopen dispatch.
+            records = self.records
+            if self.policy.dedicated_model:
+                # Earlier settled requests keep their original evidence.
+                records = [r for r in records if r["physical_attempt_count"] == "UNKNOWN"]
+                if not records:
+                    return
             try:
-                rows = self.policy.management("usage-queue?count=256")
-                if not isinstance(rows, list):
-                    raise ValueError("proxy usage telemetry is unavailable")
                 fields = ("provider", "executor_type", "model", "response_model", "request_id", "execution_id", "trace_id", "session_id", "auth_type", "failed")
-                for row in rows:
+                for row in self._usage_rows(records, deadline):
                     if not isinstance(row, dict):
                         self.failed = True
                         continue
-                    matched = next((r for r in self.records if r["http_request_id"] == row.get("session_id")), None)
+                    matched = next((r for r in records if r["http_request_id"] == row.get("session_id")), None)
                     if matched is None:
                         # A dedicated route must have no unattributed requests.
                         self.failed = True
@@ -413,8 +699,16 @@ Reported response models are checked on the actual SSE/JSON, not thread config.
                         matched["status"] = "UNKNOWN"
                         matched["physical_attempt_count"] = "UNKNOWN"
                     self.persist(matched)
-                if any(len(r.get("proxy_telemetry", [])) != 1 for r in self.records):
+                if any(len(r.get("proxy_telemetry", [])) != 1 for r in records):
                     self.failed = True
+                if self.policy.dedicated_model:
+                    for record in records:
+                        if record["status"] == "COMPLETE" and record["physical_attempt_count"] == "UNKNOWN":
+                            if self.failed:
+                                record["status"] = "UNKNOWN"
+                            else:
+                                record["physical_attempt_count"] = 1
+                            self.persist(record)
             except Exception:
                 self.failed = True
                 raise ValueError("proxy telemetry unproven; no retry or fallback") from None
