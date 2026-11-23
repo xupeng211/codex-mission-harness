@@ -16,6 +16,7 @@ import re
 import sqlite3
 import stat
 import subprocess
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -122,7 +123,8 @@ def validate_config(raw: dict) -> dict:
     allowed = {"version", "simulation", "budget", "max_rounds", "timeout_seconds", "checks", "ci",
                "profiles", "independent_review_required", "max_review_bytes", "max_context_bytes", "repository", "hosted_ci", "project_contract",
                "trusted_validation", "project_pr_ci", "local_acceptance", "model_routing",
-               "project_container", "project_delivery", "project_review_limits", "review_mode", "implementation_checkpoints"}
+               "project_container", "project_delivery", "project_review_limits", "review_mode",
+               "implementation_checkpoints", "implementation_checkpoint_outputs"}
     if not isinstance(raw, dict) or set(raw) - allowed or type(raw.get("version")) is not int or raw.get("version") != 1:
         raise ValueError("invalid factory configuration")
     config = json.loads(encoded(raw))
@@ -133,6 +135,17 @@ def validate_config(raw: dict) -> dict:
             raise ValueError(f"{key} must be boolean")
     if "implementation_checkpoints" in config and type(config["implementation_checkpoints"]) is not bool:
         raise ValueError("implementation_checkpoints must be boolean")
+    if "implementation_checkpoint_outputs" in config:
+        outputs = config["implementation_checkpoint_outputs"]
+        if (not config.get("implementation_checkpoints") or not isinstance(outputs, list)
+                or not 1 <= len(outputs) <= 7):
+            raise ValueError("implementation checkpoint outputs require one list per nonfinal assignment")
+        for paths in outputs:
+            if (not isinstance(paths, list) or not paths
+                    or any(not isinstance(path, str) or "\0" in path
+                           or any(part in {"", ".", "..", ".git"} for part in path.split("/")) for path in paths)
+                    or len(set(paths)) != len(paths)):
+                raise ValueError("implementation checkpoint outputs must be distinct exact repository paths")
     if "review_mode" in config:
         if (not isinstance(config["review_mode"], str) or config["review_mode"] not in {"single_openai", "dual"}
                 or not config["independent_review_required"]):
@@ -881,6 +894,11 @@ class Factory:
             # or repeat implementation against the same candidate.
             raise FactoryBlocked("BLOCKED_LIMIT", "completed plan key differs; no new paid planning or implementation authorized")
 
+    def prepare_plan_dispatch(self, spec, cwd):
+        self.guard_plan_cache_miss(spec["mission_id"])
+        if self.config.get("implementation_checkpoints"):
+            self.implementation_checkpoint_target(spec, cwd)
+
     def guard_rework_cache_miss(self, spec, cwd):
         """Only a fresh dispatch must still be at the failed candidate."""
         previous = self.db.execute(
@@ -888,6 +906,9 @@ class Factory:
             (spec["mission_id"],)).fetchone()
         if previous is None or self.target(spec, cwd) != json.loads(previous[0])["target"]:
             raise FactoryBlocked("UNKNOWN", "new rework dispatch target differs from failed candidate")
+        if self.db.execute("SELECT 1 FROM events WHERE mission=? AND kind='implementation_checkpoint'",
+                           (spec["mission_id"],)).fetchone():
+            self.implementation_checkpoint_target(spec, cwd, json.loads(previous[0])["target"])
 
     def agent(self, spec, cwd, stage, round_, payload, *, prepare=None):
         candidate_stage.check_dispatch(self, spec["mission_id"], stage)
@@ -913,7 +934,7 @@ class Factory:
         if not self.config["simulation"] and ("model_selection" in profile_identity or snapshot_profile(profile)):
             call_payload["_authorized_route"] = profile_identity["route_identity"]
         if stage == "plan":
-            prepare = lambda: self.guard_plan_cache_miss(spec["mission_id"])
+            prepare = lambda: self.prepare_plan_dispatch(spec, cwd)
         elif stage == "rework":
             prepare = lambda: self.guard_rework_cache_miss(spec, cwd)
         return self.operation(spec["mission_id"], key, stage, lane, identity, payload, True,
@@ -933,7 +954,7 @@ class Factory:
         return output
 
     def remaining_implementation_runs(self, mission, tasks):
-        if "max_total_tokens" in self.config["budget"] and tasks:
+        if tasks:
             used = self.db.execute("SELECT COUNT(*) FROM operations WHERE mission=? AND paid=1",
                                    (mission,)).fetchone()[0]
             remaining = self.config["budget"]["max_agent_runs"] - used
@@ -949,15 +970,56 @@ class Factory:
 
     def implementation_checkpoint_target(self, spec, cwd, expected=None):
         self.require_implementation_workspace(spec, cwd, expected["head"] if expected else None)
+        self.verify_checkpoint_source(cwd, expected["head"] if expected else git(cwd, "rev-parse", "HEAD"))
         current = self.target(spec, cwd)
         if expected is not None and current != expected:
             raise FactoryBlocked("UNKNOWN", "implementation checkpoint target changed")
         return current
 
+    @staticmethod
+    def verify_checkpoint_source(cwd, head):
+        # Git status hides ignored files, empty directories and some index flags.
+        # Compare the physical checkout with the tree before trusting its bytes.
+        from .factory_project import tracked_source_digest
+        expected = set(filter(None, git(cwd, "ls-tree", "-r", "-t", "--name-only", "-z", head).split("\0")))
+        observed = set()
+
+        def raise_error(error):
+            raise error
+
+        for directory, dirs, files in os.walk(cwd, onerror=raise_error):
+            parent = Path(directory)
+            if parent == cwd and ".git" in dirs:
+                dirs.remove(".git")
+            for name in dirs + files:
+                path = parent / name
+                relative = path.relative_to(cwd).as_posix()
+                mode = path.lstat().st_mode
+                if relative not in expected or not (stat.S_ISDIR(mode) or stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+                    raise FactoryBlocked("UNKNOWN", "implementation workspace contains inputs outside committed Git source")
+                if stat.S_ISLNK(mode):
+                    resolved = path.resolve()
+                    if not resolved.is_relative_to(cwd) or resolved.is_relative_to(cwd / ".git"):
+                        raise FactoryBlocked("UNKNOWN", "implementation workspace symlink points outside committed Git source")
+                observed.add(relative)
+        if observed != expected:
+            raise FactoryBlocked("UNKNOWN", "implementation workspace is missing committed Git source")
+        tracked_source_digest(cwd, head, require_committed=True)
+
+    @staticmethod
+    def require_checkpoint_outputs(cwd, before, head, paths):
+        for path in paths:
+            old = git(cwd, "ls-tree", before, "--", path).split()
+            new = git(cwd, "ls-tree", head, "--", path).split()
+            if (not new or new[0] not in {"100644", "100755"} or new[1] != "blob"
+                    or new[2] == (old[2] if old else None)):
+                raise FactoryBlocked("BLOCKED_VALIDATION", f"implementation checkpoint lacks required changed output: {path}")
+
     def implementation_progress(self, spec, cwd, checkpoints, implementations):
         if len(checkpoints) != len(implementations):
             raise FactoryBlocked("UNKNOWN", "implementation lacks a durable checkpoint; worktree and accounting retained")
         outputs = []
+        required = self.config.get("implementation_checkpoint_outputs", [])
         for index, (receipt, operation) in enumerate(zip(checkpoints, implementations)):
             assignment = json.loads(operation["input"])
             identity = json.loads(operation["identity"])
@@ -970,6 +1032,10 @@ class Factory:
             self.verify_evidence(operation, bind_envelope=True)
             outputs.append(self.implementation_output(json.loads(operation["result"])))
             commands = self.config["checks"] if index + 1 < len(assignment["plan"]["tasks"]) else []
+            paths = required[index] if index < len(required) else []
+            if receipt.get("outputs") != paths or (commands and (not paths or assignment.get("checkpoint_outputs") != paths)):
+                raise FactoryBlocked("UNKNOWN", "implementation checkpoint lacks verified output requirements")
+            self.require_checkpoint_outputs(cwd, identity["dispatch_head"], target["head"], paths)
             if len(receipt["checks"]) != len(commands):
                 raise FactoryBlocked("UNKNOWN", "implementation checkpoint is missing required checks")
             for command, key in zip(commands, receipt["checks"]):
@@ -981,7 +1047,8 @@ class Factory:
                 self.verify_evidence(check, bind_envelope=True)
                 payload, result = json.loads(check["input"]), json.loads(check["result"])
                 if (payload["target"] != target or payload["command"] != command
-                        or ("validation_binding" not in payload and payload.get("checkpoint_index") != index)
+                        or ("validation_binding" not in payload and
+                            (payload.get("checkpoint_index") != index or payload.get("exact_source") is not True))
                         or result.get("status") != "PASS" or type(result.get("exit_code")) is not int
                         or result["exit_code"] != 0
                         or not result.get("raw_evidence")):
@@ -1018,7 +1085,9 @@ class Factory:
         self.require_implementation_workspace(spec, cwd, current["head"])
         target = self.checkpoint(spec, cwd)
         intermediate = index + 1 < len(assignments)
-        checks = self.gates(spec, cwd, target, "checks", 0, checkpoint_index=index) if intermediate else []
+        paths = assignments[index].get("checkpoint_outputs", [])
+        self.require_checkpoint_outputs(cwd, current["head"], target["head"], paths)
+        checks = self.gates(spec, cwd, target, "checks", 0, checkpoint_index=index, exact_source=True) if intermediate else []
         if any(check["status"] != "PASS" for check in checks):
             raise FactoryBlocked("BLOCKED_VALIDATION", "implementation checkpoint check failed")
         if any(not check.get("raw_evidence") for check in checks):
@@ -1027,12 +1096,31 @@ class Factory:
         key = self.db.execute("SELECT key FROM operations WHERE mission=? AND stage='implement' ORDER BY rowid DESC LIMIT 1",
                               (mission,)).fetchone()[0]
         self.event(mission, "implementation_checkpoint", {"task_index": index, "target": target,
-                   "implementation": key, "checks": [check["evidence_key"] for check in checks]})
+                   "implementation": key, "outputs": paths, "checks": [check["evidence_key"] for check in checks]})
         if intermediate:
             self.state(mission, IMPLEMENTATION_CHECKPOINT, "targeted checks passed; resume to continue implementation")
         else:
             self.db.commit()
         return outputs + [output], target, intermediate
+
+    @staticmethod
+    def isolated_checkout(cwd, path, head):
+        git(cwd, "clone", "--no-local", "--no-hardlinks", "--no-checkout", "--", str(cwd), str(path))
+        git(path, "remote", "remove", "origin")
+        git(path, "checkout", "--detach", head)
+
+    def checkpoint_gate(self, spec, cwd, target, command, transcript, timeout):
+        with tempfile.TemporaryDirectory(dir=self.root, prefix="checkpoint-check-") as directory:
+            checkout = Path(directory) / "source"
+            self.isolated_checkout(cwd, checkout, target["head"])
+            if self.target(spec, checkout) != target:
+                raise FactoryBlocked("UNKNOWN", "checkpoint check checkout differs from exact target")
+            self.verify_checkpoint_source(checkout, target["head"])
+            result = self.runtime.gate(command, checkout, target, transcript, timeout)
+            self.verify_checkpoint_source(checkout, target["head"])
+            if self.target(spec, checkout) != target:
+                raise FactoryBlocked("UNKNOWN", "checkpoint check changed its exact checkout")
+            return result
 
     def review_context(self, spec, cwd, target, lane):
         # Fresh, isolated repository for EACH lane. It has no prior findings,
@@ -1040,9 +1128,7 @@ class Factory:
         path = self.root / "reviews" / spec["mission_id"] / digest({"target": target, "lane": lane})
         if not path.exists():
             path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-            git(cwd, "clone", "--no-local", "--no-hardlinks", "--no-checkout", "--", str(cwd), str(path))
-            git(path, "remote", "remove", "origin")
-            git(path, "checkout", "--detach", target["head"])
+            self.isolated_checkout(cwd, path, target["head"])
         if self.target(spec, path) != target:
             raise FactoryBlocked("UNKNOWN", "review checkout differs from exact delivery target")
         return path
@@ -1480,8 +1566,10 @@ class Factory:
         self.check_project_strict_result(spec, target, result)
         return [{**result, "evidence_key": key}]
 
-    def gates(self, spec, cwd, target, kind, round_, *, checkpoint_index=None):
+    def gates(self, spec, cwd, target, kind, round_, *, checkpoint_index=None, exact_source=False):
         candidate_stage.check_dispatch(self, spec["mission_id"], kind)
+        if exact_source:
+            self.implementation_checkpoint_target(spec, cwd, target)
         if candidate_stage.requested(spec) and kind == "checks":
             round_ = getattr(self, "_single_qa_round", round_)
         results = []
@@ -1493,12 +1581,14 @@ class Factory:
                        **({"validation": validation, "mission_id": spec["mission_id"]} if validation else {})}
             if checkpoint_index is not None:
                 payload["checkpoint_index"] = checkpoint_index
+            # Formal trusted validation has its own established input schema.
+            if exact_source and (not validation or checkpoint_index is not None):
+                payload["exact_source"] = True
             key = digest({"kind": kind, "index": index, **payload})
             strict = False
             if validation:
                 result = self.operation(spec["mission_id"], key, kind, "local", {"target": target}, payload, False,
-                                        lambda transcript: self.runtime.project_validation(validation, spec, command, cwd, target, transcript, self.operation_timeout(spec["mission_id"]))
-                                        if validation else self.runtime.gate(command, cwd, target, transcript, self.operation_timeout(spec["mission_id"])))
+                                        lambda transcript: self.runtime.project_validation(validation, spec, command, cwd, target, transcript, self.operation_timeout(spec["mission_id"])))
                 if validation:
                     from .factory_validation import validate_result, profile_for
                     try:
@@ -1516,12 +1606,15 @@ class Factory:
                     # a new round alone does not require another expensive run.
                     key = digest({"canonical_validation": binding})
                 def invoke(transcript):
+                    timeout = self.operation_timeout(spec["mission_id"])
                     if self.project and not self.config["simulation"]:
                         if "project_container" not in self.config:
                             raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "Controller container policy is required; host fallback forbidden")
                         return self.runtime.container_gate(self.config["project_container"], spec, cwd, target, command,
-                                                           transcript, self.operation_timeout(spec["mission_id"]))
-                    return self.runtime.gate(command, cwd, target, transcript, self.operation_timeout(spec["mission_id"]))
+                                                           transcript, timeout)
+                    if exact_source:
+                        return self.checkpoint_gate(spec, cwd, target, command, transcript, timeout)
+                    return self.runtime.gate(command, cwd, target, transcript, timeout)
                 result = self.operation(spec["mission_id"], key, kind, "local", identity, payload, False, invoke)
                 if self.project and not self.config["simulation"]:
                     if (result.get("target") != target or result.get("fixture") is not False
@@ -1531,7 +1624,9 @@ class Factory:
                         raise FactoryBlocked("BLOCKED_VALIDATION", result.get("status", "container validation unavailable"))
             if result.get("status") not in ("PASS", "FAIL") or type(result.get("exit_code")) is not int or (result["status"] == "PASS") != (result["exit_code"] == 0):
                 raise FactoryBlocked("UNKNOWN", "test/CI command lacks a proven exit status")
-            if self.target(spec, cwd) != target:
+            if exact_source:
+                self.implementation_checkpoint_target(spec, cwd, target)
+            elif self.target(spec, cwd) != target:
                 raise FactoryBlocked("UNKNOWN", "test/CI changed the reviewed target")
             if strict and result["status"] == "PASS":
                 self.check_project_strict_result(spec, target, result)
@@ -1929,7 +2024,11 @@ class Factory:
                 spec, cwd = json.loads(row["spec"]), Path(row["candidate"])
                 if self.project and status == READY and (self.config["simulation"] or not {"project_pr_ci", "project_delivery"} & set(self.config)):
                     raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "live readiness requires explicit PR CI and live evidence")
-                if self.target(spec, cwd) != delivery.get("target"):
+                if checkpoints:
+                    if any("outputs" not in receipt for receipt in checkpoints):
+                        raise FactoryBlocked("UNKNOWN", "historical checkpoints lack verified output requirements")
+                    self.implementation_checkpoint_target(spec, cwd, delivery["target"])
+                elif self.target(spec, cwd) != delivery.get("target"):
                     raise FactoryBlocked("UNKNOWN", "delivery HEAD/tree/scope changed after verification")
                 for validation in self.require_project_validation(spec, cwd, delivery["target"]):
                     if validation["evidence_key"] not in delivery["evidence_keys"]:
@@ -2270,7 +2369,15 @@ class Factory:
             if not 1 <= len(plan["tasks"]) <= 8:
                 raise FactoryBlocked("UNKNOWN", "technical lead task count is outside the bounded contract")
             staged = self.config.get("implementation_checkpoints") and len(plan["tasks"]) > 1
-            if row["round"] == 0 and not staged:
+            required = self.config.get("implementation_checkpoint_outputs", [])
+            if staged:
+                if len(required) != len(plan["tasks"]) - 1:
+                    raise FactoryBlocked("BLOCKED_VALIDATION", "each nonfinal assignment requires authorized checkpoint outputs")
+                if any(path == spec.get("mission_scope_file") or
+                       not any(fnmatch.fnmatchcase(path, pattern) for pattern in spec["scope"])
+                       for paths in required for path in paths):
+                    raise FactoryBlocked("BLOCKED_SCOPE", "implementation checkpoint outputs exceed authorized assignment scope")
+            elif row["round"] == 0 and "max_total_tokens" in self.config["budget"]:
                 self.remaining_implementation_runs(mission, len(plan["tasks"]))
             feedback, feedback_target = [], None
             if row["round"]:
@@ -2291,6 +2398,8 @@ class Factory:
                     stage = "rework"
                 assignments = [{**payload, "task_index": index, "current_task": task} for index, task in enumerate(plan["tasks"])] if round_ == 0 else [payload]
                 if staged and round_ == 0:
+                    for assignment, paths in zip(assignments, required):
+                        assignment["checkpoint_outputs"] = paths
                     outputs, target, paused = self.staged_implementation(spec, cwd, assignments)
                     if paused:
                         return self.report(mission)
@@ -2303,9 +2412,10 @@ class Factory:
                 if not target["files"] or self.project and set(target["files"]) == {spec["mission_scope_file"]}:
                     raise FactoryBlocked("UNKNOWN", "implementation produced no candidate changes or acceptance tests; no delivery was asserted")
                 self.state(mission, "TEST")
-                tests = self.gates(spec, cwd, target, "checks", round_)
+                gate_options = {"exact_source": True} if staged else {}
+                tests = self.gates(spec, cwd, target, "checks", round_, **gate_options)
                 self.state(mission, "CI")
-                ci = self.gates(spec, cwd, target, "ci", round_)
+                ci = self.gates(spec, cwd, target, "ci", round_, **gate_options)
                 feedback = [{"department": kind, "result": result} for kind, results in (("test", tests), ("ci", ci)) for result in results if result["status"] != "PASS"]
                 reviews = []
                 if not feedback:
@@ -2321,12 +2431,16 @@ class Factory:
                 if not feedback:
                     remote = None
                     if self.project and not self.config["simulation"] and "project_delivery" in self.config:
+                        if staged:
+                            self.implementation_checkpoint_target(spec, cwd, target)
                         self.state(mission, "PR_CI")
                         remote = self.project_pr_ci(spec, cwd, target, reviews, tests + ci)
                         if remote["ci"]["status"] != "PASS":
                             feedback.append({"department": "pr_ci", "result": remote["ci"]})
                 if not feedback:
-                    if self.target(spec, cwd) != target:
+                    if staged:
+                        self.implementation_checkpoint_target(spec, cwd, target)
+                    elif self.target(spec, cwd) != target:
                         raise FactoryBlocked("UNKNOWN", "final delivery target changed after gates")
                     project_gate = self.project_final_gate(spec, cwd, target, reviews, ci if "project_pr_ci" in self.config else remote) if self.project else None
                     delivery = {"target": target, "implemented": work["summary"], "risks": work["known_risks"],

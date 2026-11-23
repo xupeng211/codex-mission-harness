@@ -150,23 +150,35 @@ model understanding, planning success or business delivery.
 
 ### Ordered implementation checkpoints
 
-An operator can set `implementation_checkpoints: true` before submitting a
-new mission. It is part of the immutable mission policy. On the regular
-multi-task path, list dependent assignments in execution order. After each
-nonfinal assignment, the Controller commits its changes, runs the configured
-`checks` on that exact target, and reports `IMPLEMENTATION_CHECKPOINT`
-after a pass. The report carries each checkpoint's exact target and the keys of
-its implementation and check evidence. The existing `resume` command advances
-to the next assignment. The CLI exits nonzero at a checkpoint because final
-delivery is pending.
+Before submitting a staged mission, set `implementation_checkpoints: true`
+and list the required output paths for each nonfinal assignment in
+`implementation_checkpoint_outputs`. For two assignments, an example is
+`[["src/service.py", "tests/test_service.py"]]`. Both settings are part of
+the immutable mission policy. List dependent assignments in execution order.
+Each required output must be a regular tracked file within the mission scope,
+with content that changed in its assigned segment. The operator's existing
+`checks` must cover the behavior the next assignment needs.
 
-On resume, the Controller verifies completed assignments, check logs and the
-current Git target before reserving the next operation. An interrupted
+After each nonfinal assignment, the Controller commits its changes, verifies
+the required outputs, and runs the configured checks for that exact target.
+Generic checks run in a fresh checkout of that commit. Project validation
+keeps its existing executor. After a pass the Controller reports
+`IMPLEMENTATION_CHECKPOINT` with the target, required outputs, and the keys
+of the implementation and check evidence. The existing `resume` command
+advances to the next assignment. The CLI exits nonzero at a checkpoint because
+final delivery is pending.
+
+On resume, the Controller verifies completed assignments, committed outputs,
+check logs and the physical checkout before reserving the next operation.
+Uncommitted inputs, including ignored files, block continuation. Work that
+needs generated files should use the existing temporary workspace. Historical
+checkpoints without an approved output policy cannot advance. An interrupted
 assignment without a durable checkpoint, an unknown result or a changed
-candidate stops with its evidence and accounting retained. A failed checkpoint
-check stops with `BLOCKED_VALIDATION`. The existing run, token and wall-clock
-admission rules apply. The run-count precheck counts assignments still to
-dispatch and the configured review lanes.
+candidate retains its evidence and accounting. Missing outputs or failed
+checkpoint checks stop with `BLOCKED_VALIDATION`. The run-count precheck
+counts assignments still to dispatch and the configured review lanes even
+when the policy specifies only a call limit. Token and wall-clock admission
+continue to use the original rules.
 
 After the last assignment, the regular final tests, CI, independent review and
 applicable PR gates still cover the cumulative BASE-to-final-HEAD changes.

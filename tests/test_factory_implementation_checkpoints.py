@@ -12,12 +12,14 @@ from harness.factory_fixture import AcceptanceRuntime, fixture_config
 
 
 class DependentRuntime(AcceptanceRuntime):
-    def __init__(self, *, first_usage=30, unknown=False, failing_check=False):
+    def __init__(self, *, first_usage=30, unknown=False, failing_check=False, first_change="complete"):
         super().__init__()
         self.first_usage = first_usage
         self.unknown = unknown
         self.failing_check = failing_check
+        self.first_change = first_change
         self.gate_calls = []
+        self.gate_workspaces = []
 
     def agent(self, role, profile, cwd, payload, transcript, timeout, denied_roots):
         if role != "implement":
@@ -29,7 +31,7 @@ class DependentRuntime(AcceptanceRuntime):
             return result
         index = payload["task_index"]
         self.calls.append({"role": role, "task_index": index, "head": git(cwd, "rev-parse", "HEAD")})
-        if index == 0:
+        if index == 0 and self.first_change in {"complete", "ignored"}:
             (cwd / "score.py").write_text((cwd / "score.py").read_text() +
                                           "\ndef average(values):\n    return sum(values) / len(values)\n")
             (cwd / "tests").mkdir()
@@ -37,7 +39,11 @@ class DependentRuntime(AcceptanceRuntime):
                 "import unittest\nfrom score import average\n"
                 "class StageOne(unittest.TestCase):\n"
                 "    def test_average(self): self.assertEqual(average([1, 2]), 1.5)\n")
-        else:
+            if self.first_change == "ignored":
+                (cwd / "local_seed.txt").write_text("not an approved input\n")
+        elif index == 0 and self.first_change == "unrelated":
+            (cwd / "notes.txt").write_text("does not implement average\n")
+        elif index == 1:
             if "def average" not in git(cwd, "show", "HEAD:score.py"):
                 raise AssertionError("dependent assignment requires a committed first stage")
             (cwd / "consumer.py").write_text("from score import average\n\ndef doubled(values):\n    return 2 * average(values)\n")
@@ -54,6 +60,7 @@ class DependentRuntime(AcceptanceRuntime):
 
     def gate(self, command, cwd, target, transcript, timeout):
         self.gate_calls.append((command, target["head"]))
+        self.gate_workspaces.append(cwd)
         if self.failing_check:
             transcript.write_text("targeted check failed\n")
             return {"status": "FAIL", "exit_code": 1}
@@ -68,6 +75,7 @@ class ImplementationCheckpointTests(unittest.TestCase):
         source = self.root / "source"
         source.mkdir()
         (source / "score.py").write_text("def add(a, b):\n    return a + b\n")
+        (source / ".gitignore").write_text("local_seed.txt\n")
         git(source, "init", "-q")
         git(source, "add", ".")
         git(source, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-qm", "base")
@@ -76,6 +84,7 @@ class ImplementationCheckpointTests(unittest.TestCase):
                      "base": self.base, "objective": "Implement average and its dependent consumer"}
         self.config = fixture_config()
         self.config["implementation_checkpoints"] = True
+        self.config["implementation_checkpoint_outputs"] = [["score.py", "tests/test_average.py"]]
         self.config["budget"] = {"max_agent_runs": 5, "max_run_tokens": 50,
                                  "max_total_tokens": 250, "max_wall_seconds": 3600}
         self.factory = None
@@ -115,6 +124,8 @@ class ImplementationCheckpointTests(unittest.TestCase):
         self.assertEqual(git(self.cwd, "status", "--porcelain"), "")
         self.assertEqual(self.runtime.gate_calls, [(self.config["checks"][0], self.first_head)])
         self.assertEqual(len(receipt["checks"]), 1)
+        self.assertEqual(receipt["outputs"], self.config["implementation_checkpoint_outputs"][0])
+        self.assertNotIn(self.cwd, self.runtime.gate_workspaces)
         return self.snapshot()
 
     def test_reopen_dispatches_only_dependent_work_and_runs_final_gates(self):
@@ -127,9 +138,16 @@ class ImplementationCheckpointTests(unittest.TestCase):
         self.assertEqual([call["role"] for call in self.runtime.calls], ["implement", "review", "review"])
         self.assertEqual(self.runtime.gate_calls, [(self.config[kind][0], final["TARGET_HEAD"])
                                                    for kind in ("checks", "ci")])
+        self.assertNotIn(self.cwd, self.runtime.gate_workspaces)
         self.assertEqual(git(self.cwd, "rev-parse", "HEAD^"), self.first_head)
         self.assertEqual(set(final["EXACT_TARGET"]["files"]),
                          {"score.py", "consumer.py", "tests/test_average.py", "tests/test_consumer.py"})
+        clean = self.root / "clean-checkout"
+        git(self.cwd, "clone", "--no-local", "--no-hardlinks", "--", str(self.cwd), str(clean))
+        self.assertEqual(git(clean, "rev-parse", "HEAD"), final["TARGET_HEAD"])
+        self.assertEqual(git(clean, "rev-parse", "HEAD^{tree}"), final["EXACT_TARGET"]["tree"])
+        self.assertEqual(AcceptanceRuntime().gate(self.config["checks"][0], clean, final["EXACT_TARGET"],
+                                                 self.root / "clean-checks.raw", 30)["status"], "PASS")
         self.assertEqual(final["BUDGET_USED"]["agent_runs"], 5)
         self.assertEqual(final["BUDGET_USED"]["observed_tokens"], 75)
         after = self.snapshot()
@@ -138,6 +156,8 @@ class ImplementationCheckpointTests(unittest.TestCase):
         self.assertEqual(self.run_mission()["DELIVERY_STATUS"], READY)
         self.assertEqual(self.runtime.calls + self.runtime.gate_calls, [])
         self.assertEqual(self.snapshot(), after)
+        (self.cwd / "local_seed.txt").write_text("unapproved input after delivery\n")
+        self.assertEqual(self.factory.report(self.spec["mission_id"])["DELIVERY_STATUS"], "UNKNOWN")
 
     def test_unknown_dependent_result_is_retained_and_never_replayed(self):
         initial = self.first_stage()
@@ -165,6 +185,88 @@ class ImplementationCheckpointTests(unittest.TestCase):
         self.assertEqual(self.runtime.calls + self.runtime.gate_calls, [])
         self.assertEqual(self.snapshot(), initial)
         self.assertEqual((self.cwd / "outside.txt").read_text(), "external edit")
+
+    def test_ignored_input_stops_before_reservation_on_reopen(self):
+        initial = self.first_stage()
+        input_file = self.cwd / "local_seed.txt"
+        input_file.write_text("not an approved input\n")
+        self.assertEqual(git(self.cwd, "status", "--porcelain"), "")
+        self.open()
+        self.assertEqual(self.factory.report(self.spec["mission_id"])["DELIVERY_STATUS"], "UNKNOWN")
+        stopped = self.run_mission()
+        self.assertEqual(stopped["DELIVERY_STATUS"], "UNKNOWN")
+        self.assertIn("outside committed Git source", stopped["BLOCKERS_REMAINING"][0])
+        self.assertEqual(self.runtime.calls + self.runtime.gate_calls, [])
+        self.assertEqual(self.snapshot(), initial)
+        self.assertEqual(input_file.read_text(), "not an approved input\n")
+
+    def test_ignored_input_from_builder_cannot_reach_checks_or_acceptance(self):
+        self.open(first_change="ignored").submit(self.spec)
+        stopped = self.run_mission()
+        self.assertEqual(stopped["DELIVERY_STATUS"], "UNKNOWN", stopped)
+        self.assertNotIn("IMPLEMENTATION_CHECKPOINTS", stopped)
+        self.assertEqual(self.runtime.gate_calls, [])
+        self.assertTrue((Path(stopped["CANDIDATE"]) / "local_seed.txt").is_file())
+
+    def test_tracked_bytes_hidden_from_git_status_stop_before_reservation(self):
+        initial = self.first_stage()
+        git(self.cwd, "update-index", "--assume-unchanged", "--", "score.py")
+        path = self.cwd / "score.py"
+        path.write_text(path.read_text() + "\n# modified after acceptance\n")
+        self.assertEqual(git(self.cwd, "status", "--porcelain"), "")
+        self.open()
+        stopped = self.run_mission()
+        self.assertEqual(stopped["DELIVERY_STATUS"], "UNKNOWN", stopped)
+        self.assertIn("differs from committed HEAD", stopped["BLOCKERS_REMAINING"][0])
+        self.assertEqual(self.runtime.calls + self.runtime.gate_calls, [])
+        self.assertEqual(self.snapshot(), initial)
+
+    def test_empty_or_unrelated_work_cannot_satisfy_required_outputs(self):
+        for change in ("none", "unrelated"):
+            with self.subTest(change=change):
+                self.spec["mission_id"] = change
+                self.open(first_change=change).submit(self.spec)
+                stopped = self.run_mission()
+                self.assertEqual(stopped["DELIVERY_STATUS"], "BLOCKED_VALIDATION", stopped)
+                self.assertIn("required changed output: score.py", stopped["BLOCKERS_REMAINING"][0])
+                self.assertNotIn("IMPLEMENTATION_CHECKPOINTS", stopped)
+                self.assertEqual([call["role"] for call in self.runtime.calls], ["plan", "implement"])
+                self.assertEqual(self.runtime.gate_calls, [])
+                initial = self.snapshot()
+                self.open()
+                self.assertEqual(self.run_mission()["DELIVERY_STATUS"], "BLOCKED_VALIDATION")
+                self.assertEqual(self.runtime.calls + self.runtime.gate_calls, [])
+                self.assertEqual(self.snapshot(), initial)
+
+    def test_call_count_only_budget_stops_before_first_builder(self):
+        self.config["budget"] = {"max_agent_runs": 3}
+        self.open().submit(self.spec)
+        stopped = self.run_mission()
+        self.assertEqual(stopped["DELIVERY_STATUS"], "BLOCKED_BUDGET", stopped)
+        self.assertEqual([call["role"] for call in self.runtime.calls], ["plan"])
+        self.assertEqual(stopped["BUDGET_USED"]["agent_runs"], 1)
+        self.assertEqual(self.runtime.gate_calls, [])
+        self.assertNotIn("IMPLEMENTATION_CHECKPOINTS", stopped)
+        initial = self.snapshot()
+        self.open()
+        self.assertEqual(self.run_mission()["DELIVERY_STATUS"], "BLOCKED_BUDGET")
+        self.assertEqual(self.runtime.calls + self.runtime.gate_calls, [])
+        self.assertEqual(self.snapshot(), initial)
+
+    def test_staged_plan_without_output_authority_stops_before_first_builder(self):
+        del self.config["implementation_checkpoint_outputs"]
+        self.open().submit(self.spec)
+        stopped = self.run_mission()
+        self.assertEqual(stopped["DELIVERY_STATUS"], "BLOCKED_VALIDATION", stopped)
+        self.assertIn("authorized checkpoint outputs", stopped["BLOCKERS_REMAINING"][0])
+        self.assertEqual([call["role"] for call in self.runtime.calls], ["plan"])
+
+    def test_checkpoint_output_outside_scope_stops_before_first_builder(self):
+        self.spec["scope"] = ["score.py"]
+        self.open().submit(self.spec)
+        stopped = self.run_mission()
+        self.assertEqual(stopped["DELIVERY_STATUS"], "BLOCKED_SCOPE", stopped)
+        self.assertEqual([call["role"] for call in self.runtime.calls], ["plan"])
 
     def test_externally_advanced_clean_head_stops_before_reservation(self):
         initial = self.first_stage()
@@ -249,6 +351,7 @@ class ImplementationCheckpointTests(unittest.TestCase):
         spec = {**project.spec, "approved_mission_scope": project.approval(),
                 "pr_body_template": "OFFLINE PR body {{candidate_head}} {{review_timestamp}}"}
         config = {**project.config, "simulation": False, "implementation_checkpoints": True,
+                  "implementation_checkpoint_outputs": self.config["implementation_checkpoint_outputs"],
                   "project_container": CONTAINER, "project_delivery": DELIVERY,
                   "project_review_limits": LIMITS, "checks": [["make", "verify-targeted"]],
                   "ci": [["make", "verify-strict"]], "budget": self.config["budget"]}
