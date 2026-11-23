@@ -12,12 +12,13 @@ from harness.factory_fixture import AcceptanceRuntime, fixture_config
 
 
 class DependentRuntime(AcceptanceRuntime):
-    def __init__(self, *, first_usage=30, unknown=False, failing_check=False, first_change="complete"):
+    def __init__(self, *, first_usage=30, unknown=False, failing_check=False, first_change="complete", tasks=None):
         super().__init__()
         self.first_usage = first_usage
         self.unknown = unknown
         self.failing_check = failing_check
         self.first_change = first_change
+        self.tasks = tasks or ["Add average", "Implement a consumer of average"]
         self.gate_calls = []
         self.gate_workspaces = []
 
@@ -25,7 +26,7 @@ class DependentRuntime(AcceptanceRuntime):
         if role != "implement":
             result = super().agent(role, profile, cwd, payload, transcript, timeout, denied_roots)
             if role == "plan":
-                result["output"]["tasks"] = ["Add average", "Implement a consumer of average"]
+                result["output"]["tasks"] = self.tasks
                 result["usage"] = {"input_tokens": 15, "output_tokens": 5}
                 transcript.write_text(json.dumps(result["output"]))
             return result
@@ -261,6 +262,72 @@ class ImplementationCheckpointTests(unittest.TestCase):
         self.assertIn("authorized checkpoint outputs", stopped["BLOCKERS_REMAINING"][0])
         self.assertEqual([call["role"] for call in self.runtime.calls], ["plan"])
 
+    def test_plan_cannot_collapse_approved_assignments(self):
+        self.open(tasks=["Implement everything"]).submit(self.spec)
+        stopped = self.run_mission()
+        self.assertEqual(stopped["DELIVERY_STATUS"], "BLOCKED_VALIDATION", stopped)
+        self.assertEqual([call["role"] for call in self.runtime.calls], ["plan"])
+        requirements = self.runtime.calls[0]["payload"]["checkpoint_requirements"]
+        self.assertEqual(requirements["task_count"], 2)
+        self.assertEqual(requirements["nonfinal_outputs"], self.config["implementation_checkpoint_outputs"])
+        self.assertEqual(stopped["BUDGET_USED"]["agent_runs"], 1)
+        actual = self.snapshot()
+        self.open()
+        self.assertEqual(self.run_mission()["DELIVERY_STATUS"], "BLOCKED_VALIDATION")
+        self.assertEqual(self.runtime.calls, [])
+        self.assertEqual(self.snapshot(), actual)
+
+    def test_first_plan_requires_the_controller_prepared_head_and_tree(self):
+        mission = self.open().submit(self.spec)
+        _, cwd = self.factory.prepare(mission)
+        prepared = self.factory.checkpoint_start(mission)
+        self.assertEqual(prepared, {"head": self.base, "tree": git(cwd, "rev-parse", "HEAD^{tree}")})
+        (cwd / "external.txt").write_text("external commit before planning\n")
+        git(cwd, "add", ".")
+        git(cwd, "-c", "user.name=External", "-c", "user.email=external@localhost",
+            "commit", "-qm", "external advance")
+        external = git(cwd, "rev-parse", "HEAD")
+        self.assertEqual(git(cwd, "status", "--porcelain"), "")
+        self.open()
+        stopped = self.run_mission()
+        self.assertEqual(stopped["DELIVERY_STATUS"], "UNKNOWN", stopped)
+        self.assertIn("Controller-prepared start", stopped["BLOCKERS_REMAINING"][0])
+        self.assertEqual(self.runtime.calls, [])
+        self.assertEqual(self.snapshot(), {})
+        self.assertEqual(git(cwd, "rev-parse", "HEAD"), external)
+        self.assertEqual(self.factory.checkpoint_start(mission), prepared)
+
+    def test_review_rechecks_ignored_and_hidden_tracked_drift_before_reservation(self):
+        for variant in ("ignored", "tracked"):
+            with self.subTest(variant=variant):
+                self.spec["mission_id"] = variant
+                initial = self.first_stage()
+                self.open()
+                original = self.factory.review_context
+
+                def changed_context(spec, cwd, target, lane):
+                    checkout = original(spec, cwd, target, lane)
+                    if variant == "ignored":
+                        (checkout / "local_seed.txt").write_text("outside review input\n")
+                    else:
+                        git(checkout, "update-index", "--assume-unchanged", "--", "score.py")
+                        with (checkout / "score.py").open("a") as stream:
+                            stream.write("\n# outside review input\n")
+                    self.assertEqual(git(checkout, "status", "--porcelain"), "")
+                    return checkout
+
+                with patch.object(self.factory, "review_context", side_effect=changed_context):
+                    stopped = self.run_mission()
+                self.assertEqual(stopped["DELIVERY_STATUS"], "UNKNOWN", stopped)
+                reason = "outside committed Git source" if variant == "ignored" else "differs from committed HEAD"
+                self.assertIn(reason, stopped["BLOCKERS_REMAINING"][0])
+                self.assertEqual([call["role"] for call in self.runtime.calls], ["implement"])
+                self.assertEqual(self.factory.db.execute(
+                    "SELECT COUNT(*) FROM operations WHERE mission=? AND stage='review'",
+                    (self.spec["mission_id"],)).fetchone()[0], 0)
+                after = self.snapshot()
+                self.assertEqual({key: after[key] for key in initial}, initial)
+
     def test_checkpoint_output_outside_scope_stops_before_first_builder(self):
         self.spec["scope"] = ["score.py"]
         self.open().submit(self.spec)
@@ -360,8 +427,14 @@ class ImplementationCheckpointTests(unittest.TestCase):
             runtime = LiveProtocolDouble()
             runtime.agent = DependentRuntime().agent
             with closing(Factory(state, config, runtime)) as factory:
-                checkpoint = factory.run(factory.submit(spec))
+                mission = factory.submit(spec)
+                checkpoint = factory.run(mission)
                 self.assertEqual(checkpoint["DELIVERY_STATUS"], IMPLEMENTATION_CHECKPOINT, checkpoint)
+                start = factory.checkpoint_start(mission)
+                self.assertNotEqual(start["head"], spec["base"])
+                plan = json.loads(factory.db.execute("SELECT input FROM operations WHERE stage='plan'").fetchone()[0])
+                self.assertEqual(plan["workspace"]["dispatch_head"], start["head"])
+                self.assertEqual(plan["workspace"]["dispatch_tree"], start["tree"])
                 self.assertIsNone(runtime.remote)
                 self.assertEqual(runtime.calls, [])
             runtime = LiveProtocolDouble()
@@ -382,3 +455,27 @@ class ImplementationCheckpointTests(unittest.TestCase):
                 for op in final_steps:
                     target = json.loads(op["input"])["target"]
                     self.assertEqual((target["base"], target["head"]), (spec["base"], final["TARGET_HEAD"]))
+
+    def test_project_scope_is_checked_before_reserving_the_builder(self):
+        from test_factory_project import ProjectContractTests, ProjectRuntime
+
+        project = ProjectContractTests()
+        project.setUp()
+        self.addCleanup(project.doCleanups)
+        builder = DependentRuntime()
+        runtime = ProjectRuntime()
+        runtime.agent = builder.agent
+        config = {**project.config, "implementation_checkpoints": True,
+                  "implementation_checkpoint_outputs": self.config["implementation_checkpoint_outputs"]}
+        # The mission's default generic scope permits the file. The approved
+        # project scope omits it.
+        with closing(Factory(self.root / "restricted-project", config, runtime)) as factory:
+            mission = factory.submit(project.spec)
+            stopped = factory.run(mission)
+            self.assertEqual(stopped["DELIVERY_STATUS"], "BLOCKED_SCOPE", stopped)
+            self.assertIn("project rejected checkpoint outputs", stopped["BLOCKERS_REMAINING"][0])
+            self.assertEqual([call["role"] for call in builder.calls], ["plan"])
+            self.assertEqual([row[0] for row in factory.db.execute("SELECT stage FROM operations")], ["plan"])
+            cwd = Path(stopped["CANDIDATE"])
+            self.assertEqual(git(cwd, "rev-parse", "HEAD"), factory.checkpoint_start(mission)["head"])
+            self.assertFalse((cwd / "tests/test_average.py").exists())

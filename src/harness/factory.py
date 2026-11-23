@@ -598,6 +598,14 @@ class Factory:
                     policy = self.project_policy(spec, cwd, paths)
                     if self.config.get("review_mode") == "single_openai":
                         review_lanes({"review_mode": "single_openai", "project_policy": policy})
+            if self.config.get("implementation_checkpoints") and not candidate_stage.requested(spec):
+                head, tree = git(cwd, "rev-parse", "HEAD", "HEAD^{tree}").splitlines()
+                if head != spec["base"] and (
+                        not self.project or git(cwd, "show", "-s", "--format=%P", head).strip() != spec["base"]
+                        or git(cwd, "diff", "--no-ext-diff", "--no-renames", "--name-only",
+                               spec["base"], head, "--") != spec["mission_scope_file"]):
+                    raise FactoryBlocked("UNKNOWN", "candidate preparation introduced changes outside the Controller scope commit")
+                self.event(mission, "candidate_prepared", {"head": head, "tree": tree})
             self.state(mission, "PLAN")
         if cwd.resolve() != cwd or not (cwd / ".git").is_dir() or (cwd / ".git").is_symlink():
             raise FactoryBlocked("UNKNOWN", "candidate isolation identity is invalid")
@@ -894,10 +902,39 @@ class Factory:
             # or repeat implementation against the same candidate.
             raise FactoryBlocked("BLOCKED_LIMIT", "completed plan key differs; no new paid planning or implementation authorized")
 
-    def prepare_plan_dispatch(self, spec, cwd):
+    def checkpoint_start(self, mission):
+        prepared = self.db.execute("SELECT payload FROM events WHERE mission=? AND kind='candidate_prepared'",
+                                   (mission,)).fetchone()
+        if prepared is None:
+            raise FactoryBlocked("UNKNOWN", "Controller preparation evidence is missing for the planning target")
+        return json.loads(prepared[0])
+
+    def verify_checkpoint_plan(self, mission, required):
+        start = self.checkpoint_start(mission)
+        plan = self.db.execute("SELECT * FROM operations WHERE mission=? AND stage='plan' AND status='COMPLETE'",
+                               (mission,)).fetchone()
+        if plan is None:
+            raise FactoryBlocked("UNKNOWN", "completed checkpoint plan evidence is missing")
+        self.verify_evidence(plan)
+        payload = json.loads(plan["input"])
+        workspace = payload.get("workspace", {})
+        requirements = payload.get("checkpoint_requirements", {})
+        if (json.loads(plan["identity"])["dispatch_head"] != start["head"]
+                or workspace.get("dispatch_head") != start["head"] or workspace.get("dispatch_tree") != start["tree"]
+                or requirements.get("task_count") != len(required) + 1
+                or requirements.get("nonfinal_outputs") != required):
+            raise FactoryBlocked("UNKNOWN", "completed plan differs from the Controller-prepared start or approved assignments")
+        return start
+
+    def prepare_plan_dispatch(self, spec, cwd, workspace):
         self.guard_plan_cache_miss(spec["mission_id"])
         if self.config.get("implementation_checkpoints"):
-            self.implementation_checkpoint_target(spec, cwd)
+            start = self.checkpoint_start(spec["mission_id"])
+            if workspace["dispatch_head"] != start["head"] or workspace["dispatch_tree"] != start["tree"]:
+                raise FactoryBlocked("UNKNOWN", "planning target differs from the Controller-prepared start")
+            target = self.implementation_checkpoint_target(spec, cwd)
+            if target["head"] != start["head"] or target["tree"] != start["tree"]:
+                raise FactoryBlocked("UNKNOWN", "planning target differs from the Controller-prepared start")
 
     def guard_rework_cache_miss(self, spec, cwd):
         """Only a fresh dispatch must still be at the failed candidate."""
@@ -930,11 +967,21 @@ class Factory:
                 "branch": git(cwd, "rev-parse", "--abbrev-ref", "HEAD"),
                 "has_remotes": bool(git(cwd, "remote")),
             }}
+            if self.config.get("implementation_checkpoints"):
+                payload["workspace"]["dispatch_tree"] = git(cwd, "rev-parse", "HEAD^{tree}")
+            required = self.config.get("implementation_checkpoint_outputs")
+            if required:
+                # The requirements are already part of immutable policy. Preserve
+                # the plan key so a reopen never buys a replacement plan.
+                payload["checkpoint_requirements"] = {
+                    "task_count": len(required) + 1, "nonfinal_outputs": required,
+                    "instruction": "Plan exactly the approved assignments in order, including each nonfinal assignment's required outputs.",
+                }
         call_payload = dict(payload)
         if not self.config["simulation"] and ("model_selection" in profile_identity or snapshot_profile(profile)):
             call_payload["_authorized_route"] = profile_identity["route_identity"]
         if stage == "plan":
-            prepare = lambda: self.prepare_plan_dispatch(spec, cwd)
+            prepare = lambda: self.prepare_plan_dispatch(spec, cwd, payload["workspace"])
         elif stage == "rework":
             prepare = lambda: self.guard_rework_cache_miss(spec, cwd)
         return self.operation(spec["mission_id"], key, stage, lane, identity, payload, True,
@@ -1056,7 +1103,7 @@ class Factory:
         current = self.implementation_checkpoint_target(spec, cwd, checkpoints[-1]["target"] if checkpoints else None)
         return outputs, current
 
-    def staged_implementation(self, spec, cwd, assignments):
+    def staged_implementation(self, spec, cwd, assignments, start):
         mission = spec["mission_id"]
         checkpoints = [json.loads(event[0]) for event in self.db.execute(
             "SELECT payload FROM events WHERE mission=? AND kind='implementation_checkpoint' ORDER BY sequence", (mission,))]
@@ -1072,11 +1119,8 @@ class Factory:
             raise FactoryBlocked("UNKNOWN", "implementation checkpoints exceed the bounded plan")
         if index == len(assignments):
             return outputs, current, False
-        if index == 0:
-            plan = self.db.execute("SELECT identity FROM operations WHERE mission=? AND stage='plan' AND status='COMPLETE'",
-                                   (mission,)).fetchone()
-            if plan is None or json.loads(plan[0])["dispatch_head"] != current["head"]:
-                raise FactoryBlocked("UNKNOWN", "workspace HEAD differs from the completed plan")
+        if index == 0 and any(current[k] != v for k, v in start.items()):
+            raise FactoryBlocked("UNKNOWN", "workspace differs from the Controller-prepared start of the completed plan")
         self.remaining_implementation_runs(mission, len(assignments) - index)
         self.state(mission, "IMPLEMENT")
         output = self.implementation_output(self.agent(
@@ -1129,9 +1173,18 @@ class Factory:
         if not path.exists():
             path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
             self.isolated_checkout(cwd, path, target["head"])
+        self.verify_review_checkout(spec, path, target)
+        return path
+
+    def verify_review_checkout(self, spec, path, target):
+        metadata = path / ".git"
+        if (path.resolve() != path or not metadata.is_dir() or metadata.is_symlink()
+                or (metadata / "objects/info/alternates").exists()
+                or git(path, "branch", "--show-current") or git(path, "remote")):
+            raise FactoryBlocked("UNKNOWN", "independent review checkout isolation changed")
         if self.target(spec, path) != target:
             raise FactoryBlocked("UNKNOWN", "review checkout differs from exact delivery target")
-        return path
+        self.verify_checkpoint_source(path, target["head"])
 
     def review(self, spec, cwd, target, lane):
         if self.project:
@@ -1166,20 +1219,23 @@ class Factory:
         identity = {"target": target, "profile": self.profile_identities[lane], "engine": "codex-official-rubric-structured-turn" if lane == "reviewer" else "deepseek-chat-completions",
                     "rubric": rubric}
         key = digest(identity)
-        if lane == "reviewer":
-            invoke = lambda transcript: self.runtime.agent("review", profile, review_cwd, payload, transcript,
-                                                           self.operation_timeout(spec["mission_id"]),
-                                                           [self.root, Path(spec["repository"])] )
-        else:
-            invoke = lambda transcript: self.runtime.second_review(profile, review_cwd, payload, transcript,
-                                                                   self.operation_timeout(spec["mission_id"]))
+        def verify_checkout():
+            self.verify_review_checkout(spec, review_cwd, target)
+
+        def invoke(transcript, _prepared):
+            verify_checkout()
+            timeout = self.operation_timeout(spec["mission_id"])
+            if lane == "reviewer":
+                return self.runtime.agent("review", profile, review_cwd, payload, transcript, timeout,
+                                          [self.root, Path(spec["repository"])])
+            return self.runtime.second_review(profile, review_cwd, payload, transcript, timeout)
         # Only a PROVEN completed result can get one fresh formatting/source
         # validation attempt. Dispatch uncertainty is never retried by operation().
         for attempt in range(2):
             attempt_key = key if attempt == 0 else digest({"review": key, "validation_attempt": attempt})
-            result = self.operation(spec["mission_id"], attempt_key, "review", lane, identity, payload, True, invoke)
-            if self.target(spec, review_cwd) != target:
-                raise FactoryBlocked("UNKNOWN", "reviewer mutated its exact target")
+            result = self.operation(spec["mission_id"], attempt_key, "review", lane, identity, payload, True, invoke,
+                                    prepare=verify_checkout)
+            verify_checkout()
             try:
                 verdict, findings = review_verdict(result.get("output"), review_cwd, target)
             except (ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
@@ -1202,6 +1258,8 @@ class Factory:
         payload = {"target": target, "review_range": target["review_range"], "lane": lane}
         key = digest(identity)
         def prepare():
+            if self.config.get("implementation_checkpoint_outputs"):
+                self.implementation_checkpoint_target(spec, cwd, target)
             try:
                 if Path(cwd).absolute() != Path(self.row(spec["mission_id"])["candidate"]):
                     raise ValueError("canonical review must use the Controller-owned candidate")
@@ -1224,7 +1282,9 @@ class Factory:
             lambda transcript, prepared: self.runtime.project_review(spec, cwd, target, lane, transcript,
                 self.operation_timeout(spec["mission_id"]), prepared=prepared),
             prepare=prepare)
-        if self.target(spec, cwd) != target:
+        if self.config.get("implementation_checkpoint_outputs"):
+            self.implementation_checkpoint_target(spec, cwd, target)
+        elif self.target(spec, cwd) != target:
             raise FactoryBlocked("UNKNOWN", "canonical reviewer changed the exact target")
         try:
             self.verify_evidence(self.db.execute(
@@ -2008,10 +2068,12 @@ class Factory:
         preflights = [json.loads(e["payload"]) for e in events if e["kind"] == "prepaid_preflight"]
         status, reason = row["status"], row["reason"]
         checkpoints = [json.loads(e["payload"]) for e in events if e["kind"] == "implementation_checkpoint"]
+        required = self.config.get("implementation_checkpoint_outputs", [])
         if status == IMPLEMENTATION_CHECKPOINT:
             try:
                 if not checkpoints:
                     raise FactoryBlocked("UNKNOWN", "implementation checkpoint is missing")
+                self.verify_checkpoint_plan(mission, required)
                 self.implementation_progress(spec, Path(row["candidate"]), checkpoints,
                                              [op for op in operations if op["stage"] == "implement"])
             except FactoryBlocked as exc:
@@ -2024,9 +2086,10 @@ class Factory:
                 spec, cwd = json.loads(row["spec"]), Path(row["candidate"])
                 if self.project and status == READY and (self.config["simulation"] or not {"project_pr_ci", "project_delivery"} & set(self.config)):
                     raise FactoryBlocked("BLOCKED_PROJECT_CONTRACT", "live readiness requires explicit PR CI and live evidence")
-                if checkpoints:
-                    if any("outputs" not in receipt for receipt in checkpoints):
-                        raise FactoryBlocked("UNKNOWN", "historical checkpoints lack verified output requirements")
+                if checkpoints or required:
+                    if len(checkpoints) != len(required) + 1 or any("outputs" not in receipt for receipt in checkpoints):
+                        raise FactoryBlocked("UNKNOWN", "delivery lacks the approved implementation checkpoints")
+                    self.verify_checkpoint_plan(mission, required)
                     self.implementation_checkpoint_target(spec, cwd, delivery["target"])
                 elif self.target(spec, cwd) != delivery.get("target"):
                     raise FactoryBlocked("UNKNOWN", "delivery HEAD/tree/scope changed after verification")
@@ -2368,15 +2431,24 @@ class Factory:
                 raise FactoryBlocked("WAITING_PRODUCT_DECISION", "; ".join(plan["decisions_required"]))
             if not 1 <= len(plan["tasks"]) <= 8:
                 raise FactoryBlocked("UNKNOWN", "technical lead task count is outside the bounded contract")
-            staged = self.config.get("implementation_checkpoints") and len(plan["tasks"]) > 1
             required = self.config.get("implementation_checkpoint_outputs", [])
+            staged = self.config.get("implementation_checkpoints", False) and (bool(required) or len(plan["tasks"]) > 1)
             if staged:
                 if len(required) != len(plan["tasks"]) - 1:
-                    raise FactoryBlocked("BLOCKED_VALIDATION", "each nonfinal assignment requires authorized checkpoint outputs")
+                    raise FactoryBlocked("BLOCKED_VALIDATION",
+                                         f"plan has {len(plan['tasks'])} assignments; authorized checkpoint outputs require {len(required) + 1}")
+                paths = sorted({path for outputs in required for path in outputs})
                 if any(path == spec.get("mission_scope_file") or
-                       not any(fnmatch.fnmatchcase(path, pattern) for pattern in spec["scope"])
-                       for paths in required for path in paths):
+                       not any(fnmatch.fnmatchcase(path, pattern) for pattern in spec["scope"]) for path in paths):
                     raise FactoryBlocked("BLOCKED_SCOPE", "implementation checkpoint outputs exceed authorized assignment scope")
+                start = self.verify_checkpoint_plan(mission, required)
+                if self.project:
+                    try:
+                        policy = self.project_policy(spec, cwd, paths)
+                        if self.config.get("review_mode") == "single_openai":
+                            review_lanes({**policy, "review_mode": "single_openai"})
+                    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                        raise FactoryBlocked("BLOCKED_SCOPE", f"project rejected checkpoint outputs: {exc}") from exc
             elif row["round"] == 0 and "max_total_tokens" in self.config["budget"]:
                 self.remaining_implementation_runs(mission, len(plan["tasks"]))
             feedback, feedback_target = [], None
@@ -2400,7 +2472,7 @@ class Factory:
                 if staged and round_ == 0:
                     for assignment, paths in zip(assignments, required):
                         assignment["checkpoint_outputs"] = paths
-                    outputs, target, paused = self.staged_implementation(spec, cwd, assignments)
+                    outputs, target, paused = self.staged_implementation(spec, cwd, assignments, start)
                     if paused:
                         return self.report(mission)
                 else:

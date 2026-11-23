@@ -155,9 +155,18 @@ and list the required output paths for each nonfinal assignment in
 `implementation_checkpoint_outputs`. For two assignments, an example is
 `[["src/service.py", "tests/test_service.py"]]`. Both settings are part of
 the immutable mission policy. List dependent assignments in execution order.
+The planner receives the required paths and the assignment count derived
+from the output lists. The Controller rejects a plan with a different count
+before reserving any implementation.
 Each required output must be a regular tracked file within the mission scope,
 with content that changed in its assigned segment. The operator's existing
-`checks` must cover the behavior the next assignment needs.
+`checks` must cover the behavior the next assignment needs. Project missions
+also check every required path against the trusted project policy before
+dispatching implementation.
+
+The Controller records the prepared HEAD and tree before exposing the PLAN
+state. This includes its scope commit in project mode. The first planner
+dispatch and restored planning evidence must bind that recorded start.
 
 After each nonfinal assignment, the Controller commits its changes, verifies
 the required outputs, and runs the configured checks for that exact target.
@@ -172,7 +181,8 @@ On resume, the Controller verifies completed assignments, committed outputs,
 check logs and the physical checkout before reserving the next operation.
 Uncommitted inputs, including ignored files, block continuation. Work that
 needs generated files should use the existing temporary workspace. Historical
-checkpoints without an approved output policy cannot advance. An interrupted
+checkpoints require both an approved output policy and recorded preparation
+evidence to advance. An interrupted
 assignment without a durable checkpoint, an unknown result or a changed
 candidate retains its evidence and accounting. Missing outputs or failed
 checkpoint checks stop with `BLOCKED_VALIDATION`. The run-count precheck
@@ -182,6 +192,9 @@ continue to use the original rules.
 
 After the last assignment, the regular final tests, CI, independent review and
 applicable PR gates still cover the cumulative BASE-to-final-HEAD changes.
+Generic independent review checks the actual files of each detached review
+checkout against the committed tree before reservation and before execution.
+The canonical project review keeps its trusted runner and detached context.
 The single-task, local-candidate and rework paths retain their flow.
 
 Budget units are agent executions, not dollars or internal Codex model requests. Native subagent fan-out is disabled to avoid an unregistered execution tree; role/task threads still use the official runtime. Real money remains UNKNOWN; Provider account limits are necessary for a monetary ceiling. Fixture telemetry explicitly records zero real Provider calls and cannot become a formal receipt.
