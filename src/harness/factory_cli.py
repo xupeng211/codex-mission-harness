@@ -9,7 +9,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from .factory import Factory, validate_config
+from .factory import IMPLEMENTATION_CHECKPOINT, Factory, validate_config
 from .factory_fixture import demo
 from .factory_runtime import official_rubric, LocalRuntime
 from .model_registry import read_private_token
@@ -58,6 +58,10 @@ def readable(result):
         lines += [f"测试：{result['TEST_RESULT']}；本地 CI：{result['LOCAL_CI']}；GitHub CI：{result['HOSTED_CI']}",
                   f"候选版本：{result['TARGET_HEAD']}", f"候选源码：{result['CANDIDATE']}",
                   "开发、测试和审核已完成。最终合并/发布仍需你的明确批准。"]
+    elif result["DELIVERY_STATUS"] == IMPLEMENTATION_CHECKPOINT:
+        checkpoint = result["IMPLEMENTATION_CHECKPOINTS"][-1]
+        lines += [f"第 {checkpoint['task_index'] + 1} 段通过定向检查",
+                  f"检查点版本：{checkpoint['target']['head']}", f"候选源码：{result['CANDIDATE']}"]
     else:
         lines += ["原因：" + '; '.join(result['BLOCKERS_REMAINING'])]
     preflight = result.get("PREPAID_PREFLIGHT")

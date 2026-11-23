@@ -148,6 +148,30 @@ this patch supplies no recovery mechanism or new spending authority. Offline
 fixtures prove transport/evidence/dispatch and rejection behavior, not future
 model understanding, planning success or business delivery.
 
+### Ordered implementation checkpoints
+
+An operator can set `implementation_checkpoints: true` before submitting a
+new mission. It is part of the immutable mission policy. On the regular
+multi-task path, list dependent assignments in execution order. After each
+nonfinal assignment, the Controller commits its changes, runs the configured
+`checks` on that exact target, and reports `IMPLEMENTATION_CHECKPOINT`
+after a pass. The report carries each checkpoint's exact target and the keys of
+its implementation and check evidence. The existing `resume` command advances
+to the next assignment. The CLI exits nonzero at a checkpoint because final
+delivery is pending.
+
+On resume, the Controller verifies completed assignments, check logs and the
+current Git target before reserving the next operation. An interrupted
+assignment without a durable checkpoint, an unknown result or a changed
+candidate stops with its evidence and accounting retained. A failed checkpoint
+check stops with `BLOCKED_VALIDATION`. The existing run, token and wall-clock
+admission rules apply. The run-count precheck counts assignments still to
+dispatch and the configured review lanes.
+
+After the last assignment, the regular final tests, CI, independent review and
+applicable PR gates still cover the cumulative BASE-to-final-HEAD changes.
+The single-task, local-candidate and rework paths retain their flow.
+
 Budget units are agent executions, not dollars or internal Codex model requests. Native subagent fan-out is disabled to avoid an unregistered execution tree; role/task threads still use the official runtime. Real money remains UNKNOWN; Provider account limits are necessary for a monetary ceiling. Fixture telemetry explicitly records zero real Provider calls and cannot become a formal receipt.
 
 Known completed results are reused after envelope and raw-file hash verification. A proven completed malformed review allows one separately charged validation attempt. Lost requests never automatically replay. Controller death with a reservation but no trustworthy completion is UNKNOWN. A published implementation receipt can recover its pending Git checkpoint without repeating that paid execution. A per-mission POSIX lock prevents concurrent controllers from racing source/dispatch. GNU `timeout` also bounds the App Server process independently of controller reads; controller death cannot leave an unlimited paid runtime.
