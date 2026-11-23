@@ -206,7 +206,7 @@ def verify_target(spec, cwd, target):
     return contract.policy(spec, cwd, files)
 
 
-def tracked_source_digest(cwd, head, *, require_committed=False, gitlink_base=None):
+def tracked_source_digest(cwd, head, *, require_committed=False, gitlink_base=None, reference_checkout=None):
     from .factory import git
     entries = git(cwd, "ls-tree", "-r", "-z", head).split("\0")
     if gitlink_base is not None:
@@ -228,10 +228,15 @@ def tracked_source_digest(cwd, head, *, require_committed=False, gitlink_base=No
         if kind != "blob" or mode not in {"100644", "100755", "120000"}:
             raise ValueError("unsupported source entry in candidate")
         value = os.readlink(local).encode() if local.is_symlink() else local.read_bytes()
-        actual_blob = hashlib.sha1(b"blob " + str(len(value)).encode() + b"\0" + value).hexdigest()
         actual_mode = "120000" if local.is_symlink() else "100755" if local.stat().st_mode & 0o111 else "100644"
-        if require_committed and (actual_blob != object_id or mode != actual_mode):
-            raise ValueError("actual candidate source differs from committed HEAD bytes/mode")
+        if require_committed:
+            if reference_checkout is not None and mode != "120000":
+                expected = reference_checkout / path
+                matches = not expected.is_symlink() and value == expected.read_bytes()
+            else:
+                matches = hashlib.sha1(b"blob " + str(len(value)).encode() + b"\0" + value).hexdigest() == object_id
+            if not matches or mode != actual_mode:
+                raise ValueError("actual candidate source differs from committed HEAD checkout bytes/mode")
         result.update(json.dumps([path, actual_mode, sha256(value)]).encode())
     return result.hexdigest()
 

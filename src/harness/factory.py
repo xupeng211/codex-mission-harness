@@ -100,12 +100,15 @@ def private_dir(path: Path) -> Path:
     return path.resolve()
 
 
-def git(repo: Path, *args: str) -> str:
+def git(repo: Path, *args: str, object_directory: Path | None = None) -> str:
     env = {"PATH": SAFE_PATH, "HOME": "/nonexistent", "LANG": "C.UTF-8",
            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
            "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_OPTIONAL_LOCKS": "0",
-           "GIT_NO_LAZY_FETCH": "1", "GIT_LITERAL_PATHSPECS": "1"}
+           "GIT_NO_LAZY_FETCH": "1", "GIT_LITERAL_PATHSPECS": "1", "GIT_ATTR_NOSYSTEM": "1"}
+    if object_directory is not None:
+        env["GIT_OBJECT_DIRECTORY"] = str(object_directory)
     data = subprocess.check_output(["git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
+                                    "-c", "core.attributesFile=/dev/null",
                                     "-c", "core.quotePath=false",
                                     "-c", "core.fsmonitor=false", "-C", str(repo), *args],
                                    env=env, stderr=subprocess.PIPE, timeout=60).decode()
@@ -1023,8 +1026,7 @@ class Factory:
             raise FactoryBlocked("UNKNOWN", "implementation checkpoint target changed")
         return current
 
-    @staticmethod
-    def verify_checkpoint_source(cwd, head, *, gitlink_base=None):
+    def verify_checkpoint_source(self, cwd, head, *, gitlink_base=None):
         # Git status hides ignored files, empty directories and some index flags.
         # Compare the physical checkout with the tree before trusting its bytes.
         from .factory_project import tracked_source_digest
@@ -1051,7 +1053,19 @@ class Factory:
                 observed.add(relative)
         if observed != expected:
             raise FactoryBlocked("UNKNOWN", "implementation workspace is missing committed Git source")
-        tracked_source_digest(cwd, head, require_committed=True, gitlink_base=gitlink_base)
+        if not any(Path(path).name == ".gitattributes" for path in expected):
+            tracked_source_digest(cwd, head, require_committed=True, gitlink_base=gitlink_base)
+            return
+        # Let Git render committed attributes in a clean index/worktree with
+        # no source-repo config, info/attributes or external filter commands.
+        with tempfile.TemporaryDirectory(dir=self.root, prefix="checkout-reference-") as temporary:
+            reference = Path(temporary)
+            objects = cwd / ".git" / "objects"
+            git(reference, "init", "--quiet", "--template=")
+            git(reference, "read-tree", head, object_directory=objects)
+            git(reference, "checkout-index", "--all", object_directory=objects)
+            tracked_source_digest(cwd, head, require_committed=True, gitlink_base=gitlink_base,
+                                  reference_checkout=reference)
 
     @staticmethod
     def require_checkpoint_outputs(cwd, before, head, paths):

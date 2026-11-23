@@ -94,6 +94,53 @@ class FactoryAcceptanceTests(unittest.TestCase):
         self.assertEqual(self.factory.run(mission)["DELIVERY_STATUS"], READY)
         self.assertEqual(self.runtime.calls, [])
 
+    def submit_with_crlf_checkout(self):
+        guide = "docs/guide.txt"
+        (self.repo / "docs").mkdir()
+        (self.repo / "docs/.gitattributes").write_text("guide.txt text eol=crlf\n")
+        (self.repo / guide).write_bytes(b"Unchanged documentation.\r\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@localhost",
+            "commit", "-qm", "document with committed checkout attributes")
+        return self.factory.submit({**self.spec, "mission_id": "with-crlf"}), guide
+
+    def test_ordinary_delivery_verifies_the_committed_crlf_checkout_in_both_lanes(self):
+        mission, guide = self.submit_with_crlf_checkout()
+        report = self.factory.run(mission)
+        self.assertEqual(report["DELIVERY_STATUS"], READY, report)
+        self.assertNotIn(guide, report["EXACT_TARGET"]["files"])
+        for review in report["REVIEW_RESULT"]:
+            checkout = Path(next(call["payload"]["review_root"] for call in self.runtime.calls
+                                 if call["role"] == "review" and call["provider"] == review["provider"]
+                                 and call["payload"]["target"]["head"] == report["TARGET_HEAD"]))
+            self.assertEqual((checkout / guide).read_bytes(), b"Unchanged documentation.\r\n")
+            self.assertEqual(git(checkout, "show", f"HEAD:{guide}"), "Unchanged documentation.\n")
+
+    def test_crlf_review_rejects_extra_files_and_hidden_changes_before_reservation(self):
+        mission, guide = self.submit_with_crlf_checkout()
+        spec, candidate = self.factory.prepare(mission)
+        target = self.factory.target(spec, candidate)
+        for variant in ("different content", "wrong checkout form", "extra file"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory(dir=self.root) as directory:
+                checkout = Path(directory) / "source"
+                self.factory.isolated_checkout(candidate, checkout, target["head"])
+                if variant == "extra file":
+                    (checkout / ".git/info/exclude").write_text("local-only.txt\n")
+                    (checkout / "local-only.txt").write_text("not in the commit\n")
+                else:
+                    git(checkout, "update-index", "--assume-unchanged", "--", guide)
+                    (checkout / guide).write_bytes(
+                        b"Changed documentation.\r\n" if variant == "different content"
+                        else b"Unchanged documentation.\n")
+                    if variant == "wrong checkout form":
+                        (checkout / ".git/info/attributes").write_text(f"{guide} text eol=lf\n")
+                self.assertEqual(git(checkout, "status", "--porcelain"), "")
+                with patch.object(self.factory, "review_context", return_value=checkout):
+                    with self.assertRaisesRegex((ValueError, FactoryBlocked), "committed (HEAD|Git source)"):
+                        self.factory.review(spec, candidate, target, "reviewer")
+                self.assertEqual(self.runtime.calls, [])
+                self.assertEqual(self.factory.db.execute("SELECT COUNT(*) FROM operations").fetchone()[0], 0)
+
     def test_ordinary_review_rejects_local_files_in_gitlink_before_reservation(self):
         mission, module = self.submit_with_gitlink()
         original = self.factory.review_context

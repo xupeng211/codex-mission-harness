@@ -194,6 +194,10 @@ After the last assignment, the regular final tests, CI, independent review and
 applicable PR gates still cover the cumulative BASE-to-final-HEAD changes.
 Generic independent review checks the actual files of each detached review
 checkout against the committed tree before reservation and before execution.
+When the commit supplies `.gitattributes`, the Controller uses Git to
+materialize the expected checkout in an isolated index and checks those
+bytes. This also applies to checkpoint verification. The reference uses
+the committed attributes and a fresh Git configuration.
 For ordinary missions, the nonrecursive review checkout represents a Git
 submodule by its committed pointer and an empty directory. The Controller
 requires the pointers in BASE and the final commit to match.
