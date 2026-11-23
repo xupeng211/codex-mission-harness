@@ -194,6 +194,9 @@ After the last assignment, the regular final tests, CI, independent review and
 applicable PR gates still cover the cumulative BASE-to-final-HEAD changes.
 Generic independent review checks the actual files of each detached review
 checkout against the committed tree before reservation and before execution.
+For ordinary missions, the nonrecursive review checkout represents a Git
+submodule by its committed pointer and an empty directory. The Controller
+requires the pointers in BASE and the final commit to match.
 The canonical project review keeps its trusted runner and detached context.
 The single-task, local-candidate and rework paths retain their flow.
 

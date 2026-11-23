@@ -1024,7 +1024,7 @@ class Factory:
         return current
 
     @staticmethod
-    def verify_checkpoint_source(cwd, head):
+    def verify_checkpoint_source(cwd, head, *, gitlink_base=None):
         # Git status hides ignored files, empty directories and some index flags.
         # Compare the physical checkout with the tree before trusting its bytes.
         from .factory_project import tracked_source_digest
@@ -1051,7 +1051,7 @@ class Factory:
                 observed.add(relative)
         if observed != expected:
             raise FactoryBlocked("UNKNOWN", "implementation workspace is missing committed Git source")
-        tracked_source_digest(cwd, head, require_committed=True)
+        tracked_source_digest(cwd, head, require_committed=True, gitlink_base=gitlink_base)
 
     @staticmethod
     def require_checkpoint_outputs(cwd, before, head, paths):
@@ -1184,7 +1184,8 @@ class Factory:
             raise FactoryBlocked("UNKNOWN", "independent review checkout isolation changed")
         if self.target(spec, path) != target:
             raise FactoryBlocked("UNKNOWN", "review checkout differs from exact delivery target")
-        self.verify_checkpoint_source(path, target["head"])
+        gitlink_base = None if self.config.get("implementation_checkpoints") else target["base"]
+        self.verify_checkpoint_source(path, target["head"], gitlink_base=gitlink_base)
 
     def review(self, spec, cwd, target, lane):
         if self.project:

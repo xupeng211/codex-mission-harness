@@ -206,19 +206,31 @@ def verify_target(spec, cwd, target):
     return contract.policy(spec, cwd, files)
 
 
-def tracked_source_digest(cwd, head, *, require_committed=False):
+def tracked_source_digest(cwd, head, *, require_committed=False, gitlink_base=None):
     from .factory import git
+    entries = git(cwd, "ls-tree", "-r", "-z", head).split("\0")
+    if gitlink_base is not None:
+        base_entries = git(cwd, "ls-tree", "-r", "-z", gitlink_base).split("\0")
+        if ({entry for entry in entries if entry.startswith("160000 commit ")}
+                != {entry for entry in base_entries if entry.startswith("160000 commit ")}):
+            raise ValueError("submodule pointers differ from the approved base")
     result = hashlib.sha256()
-    for entry in filter(None, git(cwd, "ls-tree", "-r", "-z", head).split("\0")):
+    for entry in filter(None, entries):
         metadata, path = entry.split("\t", 1)
-        mode, kind, blob = metadata.split()
+        mode, kind, object_id = metadata.split()
+        local = cwd / path
+        if gitlink_base is not None and mode == "160000" and kind == "commit":
+            # A nonrecursive review checkout contains only a placeholder.
+            if local.is_symlink() or not local.is_dir() or any(local.iterdir()):
+                raise ValueError("review submodule placeholder is missing or not an empty directory")
+            result.update(json.dumps([path, mode, object_id]).encode())
+            continue
         if kind != "blob" or mode not in {"100644", "100755", "120000"}:
             raise ValueError("unsupported source entry in candidate")
-        local = cwd / path
         value = os.readlink(local).encode() if local.is_symlink() else local.read_bytes()
         actual_blob = hashlib.sha1(b"blob " + str(len(value)).encode() + b"\0" + value).hexdigest()
         actual_mode = "120000" if local.is_symlink() else "100755" if local.stat().st_mode & 0o111 else "100644"
-        if require_committed and (actual_blob != blob or mode != actual_mode):
+        if require_committed and (actual_blob != object_id or mode != actual_mode):
             raise ValueError("actual candidate source differs from committed HEAD bytes/mode")
         result.update(json.dumps([path, actual_mode, sha256(value)]).encode())
     return result.hexdigest()

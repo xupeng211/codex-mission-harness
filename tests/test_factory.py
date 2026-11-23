@@ -65,6 +65,65 @@ class FactoryAcceptanceTests(unittest.TestCase):
         self.assertTrue((Path(report["CANDIDATE"]) / "tests/test_score.py").is_file())
         self.assertIn("test_fractional", (Path(report["CANDIDATE"]) / "tests/test_score.py").read_text())
 
+    def submit_with_gitlink(self):
+        module = "vendor/library"
+        (self.repo / ".gitmodules").write_text(
+            '[submodule "library"]\n\tpath = vendor/library\n\turl = ../library\n\tignore = all\n')
+        git(self.repo, "add", ".gitmodules")
+        git(self.repo, "update-index", "--add", "--cacheinfo", f"160000,{self.base},{module}")
+        git(self.repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@localhost",
+            "commit", "-qm", "baseline with uninitialized submodule")
+        (self.repo / module).mkdir(parents=True)
+        return self.factory.submit({**self.spec, "mission_id": "with-gitlink"}), module
+
+    def test_ordinary_delivery_accepts_unchanged_empty_gitlink_in_both_review_lanes(self):
+        mission, module = self.submit_with_gitlink()
+        report = self.factory.run(mission)
+        self.assertEqual(report["DELIVERY_STATUS"], READY, report)
+        target = report["EXACT_TARGET"]
+        self.assertNotIn(module, target["files"])
+        self.assertEqual({entry["lane"] for entry in report["REVIEW_RESULT"]}, {"reviewer", "second_reviewer"})
+        for call in (call for call in self.runtime.calls if call["role"] == "review"):
+            checkout = Path(call["payload"]["review_root"])
+            reviewed = call["payload"]["target"]["head"]
+            self.assertEqual(git(checkout, "ls-tree", target["base"], "--", module),
+                             git(checkout, "ls-tree", reviewed, "--", module))
+            self.assertTrue((checkout / module).is_dir())
+            self.assertEqual(list((checkout / module).iterdir()), [])
+        self.reopen()
+        self.assertEqual(self.factory.run(mission)["DELIVERY_STATUS"], READY)
+        self.assertEqual(self.runtime.calls, [])
+
+    def test_ordinary_review_rejects_local_files_in_gitlink_before_reservation(self):
+        mission, module = self.submit_with_gitlink()
+        original = self.factory.review_context
+
+        def with_local_file(*args):
+            checkout = original(*args)
+            (checkout / module / "uncommitted.txt").write_text("not part of the reviewed tree\n")
+            self.assertEqual(git(checkout, "status", "--porcelain"), "")
+            return checkout
+
+        with patch.object(self.factory, "review_context", side_effect=with_local_file):
+            report = self.factory.run(mission)
+        self.assertEqual(report["DELIVERY_STATUS"], "UNKNOWN", report)
+        self.assertIn("outside committed Git source", report["BLOCKERS_REMAINING"][0])
+        self.assertEqual(self.factory.db.execute("SELECT COUNT(*) FROM operations WHERE stage='review'").fetchone()[0], 0)
+
+    def test_review_source_compares_gitlinks_with_base_independently_of_git_ignore_config(self):
+        mission, module = self.submit_with_gitlink()
+        spec, checkout = self.factory.prepare(mission)
+        self.factory.verify_checkpoint_source(checkout, spec["base"], gitlink_base=spec["base"])
+        with self.assertRaisesRegex(ValueError, "unsupported source entry"):
+            self.factory.verify_checkpoint_source(checkout, spec["base"])
+        git(checkout, "update-index", "--cacheinfo", f"160000,{spec['base']},{module}")
+        git(checkout, "-c", "user.name=Fixture", "-c", "user.email=fixture@localhost",
+            "commit", "-qm", "change submodule pointer")
+        self.assertEqual(git(checkout, "status", "--porcelain"), "")
+        with self.assertRaisesRegex(ValueError, "submodule pointers differ"):
+            self.factory.verify_checkpoint_source(checkout, git(checkout, "rev-parse", "HEAD"),
+                                                  gitlink_base=spec["base"])
+
     def test_multiple_planned_tasks_get_separate_official_agent_dispatches(self):
         original = self.runtime.agent
         def agent(role, *args):
