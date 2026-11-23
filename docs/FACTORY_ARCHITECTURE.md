@@ -197,7 +197,8 @@ checkout against the committed tree before reservation and before execution.
 When the commit supplies `.gitattributes`, the Controller uses Git to
 materialize the expected checkout in an isolated index and checks those
 bytes. This also applies to checkpoint verification. The reference uses
-the committed attributes and a fresh Git configuration.
+the committed attributes, the source repository's object format, and a
+fresh Git configuration. Raw blob checks use the same object format.
 For ordinary missions, the nonrecursive review checkout represents a Git
 submodule by its committed pointer and an empty directory. The Controller
 requires the pointers in BASE and the final commit to match.

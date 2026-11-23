@@ -208,6 +208,7 @@ def verify_target(spec, cwd, target):
 
 def tracked_source_digest(cwd, head, *, require_committed=False, gitlink_base=None, reference_checkout=None):
     from .factory import git
+    object_format = git(cwd, "rev-parse", "--show-object-format=storage") if require_committed else None
     entries = git(cwd, "ls-tree", "-r", "-z", head).split("\0")
     if gitlink_base is not None:
         base_entries = git(cwd, "ls-tree", "-r", "-z", gitlink_base).split("\0")
@@ -234,7 +235,8 @@ def tracked_source_digest(cwd, head, *, require_committed=False, gitlink_base=No
                 expected = reference_checkout / path
                 matches = not expected.is_symlink() and value == expected.read_bytes()
             else:
-                matches = hashlib.sha1(b"blob " + str(len(value)).encode() + b"\0" + value).hexdigest() == object_id
+                header = f"blob {len(value)}\0".encode("ascii")
+                matches = hashlib.new(object_format, header + value).hexdigest() == object_id
             if not matches or mode != actual_mode:
                 raise ValueError("actual candidate source differs from committed HEAD checkout bytes/mode")
         result.update(json.dumps([path, actual_mode, sha256(value)]).encode())

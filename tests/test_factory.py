@@ -141,6 +141,35 @@ class FactoryAcceptanceTests(unittest.TestCase):
                 self.assertEqual(self.runtime.calls, [])
                 self.assertEqual(self.factory.db.execute("SELECT COUNT(*) FROM operations").fetchone()[0], 0)
 
+    def test_ordinary_sha256_review_with_and_without_checkout_attributes(self):
+        for newline, suffix in ((b"\n", "plain"), (b"\r\n", "crlf")):
+            with self.subTest(checkout=suffix):
+                repo = self.root / f"sha256-{suffix}"
+                repo.mkdir()
+                git(repo, "init", "-q", "--object-format=sha256")
+                (repo / "score.py").write_bytes((self.repo / "score.py").read_bytes())
+                (repo / "guide.txt").write_bytes(b"Unchanged documentation." + newline)
+                (repo / "guide-link").symlink_to("guide.txt")
+                if suffix == "crlf":
+                    (repo / ".gitattributes").write_text("guide.txt text eol=crlf\n")
+                git(repo, "add", ".")
+                git(repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@localhost",
+                    "commit", "-qm", "SHA-256 fixture baseline")
+                mission = self.factory.submit({**self.spec, "repository": str(repo),
+                                               "mission_id": f"sha256-{suffix}"})
+                report = self.factory.run(mission)
+                self.assertEqual(report["DELIVERY_STATUS"], READY, report)
+                head = report["TARGET_HEAD"]
+                self.assertEqual(len(head), 64)
+                reviews = [call for call in self.runtime.calls if call["role"] == "review"
+                           and call["payload"]["target"]["head"] == head]
+                self.assertEqual({call["provider"] for call in reviews}, {"openai", "deepseek"})
+                for call in reviews:
+                    checkout = Path(call["payload"]["review_root"])
+                    self.assertEqual(git(checkout, "rev-parse", "--show-object-format"), "sha256")
+                    self.assertEqual((checkout / "guide.txt").read_bytes(), b"Unchanged documentation." + newline)
+                    self.assertEqual(os.readlink(checkout / "guide-link"), "guide.txt")
+
     def test_ordinary_review_rejects_local_files_in_gitlink_before_reservation(self):
         mission, module = self.submit_with_gitlink()
         original = self.factory.review_context

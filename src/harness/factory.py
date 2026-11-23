@@ -1061,7 +1061,8 @@ class Factory:
         with tempfile.TemporaryDirectory(dir=self.root, prefix="checkout-reference-") as temporary:
             reference = Path(temporary)
             objects = cwd / ".git" / "objects"
-            git(reference, "init", "--quiet", "--template=")
+            object_format = git(cwd, "rev-parse", "--show-object-format=storage")
+            git(reference, "init", "--quiet", "--template=", f"--object-format={object_format}")
             git(reference, "read-tree", head, object_directory=objects)
             git(reference, "checkout-index", "--all", object_directory=objects)
             tracked_source_digest(cwd, head, require_committed=True, gitlink_base=gitlink_base,
