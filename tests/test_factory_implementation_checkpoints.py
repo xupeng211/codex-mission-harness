@@ -408,6 +408,11 @@ class ImplementationCheckpointTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), initial)
 
     def test_project_pr_gates_receive_only_the_cumulative_candidate(self):
+        for mode in ("dual", "single_openai"):
+            with self.subTest(mode=mode):
+                self.check_project_pr_gates(mode)
+
+    def check_project_pr_gates(self, mode):
         from test_factory_controller_gates import CONTAINER, DELIVERY, LIMITS, LiveProtocolDouble
         from test_factory_project import ProjectContractTests
 
@@ -422,7 +427,10 @@ class ImplementationCheckpointTests(unittest.TestCase):
                   "project_container": CONTAINER, "project_delivery": DELIVERY,
                   "project_review_limits": LIMITS, "checks": [["make", "verify-targeted"]],
                   "ci": [["make", "verify-strict"]], "budget": self.config["budget"]}
-        state = self.root / "project-state"
+        config["review_mode"] = mode
+        if mode == "single_openai":
+            config["profiles"].pop("second_reviewer")
+        state = self.root / f"project-state-{mode}"
         with patch("harness.factory_preflight.inspect_prepaid", return_value={"status": "PASS", "findings": []}):
             runtime = LiveProtocolDouble()
             runtime.agent = DependentRuntime().agent
@@ -447,6 +455,9 @@ class ImplementationCheckpointTests(unittest.TestCase):
                 self.assertEqual(runtime.remote.writes, ["push", "create"])
                 self.assertEqual(runtime.remote.raw["head"]["sha"], final["TARGET_HEAD"])
                 self.assertFalse(final["MERGE_PERFORMED"])
+                expected_lanes = ["reviewer"] if mode == "single_openai" else ["reviewer", "second_reviewer"]
+                review_operations = factory.db.execute("SELECT lane FROM operations WHERE stage='review' ORDER BY rowid")
+                self.assertEqual([row["lane"] for row in review_operations], expected_lanes)
                 final_steps = factory.db.execute(
                     "SELECT stage,input FROM operations WHERE stage IN ('review','project_publish','project_ci','project_verify')"
                 ).fetchall()
