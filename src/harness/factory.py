@@ -2462,7 +2462,7 @@ class Factory:
                     try:
                         policy = self.project_policy(spec, cwd, paths)
                         if self.config.get("review_mode") == "single_openai":
-                            review_lanes({**policy, "review_mode": "single_openai"})
+                            review_lanes({"review_mode": "single_openai", "project_policy": policy})
                     except (OSError, ValueError, subprocess.SubprocessError) as exc:
                         raise FactoryBlocked("BLOCKED_SCOPE", f"project rejected checkpoint outputs: {exc}") from exc
             elif row["round"] == 0 and "max_total_tokens" in self.config["budget"]:
