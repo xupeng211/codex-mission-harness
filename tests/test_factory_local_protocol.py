@@ -87,6 +87,30 @@ class NativeProtocolTests(unittest.TestCase):
             "except OSError:r['write']='DENIED'\nprint(json.dumps(r))")
         self.assertEqual(result, {"readable": '{"controller":"owned"}\n', "write": "DENIED"})
 
+    def test_checkpoint_repair_native_session_reads_source_and_denies_writes(self):
+        from harness.factory_runtime import CHECKPOINT_REPAIR_SCHEMA
+
+        def inspect_without_turn(server, prompt, schema, **kwargs):
+            self.assertEqual(schema, CHECKPOINT_REPAIR_SCHEMA)
+            server.start_or_resume(None, str(self.cwd))
+            return {"probe": self.exec(server, "import pathlib,json\np=pathlib.Path('score.py')\n"
+                "r={'source':p.read_text()}\n"
+                "for key,path in " + repr({"controller": str(self.root / "state/control/private-sentinel"),
+                    "auth": str(self.auth / "private-sentinel"), "original": str(self.source / "score.py")}) + ".items():\n"
+                " try: pathlib.Path(path).read_bytes();r[key]='READABLE'\n"
+                " except OSError:r[key]='DENIED'\n"
+                "for name in ('score.py', 'new.py', '.git/HEAD'):\n"
+                " try: pathlib.Path(name).write_text('fixture');r[name]='WRITABLE'\n"
+                " except OSError:r[name]='DENIED'\nprint(json.dumps(r))")}
+
+        with patch.object(FactoryAppServer, "execute", inspect_without_turn):
+            result = LocalRuntime().agent("rework", {"provider": "openai", "model": "offline-protocol-no-inference",
+                "codex_home": str(self.auth)}, self.cwd, {"checkpoint_repair": {"path": "score.py"}},
+                self.root / "repair.raw", 30, [self.root / "state", self.source])
+        self.assertEqual(result["probe"], {"source": "def add(a, b):\n    return a + b\n",
+                                          "controller": "DENIED", "auth": "DENIED", "original": "DENIED",
+                                          "score.py": "DENIED", "new.py": "DENIED", ".git/HEAD": "DENIED"})
+
     def test_same_thread_resume_applies_overrides_after_unsubscribe_without_inference(self):
         server = self.server(False, 120000, reuse_session=True,
                              model="gpt-6.1-sol", effort="high")

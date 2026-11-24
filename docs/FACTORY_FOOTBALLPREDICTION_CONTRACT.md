@@ -23,8 +23,10 @@ Owner 另行批准后执行**。`harness factory-doctor` 不调用模型，但�
 
 mission/spec、scope 原始字节、policy、预算与 repository-external 状态存入既有
 immutable SQLite；不复用历史 mission ID、不改写历史 reservation 或 UNKNOWN。
-`approved_mission_scope` 字段仍为 `approval_id / mission_id / base / path / content /
+`approved_mission_scope` 必需字段为 `approval_id / mission_id / base / path / content /
 sha256 / expires_at`，path 必须为 `docs/agentic/missions/<mission-id>.json`。
+仅在 Owner 授权中途返工并经 Controller 核验后，才填写可选的
+`intermediate_rework: true`。此字段随其余工单授权一起冻结。
 Controller 在隔离 clone 提交 scope，Builder 不能修改；scope 自身也须明确授权。
 base、head 均使用完整 40 字符 SHA。用户源工作区和安装入口不会自动改变。
 

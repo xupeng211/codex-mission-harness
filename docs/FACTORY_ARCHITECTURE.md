@@ -185,10 +185,23 @@ checkpoints require both an approved output policy and recorded preparation
 evidence to advance. An interrupted
 assignment without a durable checkpoint, an unknown result or a changed
 candidate retains its evidence and accounting. Missing outputs or failed
-checkpoint checks stop with `BLOCKED_VALIDATION`. The run-count precheck
+checkpoint checks normally stop with `BLOCKED_VALIDATION`. The run-count precheck
 counts assignments still to dispatch and the configured review lanes even
 when the policy specifies only a call limit. Token and wall-clock admission
 continue to use the original rules.
+
+A project work order can explicitly allow an intermediate repair by setting
+`approved_mission_scope.intermediate_rework: true` in the Controller-verified
+approval before submission. Missing or false leaves intermediate repair
+disabled. Admission requires the one shared repair allowance (`max_rounds: 2`),
+remaining capacity and a verified targeted ESLint complexity failure in a
+required output. The Controller applies one text replacement and verifies the
+resulting Git blob, file mode, parent and file list before retesting and on
+reopen. It writes the repair in a private clone of the failed commit. The
+checkpoint records that checkout for continuation only after the retest
+passes and the original checkout still matches the failed target. Drift in
+the original also blocks resume. An intermediate repair consumes the slot
+shared with final rework.
 
 After the last assignment, the regular final tests, CI, independent review and
 applicable PR gates still cover the cumulative BASE-to-final-HEAD changes.

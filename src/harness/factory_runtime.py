@@ -82,6 +82,7 @@ PLAN_SCHEMA = obj({"plan": TEXT, "tasks": {"type": "array", "items": TEXT},
                    "acceptance": {"type": "array", "items": TEXT},
                    "decisions_required": {"type": "array", "items": TEXT}})
 WORK_SCHEMA = obj({"summary": TEXT, "known_risks": {"type": "array", "items": TEXT}})
+CHECKPOINT_REPAIR_SCHEMA = obj({**WORK_SCHEMA["properties"], "edit": obj({"before": TEXT, "after": TEXT})})
 
 
 class FactoryAppServer(AppServerCodex):
@@ -791,6 +792,9 @@ class LocalRuntime:
         thread_id = payload.pop("_thread_id", None)
         return_thread = bool(payload.pop("_return_thread", False))
         reuse_session = bool(payload.pop("_reuse_session", False))
+        checkpoint_repair = role == "rework" and "checkpoint_repair" in payload
+        if checkpoint_repair and (reuse_session or thread_id is not None):
+            raise RuntimeFailure("checkpoint repair requires a fresh read-only session", None, None)
         token_limit = self.resource_policy.get("max_run_tokens")
         operation_limit = payload.pop("_operation_token_limit", None)
         if operation_limit is not None:
@@ -831,7 +835,7 @@ class LocalRuntime:
                         owner._stop_execution()
             try:
                 server = FactoryAppServer(profile, cwd, transcript, timeout, denied_roots,
-                                          role in ("plan", "review"), role == "review", token_limit,
+                                          checkpoint_repair or role in ("plan", "review"), role == "review", token_limit,
                                           protected_paths=protected,
                                           execution_context={"mission_id": self._active_mission,
                                                              "runtime_execution": self._execution_id},
@@ -867,6 +871,8 @@ class LocalRuntime:
         server._reuse_session = reuse_session
         try:
             schema = REVIEW_SCHEMA if role == "review" else PLAN_SCHEMA if role == "plan" else WORK_SCHEMA
+            if checkpoint_repair:
+                schema = CHECKPOINT_REPAIR_SCHEMA
             result = server.execute(json.dumps(payload, ensure_ascii=False), schema,
                                     thread_id=thread_id, return_thread=return_thread)
             if not return_thread:
