@@ -148,6 +148,63 @@ this patch supplies no recovery mechanism or new spending authority. Offline
 fixtures prove transport/evidence/dispatch and rejection behavior, not future
 model understanding, planning success or business delivery.
 
+### Ordered implementation checkpoints
+
+Before submitting a staged mission, set `implementation_checkpoints: true`
+and list the required output paths for each nonfinal assignment in
+`implementation_checkpoint_outputs`. For two assignments, an example is
+`[["src/service.py", "tests/test_service.py"]]`. Both settings are part of
+the immutable mission policy. List dependent assignments in execution order.
+The planner receives the required paths and the assignment count derived
+from the output lists. The Controller rejects a plan with a different count
+before reserving any implementation.
+Each required output must be a regular tracked file within the mission scope,
+with content that changed in its assigned segment. The operator's existing
+`checks` must cover the behavior the next assignment needs. Project missions
+also check every required path against the trusted project policy before
+dispatching implementation.
+
+The Controller records the prepared HEAD and tree before exposing the PLAN
+state. This includes its scope commit in project mode. The first planner
+dispatch and restored planning evidence must bind that recorded start.
+
+After each nonfinal assignment, the Controller commits its changes, verifies
+the required outputs, and runs the configured checks for that exact target.
+Generic checks run in a fresh checkout of that commit. Project validation
+keeps its existing executor. After a pass the Controller reports
+`IMPLEMENTATION_CHECKPOINT` with the target, required outputs, and the keys
+of the implementation and check evidence. The existing `resume` command
+advances to the next assignment. The CLI exits nonzero at a checkpoint because
+final delivery is pending.
+
+On resume, the Controller verifies completed assignments, committed outputs,
+check logs and the physical checkout before reserving the next operation.
+Uncommitted inputs, including ignored files, block continuation. Work that
+needs generated files should use the existing temporary workspace. Historical
+checkpoints require both an approved output policy and recorded preparation
+evidence to advance. An interrupted
+assignment without a durable checkpoint, an unknown result or a changed
+candidate retains its evidence and accounting. Missing outputs or failed
+checkpoint checks stop with `BLOCKED_VALIDATION`. The run-count precheck
+counts assignments still to dispatch and the configured review lanes even
+when the policy specifies only a call limit. Token and wall-clock admission
+continue to use the original rules.
+
+After the last assignment, the regular final tests, CI, independent review and
+applicable PR gates still cover the cumulative BASE-to-final-HEAD changes.
+Generic independent review checks the actual files of each detached review
+checkout against the committed tree before reservation and before execution.
+When the commit supplies `.gitattributes`, the Controller uses Git to
+materialize the expected checkout in an isolated index and checks those
+bytes. This also applies to checkpoint verification. The reference uses
+the committed attributes, the source repository's object format, and a
+fresh Git configuration. Raw blob checks use the same object format.
+For ordinary missions, the nonrecursive review checkout represents a Git
+submodule by its committed pointer and an empty directory. The Controller
+requires the pointers in BASE and the final commit to match.
+The canonical project review keeps its trusted runner and detached context.
+The single-task, local-candidate and rework paths retain their flow.
+
 Budget units are agent executions, not dollars or internal Codex model requests. Native subagent fan-out is disabled to avoid an unregistered execution tree; role/task threads still use the official runtime. Real money remains UNKNOWN; Provider account limits are necessary for a monetary ceiling. Fixture telemetry explicitly records zero real Provider calls and cannot become a formal receipt.
 
 Known completed results are reused after envelope and raw-file hash verification. A proven completed malformed review allows one separately charged validation attempt. Lost requests never automatically replay. Controller death with a reservation but no trustworthy completion is UNKNOWN. A published implementation receipt can recover its pending Git checkpoint without repeating that paid execution. A per-mission POSIX lock prevents concurrent controllers from racing source/dispatch. GNU `timeout` also bounds the App Server process independently of controller reads; controller death cannot leave an unlimited paid runtime.
