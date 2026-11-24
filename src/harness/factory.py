@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from .factory_runtime import LocalRuntime, RuntimeFailure, official_rubric, VENDOR
@@ -100,7 +101,7 @@ def private_dir(path: Path) -> Path:
     return path.resolve()
 
 
-def git(repo: Path, *args: str, object_directory: Path | None = None) -> str:
+def git(repo: Path, *args: str, object_directory: Path | None = None, input_bytes: bytes | None = None) -> str:
     env = {"PATH": SAFE_PATH, "HOME": "/nonexistent", "LANG": "C.UTF-8",
            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
            "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_OPTIONAL_LOCKS": "0",
@@ -111,7 +112,7 @@ def git(repo: Path, *args: str, object_directory: Path | None = None) -> str:
                                     "-c", "core.attributesFile=/dev/null",
                                     "-c", "core.quotePath=false",
                                     "-c", "core.fsmonitor=false", "-C", str(repo), *args],
-                                   env=env, stderr=subprocess.PIPE, timeout=60).decode()
+                                   env=env, stderr=subprocess.PIPE, timeout=60, input=input_bytes).decode()
     return data if args[0] in ("diff", "show") and "--name-only" not in args else data.rstrip("\n")
 
 
@@ -1057,6 +1058,12 @@ class Factory:
         if not any(Path(path).name == ".gitattributes" for path in expected):
             tracked_source_digest(cwd, head, require_committed=True, gitlink_base=gitlink_base)
             return
+        with self.reference_checkout(cwd, head) as reference:
+            tracked_source_digest(cwd, head, require_committed=True, gitlink_base=gitlink_base,
+                                  reference_checkout=reference)
+
+    @contextmanager
+    def reference_checkout(self, cwd, head):
         # Let Git render committed attributes in a clean index/worktree with
         # no source-repo config, info/attributes or external filter commands.
         with tempfile.TemporaryDirectory(dir=self.root, prefix="checkout-reference-") as temporary:
@@ -1066,8 +1073,7 @@ class Factory:
             git(reference, "init", "--quiet", "--template=", f"--object-format={object_format}")
             git(reference, "read-tree", head, object_directory=objects)
             git(reference, "checkout-index", "--all", object_directory=objects)
-            tracked_source_digest(cwd, head, require_committed=True, gitlink_base=gitlink_base,
-                                  reference_checkout=reference)
+            yield reference
 
     @staticmethod
     def require_checkpoint_outputs(cwd, before, head, paths):
@@ -1120,8 +1126,15 @@ class Factory:
             raise FactoryBlocked("BLOCKED_VALIDATION", "checkpoint failure is not an in-scope ESLint complexity error")
         return lint["path"], feedback
 
+    def checkpoint_repair_authority(self, spec):
+        approved = approved_scope(json.loads(self.row(spec["mission_id"])["spec"]))
+        if approved.get("intermediate_rework") is not True or approved != approved_scope(spec):
+            raise FactoryBlocked("BLOCKED_VALIDATION", "work order does not authorize intermediate checkpoint rework")
+        return digest(approved)
+
     def guard_checkpoint_repair(self, spec, cwd, target, remaining_tasks):
         mission = spec["mission_id"]
+        self.checkpoint_repair_authority(spec)
         self.implementation_checkpoint_target(spec, cwd, target)
         self.remaining_implementation_runs(mission, remaining_tasks + 1)
         slots = 1 + remaining_tasks + len(configured_review_lanes(self.config))
@@ -1143,13 +1156,16 @@ class Factory:
                 or self.config["checks"] != [["make", "verify-targeted"]] or "project_container" not in self.config
                 or self.checkpoint_repairs(mission) or len(failed) != 1):
             raise FactoryBlocked("BLOCKED_VALIDATION", "implementation checkpoint check failed")
+        authorization = self.checkpoint_repair_authority(spec)
         key = failed[0]["evidence_key"]
         path, feedback = self.checkpoint_repair_feedback(mission, target, index, assignment["checkpoint_outputs"], key)
         source = cwd / path
         info = source.lstat()
         if source.resolve() != source or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 1024 * 1024:
             raise FactoryBlocked("BLOCKED_SCOPE", "checkpoint repair requires a bounded regular output file")
-        binding = {"target": target, "failure": key, "path": path}
+        original, _, _ = self.checkpoint_repair_version(cwd, target, path)
+        binding = {"target": target, "failure": key, "path": path, "approval_sha256": authorization,
+                   "source_sha256": hashlib.sha256(original).hexdigest()}
         payload = {**assignment, "scope": [path], "checkpoint_repair": binding, "feedback": feedback,
                    "instruction": "Fix the verified ESLint complexity failure in the one file in scope. "
                                   "The candidate is read-only. Return summary, known_risks and one edit with exact "
@@ -1163,9 +1179,12 @@ class Factory:
         if not isinstance(output, dict) or set(output) != {"summary", "known_risks", "edit"}:
             raise FactoryBlocked("UNKNOWN", "checkpoint repair output is missing or malformed")
         work = self.implementation_output({"output": {k: output[k] for k in ("summary", "known_risks")}})
-        self.apply_checkpoint_repair(source, output["edit"])
+        original, replacement, expected_entry = self.checkpoint_repair_version(cwd, target, path, output=output)
+        if hashlib.sha256(original).hexdigest() != binding["source_sha256"]:
+            raise FactoryBlocked("UNKNOWN", "checkpoint repair source differs from its dispatched version")
+        self.apply_checkpoint_repair(source, original, replacement)
         repaired = self.checkpoint(spec, cwd, repair_path=path)
-        self.verify_checkpoint_repair_commit(cwd, target, repaired, path)
+        self.verify_checkpoint_repair_commit(cwd, target, repaired, path, expected_entry)
         checks = self.gates(spec, cwd, repaired, "checks", 1, checkpoint_index=index, exact_source=True)
         if any(check["status"] != "PASS" for check in checks):
             raise FactoryBlocked("BLOCKED_VALIDATION", "implementation checkpoint check still fails after the shared repair")
@@ -1177,32 +1196,70 @@ class Factory:
             raise FactoryBlocked("UNKNOWN", "checkpoint repair retest has no original QA transcript")
         return work, repaired, checks, self.checkpoint_repairs(mission)[0]["key"]
 
+    def checkpoint_repair_version(self, cwd, failed, path, *, output=None):
+        head = failed["head"]
+        entry = git(cwd, "ls-tree", "-z", head, "--", path)
+        if not entry.startswith(("100644 blob ", "100755 blob ")):
+            raise FactoryBlocked("BLOCKED_SCOPE", "checkpoint repair requires a committed regular output file")
+        metadata, _ = entry.split("\t", 1)
+        mode, _, blob = metadata.split()
+        if int(git(cwd, "cat-file", "-s", blob)) > 1024 * 1024:
+            raise FactoryBlocked("BLOCKED_SCOPE", "checkpoint repair requires a bounded output file")
+        with self.reference_checkout(cwd, head) as reference:
+            with (reference / path).open("rb") as stream:
+                original = stream.read(1024 * 1024 + 1)
+            if len(original) > 1024 * 1024:
+                raise FactoryBlocked("BLOCKED_SCOPE", "checkpoint repair checkout file exceeds its size limit")
+            if output is None:
+                return original, None, None
+            replacement = self.checkpoint_replacement(original, output["edit"])
+            # Derive the committed blob from the expected checkout bytes using
+            # the failed tree's attributes, independently of the live index.
+            object_directory = cwd / ".git" / "objects"
+            expected_blob = git(reference, "hash-object", f"--path={path}", "--stdin",
+                                object_directory=object_directory, input_bytes=replacement)
+            if expected_blob == blob:
+                raise FactoryBlocked("BLOCKED_VALIDATION", "checkpoint repair did not change the committed file")
+            return original, replacement, f"{mode} blob {expected_blob}\t{path}\0"
+
     @staticmethod
-    def apply_checkpoint_repair(source, edit):
+    def checkpoint_replacement(original, edit):
         if (not isinstance(edit, dict) or set(edit) != {"before", "after"}
                 or not all(isinstance(value, str) for value in edit.values())):
             raise FactoryBlocked("BLOCKED_SCOPE", "checkpoint repair must be a single text replacement in the bound file")
         before, after = edit["before"].encode(), edit["after"].encode()
         if not before or before == after or len(before) + len(after) > 65536 or b"\0" in before + after:
             raise FactoryBlocked("BLOCKED_VALIDATION", "checkpoint repair replacement is empty, unchanged or oversized")
+        position = original.find(before)
+        if position < 0 or original.find(before, position + 1) >= 0:
+            raise FactoryBlocked("BLOCKED_VALIDATION", "checkpoint repair does not identify one exact original text")
+        return original[:position] + after + original[position + len(before):]
+
+    @staticmethod
+    def apply_checkpoint_repair(source, original, replacement):
+        if source.resolve() != source:
+            raise FactoryBlocked("UNKNOWN", "checkpoint repair file path changed before write")
         with os.fdopen(os.open(source, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK), "r+b") as stream:
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 1024 * 1024:
                 raise FactoryBlocked("BLOCKED_SCOPE", "checkpoint repair file identity changed")
-            original = stream.read(1024 * 1024 + 1)
-            position = original.find(before)
-            if position < 0 or original.find(before, position + 1) >= 0:
-                raise FactoryBlocked("BLOCKED_VALIDATION", "checkpoint repair does not identify one exact original text")
+            observed = stream.read(len(original) + 1)
+            current = source.lstat()
+            if (observed != original or not os.path.samestat(info, current)
+                    or (current.st_size, current.st_mtime_ns, current.st_ctime_ns) !=
+                       (info.st_size, info.st_mtime_ns, info.st_ctime_ns)):
+                raise FactoryBlocked("UNKNOWN", "checkpoint repair file bytes or identity changed before write")
             stream.seek(0)
-            stream.write(original[:position] + after + original[position + len(before):])
+            stream.write(replacement)
             stream.truncate()
 
     @staticmethod
-    def verify_checkpoint_repair_commit(cwd, failed, repaired, path):
+    def verify_checkpoint_repair_commit(cwd, failed, repaired, path, expected_entry):
         if (git(cwd, "rev-list", "--parents", "-n", "1", repaired["head"]).split() !=
                 [repaired["head"], failed["head"]]
-                or git(cwd, "diff", "--name-only", "-z", failed["head"], repaired["head"]) != path + "\0"):
-            raise FactoryBlocked("BLOCKED_SCOPE", "checkpoint repair commit exceeds its exact file scope")
+                or git(cwd, "diff", "--name-only", "--no-renames", "-z", failed["head"], repaired["head"]) != path + "\0"
+                or git(cwd, "ls-tree", "-z", repaired["head"], "--", path) != expected_entry):
+            raise FactoryBlocked("UNKNOWN", "checkpoint repair commit is not the exact replacement of the failed version")
 
     def implementation_progress(self, spec, cwd, checkpoints, implementations):
         if len(checkpoints) != len(implementations):
@@ -1239,9 +1296,14 @@ class Factory:
                 path, feedback = self.checkpoint_repair_feedback(mission, binding["target"], index, paths, binding["failure"])
                 if binding["path"] != path or repair_input["scope"] != [path] or repair_input["feedback"] != feedback:
                     raise FactoryBlocked("UNKNOWN", "checkpoint repair differs from its bound QA diagnostic")
+                if binding.get("approval_sha256") != self.checkpoint_repair_authority(spec):
+                    raise FactoryBlocked("UNKNOWN", "checkpoint repair approval differs from the frozen work order")
                 self.require_checkpoint_outputs(cwd, identity["dispatch_head"], binding["target"]["head"], paths)
-                self.verify_checkpoint_repair_commit(cwd, binding["target"], target, path)
                 output = json.loads(repair["result"])["output"]
+                original, _, expected_entry = self.checkpoint_repair_version(cwd, binding["target"], path, output=output)
+                if binding.get("source_sha256") != hashlib.sha256(original).hexdigest():
+                    raise FactoryBlocked("UNKNOWN", "checkpoint repair source differs from its dispatched version")
+                self.verify_checkpoint_repair_commit(cwd, binding["target"], target, path, expected_entry)
                 outputs[-1] = self.implementation_output({"output": {k: output[k] for k in ("summary", "known_risks")}})
             self.require_checkpoint_outputs(cwd, identity["dispatch_head"], target["head"], paths)
             if len(receipt["checks"]) != len(commands):
@@ -2258,6 +2320,9 @@ class Factory:
                         raise FactoryBlocked("UNKNOWN", "delivery lacks the approved implementation checkpoints")
                     self.verify_checkpoint_plan(mission, required)
                     self.implementation_checkpoint_target(spec, cwd, delivery["target"])
+                    if self.checkpoint_repairs(mission):
+                        self.implementation_progress(spec, cwd, checkpoints,
+                                                     [op for op in operations if op["stage"] == "implement"])
                 elif self.target(spec, cwd) != delivery.get("target"):
                     raise FactoryBlocked("UNKNOWN", "delivery HEAD/tree/scope changed after verification")
                 for validation in self.require_project_validation(spec, cwd, delivery["target"]):

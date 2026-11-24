@@ -71,8 +71,10 @@ def approved_scope(spec):
     """Validate Controller input; preserve exact UTF-8 bytes, never infer approval."""
     value = spec.get("approved_mission_scope")
     required = {"approval_id", "mission_id", "base", "path", "content", "sha256", "expires_at"}
-    if not isinstance(value, dict) or set(value) != required:
+    if not isinstance(value, dict) or set(value) - {"intermediate_rework"} != required:
         raise ValueError("explicit Controller approved_mission_scope is required")
+    if "intermediate_rework" in value and type(value["intermediate_rework"]) is not bool:
+        raise ValueError("Controller intermediate_rework approval must be boolean")
     if value["mission_id"] != spec["mission_id"] or value["base"] != spec["base"]:
         raise ValueError("scope approval mission/base mismatch")
     if not isinstance(value["approval_id"], str) or not value["approval_id"].strip():
