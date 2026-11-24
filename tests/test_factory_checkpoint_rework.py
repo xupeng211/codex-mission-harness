@@ -50,6 +50,9 @@ class StagedRepairRuntime(LiveProtocolDouble):
             path = cwd / VALIDATOR
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"// complexity fixture\r\n" if self.mode == "crlf" else b"// complexity fixture\n")
+        if self.mode == "with-temp" and role == "implement":
+            from harness.task_temp import TaskTemp
+            TaskTemp(str(cwd), "offline-checkpoint", record=transcript.with_suffix(".temp.json")).close()
         return result
 
     def container_gate(self, policy, spec, cwd, target, command, transcript, timeout):
@@ -127,7 +130,7 @@ class CheckpointReworkTests(unittest.TestCase):
         return rows, {path: path.read_bytes() for path in files}
 
     def test_approved_complexity_repair_resumes_and_preserves_old_operations(self):
-        self.prepare("pass")
+        self.prepare("with-temp")
         first, paid = self.run_first()
         self.assertEqual(first["DELIVERY_STATUS"], IMPLEMENTATION_CHECKPOINT)
         self.assertEqual([row["stage"] for row in paid], ["plan", "implement", "rework"])
@@ -137,6 +140,9 @@ class CheckpointReworkTests(unittest.TestCase):
         event = first["IMPLEMENTATION_CHECKPOINTS"][0]
         self.assertNotEqual(event["target"]["head"], diagnosis["head"])
         cwd = Path(first["CANDIDATE"])
+        origin = Path(first["ORIGINAL_CANDIDATE"])
+        self.assertEqual((origin / VALIDATOR).read_bytes(), b"// complexity fixture\n")
+        self.assertEqual(git(origin, "rev-parse", "HEAD"), diagnosis["head"])
         self.assertEqual(git(cwd, "rev-parse", "HEAD^"), diagnosis["head"])
         self.assertEqual(event["repair"], paid[-1]["key"])
         binding = json.loads(paid[-1]["input"])["checkpoint_repair"]
@@ -150,6 +156,7 @@ class CheckpointReworkTests(unittest.TestCase):
             after = self.paid(factory)
             self.assertEqual(after[:3], paid)
             self.assertEqual([op["stage"] for op in after], ["plan", "implement", "rework", "implement", "review"])
+            self.assertEqual(json.loads(after[3]["identity"])["candidate_checkout"], str(cwd))
             self.assertEqual(self.original_operations(factory)[0][:len(rows)], rows)
             self.assertEqual({p: Path(p).read_bytes() for p in before}, before)
 
@@ -216,7 +223,7 @@ class CheckpointReworkTests(unittest.TestCase):
                 self.assertEqual(self.runtime.dispatches, [("plan", None), ("implement", 0)])
                 self.assertNotIn("IMPLEMENTATION_CHECKPOINTS", first)
 
-    def test_drift_at_write_and_before_commit_never_reaches_retest(self):
+    def test_original_drift_at_repair_write_is_preserved_without_checkpoint(self):
         apply = Factory.apply_checkpoint_repair
 
         def append(source):
@@ -224,14 +231,14 @@ class CheckpointReworkTests(unittest.TestCase):
                 stream.write(b"// unrelated edit\n")
 
         def drift_before_write(source, original, replacement):
-            append(source)
+            append(self.state / "candidates" / self.spec["mission_id"] / "source" / VALIDATOR)
             apply(source, original, replacement)
 
         def drift_after_write(source, original, replacement):
             apply(source, original, replacement)
             append(source)
 
-        for inject, text in ((drift_before_write, "bytes or identity changed"),
+        for inject, text in ((drift_before_write, "original checkpoint checkout changed"),
                              (drift_after_write, "not the exact replacement")):
             with self.subTest(inject=inject.__name__):
                 self.prepare("pass")
@@ -240,12 +247,54 @@ class CheckpointReworkTests(unittest.TestCase):
                 self.assertEqual(first["DELIVERY_STATUS"], "UNKNOWN", first["BLOCKERS_REMAINING"])
                 self.assertIn(text, first["BLOCKERS_REMAINING"][0])
                 self.assertNotIn("IMPLEMENTATION_CHECKPOINTS", first)
-                self.assertIn(b"// unrelated edit", (Path(first["CANDIDATE"]) / VALIDATOR).read_bytes())
                 with self.open() as factory:
+                    origin = Path(first["CANDIDATE"])
+                    scratch = factory.repair_checkout_path(self.spec["mission_id"], paid[-1]["key"])
+                    if inject is drift_before_write:
+                        self.assertEqual((origin / VALIDATOR).read_bytes(), b"// complexity fixture\n// unrelated edit\n")
+                        self.assertEqual((scratch / VALIDATOR).read_bytes(), b"// repaired offline\n")
+                    else:
+                        self.assertEqual((origin / VALIDATOR).read_bytes(), b"// complexity fixture\n")
+                        self.assertIn(b"// unrelated edit", (scratch / VALIDATOR).read_bytes())
                     self.assertEqual(factory.run(self.spec["mission_id"])["DELIVERY_STATUS"], "UNKNOWN")
                     self.assertEqual(self.runtime.dispatches, [])
                     self.assertEqual(self.paid(factory), paid)
                     self.assertEqual(factory.db.execute("SELECT COUNT(*) FROM operations WHERE stage='checks'").fetchone()[0], 1)
+
+    def test_original_drift_after_retest_or_between_processes_stops_continuation(self):
+        gate = StagedRepairRuntime.container_gate
+
+        def drift_during_retest(runtime, policy, spec, cwd, target, command, transcript, timeout):
+            result = gate(runtime, policy, spec, cwd, target, command, transcript, timeout)
+            if (cwd / VALIDATOR).read_text() == "// repaired offline\n":
+                edit_original()
+            return result
+
+        def edit_original():
+            with origin.open("ab") as stream:
+                stream.write(b"// late external edit\n")
+
+        for during_retest in (True, False):
+            with self.subTest(during_retest=during_retest):
+                self.prepare("pass")
+                origin = self.state / "candidates" / self.spec["mission_id"] / "source" / VALIDATOR
+                with patch.object(StagedRepairRuntime, "container_gate", drift_during_retest if during_retest else gate):
+                    first, paid = self.run_first()
+                if during_retest:
+                    self.assertEqual(first["DELIVERY_STATUS"], "UNKNOWN")
+                    self.assertNotIn("IMPLEMENTATION_CHECKPOINTS", first)
+                else:
+                    self.assertEqual(first["DELIVERY_STATUS"], IMPLEMENTATION_CHECKPOINT)
+                    edit_original()
+                with self.open() as factory:
+                    rows, evidence = self.original_operations(factory)
+                    final = factory.run(self.spec["mission_id"])
+                    self.assertEqual(final["DELIVERY_STATUS"], "UNKNOWN", final["BLOCKERS_REMAINING"])
+                    self.assertIn("original checkpoint checkout changed", final["BLOCKERS_REMAINING"][0])
+                    self.assertEqual(self.runtime.dispatches, [])
+                    self.assertEqual(self.paid(factory), paid)
+                    self.assertEqual(self.original_operations(factory), (rows, evidence))
+                    self.assertEqual(origin.read_bytes(), b"// complexity fixture\n// late external edit\n")
 
     def test_reopen_rejects_even_a_recorded_pass_for_wrong_repair_blob(self):
         self.prepare("recorded-extra-edit")

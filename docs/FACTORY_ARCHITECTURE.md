@@ -197,7 +197,11 @@ disabled. Admission requires the one shared repair allowance (`max_rounds: 2`),
 remaining capacity and a verified targeted ESLint complexity failure in a
 required output. The Controller applies one text replacement and verifies the
 resulting Git blob, file mode, parent and file list before retesting and on
-reopen. An intermediate repair consumes the slot shared with final rework.
+reopen. It writes the repair in a private clone of the failed commit. The
+checkpoint records that checkout for continuation only after the retest
+passes and the original checkout still matches the failed target. Drift in
+the original also blocks resume. An intermediate repair consumes the slot
+shared with final rework.
 
 After the last assignment, the regular final tests, CI, independent review and
 applicable PR gates still cover the cumulative BASE-to-final-HEAD changes.
