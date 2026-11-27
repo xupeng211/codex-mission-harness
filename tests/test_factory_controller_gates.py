@@ -122,6 +122,8 @@ class ControllerGatesTests(unittest.TestCase):
         # The existing project dev image keeps its locked Python QA tools here.
         # env -i must preserve this fixed image path, never the host's PATH.
         self.assertIn("PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin", argv)
+        self.assertIn("HOME=/home/cmh", argv)
+        self.assertIn(f"/home/cmh:rw,nosuid,nodev,size=16m,mode=0700,uid={os.getuid()},gid={os.getgid()}", argv)
         self.assertIn(f"type=bind,src={self.cwd / '.git'},dst=/app/.git,readonly", argv)
         self.assertNotIn("docker.sock", str(argv))
         mounts = [dict(part.split("=", 1) if "=" in part else (part, "") for part in argv[i + 1].split(","))
